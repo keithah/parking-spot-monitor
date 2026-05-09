@@ -1,0 +1,11 @@
+[project]
+name = "parking-spot-monitor"
+version = "0.1.0"
+description = "Local parking spot monitor for UniFi Protect RTSP streams."
+readme = "parking-spot-monitor-spec.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
