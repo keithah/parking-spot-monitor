@@ -161,12 +161,25 @@ Send Matrix notification only on:
 occupied -> empty
 ```
 
+Each open-spot alert must include a full-frame camera snapshot captured when the spot is confirmed empty. The image should show the empty street space in context, not only a cropped ROI, so the Matrix room can verify the opening without opening the camera app.
+
 Do not alert on:
 
 - unknown -> empty
 - empty -> empty
 - passing car enters ROI briefly
 - vehicle detected in road lane but not stable in spot
+- normal spot openings during configured street-sweeping windows
+
+### Street-Sweeping Quiet Window
+
+Normal open-spot alerts are suppressed during street sweeping:
+
+```text
+1:00 PM–3:00 PM on the 1st and 3rd Monday of each month
+```
+
+The service should continue capturing frames, running detection, and updating occupancy state during the quiet window. Only normal `occupied -> empty` Matrix alerts are suppressed. The service should post a Matrix notice when the sweeping window begins and another when it ends, so the room has explicit context for the muted period.
 
 ---
 
@@ -236,16 +249,25 @@ matrix:
   homeserver: "https://matrix.example.com"
   room_id: "!roomid:example.com"
   access_token_env: "MATRIX_ACCESS_TOKEN"
+  send_snapshot: true
+  snapshot_mode: "full_frame"
 ```
 
-Message format:
+Open-spot message format:
 
 ```text
 Parking spot open: left_spot
 Parking spot open: right_spot
 ```
 
-Optional: include a JPEG snapshot with the alert.
+Each open-spot message must include a JPEG snapshot attachment. The snapshot should be the full camera frame captured at the confirmed-empty moment, retained locally under `/data/events/` for debugging.
+
+Street-sweeping message formats:
+
+```text
+Street sweeping window started: normal parking-open alerts muted until 3:00 PM
+Street sweeping window ended: normal parking-open alerts resumed
+```
 
 ---
 
@@ -299,6 +321,19 @@ matrix:
   room_id: "!roomid:example.com"
   access_token_env: "MATRIX_ACCESS_TOKEN"
   send_snapshot: true
+  snapshot_mode: "full_frame"
+
+quiet_windows:
+  street_sweeping:
+    enabled: true
+    timezone: "America/Los_Angeles"
+    ordinal_weekdays: [1, 3]
+    weekday: "monday"
+    start: "13:00"
+    end: "15:00"
+    suppress_open_spot_alerts: true
+    post_start_notice: true
+    post_end_notice: true
 ```
 
 ---
@@ -318,11 +353,13 @@ parking-spot-monitor/
     capture.py
     detector.py
     occupancy.py
+    scheduler.py
     matrix_client.py
     geometry.py
   tests/
     test_geometry.py
     test_occupancy.py
+    test_scheduler.py
   README.md
 ```
 
@@ -357,15 +394,19 @@ services:
 
 # Milestones, Slices, and Tasks
 
-## Milestone 1: Project Skeleton and Docker Runtime
+The project should be planned as multiple milestones. M001 delivers the first complete local service with conservative defaults and enough observability to trust what it is doing. Later milestones tune it against real traffic and improve operator documentation.
 
-### Slice 1.1: Create App Skeleton
+## Milestone 1: Working Local Parking Monitor
+
+Goal: ship a complete Dockerized service that watches the RTSP stream, evaluates the two configured street-parking spots, applies conservative occupancy rules, respects the street-sweeping quiet window, and posts Matrix messages with full-frame snapshots when a spot opens.
+
+### Slice 1.1: Runtime Skeleton and Config
 
 Tasks:
 
 - Create repository structure.
 - Add `src/main.py` entrypoint.
-- Add `config.yaml.example`.
+- Add `config.yaml.example` with stream, spots, detection, occupancy, Matrix, and quiet-window settings.
 - Add basic structured logging.
 - Load config from `/config/config.yaml`.
 - Validate required env vars: `RTSP_URL`, `MATRIX_ACCESS_TOKEN`.
@@ -374,236 +415,161 @@ Acceptance criteria:
 
 - `docker compose up` starts the service.
 - App logs config summary without exposing secrets.
-- App exits clearly if required config is missing.
+- App exits clearly if required config or env vars are missing.
+- Street-sweeping quiet-window settings are loaded and validated.
 
-### Slice 1.2: Dockerfile and Compose
-
-Tasks:
-
-- Build Python image with FFmpeg installed.
-- Add dependencies in `requirements.txt`.
-- Add `/dev/dri` mount in compose for Intel GPU access.
-- Add `restart: unless-stopped`.
-
-Acceptance criteria:
-
-- Image builds locally.
-- Container starts on a host without `/dev/dri` and falls back cleanly.
-- Container starts on Intel host with `/dev/dri` mounted.
-
----
-
-## Milestone 2: RTSP Capture with Intel HW Decode Fallback
-
-### Slice 2.1: Software RTSP Snapshot Capture
+### Slice 1.2: Frame Capture and Debug Frames
 
 Tasks:
 
 - Implement FFmpeg-based snapshot capture.
 - Sample one frame every `sample_interval_seconds`.
-- Save latest debug frame to `/data/latest.jpg`.
+- Prefer Intel hardware decode when available: QSV, then VAAPI, then software fallback.
+- Save latest frame to `/data/latest.jpg`.
 - Reconnect on stream failure.
 
 Acceptance criteria:
 
 - Service can pull frames from the RTSP URL.
 - Frame resolution matches expected `1458 x 806`, or logs actual resolution if different.
-- Stream reconnects after temporary failure.
+- Unsupported hardware decode falls back to software without crashing.
+- Stream reconnect attempts are visible in logs.
 
-### Slice 2.2: Intel Hardware Decode Detection
-
-Tasks:
-
-- Detect whether `/dev/dri/renderD128` exists.
-- Attempt QSV decode first.
-- Attempt VAAPI decode second.
-- Fall back to software decode.
-- Log selected decode mode.
-
-Acceptance criteria:
-
-- On unsupported hosts, app falls back to software without crashing.
-- On Intel GPU hosts, app uses hardware decode if FFmpeg supports it.
-- Failed hardware attempts are logged once, not spammed.
-
----
-
-## Milestone 3: Geometry and Spot Masking
-
-### Slice 3.1: Polygon Configuration
+### Slice 1.3: Spot Geometry and Debug Overlay
 
 Tasks:
 
 - Load left and right spot polygons from config.
 - Validate polygon coordinates are inside frame bounds.
-- Implement point-in-polygon test.
-- Implement polygon overlap ratio for detection boxes.
+- Implement point-in-polygon and bbox/polygon overlap checks.
+- Draw spot polygons on a debug frame.
+- Save `/data/debug_latest.jpg`.
 
 Acceptance criteria:
 
 - Tests cover centroid inside/outside polygon.
 - Tests cover bbox overlap with spot polygon.
 - Bottom driveway car is outside all configured spots.
-
-### Slice 3.2: Debug Overlay
-
-Tasks:
-
-- Draw spot polygons on debug frame.
-- Draw accepted detections in each spot.
-- Draw rejected detections in a different style or omit them.
-- Save `/data/debug_latest.jpg`.
-
-Acceptance criteria:
-
 - Visual output clearly shows left and right monitored spots.
-- Passing-road areas are not included in monitored polygons.
 
----
-
-## Milestone 4: Vehicle Detection
-
-### Slice 4.1: YOLO Detector Integration
+### Slice 1.4: Vehicle Detection and Spot Filtering
 
 Tasks:
 
-- Load configured YOLO model.
+- Load configured YOLO nano model.
 - Run detector at sample interval.
-- Filter to vehicle classes only.
-- Apply confidence and minimum-area thresholds.
+- Filter to vehicle classes only: `car`, `truck`, `bus`.
+- Apply confidence, minimum-area, centroid-inside-polygon, and overlap thresholds.
+- Emit per-spot detection candidates.
 
 Acceptance criteria:
 
-- Vehicles in the left and right spot are detected on the provided image.
+- Vehicles in the left and right street spots are detected on the provided image.
 - The bottom driveway car does not count for either monitored spot.
+- Passing-road vehicles are rejected unless they satisfy the configured spot geometry rules.
+- Logs explain accepted/rejected detection counts without being noisy.
 
-### Slice 4.2: Spot-Level Detection Filtering
-
-Tasks:
-
-- Assign detections to spots only if centroid is inside polygon.
-- Require minimum overlap with spot polygon.
-- Ignore detections outside spot polygons.
-
-Acceptance criteria:
-
-- Passing road vehicles are rejected unless they remain inside a spot polygon.
-- A parked car partly overlapping a spot still counts if above overlap threshold.
-
----
-
-## Milestone 5: Occupancy State Machine
-
-### Slice 5.1: Occupied State Confirmation
+### Slice 1.5: Occupancy State and Quiet-Window Policy
 
 Tasks:
 
-- Track per-spot consecutive hits.
+- Track per-spot consecutive hits and misses.
 - Track candidate bbox centroid drift.
-- Mark spot `occupied` only after configured consecutive stable hits.
+- Mark a spot `occupied` only after configured stable consecutive hits.
+- Mark a spot `empty` only after configured consecutive misses.
+- Keep `unknown` state at startup until occupied or empty is confirmed.
+- Implement the 1st/3rd Monday, 1:00 PM–3:00 PM street-sweeping quiet window.
+- Continue state updates during the quiet window while suppressing normal open-spot alerts.
+- Emit schedule events when the quiet window begins and ends.
 
 Acceptance criteria:
 
 - A passing car does not mark a spot occupied.
 - A parked car present for around 60 seconds marks the spot occupied.
-
-### Slice 5.2: Empty State Confirmation
-
-Tasks:
-
-- Track per-spot consecutive misses.
-- Mark spot `empty` only after configured misses.
-- Keep `unknown` state at startup until either occupied or empty is confirmed.
-
-Acceptance criteria:
-
 - Brief occlusions do not mark a spot empty.
-- Detector misses for 90 seconds mark an occupied spot empty.
-- Startup does not send false `empty` alerts.
+- Detector misses for around 90 seconds mark an occupied spot empty.
+- Startup does not send false empty alerts.
+- A confirmed opening during street sweeping updates internal state but does not send a normal open-spot alert.
+- Sweep start/end events are emitted exactly once per window.
 
-### Slice 5.3: Transition Events
-
-Tasks:
-
-- Emit event only for `occupied -> empty`.
-- Suppress duplicate alerts until spot becomes occupied again.
-- Include spot ID, label, timestamp, and optional snapshot path.
-
-Acceptance criteria:
-
-- One notification is sent when the left spot empties.
-- One notification is sent when the right spot empties.
-- No notification is sent for road traffic.
-
----
-
-## Milestone 6: Matrix Integration
-
-### Slice 6.1: Text Notifications
+### Slice 1.6: Matrix Text, Snapshot Upload, and End-to-End Wiring
 
 Tasks:
 
-- Implement Matrix message sender.
-- Read access token from env var.
+- Implement Matrix message sender using a bot access token from env.
 - Send text alert to configured room.
-- Retry transient failures with backoff.
+- Save event snapshots to `/data/events/`.
+- Attach a full-frame JPEG snapshot to open-spot alerts.
+- Send street-sweeping start/end notices.
+- Retry transient Matrix failures with backoff.
+- Wire capture, detection, occupancy, scheduler, and Matrix together in the service loop.
 
 Acceptance criteria:
 
-- Test message posts to Matrix room.
-- Failed Matrix post is logged and retried.
+- One Matrix alert is sent when the left spot empties outside the quiet window.
+- One Matrix alert is sent when the right spot empties outside the quiet window.
+- Each open-spot alert includes a full-frame snapshot showing the empty spot in context.
+- No normal open-spot alert is sent during the street-sweeping quiet window.
+- Matrix receives a start notice when sweeping begins and an end notice when normal alerts resume.
+- Failed Matrix posts are logged and retried without crashing the service.
 
-### Slice 6.2: Snapshot Upload
-
-Tasks:
-
-- Save event snapshot to `/data/events/`.
-- Upload image to Matrix media endpoint.
-- Send message with attached image.
-
-Acceptance criteria:
-
-- Alert includes a snapshot showing the open spot.
-- Snapshot file is retained locally for debugging.
-
----
-
-## Milestone 7: Hardening and Tuning
-
-### Slice 7.1: Runtime Observability
+### Slice 1.7: Docker Runtime and Operator Signals
 
 Tasks:
 
-- Log per-spot state changes.
-- Log detection counts and accepted/rejected counts.
+- Build Python image with FFmpeg installed.
+- Add OpenCV headless, Ultralytics, Matrix client, and scheduling dependencies.
+- Add `/dev/dri` mount in compose for Intel GPU access.
+- Add `restart: unless-stopped`.
 - Add periodic heartbeat log.
-- Add optional healthcheck endpoint or health file.
+- Add optional health file or healthcheck endpoint.
 
 Acceptance criteria:
 
-- It is easy to tell whether the script is running and seeing frames.
-- Logs explain why a detection did or did not count.
+- Image builds locally.
+- Container starts on a host without `/dev/dri` and falls back cleanly.
+- Container starts on Intel host with `/dev/dri` mounted when available.
+- It is easy to tell whether the script is running, seeing frames, and posting alerts.
 
-### Slice 7.2: Tuning Pass with Real Street Traffic
+## Milestone 2: Calibration and Real-Traffic Hardening
+
+Goal: run the service against real street traffic long enough to tune false positives/false negatives and make the monitored polygons and thresholds trustworthy.
+
+### Slice 2.1: Real-World Observation Run
 
 Tasks:
 
 - Run for at least one full day.
 - Review false positives and false negatives.
-- Adjust spot polygons.
-- Tune confidence, overlap, hit/miss thresholds.
-- Decide whether each spot needs separate thresholds.
+- Inspect saved event snapshots and debug overlays.
+- Compare logs against expected street behavior.
 
 Acceptance criteria:
 
-- No alerts from ordinary passing traffic during test period.
+- No alerts from ordinary passing traffic during the observation period.
 - Spot-empty alerts occur within roughly 1-2 minutes after a parked car leaves.
+- Any missed alerts or false alerts have enough logged context to explain why.
 
----
+### Slice 2.2: Threshold and Polygon Tuning
 
-## Milestone 8: Documentation
+Tasks:
 
-### Slice 8.1: README
+- Adjust spot polygons if needed.
+- Tune confidence, overlap, hit/miss, drift, and sample interval thresholds.
+- Decide whether each spot needs separate thresholds.
+- Update `config.yaml.example` with tuned defaults.
+
+Acceptance criteria:
+
+- User can tune left and right spots without touching Python code.
+- Tuned defaults reflect real camera behavior rather than only the initial screenshot.
+- Tuning changes are documented with rationale.
+
+## Milestone 3: Documentation and Maintenance Polish
+
+Goal: make the service easy to install, operate, calibrate, and debug later.
+
+### Slice 3.1: README and Setup Guide
 
 Tasks:
 
@@ -612,12 +578,14 @@ Tasks:
 - Document Docker Compose usage.
 - Document Matrix bot setup.
 - Document Intel GPU passthrough.
+- Document required env vars without exposing secret values.
 
 Acceptance criteria:
 
 - A clean machine can run the service from README instructions.
+- A future operator can tell how to configure Matrix, RTSP, GPU passthrough, and the street-sweeping schedule.
 
-### Slice 8.2: Calibration Guide
+### Slice 3.2: Calibration and Troubleshooting Guide
 
 Tasks:
 
@@ -625,10 +593,12 @@ Tasks:
 - Explain how to inspect debug overlays.
 - Explain recommended thresholds.
 - Explain why road traffic should be excluded by ROI and persistence logic.
+- Explain how to diagnose Matrix post failures, RTSP reconnects, and model detection misses.
 
 Acceptance criteria:
 
 - User can tune left and right spots without touching Python code.
+- Troubleshooting starts from durable logs and saved images, not guesswork.
 
 ---
 
@@ -640,6 +610,7 @@ Acceptance criteria:
 - Do not use cloud AI APIs.
 - Do not alert on every vehicle detection.
 - Do not monitor the driveway/bottom car.
+- Do not suppress detection or state updates during street sweeping; only suppress normal open-spot alerts.
 
 ---
 
