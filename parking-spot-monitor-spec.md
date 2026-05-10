@@ -7,7 +7,7 @@ Build a small local Docker service that watches a UniFi Protect RTSP stream, mon
 Source stream:
 
 ```text
-rtsps://192.168.42.73:7441/WMV14zD0lCh90yFb?enableSrtp
+<RTSP_URL>
 ```
 
 Source image dimensions: `1458 x 806`.
@@ -220,7 +220,7 @@ The container should mount Intel GPU devices when available:
 ```bash
 docker run \
   --device /dev/dri:/dev/dri \
-  --env RTSP_URL='rtsps://192.168.42.73:7441/WMV14zD0lCh90yFb?enableSrtp' \
+  --env RTSP_URL='<RTSP_URL>' \
   parking-spot-monitor:latest
 ```
 
@@ -383,7 +383,7 @@ services:
     devices:
       - /dev/dri:/dev/dri
     environment:
-      RTSP_URL: "rtsps://192.168.42.73:7441/WMV14zD0lCh90yFb?enableSrtp"
+      RTSP_URL: "<RTSP_URL>"
       MATRIX_ACCESS_TOKEN: "${MATRIX_ACCESS_TOKEN}"
     volumes:
       - ./config.yaml:/config/config.yaml:ro
