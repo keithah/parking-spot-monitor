@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+config.yaml
+
+# Runtime/artifacts
+.bg-shell/
+.gsd/runtime/
+.gsd/notifications.jsonl
+data/latest.jpg
+data/debug_latest.jpg
+data/snapshots/
+
+# ── GSD baseline (auto-generated) ──
+.gsd
+.gsd-id
+.mcp.json
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+node_modules/
+.next/
+dist/
+build/
+*.pyc
+target/
+vendor/
+*.log
+coverage/
+.cache/
+tmp/
