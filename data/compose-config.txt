@@ -1,0 +1,34 @@
+name: m001
+services:
+  parking-spot-monitor:
+    build:
+      context: /home/keith/.gsd/projects/95a213d63160/worktrees/M001
+      dockerfile: Dockerfile
+    command:
+      - python
+      - -m
+      - parking_spot_monitor
+      - --config
+      - /config/config.yaml
+      - --data-dir
+      - /data
+    environment:
+      MATRIX_ACCESS_TOKEN: null
+      RTSP_URL: null
+    image: parking-spot-monitor:local
+    networks:
+      default: null
+    restart: "no"
+    volumes:
+      - type: bind
+        source: /home/keith/.gsd/projects/95a213d63160/worktrees/M001/config.yaml
+        target: /config/config.yaml
+        read_only: true
+        bind: {}
+      - type: bind
+        source: /home/keith/.gsd/projects/95a213d63160/worktrees/M001/data
+        target: /data
+        bind: {}
+networks:
+  default:
+    name: m001_default

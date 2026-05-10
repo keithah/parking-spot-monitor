@@ -1,0 +1,64 @@
+{
+  "artifact": "m001-s05-reconciliation-status",
+  "schema_version": 1,
+  "milestone_id": "M001",
+  "approval_context": {
+    "slice_id": "S17",
+    "task_id": "T01",
+    "purpose": "authorized administrative reconciliation for the historical S05/T05 task-accounting mismatch"
+  },
+  "observed_gsd_status": {
+    "source": "gsd_milestone_status(M001)",
+    "milestone_status": "active",
+    "slice_id": "S05",
+    "slice_status": "complete",
+    "total_tasks": 5,
+    "done_tasks": 4,
+    "pending_tasks": 1,
+    "boundary_condition": "S05 is complete while one historical task remains pending."
+  },
+  "resolution": "authorized_admin_reconciled",
+  "administrative_reconciliation_is_blocker": false,
+  "milestone_validation_may_pass": false,
+  "milestone_validation_hold_reason": "This reconciliation removes the administrative S05/T05 blocker only. M001 validation must remain blocked until strict live proof succeeds and the later S17 task explicitly updates this field.",
+  "requirements_validated_by_this_artifact": [],
+  "requirements_not_validated_by_this_artifact": [
+    "R003",
+    "R015"
+  ],
+  "canonical_code_test_remediation_evidence": {
+    "slice_id": "S15",
+    "task_id": "T01",
+    "path": ".gsd/milestones/M001/slices/S15/tasks/T01-SUMMARY.md",
+    "summary": "S15/T01 is the canonical source-code and test remediation evidence for the historical S05/T05 findings."
+  },
+  "historical_task_provenance": {
+    "slice_id": "S05",
+    "task_id": "T05",
+    "path": ".gsd/milestones/M001/slices/S05/tasks/T05-PLAN.md",
+    "summary": "S05/T05 describes the original continuity and state-safety remediation contract whose source/test work was later completed in S15/T01."
+  },
+  "validation_provenance": {
+    "path": ".gsd/milestones/M001/M001-VALIDATION.md",
+    "prior_status": "needs-remediation because live proof remained incomplete and this administrative reconciliation had not yet been authorized"
+  },
+  "reconciliation_rationale": [
+    "S05 was not reopened because gsd_slice_reopen would reset all S05 tasks and discard historical task-state continuity for completed work.",
+    "Direct database mutation is prohibited, so this artifact records an authorized administrative reconciliation without changing GSD task rows directly.",
+    "The complete-with-one-pending mismatch is represented explicitly rather than silently erased.",
+    "The administrative issue is no longer a milestone blocker, but R003 and R015 remain unvalidated until strict Docker live proof and Matrix readback succeed."
+  ],
+  "supported_state_mutation_applied": false,
+  "supported_state_mutation_reason": "No GSD task row was directly changed; the supported action in S17/T01 is an operator-readable reconciliation artifact.",
+  "raw_db_dump_included": false,
+  "sensitive_values_included": false,
+  "redaction_safety": {
+    "contains_rtsp_url": false,
+    "contains_auth_header": false,
+    "contains_credential_value": false,
+    "contains_stack_trace": false,
+    "contains_raw_service_response": false,
+    "notes": "Only names, paths, statuses, counts, and requirement identifiers are recorded."
+  },
+  "next_required_step": "Run strict live proof in later S17 tasks, verify captured JPEG artifacts and room readback, then update milestone_validation_may_pass only after the proof succeeds."
+}

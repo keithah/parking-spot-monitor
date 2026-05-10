@@ -1,0 +1,15 @@
+services:
+  parking-spot-monitor:
+    build: .
+    image: parking-spot-monitor:local
+    command: ["python", "-m", "parking_spot_monitor", "--config", "/config/config.yaml", "--data-dir", "/data"]
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ./data:/data
+      # Optional read-only model mount for operators who pre-stage YOLO weights.
+      #   - ./models:/models:ro
+    restart: "no"
+    # Hardware decode passthrough for Intel QSV/VAAPI.
+    # Hosts without /dev/dri should remove or override this device mapping.
+    devices:
+      - /dev/dri:/dev/dri
