@@ -18,6 +18,7 @@ env/
 .env
 .env.*
 !.env.example
+config.yaml
 
 # Runtime/artifacts
 .bg-shell/

@@ -1,0 +1,26 @@
+{
+  "artifact_checks": null,
+  "artifacts": null,
+  "docker_exit_code": null,
+  "marker_checks": null,
+  "markers": null,
+  "matrix_room_readback": null,
+  "missing_inputs": [
+    "RTSP_URL",
+    "matrix.homeserver",
+    "matrix.room_id",
+    "MATRIX_TOKEN_ENV"
+  ],
+  "phase": "preflight",
+  "redaction": {
+    "redaction_replacements": 0,
+    "secret_occurrences": 0
+  },
+  "redaction_scan": {
+    "redaction_replacements": 0,
+    "secret_occurrences": 0
+  },
+  "room_readback": null,
+  "room_readback_status": "not_attempted",
+  "status": "preflight_failed"
+}

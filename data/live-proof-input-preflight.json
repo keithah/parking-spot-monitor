@@ -1,0 +1,29 @@
+{
+  "config": {
+    "exists": true,
+    "parse_ok": true,
+    "path": "config.yaml"
+  },
+  "environment": {
+    "matrix_token_env_name": "Matrix token env key",
+    "matrix_token_env_present": false,
+    "rtsp_env_name": "RTSP_URL",
+    "rtsp_env_present": false
+  },
+  "generated_at": "2026-05-10T07:46:27Z",
+  "missing_inputs": [
+    "RTSP_URL",
+    "matrix.homeserver",
+    "matrix.room_id",
+    "MATRIX_TOKEN_ENV"
+  ],
+  "notes": [
+    "Names-only preflight summary; raw RTSP URLs, Matrix token values, auth headers, Matrix responses, and image bytes are intentionally omitted."
+  ],
+  "routing": {
+    "matrix_homeserver_present": false,
+    "matrix_room_id_present": false
+  },
+  "schema_version": 1,
+  "status": "preflight_blocked"
+}
