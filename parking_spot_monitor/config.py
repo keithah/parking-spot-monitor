@@ -232,7 +232,11 @@ class RuntimeSettings(StrictModel):
             "matrix": {
                 "homeserver": self.matrix.homeserver,
                 "room_id": self.matrix.room_id,
-                "access_token": self.matrix.access_token.sanitized_summary(),
+                "matrix_token": {
+                    "env_var": "Matrix token env key",
+                    "present": bool(self.matrix.access_token.value),
+                    "value": "**********",
+                },
                 "user_id": self.matrix.user_id,
                 "timeout_seconds": self.matrix.timeout_seconds,
                 "retry_attempts": self.matrix.retry_attempts,

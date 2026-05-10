@@ -59,7 +59,8 @@ def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
 
     assert "./config.yaml:/config/config.yaml:ro" in service["volumes"]
     assert "./data:/data" in service["volumes"]
-    assert service["environment"] == ["RTSP_URL", "MATRIX_ACCESS_TOKEN"]
+    assert "env_file" not in service
+    assert "environment" not in service
     assert service["command"] == [
         "python",
         "-m",
@@ -70,9 +71,8 @@ def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
         "/data",
     ]
     assert "--validate-config" not in service["command"]
-    assert "devices" not in service
-    assert "# devices:" in compose_text
-    assert "#   - /dev/dri:/dev/dri" in compose_text
+    assert service["devices"] == ["/dev/dri:/dev/dri"]
+    assert "/dev/dri:/dev/dri" in compose_text
     assert "#   - ./models:/models:ro" in compose_text
 
 

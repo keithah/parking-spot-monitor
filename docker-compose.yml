@@ -3,16 +3,13 @@ services:
     build: .
     image: parking-spot-monitor:local
     command: ["python", "-m", "parking_spot_monitor", "--config", "/config/config.yaml", "--data-dir", "/data"]
-    environment:
-      - RTSP_URL
-      - MATRIX_ACCESS_TOKEN
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ./data:/data
       # Optional read-only model mount for operators who pre-stage YOLO weights.
       #   - ./models:/models:ro
     restart: "no"
-    # Optional hardware decode passthrough for hosts with Intel/VAAPI devices.
-    # Leave this commented so `docker compose config` works on hosts without /dev/dri.
-    # devices:
-    #   - /dev/dri:/dev/dri
+    # Hardware decode passthrough for Intel QSV/VAAPI.
+    # Hosts without /dev/dri should remove or override this device mapping.
+    devices:
+      - /dev/dri:/dev/dri

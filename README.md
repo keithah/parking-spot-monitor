@@ -12,7 +12,7 @@ Start from the tracked example and keep real secrets out of YAML and committed f
 cp config.yaml.example config.yaml
 ```
 
-`config.yaml` should contain environment variable names only. The service resolves these required variables at startup:
+`config.yaml` should contain environment variable names only. The service resolves these required variables at startup; provide them through your shell, service manager, or ignored `.env` file used by the live-proof wrapper:
 
 - `RTSP_URL`
 - `MATRIX_ACCESS_TOKEN`
@@ -58,7 +58,7 @@ python scripts/run_docker_live_proof.py
 python scripts/verify_live_proof.py
 ```
 
-`scripts/run_docker_live_proof.py` runs the Dockerized `--live-proof-once` command, captures redacted Docker stdout/stderr logs, performs Matrix room readback, and produces `data/live-proof-result.json`. It requires real live inputs by name/path only: `config.yaml`, `RTSP_URL`, Matrix access-token environment routing such as `MATRIX_ACCESS_TOKEN`, and the Matrix homeserver/room routing in operator config. Do not paste actual RTSP URLs, Matrix tokens, room response bodies, or other secret values into examples, logs, or reports.
+`scripts/run_docker_live_proof.py` runs the Dockerized `--live-proof-once` command, passes `RTSP_URL` and the configured Matrix token environment key to `docker compose run`, captures redacted Docker stdout/stderr logs, performs Matrix room readback, and produces `data/live-proof-result.json`. It requires real live inputs by name/path only: `config.yaml`, `RTSP_URL`, Matrix access-token environment routing such as `MATRIX_ACCESS_TOKEN`, and the Matrix homeserver/room routing in operator config. Do not paste actual RTSP URLs, Matrix tokens, room response bodies, or other secret values into examples, logs, or reports.
 
 Runner exit codes are part of the proof contract: `0` means the runner completed strict live proof, `2` means preflight blockers such as missing `config.yaml`, `RTSP_URL`, or Matrix token routing prevented live proof from running, and any other non-zero exit means Docker execution, marker checks, artifact checks, Matrix room readback, or redaction validation failed. Missing live inputs are blockers, not successful proof; preflight blocker evidence means R003/R015 remain unvalidated.
 
@@ -100,18 +100,18 @@ A missing mounted model is treated as a detector/model-load runtime failure, not
 
 The detector adapter imports Ultralytics lazily when the model object is constructed, reuses that single model for subsequent frame predictions, and normalizes model output into detector-neutral vehicle records before the spot filtering rules run. Unit tests use fake YOLO result objects, so normal test runs do not download weights or run real inference. They prove deterministic class, confidence, area, centroid, overlap, adapter, and failure-path behavior without network access. Live camera accuracy proof remains operator evidence collected through the live-proof commands; the earlier detection.model allowlisting item is now implemented, while model-threshold tuning and non-root container hardening remain future hardening work after M001 (previously deferred to S07).
 
-Build and inspect the Docker runtime contract:
+Build and inspect the Docker runtime contract. If your shell has real live secrets loaded, do not paste rendered Compose output into logs or tickets; use `docker compose config --no-interpolate` for structure-only inspection or scan the output for forbidden secret patterns.
 
 ```sh
 docker build -t parking-spot-monitor:test .
-docker compose config
+docker compose config --no-interpolate
 ```
 
-Run the Compose default as the real capture runtime against a mounted operator config and data directory:
+Run the Compose default as the real capture runtime against a mounted operator config and data directory. The service definition intentionally does not bake secret env values into `docker-compose.yml`; provide them from the shell or service manager at runtime.
 
 ```sh
 mkdir -p data
-docker compose up parking-spot-monitor
+RTSP_URL="$RTSP_URL" MATRIX_ACCESS_TOKEN="$MATRIX_ACCESS_TOKEN" docker compose up parking-spot-monitor
 ```
 
 Run the same finite capture proof in Docker when you want a bounded smoke check that writes `/data/latest.jpg` inside the container and `./data/latest.jpg` on the host:
@@ -153,7 +153,7 @@ Use this final local verification contract for Docker/operator changes:
 python -m pytest tests/test_config.py tests/test_docker_contract.py -q
 python -m pytest -q
 docker build -t parking-spot-monitor:test .
-docker compose config
+docker compose config --no-interpolate
 RTSP_URL=placeholder MATRIX_ACCESS_TOKEN=placeholder \
   python -m parking_spot_monitor --config config.yaml --validate-config
 python -m parking_spot_monitor --config config.yaml --data-dir ./data --capture-once
@@ -172,6 +172,6 @@ docker run --rm parking-spot-monitor:test \
 
 That failure command should exit non-zero and emit structured `startup-config-invalid` logs containing the config path and validation phase, not secret values.
 
-## Optional hardware decode
+## Hardware decode
 
-`docker-compose.yml` intentionally leaves `/dev/dri` passthrough commented out so Compose can render on hosts without Intel/VAAPI devices. If a later capture slice needs hardware decode on a host that provides `/dev/dri`, uncomment the documented `devices` block.
+`docker-compose.yml` mounts `/dev/dri:/dev/dri` so hardware decode can work inside the container. The capture path tries QSV, VAAPI, DRM, then software; on this host QSV/VAAPI device setup fails but DRM succeeds once `/dev/dri` is mounted. Without this device passthrough, FFmpeg cannot create hardware devices and the capture path falls back to software decode. Hosts without `/dev/dri` should remove or override the `devices` mapping for software-only operation.

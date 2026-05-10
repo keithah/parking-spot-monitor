@@ -1,17 +1,193 @@
 {
-  "artifact_checks": null,
-  "artifacts": null,
-  "docker_exit_code": null,
-  "marker_checks": null,
-  "markers": null,
-  "matrix_room_readback": null,
-  "missing_inputs": [
+  "artifact_checks": {
+    "latest_jpeg": {
+      "byte_size": 90836,
+      "exists": true,
+      "format": "JPEG",
+      "height": 360,
+      "path": "data/latest.jpg",
+      "valid_jpeg": true,
+      "width": 640
+    },
+    "snapshot_jpegs": {
+      "count": 5,
+      "files": [
+        {
+          "byte_size": 95551,
+          "exists": true,
+          "format": "JPEG",
+          "height": 360,
+          "path": "data/snapshots/live-proof-camera-2026-05-10t17-48-22-281745-00-00.jpg",
+          "valid_jpeg": true,
+          "width": 640
+        },
+        {
+          "byte_size": 94098,
+          "exists": true,
+          "format": "JPEG",
+          "height": 360,
+          "path": "data/snapshots/live-proof-camera-2026-05-10t17-49-39-687101-00-00.jpg",
+          "valid_jpeg": true,
+          "width": 640
+        },
+        {
+          "byte_size": 92721,
+          "exists": true,
+          "format": "JPEG",
+          "height": 360,
+          "path": "data/snapshots/live-proof-camera-2026-05-10t17-51-13-404910-00-00.jpg",
+          "valid_jpeg": true,
+          "width": 640
+        },
+        {
+          "byte_size": 91614,
+          "exists": true,
+          "format": "JPEG",
+          "height": 360,
+          "path": "data/snapshots/live-proof-camera-2026-05-10t17-55-29-160671-00-00.jpg",
+          "valid_jpeg": true,
+          "width": 640
+        },
+        {
+          "byte_size": 90836,
+          "exists": true,
+          "format": "JPEG",
+          "height": 360,
+          "path": "data/snapshots/live-proof-camera-2026-05-10t17-58-01-559166-00-00.jpg",
+          "valid_jpeg": true,
+          "width": 640
+        }
+      ],
+      "valid_count": 5
+    }
+  },
+  "artifacts": {
+    "latest_jpeg": {
+      "byte_size": 90836,
+      "exists": true,
+      "format": "JPEG",
+      "height": 360,
+      "path": "data/latest.jpg",
+      "valid_jpeg": true,
+      "width": 640
+    },
+    "snapshot_jpegs": {
+      "count": 5,
+      "files": [
+        {
+          "byte_size": 95551,
+          "exists": true,
+          "format": "JPEG",
+          "height": 360,
+          "path": "data/snapshots/live-proof-camera-2026-05-10t17-48-22-281745-00-00.jpg",
+          "valid_jpeg": true,
+          "width": 640
+        },
+        {
+          "byte_size": 94098,
+          "exists": true,
+          "format": "JPEG",
+          "height": 360,
+          "path": "data/snapshots/live-proof-camera-2026-05-10t17-49-39-687101-00-00.jpg",
+          "valid_jpeg": true,
+          "width": 640
+        },
+        {
+          "byte_size": 92721,
+          "exists": true,
+          "format": "JPEG",
+          "height": 360,
+          "path": "data/snapshots/live-proof-camera-2026-05-10t17-51-13-404910-00-00.jpg",
+          "valid_jpeg": true,
+          "width": 640
+        },
+        {
+          "byte_size": 91614,
+          "exists": true,
+          "format": "JPEG",
+          "height": 360,
+          "path": "data/snapshots/live-proof-camera-2026-05-10t17-55-29-160671-00-00.jpg",
+          "valid_jpeg": true,
+          "width": 640
+        },
+        {
+          "byte_size": 90836,
+          "exists": true,
+          "format": "JPEG",
+          "height": 360,
+          "path": "data/snapshots/live-proof-camera-2026-05-10t17-58-01-559166-00-00.jpg",
+          "valid_jpeg": true,
+          "width": 640
+        }
+      ],
+      "valid_count": 5
+    }
+  },
+  "completed_at": "2026-05-10T17:58:02Z",
+  "docker_command": [
+    "docker",
+    "compose",
+    "run",
+    "--rm",
+    "-e",
     "RTSP_URL",
-    "matrix.homeserver",
-    "matrix.room_id",
-    "MATRIX_TOKEN_ENV"
+    "-e",
+    "Matrix token env key",
+    "parking-spot-monitor",
+    "python",
+    "-m",
+    "parking_spot_monitor",
+    "--config",
+    "/config/config.yaml",
+    "--data-dir",
+    "/data",
+    "--live-proof-once"
   ],
-  "phase": "preflight",
+  "docker_exit_code": 0,
+  "marker_checks": {
+    "forbidden": [
+      "LIVE_PROOF_SKIPPED_CONFIG_ABSENT",
+      "LIVE_PROOF_SKIPPED_RTSP_ENV_ABSENT",
+      "LIVE_PROOF_SKIPPED_MATRIX_ENV_ABSENT",
+      "LIVE_RTSP_CAPTURE_FAILED",
+      "LIVE_MATRIX_TEXT_FAILED",
+      "LIVE_MATRIX_IMAGE_FAILED"
+    ],
+    "forbidden_present": [],
+    "missing_required": [],
+    "required": [
+      "LIVE_RTSP_CAPTURE_OK",
+      "LIVE_MATRIX_TEXT_OK",
+      "LIVE_MATRIX_IMAGE_OK"
+    ],
+    "required_present": true
+  },
+  "markers": {
+    "forbidden": [
+      "LIVE_PROOF_SKIPPED_CONFIG_ABSENT",
+      "LIVE_PROOF_SKIPPED_RTSP_ENV_ABSENT",
+      "LIVE_PROOF_SKIPPED_MATRIX_ENV_ABSENT",
+      "LIVE_RTSP_CAPTURE_FAILED",
+      "LIVE_MATRIX_TEXT_FAILED",
+      "LIVE_MATRIX_IMAGE_FAILED"
+    ],
+    "forbidden_present": [],
+    "missing_required": [],
+    "required": [
+      "LIVE_RTSP_CAPTURE_OK",
+      "LIVE_MATRIX_TEXT_OK",
+      "LIVE_MATRIX_IMAGE_OK"
+    ],
+    "required_present": true
+  },
+  "matrix_room_readback": {
+    "image_found": true,
+    "inspected_count": 10,
+    "reason": null,
+    "status": "verified",
+    "text_found": true
+  },
+  "phase": "complete",
   "redaction": {
     "redaction_replacements": 0,
     "secret_occurrences": 0
@@ -20,7 +196,15 @@
     "redaction_replacements": 0,
     "secret_occurrences": 0
   },
-  "room_readback": null,
-  "room_readback_status": "not_attempted",
-  "status": "preflight_failed"
+  "room_readback": {
+    "image_found": true,
+    "inspected_count": 10,
+    "reason": null,
+    "status": "verified",
+    "text_found": true
+  },
+  "room_readback_status": "verified",
+  "schema_version": 1,
+  "started_at": "2026-05-10T17:57:57Z",
+  "status": "success"
 }

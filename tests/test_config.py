@@ -125,6 +125,13 @@ def test_sanitized_summary_never_contains_secret_values() -> None:
     assert FAKE_RTSP_URL not in rendered
     assert FAKE_MATRIX_TOKEN not in rendered
     assert SECRET_MARKER not in rendered
+    summary_rendered = repr(summary) + str(summary)
+    assert "access_token" not in summary_rendered.lower()
+    assert summary["matrix"]["matrix_token"] == {
+        "env_var": "Matrix token env key",
+        "present": True,
+        "value": "**********",
+    }
     assert summary["detection"]["min_bbox_area_px"] == settings.detection.min_bbox_area_px
     assert summary["detection"]["min_polygon_overlap_ratio"] == settings.detection.min_polygon_overlap_ratio
     assert summary["quiet_windows"] == [

@@ -652,7 +652,8 @@ def test_validate_config_success_emits_sanitized_startup_events(capsys: pytest.C
     assert '"event":"startup-config-loaded"' in output
     assert '"event":"startup-ready"' in output
     assert '"env_var":"RTSP_URL"' in output
-    assert '"env_var":"MATRIX_ACCESS_TOKEN"' in output
+    assert '"env_var":"Matrix token env key"' in output
+    assert "access_token" not in output.lower()
     assert_no_secret_leak(output)
 
 
@@ -882,7 +883,7 @@ def test_capture_once_failure_skips_debug_overlay(
             duration_seconds=0.02,
             timeout_seconds=15.0,
             returncode=1,
-            attempted_modes=[DecodeMode.QSV, DecodeMode.VAAPI, DecodeMode.SOFTWARE],
+            attempted_modes=[DecodeMode.QSV, DecodeMode.VAAPI, DecodeMode.DRM, DecodeMode.SOFTWARE],
         )
 
     def fake_overlay(_settings: object, source_path: Path, output_path: Path, *, logger: Any) -> object:
@@ -1182,7 +1183,7 @@ def test_capture_once_failure_returns_nonzero_without_traceback_or_secret(
             duration_seconds=0.02,
             timeout_seconds=15.0,
             returncode=1,
-            attempted_modes=[DecodeMode.QSV, DecodeMode.VAAPI, DecodeMode.SOFTWARE],
+            attempted_modes=[DecodeMode.QSV, DecodeMode.VAAPI, DecodeMode.DRM, DecodeMode.SOFTWARE],
         )
 
     exit_code = _main(
@@ -1195,7 +1196,7 @@ def test_capture_once_failure_returns_nonzero_without_traceback_or_secret(
     assert exit_code == 1
     assert '"event":"capture-failed"' in output
     assert '"reason":"ffmpeg-nonzero-exit"' in output
-    assert '"attempted_modes":["qsv","vaapi","software"]' in output
+    assert '"attempted_modes":["qsv","vaapi","drm","software"]' in output
     assert "Traceback" not in output
     assert_no_secret_leak(output)
 

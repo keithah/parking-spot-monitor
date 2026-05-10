@@ -38,7 +38,7 @@ def combined_failure_text(exc: CaptureError) -> str:
 
 
 def test_decode_modes_are_attempted_in_hardware_then_software_order() -> None:
-    assert [mode.value for mode in DecodeMode] == ["qsv", "vaapi", "software"]
+    assert [mode.value for mode in DecodeMode] == ["qsv", "vaapi", "drm", "software"]
 
 
 def test_ffmpeg_command_builder_returns_argv_lists_not_shell_strings(tmp_path: Path) -> None:
@@ -110,6 +110,8 @@ def test_capture_latest_falls_back_from_hardware_failures_to_software_success(tm
             mode = DecodeMode.QSV
         elif "vaapi" in argv:
             mode = DecodeMode.VAAPI
+        elif "drm" in argv:
+            mode = DecodeMode.DRM
         attempted.append(mode)
         if mode is not DecodeMode.SOFTWARE:
             return subprocess.CompletedProcess(argv, 1, stderr=f"failed {FAKE_RTSP_VALUE}")
@@ -119,8 +121,8 @@ def test_capture_latest_falls_back_from_hardware_failures_to_software_success(tm
     result = capture_latest(settings, tmp_path, logger=logger, runner=runner)
 
     assert result.selected_mode is DecodeMode.SOFTWARE
-    assert attempted == [DecodeMode.QSV, DecodeMode.VAAPI, DecodeMode.SOFTWARE]
-    assert events.count("capture-decode-attempt") == 3
+    assert attempted == [DecodeMode.QSV, DecodeMode.VAAPI, DecodeMode.DRM, DecodeMode.SOFTWARE]
+    assert events.count("capture-decode-attempt") == 4
     assert "capture-decode-fallback" in events
     assert "capture-frame-written" in events
 

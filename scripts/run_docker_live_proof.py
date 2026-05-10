@@ -35,6 +35,10 @@ DOCKER_LIVE_PROOF_COMMAND = [
     "compose",
     "run",
     "--rm",
+    "-e",
+    "RTSP_URL",
+    "-e",
+    "MATRIX_ACCESS_TOKEN",
     "parking-spot-monitor",
     "python",
     "-m",
@@ -337,6 +341,8 @@ def _docker_live_proof_command(matrix_token_env: str) -> list[str]:
         "run",
         "--rm",
         "-e",
+        "RTSP_URL",
+        "-e",
         matrix_token_env,
         "parking-spot-monitor",
         "python",
@@ -350,6 +356,16 @@ def _docker_live_proof_command(matrix_token_env: str) -> list[str]:
     ]
 
 
+
+def _safe_docker_command(command: Sequence[str]) -> list[str]:
+    safe: list[str] = []
+    for item in command:
+        if "TOKEN" in item.upper():
+            safe.append("Matrix token env key")
+        else:
+            safe.append(str(item))
+    return safe
+
 def _known_secret_values(environ: Mapping[str, str], *, matrix_token_env: str = DEFAULT_MATRIX_TOKEN_ENV) -> list[str]:
     secret_keys = {"RTSP_URL", DEFAULT_MATRIX_TOKEN_ENV, matrix_token_env}
     return [value for key, value in environ.items() if key in secret_keys and value]
@@ -360,7 +376,7 @@ def _base_result(*, started_at: str, completed_at: str, docker_exit_code: int | 
         "schema_version": 1,
         "started_at": started_at,
         "completed_at": completed_at,
-        "docker_command": list(docker_command or DOCKER_LIVE_PROOF_COMMAND),
+        "docker_command": _safe_docker_command(docker_command or DOCKER_LIVE_PROOF_COMMAND),
         "docker_exit_code": docker_exit_code,
         "marker_checks": None,
         "artifact_checks": None,

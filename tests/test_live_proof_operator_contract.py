@@ -120,8 +120,7 @@ def test_alternate_matrix_token_env_is_checked_passed_to_docker_and_used_for_rea
     write_jpeg(data_dir / "snapshots" / "live-proof-camera-2026-05-18t19-00-00z.jpg")
 
     def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        assert command[:5] == ["docker", "compose", "run", "--rm", "-e"]
-        assert command[5] == token_env
+        assert command[:8] == ["docker", "compose", "run", "--rm", "-e", "RTSP_URL", "-e", token_env]
         assert "parking-spot-monitor" in command
         return subprocess.CompletedProcess(
             command,
@@ -151,6 +150,8 @@ def test_alternate_matrix_token_env_is_checked_passed_to_docker_and_used_for_rea
     assert exit_code == 0
     assert result["status"] == "success"
     assert SECRET_TOKEN not in rendered
+    assert "access_token" not in rendered.lower()
+    assert "Matrix token env key" in rendered
 
 
 def test_bare_runner_invocation_imports_package_from_repository_root(tmp_path: Path) -> None:

@@ -25,6 +25,7 @@ _SECRET_PATTERNS = (
 class DecodeMode(str, Enum):
     QSV = "qsv"
     VAAPI = "vaapi"
+    DRM = "drm"
     SOFTWARE = "software"
 
 
@@ -102,9 +103,11 @@ def build_ffmpeg_argv(rtsp_url: str, output_path: str | Path, mode: DecodeMode) 
         "tcp",
     ]
     if mode is DecodeMode.QSV:
-        argv.extend(["-hwaccel", "qsv"])
+        argv.extend(["-hwaccel", "qsv", "-hwaccel_device", "/dev/dri/renderD128", "-hwaccel_output_format", "qsv"])
     elif mode is DecodeMode.VAAPI:
-        argv.extend(["-hwaccel", "vaapi"])
+        argv.extend(["-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128", "-hwaccel_output_format", "vaapi"])
+    elif mode is DecodeMode.DRM:
+        argv.extend(["-hwaccel", "drm", "-hwaccel_device", "/dev/dri/renderD128"])
     argv.extend([
         "-i",
         rtsp_url,
