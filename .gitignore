@@ -27,6 +27,30 @@ config.yaml
 data/latest.jpg
 data/debug_latest.jpg
 data/snapshots/
+data/calibration-bundles/
+data/health.json
+data/state.json
+
+# Local operator evidence and validation reports
+data/live-proof-result.json
+data/live-proof-input-preflight.json
+data/live-proof-evidence.md
+data/live-proof-docker.stdout.log
+data/live-proof-docker.stderr.log
+data/alert-soak-result.json
+data/alert-soak-input-preflight.json
+data/alert-soak-evidence.md
+data/alert-soak-docker.stdout.log
+data/alert-soak-docker.stderr.log
+data/replay-report.json
+data/replay-report.md
+data/tuning-report.json
+data/tuning-report.md
+data/m002-validation/m002-validation-package.json
+data/m002-validation/m002-validation-package.md
+
+# Private S07 real-traffic evidence: labels, proposed configs, replay/tuning outputs, and coverage summaries
+data/s07-replay-evidence/
 
 # ── GSD baseline (auto-generated) ──
 .gsd

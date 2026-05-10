@@ -1,0 +1,44 @@
+# Publication-safe synthetic replay labels for the offline calibration replay CLI.
+# Run with:
+#   python scripts/replay_calibration_cases.py \
+#     --config config.yaml.example \
+#     --labels examples/calibration-labels.example.yaml \
+#     --output-dir /tmp/parking-replay-report
+#
+# Optional bundle_manifest values should point to a redacted calibration bundle
+# manifest.json. The replay CLI reads only JSON metadata and never reads JPEG bytes.
+schema_version: parking-spot-monitor.replay.v1
+cases:
+  - case_id: synthetic-shared-threshold-smoke
+    # Synthetic tags demonstrate the vocabulary; they are not R018 real-capture evidence.
+    tags: [parked_empty_transition, threshold_decision]
+    # bundle_manifest: ../data/calibration-bundles/SYNTHETIC/manifest.json
+    scenarios:
+      - scenario_id: left-occupied-right-empty
+        tags: [false_positive_probe, false_negative_probe]
+        frames:
+          - frame_id: synthetic-frame-001
+            observed_at: "2026-05-10T12:00:00Z"
+            source_timestamp: "2026-05-10T12:00:00Z"
+            snapshot_path: replay://synthetic/synthetic-frame-001
+            expected:
+              left_spot: occupied
+              right_spot: empty
+            detections:
+              - class_name: car
+                confidence: 0.91
+                bbox: [330, 190, 590, 335]
+          - frame_id: synthetic-frame-002
+            observed_at: "2026-05-10T12:00:30Z"
+            source_timestamp: "2026-05-10T12:00:30Z"
+            snapshot_path: replay://synthetic/synthetic-frame-002
+            expected:
+              left_spot: empty
+              right_spot: occupied
+            detections:
+              - class_name: car
+                confidence: 0.88
+                bbox: [1040, 180, 1360, 345]
+
+  # Publication-safe shape example only. Private real manifests may use tags such as:
+  # [real_capture, bottom_driveway, passing_traffic, parked_empty_transition, false_positive_probe, false_negative_probe, threshold_decision]

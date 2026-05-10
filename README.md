@@ -35,13 +35,27 @@ Never paste camera URLs, usernames, passwords, Matrix tokens, or other secret va
 
 ## Finite validation and capture smoke checks
 
-Use `--validate-config` for finite startup/configuration checks. Use `--capture-once` for the S02/S03 finite capture proof: it attempts one frame capture, writes `latest.jpg`, refreshes the local debug overlay at `debug_latest.jpg`, and exits instead of starting the continuous monitoring loop. Live R003 acceptance requires a real operator RTSP environment supplied through environment variables; do not commit those values or paste them into examples.
+Use `--validate-config` for finite startup/configuration checks. Against an operator config with required environment variables already supplied, the direct validation command is `python -m parking_spot_monitor --config config.yaml --validate-config`. Use `--capture-once` for the S02/S03 finite capture proof: it attempts one frame capture, writes `latest.jpg`, refreshes the local debug overlay at `debug_latest.jpg`, and exits instead of starting the continuous monitoring loop. Live R003 acceptance requires a real operator RTSP environment supplied through environment variables; do not commit those values or paste them into examples.
 
 Local validation against the tracked example can use non-secret placeholder values because it does not connect to the camera or Matrix:
 
 ```sh
-RTSP_URL=placeholder MATRIX_ACCESS_TOKEN=placeholder \
-  python -m parking_spot_monitor --config config.yaml.example --validate-config
+python - <<'PY'
+import os
+import subprocess
+import sys
+
+os.environ["RTSP_URL"] = "placeholder"
+os.environ["MATRIX_ACCESS_TOKEN"] = "placeholder"
+sys.exit(subprocess.call([
+    sys.executable,
+    "-m",
+    "parking_spot_monitor",
+    "--config",
+    "config.yaml.example",
+    "--validate-config",
+]))
+PY
 ```
 
 Local one-frame capture proof against the operator config uses the real environment already present in your shell or service manager:
@@ -67,6 +81,223 @@ Runner exit codes are part of the proof contract: `0` means the runner completed
 Strict success requires all of the following before R003/R015 can be validated: `LIVE_RTSP_CAPTURE_OK`, `LIVE_MATRIX_TEXT_OK`, and `LIVE_MATRIX_IMAGE_OK` are present; skip/failure markers are absent; `data/latest.jpg` is a valid raw camera JPEG; at least one `data/snapshots/live-proof-*.jpg` JPEG is retained; Matrix room readback verifies both visibly labelled `LIVE PROOF / TEST MESSAGE` text and `LIVE PROOF / TEST IMAGE` image evidence in the target room; and redaction scans find zero RTSP URLs, Authorization/Bearer headers, Matrix access-token strings, raw Matrix response bodies, tracebacks, or image bytes in logs/reports. Do not use `--skip-readback` for validation: skipped or unavailable readback leaves R003/R015 remain unvalidated because send responses alone do not prove room-visible Matrix delivery.
 
 Skip markers identify missing live inputs (`LIVE_PROOF_SKIPPED_CONFIG_ABSENT`, `LIVE_PROOF_SKIPPED_RTSP_ENV_ABSENT`, or `LIVE_PROOF_SKIPPED_MATRIX_ENV_ABSENT`) and are blockers, not validation. Failure markers identify the failed phase (`LIVE_RTSP_CAPTURE_FAILED`, `LIVE_MATRIX_TEXT_FAILED`, or `LIVE_MATRIX_IMAGE_FAILED`) without logging RTSP URLs, Matrix tokens, Authorization headers, raw Matrix response bodies, tracebacks, or image bytes.
+
+## Unattended Docker live alert soak
+
+Use the unattended alert soak when you need bounded evidence that the tuned Docker service can run continuously and emit organic `occupancy-open-event` Matrix alerts without duplicate restart spam. This is a strict two-step flow: first run the bounded Docker soak producer, then run the strict verifier/report writer.
+
+```sh
+python scripts/run_docker_alert_soak.py
+python scripts/verify_alert_soak.py
+```
+
+`scripts/run_docker_alert_soak.py` runs `docker compose run --rm ... parking-spot-monitor` for `--soak-seconds` (default `300`), treats the controlled timeout as normal soak completion, captures redacted Docker stdout/stderr logs, summarizes `health.json` and `state.json`, validates `latest.jpg` and `snapshots/occupancy-open-event-*.jpg`, records duplicate event/Matrix transaction diagnostics, performs Matrix room readback for observed organic open alerts, and writes `data/alert-soak-result.json` plus `data/alert-soak-evidence.md`. `scripts/verify_alert_soak.py` is the strict gate over that JSON. It exits `0` only for strict success unless explicitly invoked with `--allow-coverage-gap` or `--allow-preflight-blocker` to render honest non-validation handoff evidence.
+
+Alert-soak statuses mean:
+
+- `success` — strict success: Docker completed normally or reached the bounded soak timeout; at least one organic `occupancy-open-event` was observed; each alert has a matching valid raw occupancy-open-event snapshot; `latest.jpg` is a valid raw camera JPEG; `health.json` is present and diagnosable; `state.json` is parseable; Matrix readback is `verified` for every alert; duplicate event IDs and Matrix transaction IDs are empty; and redaction scans report zero secret or forbidden-pattern occurrences.
+- `coverage_gap_no_alert` — no organic open event occurred during the bounded window. This is honest evidence about the soak window and may be rendered with `python scripts/verify_alert_soak.py --allow-coverage-gap`, but it is not full S08 strict live soak validation unless final closure explicitly accepts the residual risk.
+- `preflight_failed` / preflight blocker — required live inputs such as `config.yaml`, `RTSP_URL`, Matrix routing, or Matrix token environment routing were missing before Docker ran. This can be rendered with `--allow-preflight-blocker`, but it is blocker evidence rather than validation.
+- `docker_failed` — Docker startup/runtime exited unexpectedly or could not be launched. Inspect the safe Docker argv, phase, redacted Docker logs, and health/state summaries before rerunning.
+- `readback_gap` — alerts were emitted, but Matrix room readback was skipped, unavailable, malformed, or did not show the expected per-spot text and raw snapshot messages. Send responses alone do not prove room-visible delivery.
+- `validation_failed` with phase `duplicate_diagnostics` — duplicate organic event IDs or duplicate Matrix transaction IDs were detected, which is duplicate-spam failure evidence.
+- `validation_failed` with phase `artifact_validation` — required raw snapshot artifacts are missing or invalid, including invalid `latest.jpg` or invalid `occupancy-open-event` JPEG snapshots.
+- `validation_failed` with phase `redaction` — `data/alert-soak-result.json`, `data/alert-soak-evidence.md`, or the redacted Docker logs still contain secret or forbidden publication markers.
+- Any verifier-level `verification_failed` report means the result JSON was missing, malformed, inconsistent, unsupported, or unsafe to publish.
+
+Publication-safety rules are the same as the finite live proof and calibration workflows, but the alert-soak artifact boundary is specific. Keep `data/alert-soak-result.json`, `data/alert-soak-evidence.md`, `data/alert-soak-docker.stdout.log`, `data/alert-soak-docker.stderr.log`, raw snapshots under `data/snapshots/`, `data/latest.jpg`, `data/health.json`, and `data/state.json` local and ignored until reviewed. The JSON and Markdown evidence may summarize safe fields such as status, phase, safe Docker argv, per-spot alert/readback status, duplicate counts, artifact validity counts, health/state parse summaries, and redaction-scan counts. They must not include RTSP URLs, Matrix access tokens, Authorization/Bearer headers, raw Matrix response bodies, tracebacks, raw image bytes, or unredacted Docker output.
+
+The soak workflow does not tune polygons/thresholds and does not add per-spot runtime schema. If live alert divergence suggests bad polygons, shared thresholds, or spot-specific behavior, feed new private labels through `scripts/compare_calibration_tuning.py` first and use its evidence gate before changing runtime tuning.
+
+## Dockerized calibration bundle capture
+
+Use `scripts/capture_calibration_bundle.py` when an operator needs one publication-safe calibration evidence bundle from the live Docker runtime. This workflow is for calibration and detector tuning evidence only: it does not prove Matrix room delivery like `scripts/run_docker_live_proof.py`, and it does not replace later replay or threshold-tuning slices.
+
+```sh
+python scripts/capture_calibration_bundle.py
+```
+
+By default the wrapper reads host `config.yaml`, uses host `./data`, runs Docker Compose with the existing application `--capture-once` path, and writes timestamped bundles under `data/calibration-bundles/`. Override paths only when you intentionally want a different operator workspace:
+
+```sh
+python scripts/capture_calibration_bundle.py \
+  --config config.yaml \
+  --data-dir ./data \
+  --bundle-root ./data/calibration-bundles \
+  --docker-timeout-seconds 180
+```
+
+Exit codes are part of the operator contract:
+
+- `0` means Dockerized capture completed, required JPEG artifacts validated, detection summary evidence was found, and the redaction scan found no forbidden private text.
+- `2` means names-only preflight blocked the run before Docker because required inputs such as the config file, RTSP environment variable name, or Matrix token environment routing were absent.
+- `124` means Docker capture exceeded `--docker-timeout-seconds`; any partial stdout/stderr captured by Python is still redacted in the bundle when a bundle directory exists.
+- Any other Docker non-zero exit is preserved as a `docker_failed` result so capture/config/runtime failures are not hidden by the wrapper.
+- `1` means wrapper validation failed after Docker, including missing/invalid JPEG artifacts, missing detection evidence, malformed copied context, or redaction findings.
+
+Each successful or failed post-preflight bundle is agent-readable without opening private raw logs first. Expect these files inside the timestamped bundle:
+
+- `latest.jpg` — copied raw full-frame capture from `data/latest.jpg`.
+- `debug_latest.jpg` — copied local tuning overlay from `data/debug_latest.jpg`.
+- `docker.stdout.log` and `docker.stderr.log` — line-preserving redacted Docker output.
+- `manifest.json` — status, phase, Docker exit code, safe Docker argv, timestamps, selected decode mode when emitted, capture/detection event summaries, artifact validation, context copy status, validation errors, and redaction scan results.
+- `calibration-report.md` — short local README/report for humans and future agents.
+- `context/health.json` and `context/state.json` when present — optional live runtime health/state context copied for inspection; missing or malformed context is reported as a gap rather than silently ignored.
+
+The wrapper also writes `data/calibration-input-preflight.json` for preflight attempts. That file contains blocker names and presence booleans only; it intentionally omits raw camera URLs, token values, auth headers, YAML contents, image bytes, and private room responses.
+
+Use this local preflight smoke when you need names-only blocker evidence without live secrets or a real config:
+
+```sh
+tmpdir=$(mktemp -d)
+env -u RTSP_URL -u MATRIX_ACCESS_TOKEN \
+  python scripts/capture_calibration_bundle.py --config "$tmpdir/missing.yaml"
+rm -rf "$tmpdir"
+```
+
+That smoke should exit `2` and refresh `data/calibration-input-preflight.json` with missing input names only.
+
+Publication-safety rules are strict. Keep `data/calibration-bundles/`, `data/health.json`, and `data/state.json` local and ignored. Do not commit raw frames, debug overlays, live health/state, camera URLs, Matrix tokens, Authorization headers, raw Matrix responses, unredacted Docker logs, tracebacks, or image bytes. Share only reviewed/redacted text summaries when calibration evidence needs to leave the operator machine.
+
+## Labeling and replaying calibration cases
+
+Use the replay workflow when you have one or more calibration bundle captures and need deterministic, publication-safe evidence about whether the current shared detection thresholds work for both configured spots. The replay path does not run YOLO or read image bytes. Operators label detector-neutral vehicle observations and expected spot presence, then the replay evaluator feeds those synthetic detections through the same spot filtering and occupancy primitives used by runtime.
+
+Start from the tracked example label manifest:
+
+```sh
+cp examples/calibration-labels.example.yaml /tmp/calibration-labels.yaml
+```
+
+Each label manifest uses schema `parking-spot-monitor.replay.v1` and contains cases, scenarios, frames, expected spot states, detector-neutral detections, and optional semantic `tags` on cases or scenarios. Tags are normalized in reports so downstream verification can classify evidence without parsing names.
+
+```yaml
+schema_version: parking-spot-monitor.replay.v1
+cases:
+  - case_id: morning-left-occupied-right-empty
+    tags: [real_capture, bottom_driveway, parked_empty_transition, threshold_decision]
+    bundle_manifest: data/calibration-bundles/20260510T120000Z/manifest.json  # optional local metadata context
+    scenarios:
+      - scenario_id: shared-threshold-check
+        tags: [passing_traffic, false_positive_probe, false_negative_probe]
+        frames:
+          - frame_id: frame-001
+            snapshot_path: replay://operator/frame-001
+            expected:
+              left_spot: occupied
+              right_spot: empty
+            detections:
+              - class_name: car
+                confidence: 0.91
+                bbox: [330, 190, 590, 335]
+```
+
+`bundle_manifest` is optional and should point only to a local calibration bundle `manifest.json` when you want evidence context. The CLI checks whether that JSON metadata file is present and readable; missing or malformed bundle manifests block coverage for that case instead of passing silently. Optional tags should be concise evidence classifiers such as `real_capture`, `bottom_driveway`, `passing_traffic`, `parked_empty_transition`, `false_positive_probe`, `false_negative_probe`, and `threshold_decision`; synthetic examples may show the vocabulary but do not satisfy R018 real-evidence coverage. Do not put `latest.jpg` or `debug_latest.jpg` paths in reports as evidence payloads: raw bundle images stay local/ignored and are never embedded by the replay CLI.
+
+Run replay against the same config threshold values the runtime uses:
+
+```sh
+tmpdir=$(mktemp -d)
+python scripts/replay_calibration_cases.py \
+  --config config.yaml.example \
+  --labels examples/calibration-labels.example.yaml \
+  --output-dir "$tmpdir"
+```
+
+The command writes both:
+
+- `replay-report.json` — agent-inspectable report with schema version, config thresholds, case IDs, normalized case/scenario tags, per-spot TP/TN/FP/FN metrics, blocked/not-covered reasons, event findings, redaction-scan outcome, and shared-threshold sufficiency evidence.
+- `replay-report.md` — human-readable summary with the same safety boundaries, semantic tag coverage, and no embedded raw images.
+
+Case/report statuses mean:
+
+- `passed` — counted observations matched the expected occupied/empty labels for the case.
+- `failed` — at least one counted observation produced a false positive or false negative.
+- `blocked` — the case could not be assessed safely, such as missing detector data or a missing/malformed referenced bundle manifest.
+- `not_covered` — the manifest intentionally left the case/frame unassessed or provided no counted coverage for the relevant spot.
+- `inconclusive` — the shared-threshold sufficiency verdict cannot be claimed because coverage is sparse, blocked, missing for a configured spot, or errors do not isolate a spot-specific threshold problem.
+
+Shared-threshold sufficiency is conservative: `sufficient` requires counted coverage for every configured spot with no false positives or false negatives; `insufficient` means spot-divergent FP/FN evidence shows the shared thresholds are not enough; `inconclusive` means more or safer evidence is needed before changing or defending thresholds.
+
+Replay reports are designed to be publication-safe text artifacts. The JSON and Markdown report builders fail closed on RTSP URLs, Matrix tokens, Authorization/Bearer headers, raw Matrix response markers, tracebacks, and image-byte-looking content. If malformed labels, missing bundle metadata, or sparse evidence appear, treat the resulting blocked/not-covered/inconclusive report as a gap to fix rather than as validation success.
+
+## Comparing calibration tuning proposals
+
+Use the tuning comparison workflow when you have a baseline config, a proposed shared-threshold/polygon config, and the same replay label manifest for both runs. The workflow is evidence-gated: it compares both configs against identical labeled cases, writes deterministic publication-safe reports, and refuses to recommend production threshold/schema changes when replay evidence is blocked, sparse, unsafe, or non-improving.
+
+The tracked proposed config example is intentionally synthetic:
+
+- `config.yaml.example` is the baseline/current example.
+- `examples/calibration-tuning-proposed.example.yaml` is a publication-safe smoke proposal derived from the baseline with a small shared confidence-threshold adjustment and minor polygon nudges.
+- `examples/calibration-labels.example.yaml` contains synthetic labels only.
+
+Run this safe operator smoke from the repository root; it writes reports into a temporary directory and does not need live RTSP or Matrix secrets:
+
+```sh
+tmpdir=$(mktemp -d)
+python scripts/compare_calibration_tuning.py \
+  --baseline-config config.yaml.example \
+  --proposed-config examples/calibration-tuning-proposed.example.yaml \
+  --labels examples/calibration-labels.example.yaml \
+  --output-dir "$tmpdir"
+ls "$tmpdir"/tuning-report.json "$tmpdir"/tuning-report.md
+```
+
+The CLI prints compact JSON status naming the phase, report paths, redaction result, decision, status counts, metric deltas, blocked reasons, and not-covered reasons. The output directory contains:
+
+- `tuning-report.json` — agent-readable comparison with baseline/proposed thresholds, per-spot metric deltas, status counts, blocked/not-covered reasons, event deltas, redaction scan, and final decision.
+- `tuning-report.md` — human-readable summary with the same safety boundary and no embedded raw images, RTSP URLs, Matrix tokens, Authorization headers, tracebacks, raw Matrix responses, or image bytes.
+
+Tuning decisions mean:
+
+- `keep_shared_thresholds` — the proposed shared thresholds did not reduce false-positive/false-negative evidence safely. Keep the existing shared runtime config.
+- `apply_shared_tuning` — the proposed shared thresholds reduced false-positive/false-negative evidence with no new blocked evidence or safety regressions, and the proposed replay result still supports shared-threshold sufficiency. This justifies applying the shared config change, subject to operator review.
+- `needs_per_spot_thresholds` — residual replay errors diverge by spot under shared proposed thresholds, which is evidence that shared thresholds may be insufficient. Treat this as an input to a future per-spot design, not as permission to quietly change runtime schema.
+- `blocked` — the comparison cannot safely support a tuning decision because replay evidence was blocked/not-covered, redaction failed, label/config data was malformed or missing, or another safety condition prevented honest publication. Do not tune production thresholds from a blocked report.
+
+D020 evidence gate: shared thresholds remain the preferred runtime shape. Do not add per-spot runtime threshold schema/config changes unless replay evidence proves shared thresholds insufficient across the labeled cases. A `needs_per_spot_thresholds` report is the artifact that can justify designing that follow-up; absent that evidence, keep the simpler shared-threshold config.
+
+## M002 final closure validation package
+
+Use the M002 final closure package only after replay, tuning, finite live-proof, and unattended alert-soak evidence has been generated locally. The assembler is fail-closed in the package payload: it combines the existing evidence artifacts into one publication-safe package and records a non-validated `final_status` unless the evidence is strict `validated` or explicitly accepted `residual_risk_accepted`. The CLI exits non-zero only when assembly or publication-safety checks fail; inspect the package status for the validation verdict.
+
+Run it from the repository root with explicit replay and tuning report paths. The live-proof and alert-soak paths default to the local operator outputs shown below, and the final package output directory must remain `data/m002-validation` unless you are intentionally writing to another ignored local workspace:
+
+```sh
+python scripts/assemble_m002_validation_package.py \
+  --replay-report data/replay-report.json \
+  --tuning-report data/tuning-report.json \
+  --live-proof-result data/live-proof-result.json \
+  --alert-soak-result data/alert-soak-result.json \
+  --output-dir data/m002-validation
+```
+
+If `--replay-report` is omitted, the assembler reads `data/s07-replay-evidence/replay/replay-report.json`. If `--tuning-report` is omitted, it reads `data/s07-replay-evidence/tuning/tuning-report.json`. If `--live-proof-result` is omitted, the assembler reads `data/live-proof-result.json`. If `--alert-soak-result` is omitted, it reads `data/alert-soak-result.json`. Pass paths explicitly when you need the closure record to name a different replay or tuning evidence set. Use `--allow-residual-risk "..."` only when a non-strict gap has been deliberately accepted and the acceptance text is safe to include in the local package.
+
+The command produces two local artifacts:
+
+- `data/m002-validation/m002-validation-package.json` — agent/automation input with per-evidence status, safe reasons, requirement implications, tuning/no-change decision, residual-risk text when supplied, and redaction/publication-safety counts.
+- `data/m002-validation/m002-validation-package.md` — human review summary with the same status semantics and no raw Matrix bodies, tokens, RTSP URLs, tracebacks, image bytes, or private log content.
+
+Final closure statuses mean:
+
+- `validated` — replay, tuning, live-proof, and alert-soak evidence all passed their strict gates. This is the only status that validates M002 without a residual-risk note.
+- `coverage_gap` — one or more evidence surfaces is honest but incomplete, such as `coverage_gap_no_alert` from an alert soak with no organic opening or S07 semantic replay evidence that is workflow-smoke only. This does not validate M002.
+- `blocked` — required evidence is missing, malformed, unreadable, preflight-blocked, or requires follow-up before closure. Preflight blockers do not validate M002.
+- `failed` — an evidence verifier, artifact check, Matrix readback check, duplicate-spam check, or publication-safety scan failed. Redaction hits fail closure until fixed.
+- `residual_risk_accepted` — all strict surfaces passed except an explicitly accepted non-strict coverage gap. This is not the same as `validated`; it records a deliberate residual-risk acceptance for later review.
+
+Requirement reconciliation is explicit in the package. R018, R019, and R028 are evidence-derived: they may be `coverage_gap`, `blocked`, or `failed` when current S07 artifacts are workflow-smoke evidence rather than strict real-world semantic evidence. Validating R018 real-traffic replay, R019 shared-threshold sufficiency, or R028 bottom-driveway exclusion requires strict S07 semantic evidence for all required tags: `real_capture`, `bottom_driveway`, `passing_traffic`, and `threshold_decision`. S07 workflow-smoke artifacts do not validate R018/R019/R028, and synthetic examples only prove the replay/report contract.
+
+R020, R021, and R022 are deferred/out-of-scope for M002 rather than silently missing. R020 setup/Matrix/Docker/GPU/troubleshooting documentation is deferred to a later milestone; R021 encrypted Matrix room support remains out-of-scope for M002 and is not implemented by this milestone; R022 historical occupancy query/storage is out-of-scope for M002 beyond bounded local reports, retained snapshots, state, and logs.
+
+Known non-validation evidence must stay non-validation in closure notes: `coverage_gap_no_alert`, preflight blockers, skipped readback, malformed inputs, verifier errors, redaction hits, Matrix send-only evidence, and send responses alone do not prove room-visible delivery and do not validate M002. S08 strict live soak validation requires strict alert-soak success: an organic alert, per-alert Matrix readback, valid snapshots, clean duplicate diagnostics, health/state summaries, and zero redaction hits. A Matrix send response without room readback is only delivery-attempt evidence. A no-alert soak documents the bounded observation window; it does not prove live alert behavior unless residual risk is explicitly accepted.
+
+S05 does not tune polygons/thresholds and does not add per-spot threshold schema. A no-change/shared-threshold closure must cite evidence such as alert-soak strict success, tuning `keep_shared_thresholds` or `apply_shared_tuning`, clean redaction scans, or explicitly accepted residual risk. The tuning verdict needs_per_spot_thresholds blocks closure or creates a follow-up; do not quietly claim per-spot runtime threshold support from S05.
+
+The publication boundary matches `.gitignore`: raw snapshots, logs, health/state/latest frames, live-proof/alert-soak results, replay/tuning reports, and final package outputs stay local/ignored until reviewed. Never add raw snapshots, raw logs, `data/latest.jpg`, `data/debug_latest.jpg`, `data/health.json`, `data/state.json`, `data/snapshots/`, live-proof/alert-soak JSON or logs, replay/tuning reports, or `data/m002-validation/m002-validation-package.json` / `data/m002-validation/m002-validation-package.md` to version control without deliberate publication review.
+
+Honest limitation: the committed example labels and proposed config prove the workflow and report contract only. They do not prove real-world detector accuracy, live Matrix behavior, or production tuning quality. Private operator-labeled calibration cases from real captures are required before S08 or later work can claim tuned live alert behavior. Keep those private labels, bundle manifests, frames, overlays, and raw logs local unless they have been explicitly reviewed and redacted.
 
 A successful capture writes two files in the data directory:
 
@@ -111,7 +342,7 @@ Run the Compose default as the real capture runtime against a mounted operator c
 
 ```sh
 mkdir -p data
-RTSP_URL="$RTSP_URL" MATRIX_ACCESS_TOKEN="$MATRIX_ACCESS_TOKEN" docker compose up parking-spot-monitor
+docker compose up parking-spot-monitor
 ```
 
 Run the same finite capture proof in Docker when you want a bounded smoke check that writes `/data/latest.jpg` inside the container and `./data/latest.jpg` on the host:
@@ -154,8 +385,22 @@ python -m pytest tests/test_config.py tests/test_docker_contract.py -q
 python -m pytest -q
 docker build -t parking-spot-monitor:test .
 docker compose config --no-interpolate
-RTSP_URL=placeholder MATRIX_ACCESS_TOKEN=placeholder \
-  python -m parking_spot_monitor --config config.yaml --validate-config
+python - <<'PY'
+import os
+import subprocess
+import sys
+
+os.environ["RTSP_URL"] = "placeholder"
+os.environ["MATRIX_ACCESS_TOKEN"] = "placeholder"
+sys.exit(subprocess.call([
+    sys.executable,
+    "-m",
+    "parking_spot_monitor",
+    "--config",
+    "config.yaml",
+    "--validate-config",
+]))
+PY
 python -m parking_spot_monitor --config config.yaml --data-dir ./data --capture-once
 python scripts/run_docker_live_proof.py
 python scripts/verify_live_proof.py
