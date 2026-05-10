@@ -4,6 +4,51 @@ Local Python service for monitoring configured street-parking regions in a UniFi
 
 The working product spec is in [`parking-spot-monitor-spec.md`](parking-spot-monitor-spec.md).
 
+
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![Docker](https://img.shields.io/badge/runtime-docker-blue)
+![Matrix](https://img.shields.io/badge/alerts-Matrix-green)
+
+## Quick start
+
+1. Clone the repository and create an operator config:
+
+   ```sh
+   git clone https://github.com/keithah/parking-spot-monitor.git
+   cd parking-spot-monitor
+   cp config.yaml.example config.yaml
+   ```
+
+2. Edit `config.yaml` with your spot polygons and Matrix routing. Keep secrets as environment variable names only.
+
+3. Export the required live values in your shell or service manager:
+
+   ```sh
+   export RTSP_URL='<your camera RTSP URL>'
+   export MATRIX_ACCESS_TOKEN='<your Matrix access token>'
+   ```
+
+4. Build and inspect the container contract without printing resolved secrets:
+
+   ```sh
+   docker build -t parking-spot-monitor:test .
+   docker compose config --no-interpolate
+   ```
+
+5. Run the service:
+
+   ```sh
+   mkdir -p data
+   RTSP_URL="$RTSP_URL" MATRIX_ACCESS_TOKEN="$MATRIX_ACCESS_TOKEN" docker compose up parking-spot-monitor
+   ```
+
+6. Optional: run the finite live proof. It posts a labelled Matrix test message and image, verifies room readback, and writes redacted proof artifacts under `data/`:
+
+   ```sh
+   python scripts/run_docker_live_proof.py
+   python scripts/verify_live_proof.py
+   ```
+
 ## Local configuration
 
 Start from the tracked example and keep real secrets out of YAML and committed files:
