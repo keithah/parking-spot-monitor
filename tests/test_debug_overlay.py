@@ -14,7 +14,7 @@ from tests.test_config import SECRET_MARKER, fake_environ
 
 
 LEFT_EDGE_PIXEL = (300, 180)
-RIGHT_EDGE_PIXEL = (1010, 155)
+RIGHT_EDGE_PIXEL = (1010, 215)
 
 
 def synthetic_camera_fixture(path: Path) -> Path:

@@ -16,8 +16,8 @@ from parking_spot_monitor.geometry import (
 from tests.test_config import fake_environ
 
 
-LEFT_SPOT = [(300, 180), (610, 160), (690, 285), (420, 360), (260, 300)]
-RIGHT_SPOT = [(1010, 155), (1395, 170), (1395, 355), (1040, 370), (960, 250)]
+LEFT_SPOT = [(300, 180), (650, 215), (690, 285), (420, 360), (260, 300)]
+RIGHT_SPOT = [(1010, 215), (1395, 170), (1395, 355), (1040, 370), (960, 250)]
 DRIVEWAY_BBOX = (260, 330, 940, 806)
 DRIVEWAY_CENTROID = (600, 568)
 

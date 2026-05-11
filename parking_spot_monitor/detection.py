@@ -254,7 +254,8 @@ def _evaluate_detection_for_spot(
     source_timestamp: Any | None = None,
 ) -> _EvaluatedCandidate | RejectedDetection:
     area = bbox_area(detection.bbox)
-    centroid = bbox_centroid(detection.bbox)
+    membership_bbox = _lower_half_bbox(detection.bbox)
+    centroid = bbox_centroid(membership_bbox)
 
     if detection.class_name not in allowed_classes:
         return RejectedDetection(spot_id=spot_id, detection=detection, reason=RejectionReason.CLASS_NOT_ALLOWED, bbox_area_px=area, centroid=centroid)
@@ -265,7 +266,7 @@ def _evaluate_detection_for_spot(
     if not point_in_polygon(centroid, polygon):
         return RejectedDetection(spot_id=spot_id, detection=detection, reason=RejectionReason.CENTROID_OUTSIDE, bbox_area_px=area, centroid=centroid)
 
-    overlap_ratio = bbox_polygon_overlap_ratio(detection.bbox, polygon)
+    overlap_ratio = bbox_polygon_overlap_ratio(membership_bbox, polygon)
     if overlap_ratio < min_polygon_overlap_ratio:
         return RejectedDetection(
             spot_id=spot_id,
@@ -288,6 +289,11 @@ def _evaluate_detection_for_spot(
         source_timestamp=source_timestamp,
     )
     return _EvaluatedCandidate(candidate=candidate, detection=detection)
+
+
+def _lower_half_bbox(bbox: BBoxTuple) -> BBoxTuple:
+    x_min, y_min, x_max, y_max = bbox
+    return (x_min, y_min + ((y_max - y_min) / 2.0), x_max, y_max)
 
 
 def _load_ultralytics_yolo() -> Callable[[str], Any]:

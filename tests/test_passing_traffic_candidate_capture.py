@@ -65,7 +65,10 @@ def test_promote_accepted_candidate_appends_strict_passing_traffic_label(tmp_pat
     assert scenario["tags"] == ["passing_traffic", "threshold_decision"]
     assert frame["snapshot_path"] == "replay://passing-traffic-candidates/2026-05-11T00-00-00Z"
     assert frame["expected"] == {"left_spot": "empty", "right_spot": "empty"}
-    assert frame["detections"] == []
+    assert frame["detections"] == [
+        {"spot_id": "left_spot", "class_name": "car", "confidence": 0.91, "bbox": [300, 180, 650, 340]},
+        {"spot_id": "right_spot", "class_name": "car", "confidence": 0.88, "bbox": [1025, 190, 1412, 448]},
+    ]
 
 
 def test_promote_ignores_unaccepted_candidates(tmp_path: Path) -> None:

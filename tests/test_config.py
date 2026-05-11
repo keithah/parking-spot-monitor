@@ -292,7 +292,7 @@ runtime:
 def test_polygon_boundary_points_are_accepted(tmp_path: Path) -> None:
     config = Path("config.yaml.example").read_text(encoding="utf-8")
     config = config.replace("[300, 180]", "[0, 0]")
-    config = config.replace("[610, 160]", "[1458, 806]")
+    config = config.replace("[650, 215]", "[1458, 806]")
     path = write_config(tmp_path, config)
 
     settings = load_settings(path, environ=fake_environ())

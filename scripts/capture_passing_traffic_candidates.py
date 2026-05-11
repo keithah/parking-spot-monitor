@@ -206,7 +206,7 @@ def _label_case_from_candidate(item: dict[str, Any]) -> dict[str, Any]:
                         "observed_at": item.get("observed_at") or "1970-01-01T00:00:00Z",
                         "snapshot_path": item["snapshot_ref"],
                         "expected": {"left_spot": "empty", "right_spot": "empty"},
-                        "detections": [],
+                        "detections": list(item.get("detections") or []),
                     }
                 ],
             }

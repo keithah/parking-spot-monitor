@@ -187,6 +187,50 @@ def test_process_detection_scales_configured_polygons_to_actual_frame_size(
     assert '"frame_size_mismatch":true' in output
     assert '"configured_frame_size":{"height":806,"width":1458}' in output
     assert '"actual_frame_size":{"height":360,"width":640}' in output
+    assert '"accepted_by_spot":{"left_spot":true,"right_spot":false}' in output
+
+
+def test_runtime_loop_matrix_state_change_skip_log_explains_policy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()]]
+    delivery = FakeMatrixDelivery()
+
+    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+        return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
+
+    class SequencedDetector:
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            return detections.pop(0)
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: SequencedDetector(),
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
+        sleep=lambda _seconds: None,
+        max_iterations=3,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    records = json_records(output)
+    skipped = [
+        record
+        for record in records
+        if record.get("event") == "matrix-delivery-skipped"
+        and record.get("event_type") == "occupancy-state-changed"
+        and record.get("spot_id") == "left_spot"
+    ]
+    assert exit_code == 0
+    assert delivery.open_alerts == []
+    assert len(skipped) == 1
+    assert skipped[0]["reason"] == "state-change-not-alert"
+    assert skipped[0]["matrix_dispatch_policy"] == "open-events-only"
+    assert skipped[0]["next_expected_event"] == "occupancy-open-event"
+    assert_no_secret_leak(output)
 
 
 def test_runtime_loop_matrix_quiet_window_start_notice_sent_once_by_event_id(

@@ -20,8 +20,14 @@ LEFT_SPOT = [(0, 0), (100, 0), (100, 100), (0, 100)]
 RIGHT_SPOT = [(200, 0), (300, 0), (300, 100), (200, 100)]
 SPOTS = {"left_spot": LEFT_SPOT, "right_spot": RIGHT_SPOT}
 CONFIGURED_SPOTS = {
-    "left_spot": [(300, 180), (610, 160), (690, 285), (420, 360), (260, 300)],
-    "right_spot": [(1010, 155), (1395, 170), (1395, 355), (1040, 370), (960, 250)],
+    "left_spot": [(300, 180), (650, 215), (690, 285), (420, 360), (260, 300)],
+    "right_spot": [(1010, 215), (1395, 170), (1395, 355), (1040, 370), (960, 250)],
+}
+LIVE_FRAME_SCALE_X = 1458 / 640
+LIVE_FRAME_SCALE_Y = 806 / 360
+LIVE_CONFIGURED_SPOTS = {
+    spot_id: [(x / LIVE_FRAME_SCALE_X, y / LIVE_FRAME_SCALE_Y) for x, y in polygon]
+    for spot_id, polygon in CONFIGURED_SPOTS.items()
 }
 
 
@@ -64,6 +70,29 @@ def test_filter_spot_detections_rejects_driveway_bbox_by_centroid() -> None:
     assert result.by_spot["left_spot"].accepted is None
     assert result.by_spot["right_spot"].accepted is None
     assert result.rejection_counts == {RejectionReason.CENTROID_OUTSIDE: 2}
+
+
+def test_filter_spot_detections_uses_lower_half_for_spot_membership() -> None:
+    curb_half = {"curb_spot": [(0, 50), (100, 50), (100, 100), (0, 100)]}
+
+    result = filter_spot_detections(
+        [
+            detection((10, 0, 90, 80), confidence=0.91),
+            detection((10, 0, 90, 60), confidence=0.92),
+        ],
+        spots=curb_half,
+        allowed_classes={"car"},
+        confidence_threshold=0.35,
+        min_bbox_area_px=100,
+        min_polygon_overlap_ratio=0.2,
+    )
+
+    accepted = result.by_spot["curb_spot"].accepted
+    assert accepted is not None
+    assert accepted.bbox == (10.0, 0.0, 90.0, 80.0)
+    assert accepted.centroid == (50.0, 60.0)
+    assert accepted.overlap_ratio == pytest.approx(0.75)
+    assert [rejection.reason for rejection in result.by_spot["curb_spot"].rejected] == [RejectionReason.CENTROID_OUTSIDE]
 
 
 def test_filter_spot_detections_rejects_s03_driveway_bbox_for_configured_spots() -> None:

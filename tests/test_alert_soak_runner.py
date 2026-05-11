@@ -190,6 +190,47 @@ def test_requested_soak_timeout_is_expected_completion_but_no_alerts_are_coverag
     assert result["room_readback_status"] == "not_applicable"
 
 
+def test_timeout_does_not_duplicate_partial_output_returned_again_after_terminate(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    data_dir = tmp_path / "data"
+    write_config(config_path)
+    write_jpeg(data_dir / "latest.jpg")
+    write_jpeg(data_dir / "snapshots" / SNAPSHOT_NAME)
+    process = TimeoutProcess(stderr_after=alert_lines())
+
+    def fake_readback(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "chunk": [
+                {"content": {"msgtype": "m.text", "body": "Parking spot open: left_spot at now"}},
+                {"content": {"msgtype": "m.image", "body": "Raw full-frame snapshot for left_spot at now"}},
+            ]
+        }
+
+    # Simulate subprocess implementations that include all buffered stderr both
+    # in TimeoutExpired.stderr and in the follow-up communicate() result.
+    def communicate(timeout: float | None = None):
+        process.calls += 1
+        if process.calls == 1:
+            raise subprocess.TimeoutExpired(cmd=["docker"], timeout=timeout, output="", stderr=alert_lines())
+        process.returncode = -15 if process.terminated else -9
+        return "", alert_lines()
+
+    process.communicate = communicate  # type: ignore[method-assign]
+
+    exit_code = runner.main(
+        ["--config", str(config_path), "--data-dir", str(data_dir), "--soak-seconds", "0.01"],
+        environ={"RTSP_URL": SECRET_RTSP, "MATRIX_ACCESS_TOKEN": SECRET_TOKEN},
+        popen_factory=lambda *args, **kwargs: process,
+        readback=fake_readback,
+    )
+
+    result = read_result(data_dir)
+    assert exit_code == 0
+    assert result["status"] == "success"
+    assert result["alert_summary"]["organic_alert_count"] == 1
+    assert result["duplicate_summary"] == {"event_ids": {}, "txn_ids": {}}
+
+
 def test_success_parses_organic_alerts_validates_jpegs_and_matrix_readback(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     data_dir = tmp_path / "data"

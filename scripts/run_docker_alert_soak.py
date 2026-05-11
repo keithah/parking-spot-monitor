@@ -141,8 +141,8 @@ def main(
                 killed = True
                 proc.kill()
                 more_stdout, more_stderr = proc.communicate(timeout=10)
-            stdout_raw = _coerce_text(stdout_raw) + _coerce_text(more_stdout)
-            stderr_raw = _coerce_text(stderr_raw) + _coerce_text(more_stderr)
+            stdout_raw = _combine_timeout_output(stdout_raw, more_stdout)
+            stderr_raw = _combine_timeout_output(stderr_raw, more_stderr)
             docker_exit_code = proc.returncode
     except OSError as exc:
         result = _normalize_result(
@@ -635,6 +635,20 @@ def _hardware_decode_report_line(hardware: Mapping[str, Any]) -> str:
         if isinstance(check, dict)
     ) or "none"
     return f"- Hardware decode: `{hardware.get('status')}` accepted=`{hardware.get('accepted')}` checks=`{rendered_checks}`"
+
+def _combine_timeout_output(partial: object, after_terminate: object) -> str:
+    partial_text = _coerce_text(partial)
+    after_text = _coerce_text(after_terminate)
+    if not partial_text:
+        return after_text
+    if not after_text:
+        return partial_text
+    if after_text.startswith(partial_text):
+        return after_text
+    if partial_text.startswith(after_text):
+        return partial_text
+    return partial_text + after_text
+
 
 def _coerce_text(value: object) -> str:
     if value is None:

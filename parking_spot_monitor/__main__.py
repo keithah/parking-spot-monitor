@@ -401,6 +401,7 @@ def _process_detection_for_capture(
         "spot_ids": list(result.by_spot.keys()),
         "detection_count": len(detections),
         "accepted_count": sum(1 for spot in result.by_spot.values() if spot.accepted is not None),
+        "accepted_by_spot": _accepted_by_spot(result),
         "rejection_counts": _stringify_rejection_counts(result),
         "thresholds": {
             "confidence_threshold": settings.detection.confidence_threshold,
@@ -546,12 +547,20 @@ def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: 
         return None
 
     reason = "suppressed" if event_name == OccupancyEventType.OPEN_SUPPRESSED.value else "unsupported-event-type"
+    extra_fields: dict[str, Any] = {}
+    if event_name == OccupancyEventType.STATE_CHANGED.value:
+        reason = "state-change-not-alert"
+        extra_fields = {
+            "matrix_dispatch_policy": "open-events-only",
+            "next_expected_event": OccupancyEventType.OPEN_EVENT.value,
+        }
     logger.info(
         "matrix-delivery-skipped",
         event_type=event_name,
         spot_id=event.get("spot_id"),
         event_id=event.get("event_id"),
         reason=reason,
+        **extra_fields,
     )
     return None
 
@@ -725,6 +734,10 @@ def _frame_size_dict(size: tuple[int, int] | None) -> dict[str, int] | None:
 
 def _stringify_rejection_counts(result: DetectionFilterResult) -> dict[str, int]:
     return {str(reason): count for reason, count in result.rejection_counts.items()}
+
+
+def _accepted_by_spot(result: DetectionFilterResult) -> dict[str, bool]:
+    return {spot_id: spot.accepted is not None for spot_id, spot in result.by_spot.items()}
 
 
 def _candidate_summaries(result: DetectionFilterResult) -> list[dict[str, Any]]:
