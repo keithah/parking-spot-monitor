@@ -36,6 +36,10 @@ class HealthStatus:
                 "iteration": self.iteration,
                 "last_frame_at": self.last_frame_at,
                 "selected_decode_mode": self.selected_decode_mode,
+                "capture": {
+                    "last_success_at": self.last_frame_at,
+                    "selected_decode_mode": self.selected_decode_mode,
+                },
                 "consecutive_capture_failures": self.consecutive_capture_failures,
                 "consecutive_detection_failures": self.consecutive_detection_failures,
                 "last_matrix_error": dict(self.last_matrix_error) if self.last_matrix_error is not None else None,

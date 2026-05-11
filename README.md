@@ -374,7 +374,7 @@ For R015 evidence, capture all of the following before marking the requirement v
 - `./data/state.json` and `./data/snapshots/` are inspectable so operators can distinguish restart state, latest frame evidence, and retained Matrix event/live-proof snapshots. Use `find data/snapshots -maxdepth 1 -type f | sort` to inspect retained event snapshots after a live proof or alert run.
 - No captured log or README/runbook artifact contains RTSP URLs, Matrix access tokens, Authorization headers, raw Matrix response bodies, tracebacks, or image bytes.
 
-The compact health JSON shape is intentionally operator-readable and stable enough for smoke inspection. Expect keys such as `status`, `iteration`, `started_at`, `updated_at`, `last_frame_at`, `selected_decode_mode`, `consecutive_capture_failures`, `consecutive_detection_failures`, `last_matrix_error`, `retention_failure_count`, `retention_error`, `state_save_error`, and `last_error`; sanitized nested errors include phase/type/message metadata but not raw secrets or tracebacks.
+The compact health JSON shape is intentionally operator-readable and stable enough for smoke inspection. Expect keys such as `status`, `iteration`, `started_at`, `updated_at`, `last_frame_at`, `selected_decode_mode`, `"capture"`, `consecutive_capture_failures`, `consecutive_detection_failures`, `last_matrix_error`, `retention_failure_count`, `retention_error`, `state_save_error`, and `last_error`; `"capture"` includes `last_success_at` and `selected_decode_mode` so operators can quickly see the active decode path (`qsv`, `vaapi`, `drm`, or `software`) without scanning logs. Sanitized nested errors include phase/type/message metadata but not raw secrets or tracebacks.
 
 M001 keeps the container running as root to avoid ambiguous host bind-mount ownership failures for `/data/latest.jpg`, `/data/state.json`, `/data/snapshots/`, and `/data/health.json`. Non-root container hardening is a future hardening item and must include docs/tests for host `./data` ownership before changing the Docker user.
 
@@ -404,6 +404,7 @@ PY
 python -m parking_spot_monitor --config config.yaml --data-dir ./data --capture-once
 python scripts/run_docker_live_proof.py
 python scripts/verify_live_proof.py
+python scripts/verify_hardware_decode.py --json
 python -m json.tool data/health.json
 find data/snapshots -maxdepth 1 -type f | sort
 ```
@@ -419,4 +420,6 @@ That failure command should exit non-zero and emit structured `startup-config-in
 
 ## Hardware decode
 
-`docker-compose.yml` mounts `/dev/dri:/dev/dri` so hardware decode can work inside the container. The capture path tries QSV, VAAPI, DRM, then software; on this host QSV/VAAPI device setup fails but DRM succeeds once `/dev/dri` is mounted. Without this device passthrough, FFmpeg cannot create hardware devices and the capture path falls back to software decode. Hosts without `/dev/dri` should remove or override the `devices` mapping for software-only operation.
+`docker-compose.yml` mounts `/dev/dri:/dev/dri` so hardware decode can work inside the container. The image installs `intel-media-va-driver` and `vainfo`, and sets `LIBVA_DRIVER_NAME=iHD`; VAAPI should initialize on Intel Iris Xe hosts when `/dev/dri/renderD128` is passed through. The capture path tries VAAPI, DRM, then software by default. QSV may still fail on this host even though FFmpeg is built with `--enable-libvpl`, `libvpl2` is installed, and QSV codecs are listed; the observed failure is `Error creating a MFX session: -9`, while VAAPI succeeds and runtime health/logs should show `selected_mode=vaapi`. Without device passthrough, FFmpeg cannot create hardware devices and the capture path falls back to software decode.
+
+Verify the active container hardware surface with `python scripts/verify_hardware_decode.py --json`. For a concise text check, run `python scripts/verify_hardware_decode.py`; expected output on this host is `hardware_decode_status=vaapi_supported_qsv_unavailable`, which means VAAPI is working and QSV is documented as unavailable. `qsv_required_but_unavailable` is only a failure when `--require-qsv` is intentionally used after changing the host/kernel/libvpl stack. `verifier_timeout` or `vaapi_unavailable` means the container hardware surface needs investigation before claiming hardware acceleration. The same compact summary is embedded in live-proof and alert-soak result/evidence artifacts as `hardware_decode_summary`. Hosts without `/dev/dri` should remove or override the `devices` mapping for software-only operation.

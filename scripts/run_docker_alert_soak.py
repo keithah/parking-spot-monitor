@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from parking_spot_monitor.logging import redact_diagnostic_text
+from scripts.hardware_decode_evidence import collect_hardware_decode_summary
 
 CONFIG_PATH = Path("config.yaml")
 DATA_DIR = Path("data")
@@ -79,6 +80,7 @@ def main(
     environ: Mapping[str, str] | None = None,
     popen_factory: PopenFactory = subprocess.Popen,
     readback: ReadbackCallable | None = None,
+    hardware_run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> int:
     args = build_parser().parse_args(argv)
     source_environ = os.environ if environ is None else environ
@@ -213,6 +215,7 @@ def main(
     )
     result_body = base | {
         "log_summary": log_summary,
+        "hardware_decode_summary": collect_hardware_decode_summary(run=hardware_run),
         "alert_summary": _alert_summary(log_summary, room_readback),
         "duplicate_summary": log_summary["duplicates"],
         "artifact_summary": artifact_summary,
@@ -577,6 +580,7 @@ def _normalize_result(result: Mapping[str, Any]) -> dict[str, Any]:
     normalized.setdefault("room_readback", None)
     normalized.setdefault("health_summary", None)
     normalized.setdefault("state_summary", None)
+    normalized.setdefault("hardware_decode_summary", None)
     normalized.setdefault("redaction_scan", {"secret_occurrences": 0, "forbidden_pattern_occurrences": 0, "redaction_replacements": 0})
     normalized["alerts"] = normalized["alert_summary"]
     normalized["duplicates"] = normalized["duplicate_summary"]
@@ -598,6 +602,7 @@ def _write_evidence_report(path: Path, result: Mapping[str, Any]) -> None:
     artifacts = result.get("artifact_summary") if isinstance(result.get("artifact_summary"), dict) else {}
     latest = artifacts.get("latest_jpeg") if isinstance(artifacts.get("latest_jpeg"), dict) else {}
     snapshots = artifacts.get("event_snapshot_jpegs") if isinstance(artifacts.get("event_snapshot_jpegs"), dict) else {}
+    hardware = result.get("hardware_decode_summary") if isinstance(result.get("hardware_decode_summary"), dict) else {}
     report = "\n".join([
         "# Alert Soak Evidence", "",
         f"- Status: `{result.get('status')}`",
@@ -612,11 +617,24 @@ def _write_evidence_report(path: Path, result: Mapping[str, Any]) -> None:
         f"- Event snapshots: count=`{snapshots.get('count', 0)}` valid_count=`{snapshots.get('valid_count', 0)}`",
         f"- Redaction secret occurrences: `{redaction.get('secret_occurrences', 0)}`",
         f"- Redaction forbidden pattern occurrences: `{redaction.get('forbidden_pattern_occurrences', 0)}`",
-        f"- Redaction replacements: `{redaction.get('redaction_replacements', 0)}`", "",
+        f"- Redaction replacements: `{redaction.get('redaction_replacements', 0)}`",
+        _hardware_decode_report_line(hardware), "",
     ])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(report, encoding="utf-8")
 
+
+
+def _hardware_decode_report_line(hardware: Mapping[str, Any]) -> str:
+    if not hardware:
+        return "- Hardware decode: `not_attempted` accepted=`False` checks=`none`"
+    checks = hardware.get("checks") if isinstance(hardware.get("checks"), dict) else {}
+    rendered_checks = ", ".join(
+        f"{name}={check.get('passed')}/{check.get('returncode')}"
+        for name, check in sorted(checks.items())
+        if isinstance(check, dict)
+    ) or "none"
+    return f"- Hardware decode: `{hardware.get('status')}` accepted=`{hardware.get('accepted')}` checks=`{rendered_checks}`"
 
 def _coerce_text(value: object) -> str:
     if value is None:

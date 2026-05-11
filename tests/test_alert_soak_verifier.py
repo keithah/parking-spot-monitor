@@ -85,6 +85,16 @@ def base_success() -> dict[str, Any]:
             "inspected_count": 4,
             "per_alert": [{"event_id": EVENT_ID, "spot_id": "left_spot", "text_found": True, "image_found": True}],
         },
+        "hardware_decode_summary": {
+            "attempted": True,
+            "exit_code": 0,
+            "status": "vaapi_supported_qsv_unavailable",
+            "accepted": True,
+            "checks": {
+                "vaapi_ffmpeg_init": {"passed": True, "returncode": 0},
+                "qsv_ffmpeg_init": {"passed": False, "returncode": 171},
+            },
+        },
         "redaction_scan": {"secret_occurrences": 0, "forbidden_pattern_occurrences": 0, "redaction_replacements": 2},
     }
 
@@ -106,6 +116,9 @@ def test_successful_organic_alert_report_passes_and_is_publication_safe(tmp_path
     assert "Matrix readback: `verified`" in report
     assert "Duplicate event IDs: none" in report
     assert "Requirement status: S08 strict live soak validation complete" in report
+    assert "Hardware decode: `vaapi_supported_qsv_unavailable` accepted=`True`" in report
+    assert "vaapi_ffmpeg_init=True/0" in report
+    assert "qsv_ffmpeg_init=False/171" in report
     assert "event_id" not in report
     assert "rtsp://" not in report.lower()
 

@@ -11,8 +11,8 @@ from PIL import Image
 from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix import MatrixDelivery
-from parking_spot_monitor.__main__ import _main, main
-from parking_spot_monitor.detection import DetectionError, VehicleDetection
+from parking_spot_monitor.__main__ import _main, _presence_by_spot, main
+from parking_spot_monitor.detection import DetectionError, DetectionFilterResult, RejectedDetection, RejectionReason, SpotDetectionResult, VehicleDetection
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
 from parking_spot_monitor.state import RuntimeState, save_runtime_state
@@ -1274,6 +1274,10 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
     assert health["iteration"] == 2
     assert health["last_frame_at"] == "2026-05-18T19:00:00Z"
     assert health["selected_decode_mode"] == "software"
+    assert health["capture"] == {
+        "last_success_at": "2026-05-18T19:00:00Z",
+        "selected_decode_mode": "software",
+    }
     assert health["consecutive_capture_failures"] == 0
     assert health["consecutive_detection_failures"] == 0
     assert health["last_matrix_error"] is None
@@ -1813,3 +1817,48 @@ def test_runtime_loop_matrix_upload_failure_logs_safe_context_and_retains_copied
     assert "Traceback" not in output
     assert "raw_image_bytes abc" not in output
     assert_no_secret_leak(output)
+
+
+def test_presence_by_spot_treats_small_in_spot_vehicle_as_release_suppression() -> None:
+    small_vehicle = VehicleDetection(class_name="car", confidence=0.9, bbox=(10, 10, 20, 20))
+    result = DetectionFilterResult(
+        by_spot={
+            "left_spot": SpotDetectionResult(
+                spot_id="left_spot",
+                accepted=None,
+                rejected=[
+                    RejectedDetection(
+                        spot_id="left_spot",
+                        detection=small_vehicle,
+                        reason=RejectionReason.AREA_TOO_SMALL,
+                    )
+                ],
+            ),
+            "right_spot": SpotDetectionResult(spot_id="right_spot", accepted=None, rejected=[]),
+        },
+        rejection_counts={RejectionReason.AREA_TOO_SMALL: 1},
+    )
+
+    assert _presence_by_spot(result) == {"left_spot": True, "right_spot": False}
+
+
+def test_presence_by_spot_does_not_count_centroid_outside_vehicle() -> None:
+    passing_vehicle = VehicleDetection(class_name="car", confidence=0.9, bbox=(10, 10, 100, 100))
+    result = DetectionFilterResult(
+        by_spot={
+            "left_spot": SpotDetectionResult(
+                spot_id="left_spot",
+                accepted=None,
+                rejected=[
+                    RejectedDetection(
+                        spot_id="left_spot",
+                        detection=passing_vehicle,
+                        reason=RejectionReason.CENTROID_OUTSIDE,
+                    )
+                ],
+            )
+        },
+        rejection_counts={RejectionReason.CENTROID_OUTSIDE: 1},
+    )
+
+    assert _presence_by_spot(result) == {"left_spot": False}

@@ -271,6 +271,7 @@ def _evidence_summary_lines(result: Mapping[str, Any]) -> list[str]:
     snapshots = artifacts.get("snapshot_jpegs") if isinstance(artifacts.get("snapshot_jpegs"), dict) else {}
     readback = result.get("room_readback") if isinstance(result.get("room_readback"), dict) else {}
     redaction = result.get("redaction_scan") if isinstance(result.get("redaction_scan"), dict) else {}
+    hardware = result.get("hardware_decode_summary") if isinstance(result.get("hardware_decode_summary"), dict) else {}
 
     required_missing = markers.get("missing_required", "not checked")
     forbidden_present = markers.get("forbidden_present", "not checked")
@@ -284,7 +285,20 @@ def _evidence_summary_lines(result: Mapping[str, Any]) -> list[str]:
         f"- Matrix room readback: {readback_status} text_found={readback.get('text_found')} image_found={readback.get('image_found')}",
         f"- Redaction secret occurrences: `{redaction.get('secret_occurrences', 0)}`",
         f"- Redaction replacements: `{redaction.get('redaction_replacements', 0)}`",
+        _hardware_decode_line(hardware),
     ]
+
+
+def _hardware_decode_line(hardware: Mapping[str, Any]) -> str:
+    if not hardware:
+        return "- Hardware decode: `not_attempted` accepted=`False` checks=`none`"
+    checks = hardware.get("checks") if isinstance(hardware.get("checks"), dict) else {}
+    rendered_checks = ", ".join(
+        f"{name}={check.get('passed')}/{check.get('returncode')}"
+        for name, check in sorted(checks.items())
+        if isinstance(check, dict)
+    ) or "none"
+    return f"- Hardware decode: `{hardware.get('status')}` accepted=`{hardware.get('accepted')}` checks=`{rendered_checks}`"
 
 
 def _requirement_status(validation: VerificationOutcome) -> str:

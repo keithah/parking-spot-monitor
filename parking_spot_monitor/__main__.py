@@ -15,6 +15,7 @@ from parking_spot_monitor.config import RuntimeSettings, SpotConfig, load_settin
 from parking_spot_monitor.detection import (
     DetectionError,
     DetectionFilterResult,
+    RejectionReason,
     SpotDetectionCandidate,
     UltralyticsVehicleDetector,
     filter_spot_detections,
@@ -448,6 +449,7 @@ def _update_runtime_state_for_frame(
         quiet_status,
         snapshot_path,
         configured_spot_ids=configured_spot_ids,
+        presence_by_spot=_presence_by_spot(detection_result),
     )
     for event in occupancy_update.events:
         payload = event.to_dict()
@@ -472,6 +474,29 @@ def _update_runtime_state_for_frame(
         )
     return FrameUpdateResult(runtime_state=updated_state, matrix_errors=matrix_errors)
 
+
+
+def _presence_by_spot(result: DetectionFilterResult) -> dict[str, bool]:
+    """Return weak vehicle-presence evidence that suppresses open alerts.
+
+    Accepted candidates confirm normal occupancy. Rejections that still prove a
+    vehicle-like object is inside the spot should prevent release/open alerts,
+    but they must not confirm a new occupied state on their own. Centroid-outside
+    and class-not-allowed rejections are excluded so pedestrians, driveway cars,
+    and passing traffic outside the spot do not keep spots occupied forever.
+    """
+
+    suppressing_reasons = {
+        RejectionReason.AREA_TOO_SMALL,
+        RejectionReason.OVERLAP_TOO_LOW,
+        RejectionReason.CONFIDENCE_TOO_LOW,
+    }
+    presence: dict[str, bool] = {}
+    for spot_id, spot_result in result.by_spot.items():
+        presence[spot_id] = spot_result.accepted is not None or any(
+            rejected.reason in suppressing_reasons for rejected in spot_result.rejected
+        )
+    return presence
 
 def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: Mapping[str, Any], *, logger: StructuredLogger) -> dict[str, Any] | None:
     if matrix_delivery is None:

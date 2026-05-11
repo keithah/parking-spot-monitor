@@ -1,12 +1,13 @@
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    LIBVA_DRIVER_NAME=iHD
 
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg intel-media-va-driver vainfo \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./

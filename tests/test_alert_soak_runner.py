@@ -221,6 +221,60 @@ def test_success_parses_organic_alerts_validates_jpegs_and_matrix_readback(tmp_p
     assert result["aliases"] if False else result["alerts"] == result["alert_summary"]
 
 
+
+def test_success_includes_hardware_decode_summary_in_result(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    data_dir = tmp_path / "data"
+    write_config(config_path)
+    write_jpeg(data_dir / "latest.jpg")
+    write_jpeg(data_dir / "snapshots" / SNAPSHOT_NAME)
+    (data_dir / "health.json").write_text(json.dumps({"status": "ok", "iteration": 3}), encoding="utf-8")
+    (data_dir / "state.json").write_text(json.dumps({"schema_version": 1, "spots": {"left_spot": {}}}), encoding="utf-8")
+
+    def fake_hardware_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "verdict": {"accepted": True, "status": "vaapi_supported_qsv_unavailable"},
+                    "checks": {
+                        "vainfo": {"passed": True, "returncode": 0},
+                        "vaapi_ffmpeg_init": {"passed": True, "returncode": 0},
+                        "qsv_ffmpeg_init": {"passed": False, "returncode": 171},
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    exit_code = runner.main(
+        ["--config", str(config_path), "--data-dir", str(data_dir)],
+        environ={"RTSP_URL": SECRET_RTSP, "MATRIX_ACCESS_TOKEN": SECRET_TOKEN},
+        popen_factory=lambda *args, **kwargs: CompletedProcess(stdout=alert_lines(), returncode=0),
+        readback=lambda **kwargs: {
+            "chunk": [
+                {"content": {"msgtype": "m.text", "body": "Parking spot open: left_spot at now"}},
+                {"content": {"msgtype": "m.image", "body": "Raw full-frame snapshot for left_spot at now"}},
+            ]
+        },
+        hardware_run=fake_hardware_run,
+    )
+
+    result = read_result(data_dir)
+    rendered = json.dumps(result)
+    assert exit_code == 0
+    assert result["hardware_decode_summary"]["status"] == "vaapi_supported_qsv_unavailable"
+    assert result["hardware_decode_summary"]["checks"]["vaapi_ffmpeg_init"] == {"passed": True, "returncode": 0}
+    assert result["hardware_decode_summary"]["checks"]["qsv_ffmpeg_init"] == {"passed": False, "returncode": 171}
+    report = (data_dir / "alert-soak-evidence.md").read_text(encoding="utf-8")
+    assert "Hardware decode: `vaapi_supported_qsv_unavailable` accepted=`True`" in report
+    assert "vaapi_ffmpeg_init=True/0" in report
+    assert "qsv_ffmpeg_init=False/171" in report
+    assert SECRET_RTSP not in rendered + report
+    assert SECRET_TOKEN not in rendered + report
+
+
 def test_duplicate_txns_are_validation_failure(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     data_dir = tmp_path / "data"

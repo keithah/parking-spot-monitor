@@ -22,7 +22,7 @@ def _assert_live_proof_contract(readme: str) -> None:
     assert verifier_index != -1, f"README must name the strict verifier: {VERIFIER_COMMAND}"
     assert runner_index < verifier_index, "README must instruct operators to run the Docker live-proof producer before the strict verifier"
 
-    for required in [RESULT_PATH, EVIDENCE_PATH]:
+    for required in [RESULT_PATH, EVIDENCE_PATH, "hardware_decode_summary", "scripts/verify_hardware_decode.py --json"]:
         assert required in readme, f"README must name retained proof artifact {required}"
 
     normalized = " ".join(readme.lower().split())
@@ -51,6 +51,8 @@ def _assert_alert_soak_contract(readme: str) -> None:
         "data/alert-soak-docker.stderr.log",
         "data/health.json",
         "data/state.json",
+        "hardware_decode_summary",
+        "scripts/verify_hardware_decode.py --json",
     ]:
         assert required in readme, f"README must name alert-soak publication boundary artifact {required}"
 

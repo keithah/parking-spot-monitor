@@ -308,6 +308,9 @@ def render_evidence_report(result: Mapping[str, Any], validation: VerificationOu
         "## Health and State Summary",
         *_health_state_lines(result),
         "",
+        "## Hardware Decode Summary",
+        _hardware_decode_line(result),
+        "",
         "## Redaction Counts",
         *_redaction_lines(result),
         "",
@@ -349,6 +352,19 @@ def _health_state_lines(result: Mapping[str, Any]) -> list[str]:
         f"- state.json: exists=`{state.get('exists')}` parse_ok=`{state.get('parse_ok')}` spot_count=`{state.get('spot_count', 'unknown')}`",
     ]
 
+
+
+def _hardware_decode_line(result: Mapping[str, Any]) -> str:
+    hardware = result.get("hardware_decode_summary") if isinstance(result.get("hardware_decode_summary"), dict) else {}
+    if not hardware:
+        return "- Hardware decode: `not_attempted` accepted=`False` checks=`none`"
+    checks = hardware.get("checks") if isinstance(hardware.get("checks"), dict) else {}
+    rendered_checks = ", ".join(
+        f"{name}={check.get('passed')}/{check.get('returncode')}"
+        for name, check in sorted(checks.items())
+        if isinstance(check, dict)
+    ) or "none"
+    return f"- Hardware decode: `{hardware.get('status')}` accepted=`{hardware.get('accepted')}` checks=`{rendered_checks}`"
 
 def _redaction_lines(result: Mapping[str, Any]) -> list[str]:
     redaction = result.get("redaction_scan") if isinstance(result.get("redaction_scan"), dict) else {}
