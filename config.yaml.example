@@ -42,6 +42,9 @@ matrix:
   room_id: "!parking-room:example.org"
   access_token_env: MATRIX_ACCESS_TOKEN
   user_id: "@parking-bot:example.org"
+  command_prefix: "!parking"
+  # Empty means inbound correction mutation commands are disabled/reject-all by default.
+  command_authorized_senders: []
   timeout_seconds: 10
   retry_attempts: 3
   retry_backoff_seconds: 1

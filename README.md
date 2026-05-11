@@ -316,6 +316,36 @@ The configured street-sweeping quiet window is `street_sweeping`: the first and 
 
 The structured JSON-line output should include capture attempt/write events, selected decode mode, fallback behavior when hardware decode is unavailable, duration, output path, and byte size. Overlay writes add `debug-overlay-written` records with source/output paths, image dimensions, and spot IDs. Detection records add aggregate accepted/rejected spot-filtering diagnostics. Capture failures, corrupt frames, overlay write/decode failures, detector failures, state load/save failures, and corrupt-state quarantine should report safe structured diagnostics without printing stream URLs, tokens, tracebacks, YAML content, image bytes, or full FFmpeg argv.
 
+## Vehicle-history retention, export, and prune
+
+Vehicle-history sessions, profile metadata, correction events, and archive-owned occupied JPEG artifacts are retained indefinitely under the effective data directory at `vehicle-history/`. Matrix alert snapshot retention remains separate: `storage.snapshot_retention_count` bounds event-delivery snapshots in `snapshots/`, but it does not prune vehicle-history records or archive-owned occupied images.
+
+Inspect `health.json` or `VehicleHistoryArchive.health_snapshot()` for operator-visible archive signals before opening files. The vehicle-history health fields include `retention_policy: "indefinite"`, `management_capabilities: ["export", "prune"]`, archive file/byte counts, oldest retained session timestamp, missing occupied-image reference count, and sanitized `last_maintenance_metadata` from the latest export/prune manifest.
+
+Export a local operator-owned bundle from inside the installed package/container with the standard-library CLI:
+
+```sh
+python -m parking_spot_monitor.vehicle_history_cli \
+  --data-dir ./data \
+  export --output ./vehicle-history-export.tar.gz
+```
+
+The export command writes a `.tar.gz` bundle containing the archive files plus a metadata-only manifest, then persists the same safe maintenance summary under `vehicle-history/metadata/maintenance/`. The bundle may intentionally contain raw archive image files because it is an explicit local operator export; the CLI stdout, maintenance manifest, logs, and health text must remain metadata-only and must not serialize image bytes, RTSP URLs, Matrix tokens, Authorization headers, descriptors, raw Matrix bodies, or tracebacks.
+
+Always dry-run prune before applying it:
+
+```sh
+python -m parking_spot_monitor.vehicle_history_cli \
+  --data-dir ./data \
+  prune --older-than-days 90 --dry-run
+
+python -m parking_spot_monitor.vehicle_history_cli \
+  --data-dir ./data \
+  prune --older-than-days 90 --apply
+```
+
+Use `--older-than ISO_TIMESTAMP` when you need an explicit cutoff instead of a relative day count. Prune only considers closed sessions whose close timestamp is older than the cutoff. It never deletes active sessions, and it skips image files still referenced by active or retained sessions; missing image references are counted as safe metadata gaps. Invalid cutoffs, missing required arguments, and unwritable export outputs exit non-zero without applying prune.
+
 ## Local YOLO detection and Model storage policy
 
 The runtime package includes `ultralytics>=8` so the local detector can load YOLO nano from the configured `detection.model` value, for example `yolov8n.pt`. `detection.model` accepts local model names and local POSIX paths only: use package/Ultralytics names such as `yolov8n.pt`, repo-relative operator paths such as `models/custom-detector.pt`, or mounted Docker paths such as `/models/yolov8n.pt`. Config validation rejects URL-like values (`https://...`, `s3://...`) and path traversal (`../...` or `/models/../...`) before runtime so model configuration failures are clear and do not leak secrets.
