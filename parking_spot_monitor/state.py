@@ -117,6 +117,7 @@ def save_runtime_state(path: str | os.PathLike[str], state: RuntimeState, logger
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o644)
         os.replace(temp_path, state_path)
     except Exception as exc:
         if temp_path is not None:

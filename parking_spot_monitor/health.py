@@ -70,6 +70,7 @@ def write_health_status(path: str | os.PathLike[str], status: HealthStatus, logg
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o644)
         os.replace(temp_path, health_path)
     except Exception:
         if temp_path is not None:
