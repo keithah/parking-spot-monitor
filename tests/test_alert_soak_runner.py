@@ -263,6 +263,30 @@ def test_success_parses_organic_alerts_validates_jpegs_and_matrix_readback(tmp_p
 
 
 
+def test_docker_run_uses_host_uid_gid_so_health_and_state_are_host_readable(tmp_path: Path, monkeypatch: Any) -> None:
+    config_path = tmp_path / "config.yaml"
+    data_dir = tmp_path / "data"
+    write_config(config_path)
+    process = TimeoutProcess(stdout_after='{"event":"capture-loop-paced","iteration":1}\n')
+    commands: list[list[str]] = []
+    monkeypatch.setattr(runner.os, "getuid", lambda: 1234)
+    monkeypatch.setattr(runner.os, "getgid", lambda: 5678)
+
+    def fake_popen(command: list[str], **kwargs: Any) -> TimeoutProcess:
+        commands.append(command)
+        return process
+
+    runner.main(
+        ["--config", str(config_path), "--data-dir", str(data_dir), "--soak-seconds", "0.01"],
+        environ={"RTSP_URL": SECRET_RTSP, "MATRIX_ACCESS_TOKEN": SECRET_TOKEN},
+        popen_factory=fake_popen,
+    )
+
+    assert commands
+    user_index = commands[0].index("--user")
+    assert commands[0][user_index + 1] == "1234:5678"
+
+
 def test_success_includes_hardware_decode_summary_in_result(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     data_dir = tmp_path / "data"

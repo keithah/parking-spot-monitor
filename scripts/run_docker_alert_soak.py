@@ -266,8 +266,9 @@ def _preflight_artifact(preflight: Mapping[str, Any]) -> dict[str, Any]:
 
 def _docker_alert_soak_command(matrix_token_env: str) -> list[str]:
     command = list(DOCKER_ALERT_SOAK_COMMAND)
+    command[4:4] = ["--user", f"{os.getuid()}:{os.getgid()}"]
     if matrix_token_env != DEFAULT_MATRIX_TOKEN_ENV:
-        command[7] = matrix_token_env
+        command[9] = matrix_token_env
     return command
 
 
