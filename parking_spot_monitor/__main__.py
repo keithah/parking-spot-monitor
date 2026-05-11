@@ -381,12 +381,16 @@ def _process_detection_for_capture(
     iteration: int | None = None,
 ) -> DetectionFilterResult:
     detections = detector.detect(latest_path, confidence_threshold=settings.detection.confidence_threshold)
+    actual_frame_size = _image_size(latest_path)
+    configured_frame_size = (settings.stream.frame_width, settings.stream.frame_height)
+    frame_size_mismatch = actual_frame_size is not None and actual_frame_size != configured_frame_size
+    scale = _frame_scale(configured_frame_size=configured_frame_size, actual_frame_size=actual_frame_size)
     result = filter_spot_detections(
         detections,
-        spots=_configured_spot_polygons(settings),
+        spots=_configured_spot_polygons(settings, scale=scale),
         allowed_classes=settings.detection.vehicle_classes,
         confidence_threshold=settings.detection.confidence_threshold,
-        min_bbox_area_px=settings.detection.min_bbox_area_px,
+        min_bbox_area_px=_scaled_min_bbox_area(settings.detection.min_bbox_area_px, scale=scale),
         min_polygon_overlap_ratio=settings.detection.min_polygon_overlap_ratio,
         source_frame_path=str(latest_path),
         source_timestamp=frame_timestamp,
@@ -400,9 +404,13 @@ def _process_detection_for_capture(
         "rejection_counts": _stringify_rejection_counts(result),
         "thresholds": {
             "confidence_threshold": settings.detection.confidence_threshold,
-            "min_bbox_area_px": settings.detection.min_bbox_area_px,
+            "min_bbox_area_px": _scaled_min_bbox_area(settings.detection.min_bbox_area_px, scale=scale),
+            "configured_min_bbox_area_px": settings.detection.min_bbox_area_px,
             "min_polygon_overlap_ratio": settings.detection.min_polygon_overlap_ratio,
         },
+        "actual_frame_size": _frame_size_dict(actual_frame_size),
+        "configured_frame_size": _frame_size_dict(configured_frame_size),
+        "frame_size_mismatch": frame_size_mismatch,
         "candidate_summaries": _candidate_summaries(result),
     }
     if iteration is not None:
@@ -669,15 +677,50 @@ def _parse_frame_timestamp(value: Any | None) -> datetime | None:
         return None
 
 
-def _configured_spot_polygons(settings: RuntimeSettings) -> dict[str, list[tuple[int, int]]]:
+def _configured_spot_polygons(
+    settings: RuntimeSettings, *, scale: tuple[float, float] = (1.0, 1.0)
+) -> dict[str, list[tuple[float, float]]]:
     return {
-        "left_spot": _spot_polygon(settings.spots.left_spot),
-        "right_spot": _spot_polygon(settings.spots.right_spot),
+        "left_spot": _spot_polygon(settings.spots.left_spot, scale=scale),
+        "right_spot": _spot_polygon(settings.spots.right_spot, scale=scale),
     }
 
 
-def _spot_polygon(spot: SpotConfig) -> list[tuple[int, int]]:
-    return [(point.x, point.y) for point in spot.polygon]
+def _spot_polygon(spot: SpotConfig, *, scale: tuple[float, float] = (1.0, 1.0)) -> list[tuple[float, float]]:
+    scale_x, scale_y = scale
+    return [(point.x * scale_x, point.y * scale_y) for point in spot.polygon]
+
+
+def _image_size(path: Path) -> tuple[int, int] | None:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return image.size
+    except Exception:
+        return None
+
+
+def _frame_scale(
+    *, configured_frame_size: tuple[int, int], actual_frame_size: tuple[int, int] | None
+) -> tuple[float, float]:
+    if actual_frame_size is None:
+        return (1.0, 1.0)
+    configured_width, configured_height = configured_frame_size
+    actual_width, actual_height = actual_frame_size
+    if configured_width <= 0 or configured_height <= 0:
+        return (1.0, 1.0)
+    return (actual_width / configured_width, actual_height / configured_height)
+
+
+def _scaled_min_bbox_area(value: float, *, scale: tuple[float, float]) -> float:
+    return float(value) * scale[0] * scale[1]
+
+
+def _frame_size_dict(size: tuple[int, int] | None) -> dict[str, int] | None:
+    if size is None:
+        return None
+    return {"width": int(size[0]), "height": int(size[1])}
 
 
 def _stringify_rejection_counts(result: DetectionFilterResult) -> dict[str, int]:

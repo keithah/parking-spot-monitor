@@ -29,7 +29,10 @@ S07_EVIDENCE_PATHS = [
     "data/s07-replay-evidence/coverage/s07-evidence-report.json",
     "data/s07-replay-evidence/coverage/s07-evidence-report.md",
 ]
-S07_NON_EVIDENCE_PATHS = [
+PRIVATE_DATA_PATHS = [
+    "data/camera.png",
+    "data/leftspotempty.jpg",
+    "data/rightspotempty.jpg",
     "data/s07-replay-evidence-notes.md",
     "data/s07-replay-evidence-public/replay-report.json",
 ]
@@ -77,5 +80,5 @@ def test_s07_private_evidence_workspace_is_gitignored() -> None:
     assert_paths_are_gitignored(S07_EVIDENCE_PATHS, "Private S07 evidence artifacts")
 
 
-def test_s07_ignore_rule_is_narrow() -> None:
-    assert_paths_are_not_gitignored(S07_NON_EVIDENCE_PATHS, "Paths outside the private S07 workspace")
+def test_data_directory_is_private_by_default() -> None:
+    assert_paths_are_gitignored(PRIVATE_DATA_PATHS, "Private data directory artifacts")

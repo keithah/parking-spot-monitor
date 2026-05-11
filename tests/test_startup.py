@@ -9,6 +9,7 @@ import pytest
 from PIL import Image
 
 from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult
+from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix import MatrixDelivery
 from parking_spot_monitor.__main__ import _main, _presence_by_spot, main
@@ -156,6 +157,36 @@ class FakeMatrixDelivery:
         self.live_proofs.append({"latest_path": latest_path, "observed_at": observed_at, "selected_mode": selected_mode})
         if self.fail:
             raise RuntimeError(f"matrix failure {SECRET_MARKER}")
+
+
+
+def test_process_detection_scales_configured_polygons_to_actual_frame_size(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    frame = tmp_path / "low-res-latest.jpg"
+    Image.new("RGB", (640, 360), (20, 30, 40)).save(frame, format="JPEG")
+
+    class LowResDetector:
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            return [VehicleDetection(class_name="car", confidence=0.9, bbox=(142.0, 91.0, 265.0, 151.0))]
+
+    from parking_spot_monitor.__main__ import _process_detection_for_capture
+
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    result = _process_detection_for_capture(
+        settings,
+        LowResDetector(),
+        frame,
+        logger=StructuredLogger(),
+        mode="test",
+    )
+
+    output = combined_output(capsys)
+    assert result.by_spot["left_spot"].accepted is not None
+    assert result.by_spot["right_spot"].accepted is None
+    assert '"frame_size_mismatch":true' in output
+    assert '"configured_frame_size":{"height":806,"width":1458}' in output
+    assert '"actual_frame_size":{"height":360,"width":640}' in output
 
 
 def test_runtime_loop_matrix_quiet_window_start_notice_sent_once_by_event_id(

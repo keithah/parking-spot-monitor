@@ -21,6 +21,7 @@ env/
 config.yaml
 
 # Runtime/artifacts
+data/*
 .bg-shell/
 .gsd/runtime/
 .gsd/notifications.jsonl

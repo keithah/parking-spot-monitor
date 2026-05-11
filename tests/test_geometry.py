@@ -31,11 +31,15 @@ def test_example_config_uses_m001_camera_dimensions_and_street_polygons() -> Non
     assert [(point.x, point.y) for point in settings.spots.right_spot.polygon] == RIGHT_SPOT
 
 
-def test_tracked_camera_fixture_matches_config_dimensions() -> None:
+def test_synthetic_camera_fixture_matches_config_dimensions(tmp_path: Path) -> None:
     import struct
 
+    from PIL import Image
+
     settings = load_settings("config.yaml.example", environ=fake_environ())
-    png_header = Path("camera.png").read_bytes()[:24]
+    fixture_path = tmp_path / "camera.png"
+    Image.new("RGB", (settings.stream.frame_width, settings.stream.frame_height), (20, 30, 40)).save(fixture_path, format="PNG")
+    png_header = fixture_path.read_bytes()[:24]
     width, height = struct.unpack(">II", png_header[16:24])
 
     assert png_header.startswith(b"\x89PNG\r\n\x1a\n")
