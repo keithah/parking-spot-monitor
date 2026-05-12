@@ -1027,15 +1027,22 @@ def format_occupied_spot_alert(event: Mapping[str, Any]) -> str:
         default="unknown",
     )
 
-    lines = [
-        f"Parking spot occupied: {spot_id} at {observed_at}",
-        f"Likely vehicle: {label} (profile {profile_id})",
-        f"Match: {match_status}, confidence {match_confidence}",
-    ]
+    lines = [f"Parking spot occupied: {spot_id} at {observed_at}"]
 
     estimate_status = _safe_text(_first_present(estimate, "status"), default="insufficient_history")
     sample_count = _int_field(estimate, "sample_count", default=0)
     estimate_confidence = _safe_text(_first_present(estimate, "confidence"), default="unknown")
+    has_useful_vehicle_context = label != "unknown vehicle" or sample_count > 0 or estimate_status == "estimated" or match_status != "new_profile"
+    if not has_useful_vehicle_context:
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            f"Likely vehicle: {label} (profile {profile_id})",
+            f"Match: {match_status}, confidence {match_confidence}",
+        ]
+    )
+
     if estimate_status == "estimated":
         dwell_range = _mapping_field(estimate, "dwell_range")
         leave_window = _mapping_field(estimate, "leave_time_window")

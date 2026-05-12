@@ -350,6 +350,26 @@ def test_format_occupied_spot_alert_is_honest_about_insufficient_history() -> No
     )
 
 
+def test_format_occupied_spot_alert_omits_unavailable_new_profile_history_noise() -> None:
+    event = occupied_event()
+    event["likely_vehicle"] = {
+        "profile_id": "prof_sess-right-spot-2026-05-12t16-14-03-187234-00-00",
+        "match_status": "new_profile",
+        "confidence": 1,
+    }
+    event["vehicle_history_estimate"] = {
+        "status": "insufficient_history",
+        "reason": "insufficient-samples",
+        "profile_id": "prof_sess-right-spot-2026-05-12t16-14-03-187234-00-00",
+        "sample_count": 0,
+        "confidence": "low",
+        "dwell_range": None,
+        "leave_time_window": None,
+    }
+
+    assert format_occupied_spot_alert(event) == "Parking spot occupied: left_spot at 2026-05-18T13:01:02-07:00"
+
+
 def test_matrix_delivery_occupied_alert_sends_text_upload_and_raw_occupied_image(tmp_path: Path) -> None:
     source = tmp_path / "occupied.jpg"
     raw_bytes = write_jpeg(source, size=(9, 7))
