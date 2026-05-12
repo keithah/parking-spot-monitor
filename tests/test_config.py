@@ -143,9 +143,20 @@ def test_sanitized_summary_never_contains_secret_values() -> None:
             "ordinals": [1, 3],
             "start": "13:00",
             "end": "15:00",
+            "reminder_minutes_before": 60,
         }
     ]
     assert summary["storage"]["snapshot_retention_count"] == 50
+
+
+def test_quiet_window_reminder_minutes_before_must_be_positive(tmp_path: Path) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace("reminder_minutes_before: 60", "reminder_minutes_before: 0")
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert "reminder_minutes_before" in str(exc_info.value)
 
 
 def test_storage_snapshot_retention_count_must_be_positive(tmp_path: Path) -> None:

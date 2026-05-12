@@ -563,6 +563,7 @@ def _update_runtime_state_for_frame(
     notice_events = quiet_window_notice_events(
         previous_active_window_ids=runtime_state.active_quiet_window_ids,
         current=quiet_status,
+        emitted_notice_ids=runtime_state.quiet_window_notice_ids,
     )
     emitted_notice_ids = set(runtime_state.quiet_window_notice_ids)
     for notice in notice_events:
@@ -990,7 +991,7 @@ def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: 
         logger.info("matrix-delivery-skipped", event_type=event_name, reason="not-configured")
         return None
 
-    if event_name in {QuietWindowEventType.STARTED.value, QuietWindowEventType.ENDED.value}:
+    if event_name in {QuietWindowEventType.UPCOMING.value, QuietWindowEventType.STARTED.value, QuietWindowEventType.ENDED.value}:
         txn_id = str(event.get("event_id", ""))
         logger.info("matrix-delivery-attempt", event_type=event_name, event_id=txn_id, txn_id=txn_id, attempt=1)
         try:

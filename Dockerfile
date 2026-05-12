@@ -2,12 +2,15 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    LIBVA_DRIVER_NAME=iHD
+    LIBVA_DRIVER_NAME=iHD \
+    TZ=America/Los_Angeles
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg intel-media-va-driver vainfo \
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg intel-media-va-driver tzdata vainfo \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./

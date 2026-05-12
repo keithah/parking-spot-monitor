@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import httpx
 from PIL import Image, UnidentifiedImageError
@@ -20,6 +21,7 @@ MEDIA_API_PREFIX = "/_matrix/media/v3"
 JPEG_MIMETYPE = "image/jpeg"
 OPEN_SPOT_EVENT_TYPE = "occupancy-open-event"
 OCCUPIED_SPOT_EVENT_TYPE = "occupancy-occupied-event"
+DISPLAY_TIMEZONE = ZoneInfo("America/Los_Angeles")
 
 
 @dataclass(frozen=True)
@@ -969,7 +971,24 @@ def _log_retention_failure(
 
 
 def _display_observed_at(value: object) -> str:
-    return _format_observed_at(value).replace("Z", "+00:00")
+    observed_at = _parse_observed_at(value)
+    if observed_at is None:
+        return _format_observed_at(value).replace("Z", "+00:00")
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        return observed_at.isoformat()
+    return observed_at.astimezone(DISPLAY_TIMEZONE).isoformat()
+
+
+def _parse_observed_at(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        text = _require_non_empty("observed_at", value)
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
 
 
 def format_open_spot_alert(event: Mapping[str, Any]) -> str:
@@ -1115,6 +1134,10 @@ def format_quiet_window_notice(event: Mapping[str, Any]) -> str:
 
     event_type = _require_non_empty("event_type", str(event.get("event_type", "")))
     window_id = _require_non_empty("window_id", str(event.get("window_id", "")))
+    if event_type == "quiet-window-upcoming":
+        minutes_before = _int_field(event, "reminder_minutes_before", default=0)
+        lead_time = _format_lead_time(minutes_before)
+        return f"Street sweeping starts in {lead_time}: {window_id}"
     if event_type == "quiet-window-started":
         verb = "started"
     elif event_type == "quiet-window-ended":
@@ -1122,6 +1145,14 @@ def format_quiet_window_notice(event: Mapping[str, Any]) -> str:
     else:
         verb = event_type
     return f"Street sweeping {verb}: {window_id}"
+
+
+def _format_lead_time(minutes: int) -> str:
+    if minutes == 60:
+        return "1 hour"
+    if minutes > 0 and minutes % 60 == 0:
+        return f"{minutes // 60} hours"
+    return f"{minutes} minutes"
 
 
 def format_live_proof_text(*, observed_at: object, selected_mode: object) -> str:

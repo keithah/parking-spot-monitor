@@ -57,6 +57,7 @@ quiet_windows:
     ordinals: [1, 3]
     start: "13:00"
     end: "15:00"
+    reminder_minutes_before: 60
 
 storage:
   data_dir: ./data

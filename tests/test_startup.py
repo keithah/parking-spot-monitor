@@ -363,6 +363,38 @@ def test_runtime_loop_matrix_quiet_window_start_notice_sent_once_by_event_id(
     assert_no_secret_leak(output)
 
 
+def test_runtime_loop_matrix_quiet_window_upcoming_notice_sent_once_by_event_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    delivery = FakeMatrixDelivery()
+
+    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+        return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
+        sleep=lambda _seconds: None,
+        max_iterations=2,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    assert exit_code == 0
+    assert [notice["event_id"] for notice in delivery.quiet_notices] == [
+        "quiet-window-upcoming:street_sweeping:2026-05-18:13:00-15:00:60m"
+    ]
+    assert delivery.quiet_notices[0]["event_type"] == "quiet-window-upcoming"
+    assert delivery.quiet_notices[0]["reminder_minutes_before"] == 60
+    assert delivery.open_alerts == []
+    assert '"event":"matrix-delivery-succeeded"' in output
+    assert '"event_type":"quiet-window-upcoming"' in output
+    assert_no_secret_leak(output)
+
 def test_runtime_loop_matrix_quiet_window_end_notice_sent_once_by_event_id(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -445,7 +477,7 @@ def test_runtime_loop_matrix_open_event_sends_text_and_raw_snapshot(
     open_images = [image for image in matrix_client.images if image["txn_id"].startswith("occupancy-open-event:")]
     assert len(open_texts) == 1
     assert open_texts[0]["txn_id"].endswith(":text")
-    assert open_texts[0]["body"] == "Parking spot open: left_spot at 2026-05-18T19:00:00+00:00"
+    assert open_texts[0]["body"] == "Parking spot open: left_spot at 2026-05-18T12:00:00-07:00"
     assert len(open_uploads) == 1
     assert open_uploads[0]["content_type"] == "image/jpeg"
     assert open_uploads[0]["data"] == snapshot_files[0].read_bytes()
@@ -570,13 +602,18 @@ def test_runtime_loop_occupied_alert_sends_text_image_with_seeded_vehicle_estima
     active_payload = json.loads(active_files[0].read_text(encoding="utf-8"))
     snapshot_files = list((tmp_path / "snapshots").glob("occupancy-occupied-event-left-spot-*.jpg"))
     assert exit_code == 0
-    assert len(matrix_client.texts) == 1
+    assert len(matrix_client.texts) == 2
     assert len(matrix_client.uploads) == 1
     assert len(matrix_client.images) == 1
     assert len(snapshot_files) == 1
     assert snapshot_files[0].read_bytes() == Path(active_payload["occupied_snapshot_path"]).read_bytes()
     assert matrix_client.uploads[0]["data"] == Path(active_payload["occupied_snapshot_path"]).read_bytes()
-    text_body = matrix_client.texts[0]["body"]
+    reminder_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("quiet-window-upcoming:")]
+    occupied_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("occupancy-occupied-event:")]
+    assert len(reminder_texts) == 1
+    assert reminder_texts[0]["body"] == "Street sweeping starts in 1 hour: street_sweeping:2026-05-18:13:00-15:00"
+    assert len(occupied_texts) == 1
+    text_body = occupied_texts[0]["body"]
     assert "Likely vehicle: Blue Civic (profile prof_civic)" in text_body
     assert "Estimated dwell: 1 hr–1 hr 10 min (typical 1 hr 5 min)" in text_body
     assert "Usual leave window: 20:00–20:15" in text_body
@@ -768,7 +805,7 @@ def test_runtime_loop_vehicle_history_final_integrated_regression_includes_reten
     assert "Likely vehicle: Corrected Fleet (profile prof_source)" in occupied_body
     assert "Estimated dwell: 1 hr–1 hr 10 min (typical 1 hr 5 min)" in occupied_body
     assert "History: 2 samples, estimate confidence low" in occupied_body
-    assert open_texts[0]["body"] == "Parking spot open: left_spot at 2026-05-18T19:00:00+00:00"
+    assert open_texts[0]["body"] == "Parking spot open: left_spot at 2026-05-18T12:00:00-07:00"
     assert occupied_uploads[0]["data"] == Path(current_payload["occupied_snapshot_path"]).read_bytes()
     assert open_uploads[0]["data"] == (tmp_path / "snapshots" / open_uploads[0]["filename"]).read_bytes()
 
@@ -2220,7 +2257,7 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
     )
 
     def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
-        return captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z")
+        return captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z")
 
     exit_code = _main(
         ["--config", str(config_path), "--data-dir", str(tmp_path)],
@@ -2230,7 +2267,7 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
         detector_factory=noop_detector_factory,
         sleep=sleeps.append,
         max_iterations=2,
-        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+        now=lambda: datetime(2026, 5, 18, 18, 0, tzinfo=timezone.utc),
     )
 
     output = combined_output(capsys)
@@ -2239,10 +2276,10 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
     assert sleeps == [2, 2]
     assert health["status"] == "ok"
     assert health["iteration"] == 2
-    assert health["last_frame_at"] == "2026-05-18T19:00:00Z"
+    assert health["last_frame_at"] == "2026-05-18T18:00:00Z"
     assert health["selected_decode_mode"] == "software"
     assert health["capture"] == {
-        "last_success_at": "2026-05-18T19:00:00Z",
+        "last_success_at": "2026-05-18T18:00:00Z",
         "selected_decode_mode": "software",
     }
     assert health["consecutive_capture_failures"] == 0

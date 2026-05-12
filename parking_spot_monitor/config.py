@@ -124,6 +124,7 @@ class QuietWindowConfig(StrictModel):
     ordinals: list[int]
     start: str
     end: str
+    reminder_minutes_before: int | None = Field(default=None, gt=0)
 
     @field_validator("timezone")
     @classmethod
