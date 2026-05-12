@@ -33,6 +33,364 @@ With the Docker default `--data-dir /data`, those relative values resolve to `/d
 
 Never paste camera URLs, usernames, passwords, Matrix tokens, or other secret values into `config.yaml`, `docker-compose.yml`, README examples, logs, or committed files.
 
+## Operator calibration and debug artifact guide
+
+Use this section when the parking spots need tuning after a camera move, frame-size change, detector upgrade, or false-positive/missed-detection report. The supported operator boundary is deliberately narrow: edit configured spot polygons and shared detection/occupancy thresholds in `config.yaml`; do not edit Python code for routine calibration. The runtime does not currently implement a per-spot threshold schema, so do not add or rely on fields such as per-spot confidence, area, overlap, IoU, confirm, or release thresholds.
+
+### 1. Copy and validate the operator config
+
+Start from the tracked example and keep secret values in environment variables, not YAML:
+
+```sh
+cp config.yaml.example config.yaml
+RTSP_URL="<operator-provided-camera-stream>" \
+MATRIX_ACCESS_TOKEN="<operator-provided-matrix-token>" \
+python -m parking_spot_monitor --config config.yaml --validate-config
+```
+
+Validation resolves `stream.rtsp_url_env` and `matrix.access_token_env` by name, then checks the schema before runtime. Failure diagnostics should name fields or environment variable names such as `RTSP_URL` and `MATRIX_ACCESS_TOKEN`; they must not include resolved camera URLs, Matrix access tokens, Authorization headers, Matrix response bodies, tracebacks, YAML dumps, or image bytes.
+
+### 2. Edit spot polygons safely
+
+`spots.left_spot.polygon` and `spots.right_spot.polygon` are YAML lists of `[x, y]` coordinate pairs in the captured frame coordinate system. Coordinates are relative to `stream.frame_width` and `stream.frame_height`, where `x=0, y=0` is the top-left of the frame and `x=stream.frame_width, y=stream.frame_height` is the bottom-right edge. Each spot needs at least three points so the polygon has an area.
+
+Keep every polygon point inside the configured frame. Config validation rejects out-of-frame points and reports the offending polygon/index instead of starting the monitor with ambiguous geometry. After editing, rerun `--validate-config` before any capture attempt.
+
+A safe local calibration loop is:
+
+```sh
+cp config.yaml.example config.yaml
+# Edit only config.yaml: spot polygons plus shared detection/occupancy thresholds.
+RTSP_URL="<operator-provided-camera-stream>" \
+MATRIX_ACCESS_TOKEN="<operator-provided-matrix-token>" \
+python -m parking_spot_monitor --config config.yaml --validate-config
+mkdir -p data
+python -m parking_spot_monitor --config config.yaml --data-dir ./data --capture-once
+ls -l data/latest.jpg data/debug_latest.jpg
+```
+
+For the same bounded capture through Docker, use the Compose service and mounted `/data` path:
+
+```sh
+mkdir -p data
+docker compose run --rm parking-spot-monitor \
+  python -m parking_spot_monitor --config /config/config.yaml --data-dir /data --capture-once
+ls -l data/latest.jpg data/debug_latest.jpg
+```
+
+### 3. Operator-level config map
+
+- `stream` / camera: `rtsp_url_env` names the camera URL environment variable, `frame_width` and `frame_height` define the coordinate system for polygons, and `reconnect_seconds` controls capture retry backoff after capture failures.
+- `spots`: each configured spot has a human-readable `name` and a polygon. Tune these polygons to cover only the street parking regions being monitored; exclude driveway cars or unrelated curb areas by moving polygon points, not by adding Python logic.
+- `detection`: `model` selects the local YOLO model name/path, `confidence_threshold` is the shared minimum detector confidence, `min_bbox_area_px` filters tiny detections, `min_polygon_overlap_ratio` requires overlap with a configured spot polygon, and `vehicle_classes` lists accepted vehicle class names. These thresholds are shared across configured spots.
+- `occupancy`: `iou_threshold`, `confirm_frames`, and `release_frames` debounce detector output into stable occupied/empty state. These are shared occupancy controls, not spot-specific schema.
+- `matrix`: `homeserver`, `room_id`, and related routing fields define delivery targets; `access_token_env` must remain the environment variable name `MATRIX_ACCESS_TOKEN`, not a token value.
+- `quiet_windows`: configured quiet periods such as street sweeping suppress open-spot alerts while still emitting diagnostic quiet-window events.
+- `storage`: `data_dir` anchors local artifacts, `snapshots_dir` stores retained Matrix event/live-proof snapshots relative to the data directory unless absolute, and `snapshot_retention_count` bounds retained event snapshots.
+- `runtime`: `health_file`, `log_level`, `startup_timeout_seconds`, and `frame_interval_seconds` control operator health output, structured logging level, startup guardrails, and successful-loop pacing.
+
+### 4. Interpret local artifacts
+
+- `data/latest.jpg` is raw full-frame evidence from the most recent successful capture. It is intentionally unannotated so Matrix alert snapshots and later evidence retain the original camera frame.
+- `data/debug_latest.jpg` is a local RGB JPEG polygon overlay for tuning only. Use it to confirm configured street polygons line up with the raw frame. Do not treat the overlay as Matrix alert evidence and do not publish it without review.
+- `data/snapshots/` retains Matrix event/live-proof snapshots according to `storage.snapshot_retention_count`. Retention applies to event snapshots, not to `latest.jpg`, `debug_latest.jpg`, `health.json`, `state.json`, malformed filenames, or unrelated operator files.
+- `data/health.json` summarizes current runtime status, selected decode mode, timestamps, failure counters, Matrix delivery errors, retention failures, state-save errors, and last sanitized error. Inspect it with `python -m json.tool data/health.json`.
+- `data/state.json` stores conservative restart state: spot status, hit/miss streaks, duplicate-open suppression markers, quiet-window state, and related occupancy context. Inspect it with `python -m json.tool data/state.json` when state transitions look surprising.
+- Calibration bundles, replay reports, and tuning reports are local evidence gates. They summarize safe metadata and decisions; they do not embed raw images, image payload bytes, camera URLs, Matrix tokens, Authorization headers, Matrix response bodies, or tracebacks.
+
+### 5. Debug false positives and missed detections
+
+When a spot reports occupied while it should be empty, or misses a real parked vehicle, debug one layer at a time:
+
+1. Compare `data/latest.jpg` with `data/debug_latest.jpg`. If the overlay polygon covers the wrong curb area, adjust the relevant polygon in `config.yaml`, validate config, and rerun a bounded capture.
+2. Inspect JSON-line logs for `capture-frame-written` to confirm the raw frame was refreshed and for `debug-overlay-written` or `debug-overlay-failed` to confirm overlay generation succeeded or failed safely.
+3. Inspect `detection-frame-processed`. Its accepted candidate summaries and rejection counts show whether detections were rejected by confidence, class, area, polygon overlap, or spot filtering.
+4. Treat `detection-frame-failed` as an inference/model/runtime failure, not as evidence that the spot is empty. Fix the model/config/runtime issue before changing thresholds.
+5. For threshold changes, use `scripts/replay_calibration_cases.py` and `scripts/compare_calibration_tuning.py` with operator-labeled evidence. Apply only shared threshold changes supported by replay/tuning reports; a `needs_per_spot_thresholds` tuning decision is follow-up design evidence, not permission to invent runtime schema in `config.yaml`.
+
+This guide does not prove a live camera or Matrix room without real operator-provided secrets. It also does not add a browser calibration surface, NVR/retention management surface, cloud AI processing, license plate recognition, driveway-car monitoring support, encrypted Matrix room support, or non-root container hardening. Keep raw frames, snapshots, health/state, calibration bundles, replay/tuning reports, and redacted runtime logs local unless they have been deliberately reviewed for safe publication.
+
+## Clean-machine setup and Docker Compose operator guide
+
+This guide is the fresh-clone path for an operator who wants to validate configuration, launch the Docker Compose service, inspect logs/restarts, and confirm the first local artifacts without relying on private session context.
+
+### 1. Prerequisites
+
+Install these on the host before running the commands below:
+
+- Python 3.11 or newer for local config checks and optional validation commands.
+- Docker with the Compose plugin (`docker compose ...`) for container build/run operations.
+- Optional Intel hardware decode access at `/dev/dri` if the host supports VAAPI/QSV passthrough.
+- `pytest` only if you are running repository validation tests such as `python -m pytest tests/test_docker_contract.py -q`.
+
+Docker unavailable is an environment/setup blocker, not a different application contract. The commands below remain the operator contract; install Docker/Compose before exercising the container path.
+
+### 2. Create operator config and provide secrets by environment name
+
+Start from the tracked example and keep real secret values outside committed files:
+
+```sh
+cp config.yaml.example config.yaml
+```
+
+`config.yaml` names the required environment variables; it must not contain the camera stream value or Matrix access-token value. Provide the values through your shell, service manager, or another local secret mechanism that is not committed:
+
+```sh
+export RTSP_URL="<operator-provided-camera-stream>"
+export MATRIX_ACCESS_TOKEN="<operator-provided-matrix-token>"
+python -m parking_spot_monitor --config config.yaml --validate-config
+```
+
+Missing or empty values should fail validation with diagnostics naming `RTSP_URL` and/or `MATRIX_ACCESS_TOKEN` only. Do not paste resolved camera URLs, Matrix tokens, room-private responses, or raw logs into docs, tickets, or committed files.
+
+The tracked Compose file does not define an `env_file`. It passes `RTSP_URL` and `MATRIX_ACCESS_TOKEN` by name from the environment where `docker compose` is invoked.
+
+### 3. Inspect the actual Compose contract
+
+The Compose service is named `parking-spot-monitor`. It builds the local Dockerfile and tags the local image as `parking-spot-monitor:local`; you can also build an explicit test tag for clean-machine verification:
+
+```sh
+docker build -t parking-spot-monitor:test .
+docker compose config --no-interpolate
+```
+
+Use `docker compose config --no-interpolate` for structure-only inspection because it avoids expanding secret values. The service contract is:
+
+- Service name: `parking-spot-monitor`.
+- Runtime command: `python -m parking_spot_monitor --config /config/config.yaml --data-dir /data`.
+- Config mount: `./config.yaml:/config/config.yaml:ro`.
+- Data mount: `./data:/data`.
+- Environment names passed through by name: `RTSP_URL` and `MATRIX_ACCESS_TOKEN`.
+- No `env_file` contract in `docker-compose.yml`.
+- Optional model mount shown as a commented example: `./models:/models:ro`.
+
+### 4. Launch, inspect, restart, and stop the service
+
+Create the host data directory first so artifacts written to `/data` in the container appear under `./data` on the host:
+
+```sh
+mkdir -p data
+docker compose up parking-spot-monitor
+```
+
+For unattended operation, run the same service detached and inspect it with Compose:
+
+```sh
+docker compose up -d parking-spot-monitor
+docker compose logs -f parking-spot-monitor
+docker compose ps
+docker compose restart parking-spot-monitor
+docker compose down
+```
+
+`docker compose logs -f parking-spot-monitor` is the primary runtime log surface. Expect structured event names for startup/config/capture/detection/state/Matrix diagnostics, including `startup-ready`, `startup-config-invalid`, `capture-frame-written`, capture attempt/write/failure events, `detection-frame-processed`, `detection-frame-failed`, `state-loaded`, `state-saved`, `state-corrupt-quarantined`, `health-write-failed`, `occupancy-state-changed`, `occupancy-open-event`, `occupancy-open-suppressed`, Matrix delivery success/failure diagnostics, and quiet-window events such as `quiet-window-started` and `quiet-window-ended`.
+
+### 5. Run a finite Docker capture smoke and inspect first artifacts
+
+Use this bounded command when you want one capture attempt instead of the continuous monitoring loop:
+
+```sh
+mkdir -p data
+docker compose run --rm parking-spot-monitor \
+  python -m parking_spot_monitor --config /config/config.yaml --data-dir /data --capture-once
+```
+
+With real operator secrets and a reachable camera, a successful capture writes `/data/latest.jpg` in the container, visible as `./data/latest.jpg` on the host. After the runtime has written health and state, inspect the operator surfaces with:
+
+```sh
+ls -l data/latest.jpg
+python -m json.tool data/health.json
+python -m json.tool data/state.json
+find data/snapshots -maxdepth 1 -type f | sort
+```
+
+`data/latest.jpg`, `data/debug_latest.jpg`, `data/health.json`, `data/state.json`, and `data/snapshots/` are local operator artifacts. Keep raw frames, snapshots, health/state, and redacted runtime logs local unless they have been deliberately reviewed for publication.
+
+### 6. Optional `/dev/dri` hardware decode passthrough
+
+`docker-compose.yml` maps `/dev/dri:/dev/dri` so Intel VAAPI/QSV hardware decode can be used when the host exposes the device and permissions allow it. Hosts without `/dev/dri` should remove or override that device mapping and rely on software fallback.
+
+Do not claim QSV success from the presence of the mapping alone. Verify the active hardware surface with:
+
+```sh
+python scripts/verify_hardware_decode.py --json
+```
+
+QSV may be unavailable even when VAAPI works; the runtime should fall back safely and report the selected decode mode in logs and `data/health.json`.
+
+### 7. Scope and safety boundaries
+
+This guide documents setup and inspection surfaces; it does not prove a live camera or Matrix room without operator-supplied real secrets. The project does not currently claim encrypted Matrix room support, non-root container hardening, per-spot threshold schema, or a historical occupancy query UI/API. Missing live inputs, skipped Matrix readback, send-only Matrix responses, Docker startup failures, redaction hits, and no-alert observation windows are gaps or blockers, not validation success.
+
+## Troubleshooting and cleanup runbook
+
+Use this runbook after the clean-machine setup is complete and the service is being operated through the documented local surfaces. Each case follows the same pattern: symptom, evidence to inspect, and safe remediation. Keep evidence local while investigating. Do not paste camera stream values, credentials, Matrix tokens, private room IDs, Matrix content URIs, raw response bodies, tracebacks, or image payload bytes into docs, tickets, commits, or shared logs.
+
+### RTSP/capture failures or reconnect symptoms
+
+**Symptom:** `data/latest.jpg` stops updating, the service repeatedly waits before the next capture attempt, or no first frame appears after startup.
+
+**Evidence to inspect:**
+
+- `docker compose logs -f parking-spot-monitor` for capture diagnostics such as `capture-frame-written`, `capture-decode-fallback`, and `capture-all-modes-failed`.
+- `data/health.json` with `python -m json.tool data/health.json` for capture failure counters, selected decode mode, timestamps, and sanitized last-error fields.
+- `data/latest.jpg` file timestamp and size to confirm whether a new frame was actually written.
+- `config.yaml` field names only: `stream.rtsp_url_env`, `stream.reconnect_seconds`, `stream.frame_width`, and `stream.frame_height`.
+
+**Safe remediation:**
+
+- Confirm the configured environment variable name is still `RTSP_URL`, then use `docker compose config --no-interpolate` to inspect wiring without expanding the value.
+- Validate local config shape with `RTSP_URL="<operator-provided-camera-stream>" MATRIX_ACCESS_TOKEN="<operator-provided-matrix-token>" python -m parking_spot_monitor --config config.yaml.example --validate-config` when you only need schema evidence from the tracked example.
+- Adjust `stream.reconnect_seconds` only if the retry cadence is too aggressive for the camera or network.
+- Restart the service boundary with `docker compose restart parking-spot-monitor`; use `docker compose down` followed by `docker compose up -d parking-spot-monitor` only when you need a clean container start.
+
+### Hardware decode/device passthrough issues
+
+**Symptom:** Capture works only after fallback, startup logs mention unavailable hardware decode, or the host has no usable `/dev/dri` device.
+
+**Evidence to inspect:**
+
+- `docker compose ps` to confirm the container is running rather than crash-looping.
+- `docker compose logs -f parking-spot-monitor` for `capture-decode-fallback` and final capture status.
+- `data/health.json` for `selected_decode_mode` and capture failure counters.
+- `docker-compose.yml` for the `/dev/dri:/dev/dri` device mapping.
+
+**Safe remediation:**
+
+- On hosts without `/dev/dri`, remove or override the `/dev/dri:/dev/dri` mapping and rely on software decode.
+- If hardware decode intermittently fails, keep the current config and verify fallback still produces `capture-frame-written` and a refreshed `data/latest.jpg` before changing detector or occupancy thresholds.
+- Recreate the service with `docker compose up -d parking-spot-monitor` after changing Compose device wiring.
+
+### Matrix send/upload failures
+
+**Symptom:** Occupancy transitions are observed locally, but Matrix text or image delivery fails or is not visible to the operator.
+
+**Evidence to inspect:**
+
+- `docker compose logs -f parking-spot-monitor` for safe Matrix event names such as `matrix-send-failed`, `matrix-delivery-failed`, and upload/send phase summaries.
+- `data/health.json` for `last_matrix_error`, delivery failure counters, and last successful delivery timestamps when present.
+- `data/snapshots/` for retained local event snapshots that prove the service produced local evidence before delivery.
+- `config.yaml` Matrix routing fields by name only: `matrix.homeserver`, `matrix.room_id`, `matrix.access_token_env`, timeout, retry count, and retry backoff.
+
+**Safe remediation:**
+
+- Confirm `matrix.access_token_env` still names `MATRIX_ACCESS_TOKEN`; do not paste the token into YAML or logs.
+- Use `docker compose config --no-interpolate` to verify `MATRIX_ACCESS_TOKEN` is passed by name.
+- Tune only documented Matrix timeout/retry fields in `config.yaml`, then run `docker compose restart parking-spot-monitor`.
+- Treat send responses without room readback as delivery-attempt evidence only, not a live Matrix delivery guarantee.
+
+### detector misses/false negatives
+
+**Symptom:** A parked vehicle is visible in the monitored street spot, but the service does not reach an occupied state or misses an opening transition.
+
+**Evidence to inspect:**
+
+- `data/latest.jpg` for the raw frame and `data/debug_latest.jpg` for local polygon alignment.
+- `docker compose logs -f parking-spot-monitor` for `detection-frame-processed` accepted/rejected summaries and `detection-frame-failed` failures.
+- `data/state.json` with `python -m json.tool data/state.json` for hit/miss streaks and the last stable occupancy state.
+- Shared config fields under `detection` and `occupancy`, especially confidence, minimum area, polygon-overlap ratio, IoU, confirm frames, and release frames.
+
+**Safe remediation:**
+
+- Fix polygon alignment first by editing only `spots.*.polygon` in `config.yaml`, then validate config and rerun a bounded capture.
+- Change shared detector/occupancy thresholds only after comparing local evidence; the current schema does not support per-spot thresholds.
+- Do not treat `detection-frame-failed` as empty-spot evidence. Fix the model/runtime/config failure before tuning occupancy behavior.
+
+### false positives/passing traffic
+
+**Symptom:** Passing traffic, driveway cars, or unrelated curb activity causes a spot to be marked occupied or opened incorrectly.
+
+**Evidence to inspect:**
+
+- `data/latest.jpg` and `data/debug_latest.jpg` to compare raw evidence with the configured street polygons.
+- `data/state.json` for stable state, duplicate-open suppression markers, and transition context.
+- `docker compose logs -f parking-spot-monitor` for `detection-frame-processed`, rejection counts, and `occupancy-state-changed` / `occupancy-open-event` timing.
+
+**Safe remediation:**
+
+- Move polygon points to cover only the supported street-parking region; do not expand the product scope to driveway-car monitoring.
+- Increase shared overlap/area/confidence thresholds only when local evidence shows passing traffic is being counted inside the polygon.
+- After config edits, run `python -m parking_spot_monitor --config config.yaml --validate-config`, then restart with `docker compose restart parking-spot-monitor`.
+
+### Street-sweeping or quiet-window behavior
+
+**Symptom:** A real opening occurs but no Matrix open-spot alert is sent, or quiet-window notices appear around the configured street-sweeping window.
+
+**Evidence to inspect:**
+
+- `data/state.json` for active quiet-window IDs and duplicate-open suppression context.
+- `docker compose logs -f parking-spot-monitor` for `quiet-window-started`, `quiet-window-ended`, and `occupancy-open-suppressed`.
+- `config.yaml` under `quiet_windows` for the street-sweeping timezone, recurrence, weekday, ordinal, start, and end values.
+
+**Safe remediation:**
+
+- Correct only the documented quiet-window config fields, then validate config and restart the service.
+- Treat `occupancy-open-suppressed` during an active quiet-window as expected suppression, not Matrix failure.
+- Preserve `data/state.json` before deleting or resetting state so the quiet-window/restart evidence is not lost.
+
+### restart/state corruption recovery
+
+**Symptom:** After restart, spot state looks unknown, duplicate suppression changed, or startup reports corrupt state recovery.
+
+**Evidence to inspect:**
+
+- `docker compose logs -f parking-spot-monitor` for `state-loaded`, `state-saved`, and `state-corrupt-quarantined`.
+- `data/state.json` and any quarantined corrupt state file beside it.
+- `data/health.json` for state-save failure counters and sanitized last-error fields.
+
+**Safe remediation:**
+
+- Use `docker compose restart parking-spot-monitor` for ordinary restart checks.
+- If `data/state.json` was quarantined, keep the quarantined file as local evidence and let the service continue from conservative unknown defaults.
+- Stop the service with `docker compose down` before manually moving generated state evidence, and never delete `config.yaml` or secret-management files as part of state recovery.
+
+### permissions/disk write failures
+
+**Symptom:** Health, state, latest frame, debug overlay, or snapshot artifacts are missing even though the container is running.
+
+**Evidence to inspect:**
+
+- `docker compose ps` for container status and `docker compose logs -f parking-spot-monitor` for `health-write-failed`, `state-save-failed`, `debug-overlay-failed`, capture write failures, and snapshot retention failures.
+- The Compose mount `./data:/data` and host directory permissions on `data/`.
+- `data/health.json` when present for write failure counters.
+
+**Safe remediation:**
+
+- Stop the service with `docker compose down`, fix ownership/permissions or recreate the generated `data/` directory, then start with `docker compose up -d parking-spot-monitor`.
+- Preserve existing `data/latest.jpg`, `data/debug_latest.jpg`, `data/health.json`, `data/state.json`, and `data/snapshots/` evidence before pruning or recreating generated data directories.
+- Do not broaden container privileges unless the operator intentionally changes the deployment boundary.
+
+### snapshot/disk cleanup
+
+**Symptom:** Local disk usage grows under generated runtime data, especially retained event snapshots or logs.
+
+**Evidence to inspect:**
+
+- `data/snapshots/` for Matrix event/live-proof snapshots.
+- `storage.snapshot_retention_count` in `config.yaml` and source-backed retention events `snapshot-retention-pruned` and `snapshot-retention-failed` in logs.
+- `data/health.json` for retention failure counters.
+- `docker compose logs -f parking-spot-monitor` for log volume and repeated failure loops.
+
+**Safe remediation:**
+
+- Tune `storage.snapshot_retention_count` to a bounded value appropriate for the host disk, validate config, and restart the service.
+- Before deleting generated artifacts, stop the service with `docker compose down` and preserve any evidence needed for debugging.
+- Prune only generated local artifacts such as old files under `data/snapshots/` after review. Do not delete `config.yaml`, Compose files, model files, secret stores, or current evidence files unless the operator has deliberately backed them up.
+
+## Non-goals and deferred capabilities
+
+These boundaries are current-state documentation, not future-work claims:
+
+- There is no supported web UI for calibration, operations, historical queries, or live monitoring; local docs alone do not provide a browser surface.
+- This project is not an NVR/video archive. It writes bounded/current local artifacts and documented snapshots, not continuous video history.
+- It does not implement license-plate recognition, person identification, or other identity extraction.
+- It has no cloud AI dependency in the runtime contract; detection is local model execution from the configured model name/path.
+- It does not provide an encrypted Matrix-room hardening guarantee. Matrix routing is send-oriented and depends on the operator-provided homeserver, room, and token environment.
+- It does not support driveway-car monitoring as a product goal. Operators should tune polygons to street-parking regions only.
+- It does not support per-spot threshold configuration when the runtime schema is shared-only; use shared `detection` and `occupancy` fields unless a later evidence-gated design changes the schema.
+- It does not provide live-camera proof from repository tests, README examples, or local docs alone. Live-camera proof requires operator-provided runtime inputs and the documented live-proof workflows.
+- It does not provide a live Matrix delivery guarantee from send attempts or docs alone. Room-visible Matrix delivery requires explicit live proof/readback evidence.
+
 ## Finite validation and capture smoke checks
 
 Use `--validate-config` for finite startup/configuration checks. Against an operator config with required environment variables already supplied, the direct validation command is `python -m parking_spot_monitor --config config.yaml --validate-config`. Use `--capture-once` for the S02/S03 finite capture proof: it attempts one frame capture, writes `latest.jpg`, refreshes the local debug overlay at `debug_latest.jpg`, and exits instead of starting the continuous monitoring loop. Live R003 acceptance requires a real operator RTSP environment supplied through environment variables; do not commit those values or paste them into examples.
@@ -78,7 +436,7 @@ Runner exit codes are part of the proof contract: `0` means the runner completed
 
 `scripts/verify_live_proof.py` is the strict verifier. It reads `data/live-proof-result.json`, exits `0` only for strict success, exits non-zero on non-success statuses unless explicitly invoked for blocker reporting, and writes `data/live-proof-evidence.md`. The strict verifier exits non-zero when success is overclaimed without required markers, valid JPEG artifacts, Matrix room readback, or clean redaction results.
 
-Strict success requires all of the following before R003/R015 can be validated: `LIVE_RTSP_CAPTURE_OK`, `LIVE_MATRIX_TEXT_OK`, and `LIVE_MATRIX_IMAGE_OK` are present; skip/failure markers are absent; `data/latest.jpg` is a valid raw camera JPEG; at least one `data/snapshots/live-proof-*.jpg` JPEG is retained; Matrix room readback verifies both visibly labelled `LIVE PROOF / TEST MESSAGE` text and `LIVE PROOF / TEST IMAGE` image evidence in the target room; and redaction scans find zero RTSP URLs, Authorization/Bearer headers, Matrix access-token strings, raw Matrix response bodies, tracebacks, or image bytes in logs/reports. Do not use `--skip-readback` for validation: skipped or unavailable readback leaves R003/R015 remain unvalidated because send responses alone do not prove room-visible Matrix delivery.
+Strict success requires all of the following before R003/R015 can be validated: `LIVE_RTSP_CAPTURE_OK`, `LIVE_MATRIX_TEXT_OK`, and `LIVE_MATRIX_IMAGE_OK` are present; skip/failure markers are absent; `data/latest.jpg` is a valid raw camera JPEG; at least one `data/snapshots/live-proof-*.jpg` JPEG is retained; Matrix room readback verifies both visibly labelled `LIVE PROOF / TEST MESSAGE` text and `LIVE PROOF / TEST IMAGE` image evidence in the target room; and redaction scans find zero RTSP URLs, auth header markers, Matrix access-token strings, raw Matrix response bodies, tracebacks, or image bytes in logs/reports. Do not use `--skip-readback` for validation: skipped or unavailable readback leaves R003/R015 remain unvalidated because send responses alone do not prove room-visible Matrix delivery.
 
 Skip markers identify missing live inputs (`LIVE_PROOF_SKIPPED_CONFIG_ABSENT`, `LIVE_PROOF_SKIPPED_RTSP_ENV_ABSENT`, or `LIVE_PROOF_SKIPPED_MATRIX_ENV_ABSENT`) and are blockers, not validation. Failure markers identify the failed phase (`LIVE_RTSP_CAPTURE_FAILED`, `LIVE_MATRIX_TEXT_FAILED`, or `LIVE_MATRIX_IMAGE_FAILED`) without logging RTSP URLs, Matrix tokens, Authorization headers, raw Matrix response bodies, tracebacks, or image bytes.
 
@@ -105,7 +463,7 @@ Alert-soak statuses mean:
 - `validation_failed` with phase `redaction` — `data/alert-soak-result.json`, `data/alert-soak-evidence.md`, or the redacted Docker logs still contain secret or forbidden publication markers.
 - Any verifier-level `verification_failed` report means the result JSON was missing, malformed, inconsistent, unsupported, or unsafe to publish.
 
-Publication-safety rules are the same as the finite live proof and calibration workflows, but the alert-soak artifact boundary is specific. Keep `data/alert-soak-result.json`, `data/alert-soak-evidence.md`, `data/alert-soak-docker.stdout.log`, `data/alert-soak-docker.stderr.log`, raw snapshots under `data/snapshots/`, `data/latest.jpg`, `data/health.json`, and `data/state.json` local and ignored until reviewed. The JSON and Markdown evidence may summarize safe fields such as status, phase, safe Docker argv, per-spot alert/readback status, duplicate counts, artifact validity counts, health/state parse summaries, and redaction-scan counts. They must not include RTSP URLs, Matrix access tokens, Authorization/Bearer headers, raw Matrix response bodies, tracebacks, raw image bytes, or unredacted Docker output.
+Publication-safety rules are the same as the finite live proof and calibration workflows, but the alert-soak artifact boundary is specific. Keep `data/alert-soak-result.json`, `data/alert-soak-evidence.md`, `data/alert-soak-docker.stdout.log`, `data/alert-soak-docker.stderr.log`, raw snapshots under `data/snapshots/`, `data/latest.jpg`, `data/health.json`, and `data/state.json` local and ignored until reviewed. The JSON and Markdown evidence may summarize safe fields such as status, phase, safe Docker argv, per-spot alert/readback status, duplicate counts, artifact validity counts, health/state parse summaries, and redaction-scan counts. They must not include RTSP URLs, Matrix access tokens, auth header markers, raw Matrix response bodies, tracebacks, image payload bytes, or unredacted Docker output.
 
 The soak workflow does not tune polygons/thresholds and does not add per-spot runtime schema. If live alert divergence suggests bad polygons, shared thresholds, or spot-specific behavior, feed new private labels through `scripts/compare_calibration_tuning.py` first and use its evidence gate before changing runtime tuning.
 
@@ -219,7 +577,7 @@ Case/report statuses mean:
 
 Shared-threshold sufficiency is conservative: `sufficient` requires counted coverage for every configured spot with no false positives or false negatives; `insufficient` means spot-divergent FP/FN evidence shows the shared thresholds are not enough; `inconclusive` means more or safer evidence is needed before changing or defending thresholds.
 
-Replay reports are designed to be publication-safe text artifacts. The JSON and Markdown report builders fail closed on RTSP URLs, Matrix tokens, Authorization/Bearer headers, raw Matrix response markers, tracebacks, and image-byte-looking content. If malformed labels, missing bundle metadata, or sparse evidence appear, treat the resulting blocked/not-covered/inconclusive report as a gap to fix rather than as validation success.
+Replay reports are designed to be publication-safe text artifacts. The JSON and Markdown report builders fail closed on RTSP URLs, Matrix tokens, auth header markers, raw Matrix response markers, tracebacks, and image-byte-looking content. If malformed labels, missing bundle metadata, or sparse evidence appear, treat the resulting blocked/not-covered/inconclusive report as a gap to fix rather than as validation success.
 
 ## Comparing calibration tuning proposals
 
@@ -357,7 +715,7 @@ volumes:
   - ./models:/models:ro
 ```
 
-A missing mounted model is treated as a detector/model-load runtime failure, not as a secret-bearing config error. Detector failure diagnostics are intentionally safe for JSON-line logs: they include the phase, model path, frame path when applicable, error type, and a sanitized message only. They must not include RTSP URLs, Matrix tokens, raw image bytes, full FFmpeg argv, or traceback spam.
+A missing mounted model is treated as a detector/model-load runtime failure, not as a secret-bearing config error. Detector failure diagnostics are intentionally safe for JSON-line logs: they include the phase, model path, frame path when applicable, error type, and a sanitized message only. They must not include RTSP URLs, Matrix tokens, image payload bytes, full FFmpeg argv, or traceback spam.
 
 The detector adapter imports Ultralytics lazily when the model object is constructed, reuses that single model for subsequent frame predictions, and normalizes model output into detector-neutral vehicle records before the spot filtering rules run. Unit tests use fake YOLO result objects, so normal test runs do not download weights or run real inference. They prove deterministic class, confidence, area, centroid, overlap, adapter, and failure-path behavior without network access. Live camera accuracy proof remains operator evidence collected through the live-proof commands; the earlier detection.model allowlisting item is now implemented, while model-threshold tuning and non-root container hardening remain future hardening work after M001 (previously deferred to S07).
 
