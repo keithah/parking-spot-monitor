@@ -14,7 +14,13 @@ from tests.test_config import SECRET_MARKER, fake_environ
 
 
 LEFT_EDGE_PIXEL = (300, 180)
-RIGHT_EDGE_PIXEL = (1010, 155)
+RIGHT_EDGE_PIXEL = (1010, 215)
+
+
+def synthetic_camera_fixture(path: Path) -> Path:
+    settings = load_example_settings()
+    Image.new("RGB", (settings.stream.frame_width, settings.stream.frame_height), (20, 30, 40)).save(path, format="PNG")
+    return path
 
 
 def load_example_settings():
@@ -27,7 +33,7 @@ def records_from(stream: StringIO) -> list[dict[str, object]]:
 
 def test_write_debug_overlay_renders_configured_spot_polygons_to_jpeg(tmp_path: Path) -> None:
     settings = load_example_settings()
-    source_path = Path("camera.png")
+    source_path = synthetic_camera_fixture(tmp_path / "camera.png")
     output_path = tmp_path / "nested" / "debug_latest.jpg"
     log_stream = StringIO()
     logger = StructuredLogger(stream=log_stream)
@@ -134,7 +140,7 @@ def test_write_debug_overlay_reports_missing_and_corrupt_sources_safely(
 
 def test_write_debug_overlay_reports_save_failures_safely(tmp_path: Path) -> None:
     settings = load_example_settings()
-    source_path = Path("camera.png")
+    source_path = synthetic_camera_fixture(tmp_path / "camera.png")
     output_path = tmp_path / "not-a-file"
     output_path.mkdir()
     log_stream = StringIO()

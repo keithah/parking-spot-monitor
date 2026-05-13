@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from parking_spot_monitor.logging import redact_diagnostic_text
+from scripts.hardware_decode_evidence import collect_hardware_decode_summary
 
 CONFIG_PATH = Path("config.yaml")
 DATA_DIR = Path("data")
@@ -85,6 +86,7 @@ def main(
     environ: Mapping[str, str] | None = None,
     run: RunCallable = subprocess.run,
     readback: ReadbackCallable | None = None,
+    hardware_run: RunCallable = subprocess.run,
 ) -> int:
     args = build_parser().parse_args(argv)
     source_environ = os.environ if environ is None else environ
@@ -147,6 +149,8 @@ def main(
     (data_dir / STDERR_LOG).write_text(stderr_redacted, encoding="utf-8")
 
     result = _base_result(started_at=started_at, completed_at=_now_iso(), docker_exit_code=docker_exit_code, docker_command=_docker_live_proof_command(matrix_token_env))
+    result["hardware_decode_summary"] = collect_hardware_decode_summary(run=hardware_run)
+
     if docker_exit_code != 0:
         result.update(
             {
@@ -554,6 +558,7 @@ def _normalize_result_contract(result: Mapping[str, Any]) -> dict[str, Any]:
     normalized.setdefault("marker_checks", None)
     normalized.setdefault("artifact_checks", None)
     normalized.setdefault("room_readback", None)
+    normalized.setdefault("hardware_decode_summary", None)
     normalized.setdefault("redaction_scan", {"secret_occurrences": 0, "redaction_replacements": 0})
     normalized["markers"] = normalized["marker_checks"]
     normalized["artifacts"] = normalized["artifact_checks"]

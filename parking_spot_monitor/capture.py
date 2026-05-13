@@ -29,6 +29,9 @@ class DecodeMode(str, Enum):
     SOFTWARE = "software"
 
 
+DEFAULT_DECODE_MODES = (DecodeMode.VAAPI, DecodeMode.DRM, DecodeMode.SOFTWARE)
+
+
 @dataclass(frozen=True)
 class FrameCaptureResult:
     timestamp: Any
@@ -111,6 +114,10 @@ def build_ffmpeg_argv(rtsp_url: str, output_path: str | Path, mode: DecodeMode) 
     argv.extend([
         "-i",
         rtsp_url,
+    ])
+    if mode is DecodeMode.VAAPI:
+        argv.extend(["-vf", "format=nv12|vaapi,hwdownload,format=nv12"])
+    argv.extend([
         "-frames:v",
         "1",
         "-q:v",
@@ -136,7 +143,7 @@ def capture_latest(
     output_path = output_dir / "latest.jpg"
     rtsp_url = settings.stream.rtsp_url.value
     secrets = [rtsp_url, settings.matrix.access_token.value]
-    selected_modes = list(modes if modes is not None else DecodeMode)
+    selected_modes = list(modes if modes is not None else DEFAULT_DECODE_MODES)
     if not selected_modes:
         raise ValueError("at least one decode mode is required")
 

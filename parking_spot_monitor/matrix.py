@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import httpx
 from PIL import Image, UnidentifiedImageError
@@ -18,6 +19,50 @@ from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_tex
 CLIENT_API_PREFIX = "/_matrix/client/v3"
 MEDIA_API_PREFIX = "/_matrix/media/v3"
 JPEG_MIMETYPE = "image/jpeg"
+OPEN_SPOT_EVENT_TYPE = "occupancy-open-event"
+OCCUPIED_SPOT_EVENT_TYPE = "occupancy-occupied-event"
+DISPLAY_TIMEZONE = ZoneInfo("America/Los_Angeles")
+
+
+@dataclass(frozen=True)
+class MatrixTextEvent:
+    """Safe inbound Matrix text event projected from /sync."""
+
+    event_id: str
+    sender: str
+    room_id: str
+    body: str
+
+
+@dataclass(frozen=True)
+class MatrixSyncResult:
+    """Safe bounded result from one Matrix /sync poll."""
+
+    next_batch: str
+    events: tuple[MatrixTextEvent, ...]
+
+
+@dataclass(frozen=True)
+class MatrixCommand:
+    """Parsed operator command with validated, non-secret arguments."""
+
+    action: str
+    profile_id: str | None = None
+    label: str | None = None
+    source_profile_id: str | None = None
+    target_profile_id: str | None = None
+    subject_id: str | None = None
+
+
+@dataclass(frozen=True)
+class MatrixCommandPollResult:
+    """Metadata-only summary of one command poll."""
+
+    next_batch: str
+    processed_count: int
+    ignored_count: int
+    error_count: int
+    bootstrapped: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,7 +134,7 @@ class MatrixDelivery:
             source_path=str(event.get("snapshot_path", "")),
             data_dir=self.data_dir,
             snapshots_dir=self.snapshots_dir,
-            event_type="occupancy-open-event",
+            event_type=OPEN_SPOT_EVENT_TYPE,
             event_id=event_id,
             spot_id=str(event.get("spot_id", "")),
             observed_at=event.get("observed_at"),
@@ -110,6 +155,80 @@ class MatrixDelivery:
             content_uri=content_uri,
             info=snapshot.info,
         )
+
+    def send_occupied_spot_alert(self, event: Mapping[str, Any]) -> None:
+        event_id = occupied_spot_event_id(event)
+        spot_id = _require_non_empty("spot_id", str(event.get("spot_id", "")))
+        observed_at = event.get("observed_at")
+        source_path = str(event.get("occupied_snapshot_path", ""))
+        if not source_path.strip():
+            raise MatrixError(
+                "Matrix occupied snapshot path is required",
+                error_type="snapshot_missing_source",
+                event_type=OCCUPIED_SPOT_EVENT_TYPE,
+                event_id=event_id,
+                spot_id=spot_id,
+            )
+
+        if self.logger is not None:
+            self.logger.info(
+                "matrix-send-attempt",
+                event_type=OCCUPIED_SPOT_EVENT_TYPE,
+                event_id=event_id,
+                spot_id=spot_id,
+                operation="occupied-alert",
+            )
+        try:
+            self.client.send_text(
+                room_id=self.room_id,
+                txn_id=f"{event_id}:text",
+                body=format_occupied_spot_alert(event),
+            )
+            snapshot = prepare_event_snapshot(
+                source_path=source_path,
+                data_dir=self.data_dir,
+                snapshots_dir=self.snapshots_dir,
+                event_type=OCCUPIED_SPOT_EVENT_TYPE,
+                event_id=event_id,
+                spot_id=spot_id,
+                observed_at=observed_at,
+                snapshot_retention_count=self.snapshot_retention_count,
+                logger=self.logger,
+                retention_trigger="matrix-event",
+            )
+            if self.logger is not None:
+                self.logger.info("matrix-snapshot-copied", **snapshot.log_context, txn_id=snapshot.txn_id)
+            content_uri = self.client.upload_image(
+                filename=snapshot.filename,
+                data=snapshot.path.read_bytes(),
+                content_type=JPEG_MIMETYPE,
+            )
+            self.client.send_image(
+                room_id=self.room_id,
+                txn_id=f"{event_id}:image",
+                body=_occupied_snapshot_body(spot_id=spot_id, observed_at=observed_at),
+                content_uri=content_uri,
+                info=snapshot.info,
+            )
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.warning(
+                    "matrix-send-failed",
+                    event_type=OCCUPIED_SPOT_EVENT_TYPE,
+                    event_id=event_id,
+                    spot_id=spot_id,
+                    operation="occupied-alert",
+                    error_type=exc.__class__.__name__,
+                )
+            raise
+        if self.logger is not None:
+            self.logger.info(
+                "matrix-send-succeeded",
+                event_type=OCCUPIED_SPOT_EVENT_TYPE,
+                event_id=event_id,
+                spot_id=spot_id,
+                operation="occupied-alert",
+            )
 
     def send_live_proof(self, *, latest_path: str | Path, observed_at: object, selected_mode: object) -> None:
         self.send_live_proof_text(observed_at=observed_at, selected_mode=selected_mode)
@@ -187,6 +306,26 @@ class MatrixClient:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
+
+    def sync(self, *, room_id: str, since: str | None = None, timeout_ms: int = 0, limit: int = 20) -> MatrixSyncResult:
+        """Poll Matrix /sync and return only safe text events for one joined room."""
+
+        room_id = _require_non_empty("room_id", room_id)
+        params: dict[str, Any] = {"timeout": max(0, int(timeout_ms)), "limit": max(1, min(int(limit), 100))}
+        if since is not None and since.strip():
+            params["since"] = since
+        response = self._request_once("GET", f"{CLIENT_API_PREFIX}/sync", attempt=1, params=params)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise MatrixError(
+                "Matrix sync response was not valid JSON",
+                error_type="malformed_response",
+                operation="sync",
+                status_code=response.status_code,
+                missing_key="next_batch",
+            ) from exc
+        return _parse_sync_response(payload, room_id=room_id, operation="sync", status_code=response.status_code)
 
     def send_text(self, *, room_id: str, txn_id: str, body: str) -> str:
         body = _require_non_empty("body", body)
@@ -312,6 +451,250 @@ class MatrixClient:
             **diagnostics,
         )
 
+
+
+class MatrixCommandParseError(ValueError):
+    """Safe parse error for an inbound Matrix command."""
+
+
+class MatrixCommandService:
+    """Poll Matrix commands, authorize them, and apply archive corrections."""
+
+    def __init__(
+        self,
+        *,
+        client: MatrixClient,
+        archive: Any,
+        room_id: str,
+        authorized_senders: list[str] | tuple[str, ...],
+        command_prefix: str = "!parking",
+        bot_user_id: str | None = None,
+        logger: StructuredLogger | None = None,
+        sync_timeout_ms: int = 0,
+        sync_limit: int = 20,
+    ) -> None:
+        self.client = client
+        self.archive = archive
+        self.room_id = _require_non_empty("room_id", room_id)
+        self.authorized_senders = frozenset(sender for sender in authorized_senders if sender)
+        self.command_prefix = _require_non_empty("command_prefix", command_prefix)
+        self.bot_user_id = bot_user_id
+        self.logger = logger
+        self.sync_timeout_ms = sync_timeout_ms
+        self.sync_limit = sync_limit
+
+    def poll_once(self) -> MatrixCommandPollResult:
+        cursor = self.archive.read_matrix_cursor()
+        since = cursor.get("next_batch") if isinstance(cursor, Mapping) else None
+        result = self.client.sync(room_id=self.room_id, since=since, timeout_ms=self.sync_timeout_ms, limit=self.sync_limit)
+        if not since:
+            self.archive.write_matrix_cursor({"next_batch": result.next_batch})
+            self._log("info", "matrix-command-sync", phase="bootstrap", next_batch_present=True, processed_count=0, ignored_count=len(result.events))
+            return MatrixCommandPollResult(next_batch=result.next_batch, processed_count=0, ignored_count=len(result.events), error_count=0, bootstrapped=True)
+
+        processed_count = 0
+        ignored_count = 0
+        error_count = 0
+        for event in result.events:
+            outcome = self._handle_event(event)
+            if outcome == "processed":
+                processed_count += 1
+            elif outcome == "error":
+                error_count += 1
+            else:
+                ignored_count += 1
+        self.archive.write_matrix_cursor({"next_batch": result.next_batch})
+        self._log("info", "matrix-command-sync", phase="apply", next_batch_present=True, processed_count=processed_count, ignored_count=ignored_count, error_count=error_count)
+        return MatrixCommandPollResult(next_batch=result.next_batch, processed_count=processed_count, ignored_count=ignored_count, error_count=error_count)
+
+    def _handle_event(self, event: MatrixTextEvent) -> str:
+        context = {"phase": "command", "sender": event.sender, "event_id": event.event_id, "room_id": event.room_id}
+        if event.room_id != self.room_id:
+            self._log("info", "matrix-command-ignored", reason="wrong-room", **context)
+            return "ignored"
+        if self.bot_user_id and event.sender == self.bot_user_id:
+            self._log("info", "matrix-command-ignored", reason="self-message", **context)
+            return "ignored"
+        if not event.body.strip().startswith(self.command_prefix):
+            return "ignored"
+        if event.sender not in self.authorized_senders:
+            self._log("warning", "matrix-command-denied", reason="unauthorized-sender", **context)
+            self._send_reply(event, "Command rejected: sender is not authorized.")
+            return "error"
+        try:
+            command = parse_matrix_command(event.body, command_prefix=self.command_prefix)
+        except MatrixCommandParseError as exc:
+            self._log("warning", "matrix-command-parse-failed", reason=str(exc), **context)
+            self._send_reply(event, f"Command rejected: {exc}")
+            return "error"
+        try:
+            reply = self._apply_command(command, event=event)
+        except Exception as exc:
+            self._log("warning", "matrix-command-apply-failed", action=command.action, error_type=exc.__class__.__name__, **context)
+            self._send_reply(event, f"Command failed: {redact_diagnostic_text(exc.__class__.__name__)}")
+            return "error"
+        self._send_reply(event, reply)
+        self._log("info", "matrix-command-applied", action=command.action, **context)
+        return "processed"
+
+    def _apply_command(self, command: MatrixCommand, *, event: MatrixTextEvent) -> str:
+        metadata = {"matrix_event_id": event.event_id, "matrix_sender": event.sender, "matrix_room_id": event.room_id}
+        if self._correction_already_seen(event.event_id):
+            return "Command already applied; acknowledgement repeated."
+        if command.action == "rename_profile":
+            assert command.profile_id is not None and command.label is not None
+            applied = self.archive.rename_profile(command.profile_id, command.label, **metadata)
+            return f"Profile {command.profile_id} renamed to {command.label}. Correction {applied.correction_id} recorded."
+        if command.action == "merge_profiles":
+            assert command.source_profile_id is not None and command.target_profile_id is not None
+            applied = self.archive.merge_profiles(command.source_profile_id, command.target_profile_id, **metadata)
+            return f"Profile {command.source_profile_id} merged into {command.target_profile_id}. Correction {applied.correction_id} recorded."
+        if command.action == "wrong_match":
+            assert command.subject_id is not None
+            session_id = self._resolve_wrong_match_subject(command.subject_id)
+            applied = self.archive.mark_wrong_match(session_id, matrix_event_id=event.event_id, matrix_sender=event.sender, matrix_room_id=event.room_id)
+            return f"Wrong match recorded for session {session_id}. Correction {applied.correction_id} recorded."
+        if command.action == "profile_summary":
+            assert command.profile_id is not None
+            summary = self._profile_summary(command.profile_id, event=event)
+            return _format_profile_summary_reply(summary)
+        raise MatrixCommandParseError("unknown command")
+
+    def _profile_summary(self, profile_id: str, *, event: MatrixTextEvent) -> Mapping[str, Any]:
+        try:
+            return self.archive.profile_summary(profile_id, matrix_event_id=event.event_id, matrix_sender=event.sender, matrix_room_id=event.room_id)
+        except TypeError:
+            return self.archive.profile_summary(profile_id)
+
+    def _resolve_wrong_match_subject(self, subject_id: str) -> str:
+        for record in [*self.archive.load_active_sessions(), *self.archive.list_closed_sessions()]:
+            if getattr(record, "session_id", None) == subject_id:
+                return subject_id
+        matches = [record for record in [*self.archive.load_active_sessions(), *self.archive.list_closed_sessions()] if getattr(record, "spot_id", None) == subject_id]
+        if not matches:
+            return subject_id
+        matches.sort(key=lambda record: str(getattr(record, "ended_at", None) or getattr(record, "started_at", "")))
+        return str(getattr(matches[-1], "session_id"))
+
+    def _correction_already_seen(self, event_id: str) -> bool:
+        load = getattr(self.archive, "load_corrections", None)
+        if not callable(load):
+            return False
+        try:
+            return any(getattr(correction, "matrix_event_id", None) == event_id for correction in load())
+        except Exception:
+            return False
+
+    def _send_reply(self, event: MatrixTextEvent, body: str) -> None:
+        self.client.send_text(room_id=self.room_id, txn_id=f"command:{event.event_id}", body=body)
+
+    def _log(self, level: str, event_name: str, **fields: Any) -> None:
+        if self.logger is None:
+            return
+        safe_fields = _sanitize_diagnostics(fields)
+        log = getattr(self.logger, level)
+        log(event_name, **safe_fields)
+
+
+def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> MatrixCommand:
+    if not isinstance(body, str):
+        raise MatrixCommandParseError("body must be text")
+    if len(body.encode("utf-8")) > 512:
+        raise MatrixCommandParseError("body is too large")
+    text = " ".join(body.strip().split())
+    if not text:
+        raise MatrixCommandParseError("body is blank")
+    prefix = _require_non_empty("command_prefix", command_prefix)
+    if text != prefix and not text.startswith(prefix + " "):
+        raise MatrixCommandParseError("command prefix is required")
+    parts = text.split(" ")
+    if len(parts) < 2:
+        raise MatrixCommandParseError("command action is required")
+    if parts[1:3] == ["profile", "rename"]:
+        if len(parts) < 5:
+            raise MatrixCommandParseError("usage: !parking profile rename <profile_id> <label>")
+        profile_id = _validate_profile_id(parts[3], "profile_id")
+        label = _validate_label(" ".join(parts[4:]))
+        return MatrixCommand(action="rename_profile", profile_id=profile_id, label=label)
+    if parts[1:3] == ["profile", "merge"]:
+        if len(parts) != 5:
+            raise MatrixCommandParseError("usage: !parking profile merge <source_profile_id> <target_profile_id>")
+        source = _validate_profile_id(parts[3], "source_profile_id")
+        target = _validate_profile_id(parts[4], "target_profile_id")
+        if source == target:
+            raise MatrixCommandParseError("source and target profiles must differ")
+        return MatrixCommand(action="merge_profiles", source_profile_id=source, target_profile_id=target)
+    if parts[1:3] == ["profile", "summary"]:
+        if len(parts) != 4:
+            raise MatrixCommandParseError("usage: !parking profile summary <profile_id>")
+        return MatrixCommand(action="profile_summary", profile_id=_validate_profile_id(parts[3], "profile_id"))
+    if parts[1] == "wrong":
+        if len(parts) != 3:
+            raise MatrixCommandParseError("usage: !parking wrong <spot_id|session_id>")
+        return MatrixCommand(action="wrong_match", subject_id=_validate_subject_id(parts[2]))
+    raise MatrixCommandParseError("unknown command")
+
+
+def _parse_sync_response(payload: Any, *, room_id: str, operation: str, status_code: int) -> MatrixSyncResult:
+    if not isinstance(payload, dict):
+        raise MatrixError("Matrix sync response was malformed", error_type="malformed_response", operation=operation, status_code=status_code, missing_key="next_batch")
+    next_batch = payload.get("next_batch")
+    if not isinstance(next_batch, str) or not next_batch:
+        raise MatrixError("Matrix sync response was missing a required field", error_type="malformed_response", operation=operation, status_code=status_code, missing_key="next_batch")
+    events_payload = (((payload.get("rooms") or {}).get("join") or {}).get(room_id) or {}).get("timeline", {}).get("events", [])
+    if not isinstance(events_payload, list):
+        raise MatrixError("Matrix sync response room timeline was malformed", error_type="malformed_response", operation=operation, status_code=status_code, missing_key="rooms.join.timeline.events")
+    events: list[MatrixTextEvent] = []
+    for item in events_payload:
+        if not isinstance(item, Mapping) or item.get("type") != "m.room.message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, Mapping) or content.get("msgtype") != "m.text":
+            continue
+        body = content.get("body")
+        event_id = item.get("event_id")
+        sender = item.get("sender")
+        if isinstance(body, str) and isinstance(event_id, str) and isinstance(sender, str):
+            events.append(MatrixTextEvent(event_id=event_id, sender=sender, room_id=room_id, body=body[:512]))
+    return MatrixSyncResult(next_batch=next_batch, events=tuple(events))
+
+
+def _validate_profile_id(value: str, name: str) -> str:
+    if not re.fullmatch(r"prof_[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}", value):
+        raise MatrixCommandParseError(f"invalid {name}")
+    return value
+
+
+def _validate_subject_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,219}", value):
+        raise MatrixCommandParseError("invalid subject id")
+    return value
+
+
+def _validate_label(value: str) -> str:
+    label = " ".join(value.strip().split())
+    if not label:
+        raise MatrixCommandParseError("label is required")
+    if len(label) > 160:
+        raise MatrixCommandParseError("label is too long")
+    if re.search(r"[\x00-\x1f\x7f]", label):
+        raise MatrixCommandParseError("label contains control characters")
+    return label
+
+
+def _format_profile_summary_reply(summary: Mapping[str, Any]) -> str:
+    profile_id = _safe_text(summary.get("profile_id"), default="unknown")
+    label = _safe_text(summary.get("label"), default="unlabeled")
+    closed = _int_field(summary, "closed_session_count", default=0)
+    active = _int_field(summary, "active_session_count", default=0)
+    excluded = _int_field(summary, "wrong_match_excluded_session_count", default=0)
+    estimate_status = _safe_text(summary.get("estimate_status"), default="unknown")
+    estimate_samples = _int_field(summary, "estimate_sample_count", default=0)
+    return (
+        f"Profile {profile_id}: {label}\n"
+        f"Sessions: {closed} closed, {active} active, {excluded} wrong-match excluded\n"
+        f"Estimate: {estimate_status} from {estimate_samples} samples"
+    )
 
 def prepare_event_snapshot(
     *,
@@ -503,7 +886,16 @@ def prune_event_snapshots(
 def open_spot_event_id(event: Mapping[str, Any]) -> str:
     """Return the stable Matrix transaction base for a confirmed open event."""
 
-    event_type = _require_non_empty("event_type", str(event.get("event_type", "occupancy-open-event")))
+    event_type = _require_non_empty("event_type", str(event.get("event_type", OPEN_SPOT_EVENT_TYPE)))
+    spot_id = _require_non_empty("spot_id", str(event.get("spot_id", "")))
+    observed_at = _format_observed_at(event.get("observed_at"))
+    return f"{event_type}:{spot_id}:{observed_at}"
+
+
+def occupied_spot_event_id(event: Mapping[str, Any]) -> str:
+    """Return the stable Matrix transaction base for a confirmed occupied event."""
+
+    event_type = _require_non_empty("event_type", str(event.get("event_type", OCCUPIED_SPOT_EVENT_TYPE)))
     spot_id = _require_non_empty("spot_id", str(event.get("spot_id", "")))
     observed_at = _format_observed_at(event.get("observed_at"))
     return f"{event_type}:{spot_id}:{observed_at}"
@@ -579,7 +971,31 @@ def _log_retention_failure(
 
 
 def _display_observed_at(value: object) -> str:
-    return _format_observed_at(value).replace("Z", "+00:00")
+    observed_at = _parse_observed_at(value)
+    if observed_at is None:
+        return _format_observed_at(value).replace("Z", "+00:00")
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        return _format_display_datetime(observed_at)
+    return _format_display_datetime(observed_at.astimezone(DISPLAY_TIMEZONE))
+
+
+def _format_display_datetime(value: datetime) -> str:
+    time_text = _format_12_hour_time(value.hour, value.minute, value.second)
+    timezone_name = value.tzname() if value.tzinfo is not None and value.utcoffset() is not None else ""
+    suffix = f" {timezone_name}" if timezone_name else ""
+    return f"{value:%Y-%m-%d} {time_text}{suffix}"
+
+
+def _parse_observed_at(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        text = _require_non_empty("observed_at", value)
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
 
 
 def format_open_spot_alert(event: Mapping[str, Any]) -> str:
@@ -590,11 +1006,173 @@ def format_open_spot_alert(event: Mapping[str, Any]) -> str:
     return f"Parking spot open: {spot_id} at {observed_at}"
 
 
+
+
+def format_occupied_spot_alert(event: Mapping[str, Any]) -> str:
+    """Return deterministic Matrix text for a confirmed parking-occupied event.
+
+    The formatter is intentionally metadata-only: it never opens snapshot files
+    and only reads an allowlist of alert-safe fields from the provided mapping.
+    """
+
+    spot_id = _require_non_empty("spot_id", redact_diagnostic_text(event.get("spot_id", "")))
+    observed_at = _display_observed_at(event.get("observed_at"))
+    vehicle = _mapping_field(event, "likely_vehicle")
+    estimate = _mapping_field(event, "vehicle_history_estimate") or _mapping_field(event, "history_estimate")
+
+    label = _safe_text(_first_present(vehicle, "label", "vehicle_label", "display_label"), default="unknown vehicle")
+    profile_id = _safe_text(
+        _first_present(vehicle, "profile_id") or _first_present(estimate, "profile_id") or event.get("profile_id"),
+        default="unknown",
+    )
+    match_status = _safe_text(
+        _first_present(vehicle, "match_status", "status") or event.get("match_status"),
+        default="unknown",
+    )
+    match_confidence = _safe_text(
+        _first_present(vehicle, "confidence", "profile_confidence") or event.get("profile_confidence"),
+        default="unknown",
+    )
+
+    lines = [f"Parking spot occupied: {spot_id} at {observed_at}"]
+
+    estimate_status = _safe_text(_first_present(estimate, "status"), default="insufficient_history")
+    sample_count = _int_field(estimate, "sample_count", default=0)
+    estimate_confidence = _safe_text(_first_present(estimate, "confidence"), default="unknown")
+    estimate_has_high_signal = estimate_status == "estimated" and sample_count >= 3 and estimate_confidence not in {"low", "unknown"}
+    has_useful_vehicle_context = _has_meaningful_vehicle_label(label, profile_id) or estimate_has_high_signal
+    if not has_useful_vehicle_context:
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            f"Likely vehicle: {label} (profile {profile_id})",
+            f"Match: {match_status}, confidence {match_confidence}",
+        ]
+    )
+
+    if estimate_status == "estimated":
+        dwell_range = _mapping_field(estimate, "dwell_range")
+        leave_window = _mapping_field(estimate, "leave_time_window")
+        lines.append(f"Estimated dwell: {_format_dwell_range(dwell_range)}")
+        lines.append(f"Usual leave window: {_format_leave_window(leave_window)}")
+    else:
+        reason = _safe_text(_first_present(estimate, "reason"), default="insufficient-history")
+        lines.append(f"Estimate unavailable: {reason}")
+    lines.append(f"History: {sample_count} {_plural('sample', sample_count)}, estimate confidence {estimate_confidence}")
+    return "\n".join(lines)
+
+
+def _mapping_field(source: object, name: str) -> Mapping[str, Any]:
+    if isinstance(source, Mapping):
+        value = source.get(name)
+        if isinstance(value, Mapping):
+            return value
+        value = getattr(value, "__dict__", None)
+        if isinstance(value, Mapping):
+            return value
+    return {}
+
+
+def _first_present(source: Mapping[str, Any], *names: str) -> Any:
+    for name in names:
+        value = source.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _safe_text(value: object, *, default: str) -> str:
+    if value is None:
+        return default
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+    text = redact_diagnostic_text(value).strip()
+    return text or default
+
+
+def _int_field(source: Mapping[str, Any], name: str, *, default: int) -> int:
+    value = source.get(name)
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    return default
+
+
+def _format_dwell_range(dwell_range: Mapping[str, Any]) -> str:
+    lower = _int_field(dwell_range, "lower_seconds", default=0)
+    upper = _int_field(dwell_range, "upper_seconds", default=0)
+    typical = _int_field(dwell_range, "typical_seconds", default=0)
+    return f"{_format_duration(lower)}–{_format_duration(upper)} (typical {_format_duration(typical)})"
+
+
+def _format_duration(seconds: int) -> str:
+    seconds = max(0, seconds)
+    total_minutes = int(round(seconds / 60))
+    if total_minutes < 60:
+        return f"{total_minutes} {_plural('min', total_minutes)}"
+    hours, minutes = divmod(total_minutes, 60)
+    hour_text = f"{hours} {_plural('hr', hours)}"
+    if minutes == 0:
+        return hour_text
+    return f"{hour_text} {minutes} {_plural('min', minutes)}"
+
+
+def _format_leave_window(leave_window: Mapping[str, Any]) -> str:
+    start = _int_field(leave_window, "start_minute", default=0)
+    end = _int_field(leave_window, "end_minute", default=0)
+    typical = _int_field(leave_window, "typical_minute", default=0)
+    crosses_midnight = bool(leave_window.get("crosses_midnight"))
+    suffix = "; crosses midnight" if crosses_midnight else ""
+    return f"{_format_minute_of_day(start)}–{_format_minute_of_day(end)} (typical {_format_minute_of_day(typical)}{suffix})"
+
+
+def _format_minute_of_day(value: int) -> str:
+    minute = value % (24 * 60)
+    return _format_12_hour_time(minute // 60, minute % 60)
+
+
+def _format_12_hour_time(hour: int, minute: int, second: int | None = None) -> str:
+    suffix = "AM" if hour < 12 else "PM"
+    display_hour = hour % 12 or 12
+    if second is None:
+        return f"{display_hour}:{minute:02d} {suffix}"
+    return f"{display_hour}:{minute:02d}:{second:02d} {suffix}"
+
+
+def _has_meaningful_vehicle_label(label: str, profile_id: str) -> bool:
+    normalized_label = label.strip().lower()
+    normalized_profile = profile_id.strip().lower()
+    if normalized_label in {"", "unknown", "unknown vehicle"}:
+        return False
+    if normalized_profile and normalized_label == normalized_profile:
+        return False
+    if normalized_label.startswith("prof_sess-"):
+        return False
+    return True
+
+
+def _plural(word: str, count: int) -> str:
+    if word == "min":
+        return word
+    return word if count == 1 else f"{word}s"
+
+
+def _occupied_snapshot_body(*, spot_id: str, observed_at: object) -> str:
+    return f"Raw occupied full-frame snapshot for {redact_diagnostic_text(spot_id)} at {_display_observed_at(observed_at)}"
+
 def format_quiet_window_notice(event: Mapping[str, Any]) -> str:
     """Return deterministic Matrix text for a street-sweeping start/end notice."""
 
     event_type = _require_non_empty("event_type", str(event.get("event_type", "")))
     window_id = _require_non_empty("window_id", str(event.get("window_id", "")))
+    if event_type == "quiet-window-upcoming":
+        minutes_before = _int_field(event, "reminder_minutes_before", default=0)
+        lead_time = _format_lead_time(minutes_before)
+        return f"Street sweeping starts in {lead_time}: {window_id}"
     if event_type == "quiet-window-started":
         verb = "started"
     elif event_type == "quiet-window-ended":
@@ -602,6 +1180,14 @@ def format_quiet_window_notice(event: Mapping[str, Any]) -> str:
     else:
         verb = event_type
     return f"Street sweeping {verb}: {window_id}"
+
+
+def _format_lead_time(minutes: int) -> str:
+    if minutes == 60:
+        return "1 hour"
+    if minutes > 0 and minutes % 60 == 0:
+        return f"{minutes // 60} hours"
+    return f"{minutes} minutes"
 
 
 def format_live_proof_text(*, observed_at: object, selected_mode: object) -> str:

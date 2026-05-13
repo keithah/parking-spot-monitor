@@ -145,6 +145,44 @@ def test_sustained_misses_release_to_empty_and_emit_single_open_event(
     assert duplicate.events == []
 
 
+
+def test_small_remaining_vehicle_presence_suppresses_open_event(
+    occupancy_config: OccupancyConfig,
+    quiet_inactive: QuietWindowStatus,
+) -> None:
+    occupied_state = {
+        "left_spot": SpotOccupancyState(
+            status=OccupancyStatus.OCCUPIED,
+            hit_streak=2,
+            miss_streak=0,
+            last_bbox=(10.0, 10.0, 90.0, 90.0),
+            open_event_emitted=False,
+        )
+    }
+
+    first_small_car = update_occupancy(
+        previous_state=occupied_state,
+        candidates_by_spot={"left_spot": None},
+        presence_by_spot={"left_spot": True},
+        occupancy_config=occupancy_config,
+        observed_at=OBSERVED_AT,
+        quiet_window_status=quiet_inactive,
+        snapshot_path=SNAPSHOT_PATH,
+    )
+    second_small_car = update_occupancy(
+        previous_state=first_small_car.state_by_spot,
+        candidates_by_spot={"left_spot": None},
+        presence_by_spot={"left_spot": True},
+        occupancy_config=occupancy_config,
+        observed_at=OBSERVED_AT,
+        quiet_window_status=quiet_inactive,
+        snapshot_path=SNAPSHOT_PATH,
+    )
+
+    assert second_small_car.state_by_spot["left_spot"].status is OccupancyStatus.OCCUPIED
+    assert second_small_car.state_by_spot["left_spot"].miss_streak == 0
+    assert second_small_car.events == []
+
 def test_unknown_to_empty_never_emits_open_event(occupancy_config: OccupancyConfig, quiet_inactive: QuietWindowStatus) -> None:
     first = update_occupancy(
         previous_state={},

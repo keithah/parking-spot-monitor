@@ -253,6 +253,79 @@ def test_success_validates_markers_jpegs_and_matrix_readback(tmp_path: Path) -> 
     assert result["room_readback"]["image_found"] is True
 
 
+
+def test_success_includes_hardware_decode_summary_in_result(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    data_dir = tmp_path / "data"
+    write_config(config_path)
+    write_jpeg(data_dir / "latest.jpg")
+    write_jpeg(data_dir / "snapshots" / "live-proof-camera-2026-05-18t19-00-00z.jpg")
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="\n".join(["LIVE_RTSP_CAPTURE_OK", "LIVE_MATRIX_TEXT_OK", "LIVE_MATRIX_IMAGE_OK"]),
+            stderr="",
+        )
+
+    def fake_hardware_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "verdict": {"accepted": True, "status": "vaapi_supported_qsv_unavailable"},
+                    "checks": {
+                        "vainfo": {"passed": True, "returncode": 0},
+                        "vaapi_ffmpeg_init": {"passed": True, "returncode": 0},
+                        "qsv_ffmpeg_init": {"passed": False, "returncode": 171},
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    exit_code = runner.main(
+        ["--config", str(config_path), "--data-dir", str(data_dir)],
+        environ={"RTSP_URL": SECRET_RTSP, "MATRIX_ACCESS_TOKEN": SECRET_TOKEN},
+        run=fake_run,
+        readback=lambda **kwargs: {
+            "chunk": [
+                {"content": {"msgtype": "m.text", "body": "LIVE PROOF / TEST MESSAGE"}},
+                {"content": {"msgtype": "m.image", "body": "LIVE PROOF / TEST IMAGE"}},
+            ]
+        },
+        hardware_run=fake_hardware_run,
+    )
+
+    result = read_result(data_dir)
+    rendered = json.dumps(result)
+    assert exit_code == 0
+    assert result["hardware_decode_summary"] == {
+        "attempted": True,
+        "exit_code": 0,
+        "status": "vaapi_supported_qsv_unavailable",
+        "accepted": True,
+        "checks": {
+            "qsv_ffmpeg_init": {"passed": False, "returncode": 171},
+            "vaapi_ffmpeg_init": {"passed": True, "returncode": 0},
+            "vainfo": {"passed": True, "returncode": 0},
+        },
+    }
+
+    from scripts import verify_live_proof
+
+    evidence_path = data_dir / "live-proof-evidence.md"
+    assert verify_live_proof.main(["--result", str(data_dir / "live-proof-result.json"), "--evidence", str(evidence_path)]) == 0
+    report = evidence_path.read_text(encoding="utf-8")
+    assert "Hardware decode: `vaapi_supported_qsv_unavailable` accepted=`True`" in report
+    assert "vaapi_ffmpeg_init=True/0" in report
+    assert "qsv_ffmpeg_init=False/171" in report
+    assert SECRET_RTSP not in rendered + report
+    assert SECRET_TOKEN not in rendered + report
+
+
 def test_skip_marker_and_invalid_jpeg_make_wrapper_non_validation(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     data_dir = tmp_path / "data"

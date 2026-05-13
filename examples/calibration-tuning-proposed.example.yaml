@@ -1,0 +1,73 @@
+# Publication-safe synthetic proposed config for the tuning comparison smoke workflow.
+#
+# This file is derived from config.yaml.example and intentionally contains only
+# placeholder Matrix routing, environment variable names, and synthetic tuning
+# changes. It is suitable for exercising scripts/compare_calibration_tuning.py
+# against examples/calibration-labels.example.yaml, not for production tuning.
+stream:
+  rtsp_url_env: RTSP_URL
+  frame_width: 1458
+  frame_height: 806
+  reconnect_seconds: 5
+
+spots:
+  left_spot:
+    name: Left spot
+    polygon:
+      - [305, 180]
+      - [610, 160]
+      - [690, 285]
+      - [420, 360]
+      - [265, 300]
+  right_spot:
+    name: Right spot
+    polygon:
+      - [1010, 155]
+      - [1390, 170]
+      - [1390, 355]
+      - [1040, 370]
+      - [960, 250]
+
+detection:
+  model: yolov8n.pt
+  confidence_threshold: 0.4
+  min_bbox_area_px: 1200
+  min_polygon_overlap_ratio: 0.2
+  vehicle_classes:
+    - car
+    - truck
+    - bus
+
+occupancy:
+  iou_threshold: 0.2
+  confirm_frames: 3
+  release_frames: 3
+
+matrix:
+  homeserver: https://matrix.example.org
+  room_id: "!parking-room:example.org"
+  access_token_env: MATRIX_ACCESS_TOKEN
+  user_id: "@parking-bot:example.org"
+  timeout_seconds: 10
+  retry_attempts: 3
+  retry_backoff_seconds: 1
+
+quiet_windows:
+  - name: street_sweeping
+    timezone: America/Los_Angeles
+    recurrence: monthly_weekday
+    weekdays: [monday]
+    ordinals: [1, 3]
+    start: "13:00"
+    end: "15:00"
+
+storage:
+  data_dir: ./data
+  snapshots_dir: snapshots
+  snapshot_retention_count: 50
+
+runtime:
+  health_file: health.json
+  log_level: INFO
+  startup_timeout_seconds: 30
+  frame_interval_seconds: 30
