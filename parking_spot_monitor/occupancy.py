@@ -105,6 +105,7 @@ def update_occupancy(
     quiet_window_status: QuietWindowStatus,
     snapshot_path: str,
     configured_spot_ids: Sequence[str] | None = None,
+    presence_by_spot: Mapping[str, bool] | None = None,
 ) -> OccupancyUpdate:
     """Advance conservative occupancy state for configured spots.
 
@@ -120,8 +121,13 @@ def update_occupancy(
     for spot_id in spot_ids:
         prior = _copy_state(previous_state.get(spot_id, SpotOccupancyState()))
         candidate = _valid_candidate(candidates_by_spot.get(spot_id))
+        has_presence_evidence = bool(presence_by_spot and presence_by_spot.get(spot_id))
 
-        if candidate is None:
+        if candidate is None and has_presence_evidence:
+            updated, spot_events = _advance_presence_hold(
+                prior=prior,
+            )
+        elif candidate is None:
             updated, spot_events = _advance_miss(
                 spot_id=spot_id,
                 prior=prior,
@@ -145,6 +151,27 @@ def update_occupancy(
 
     return OccupancyUpdate(state_by_spot=next_state, events=events)
 
+
+
+def _advance_presence_hold(*, prior: SpotOccupancyState) -> tuple[SpotOccupancyState, list[OccupancyEvent]]:
+    """Keep a spot non-empty when weak vehicle evidence remains.
+
+    Presence evidence is intentionally weaker than an accepted parking candidate:
+    it suppresses release/open alerts but does not confirm a new occupied state.
+    This prevents false open notifications when two small vehicles share one
+    configured spot and one remains below the normal accepted-candidate threshold.
+    """
+
+    return (
+        SpotOccupancyState(
+            status=prior.status,
+            hit_streak=0,
+            miss_streak=0,
+            last_bbox=prior.last_bbox,
+            open_event_emitted=prior.open_event_emitted,
+        ),
+        [],
+    )
 
 def _advance_hit(
     *,

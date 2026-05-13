@@ -9,14 +9,14 @@ spots:
     name: Left spot
     polygon:
       - [300, 180]
-      - [610, 160]
+      - [650, 215]
       - [690, 285]
       - [420, 360]
       - [260, 300]
   right_spot:
     name: Right spot
     polygon:
-      - [1010, 155]
+      - [1010, 215]
       - [1395, 170]
       - [1395, 355]
       - [1040, 370]
@@ -42,6 +42,9 @@ matrix:
   room_id: "!parking-room:example.org"
   access_token_env: MATRIX_ACCESS_TOKEN
   user_id: "@parking-bot:example.org"
+  command_prefix: "!parking"
+  # Empty means inbound correction mutation commands are disabled/reject-all by default.
+  command_authorized_senders: []
   timeout_seconds: 10
   retry_attempts: 3
   retry_backoff_seconds: 1
@@ -54,6 +57,7 @@ quiet_windows:
     ordinals: [1, 3]
     start: "13:00"
     end: "15:00"
+    reminder_minutes_before: 60
 
 storage:
   data_dir: ./data

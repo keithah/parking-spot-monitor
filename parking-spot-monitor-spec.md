@@ -256,17 +256,26 @@ matrix:
 Open-spot message format:
 
 ```text
-Parking spot open: left_spot
-Parking spot open: right_spot
+Parking spot open: left_spot at 2026-05-12 5:16:48 PM PDT
+Parking spot open: right_spot at 2026-05-12 5:16:48 PM PDT
 ```
+
+Occupied-spot status messages use the same timestamp style and stay concise when vehicle-history evidence is weak:
+
+```text
+Parking spot occupied: right_spot at 2026-05-12 5:16:48 PM PDT
+```
+
+Only add vehicle-history lines when they give an operator real information, such as a human-readable vehicle label or a higher-signal history estimate. Do not include generated profile IDs, low-confidence dwell ranges, or other implementation noise as if they were meaningful context.
 
 Each open-spot message must include a JPEG snapshot attachment. The snapshot should be the full camera frame captured at the confirmed-empty moment, retained locally under `/data/events/` for debugging.
 
 Street-sweeping message formats:
 
 ```text
-Street sweeping window started: normal parking-open alerts muted until 3:00 PM
-Street sweeping window ended: normal parking-open alerts resumed
+Street sweeping starts in 1 hour: street_sweeping:2026-05-18:13:00-15:00
+Street sweeping started: street_sweeping:2026-05-18:13:00-15:00
+Street sweeping ended: street_sweeping:2026-05-18:13:00-15:00
 ```
 
 ---

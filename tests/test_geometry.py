@@ -16,8 +16,8 @@ from parking_spot_monitor.geometry import (
 from tests.test_config import fake_environ
 
 
-LEFT_SPOT = [(300, 180), (610, 160), (690, 285), (420, 360), (260, 300)]
-RIGHT_SPOT = [(1010, 155), (1395, 170), (1395, 355), (1040, 370), (960, 250)]
+LEFT_SPOT = [(300, 180), (650, 215), (690, 285), (420, 360), (260, 300)]
+RIGHT_SPOT = [(1010, 215), (1395, 170), (1395, 355), (1040, 370), (960, 250)]
 DRIVEWAY_BBOX = (260, 330, 940, 806)
 DRIVEWAY_CENTROID = (600, 568)
 
@@ -31,11 +31,15 @@ def test_example_config_uses_m001_camera_dimensions_and_street_polygons() -> Non
     assert [(point.x, point.y) for point in settings.spots.right_spot.polygon] == RIGHT_SPOT
 
 
-def test_tracked_camera_fixture_matches_config_dimensions() -> None:
+def test_synthetic_camera_fixture_matches_config_dimensions(tmp_path: Path) -> None:
     import struct
 
+    from PIL import Image
+
     settings = load_settings("config.yaml.example", environ=fake_environ())
-    png_header = Path("camera.png").read_bytes()[:24]
+    fixture_path = tmp_path / "camera.png"
+    Image.new("RGB", (settings.stream.frame_width, settings.stream.frame_height), (20, 30, 40)).save(fixture_path, format="PNG")
+    png_header = fixture_path.read_bytes()[:24]
     width, height = struct.unpack(">II", png_header[16:24])
 
     assert png_header.startswith(b"\x89PNG\r\n\x1a\n")

@@ -105,6 +105,8 @@ class MatrixConfig(StrictModel):
     room_id: str
     access_token: ResolvedSecret
     user_id: str | None = None
+    command_prefix: str = Field(default="!parking", min_length=1, max_length=32)
+    command_authorized_senders: list[str] = Field(default_factory=list)
     timeout_seconds: float = Field(default=10, gt=0)
     retry_attempts: int = Field(default=3, gt=0)
     retry_backoff_seconds: float = Field(default=1, ge=0)
@@ -122,6 +124,7 @@ class QuietWindowConfig(StrictModel):
     ordinals: list[int]
     start: str
     end: str
+    reminder_minutes_before: int | None = Field(default=None, gt=0)
 
     @field_validator("timezone")
     @classmethod
@@ -238,6 +241,8 @@ class RuntimeSettings(StrictModel):
                     "value": "**********",
                 },
                 "user_id": self.matrix.user_id,
+                "command_prefix": self.matrix.command_prefix,
+                "command_authorized_senders_count": len(self.matrix.command_authorized_senders),
                 "timeout_seconds": self.matrix.timeout_seconds,
                 "retry_attempts": self.matrix.retry_attempts,
                 "retry_backoff_seconds": self.matrix.retry_backoff_seconds,

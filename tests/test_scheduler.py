@@ -21,6 +21,7 @@ def street_sweeping_window() -> QuietWindowConfig:
         ordinals=[1, 3],
         start="13:00",
         end="15:00",
+        reminder_minutes_before=60,
     )
 
 
@@ -77,6 +78,34 @@ def test_start_and_end_notice_ids_are_stable_and_deduplicated() -> None:
     assert [event.event_type for event in ended] == [QuietWindowEventType.ENDED]
     assert ended[0].event_id == "quiet-window-ended:street_sweeping:2026-05-18:13:00-15:00"
     assert duplicate_ended == []
+
+
+def test_upcoming_notice_id_is_stable_and_deduplicated() -> None:
+    upcoming_status = evaluate_quiet_windows([street_sweeping_window()], datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc))
+    duplicate_status = evaluate_quiet_windows([street_sweeping_window()], datetime(2026, 5, 18, 19, 30, tzinfo=timezone.utc))
+    active_status = evaluate_quiet_windows([street_sweeping_window()], datetime(2026, 5, 18, 20, 0, tzinfo=timezone.utc))
+
+    upcoming = quiet_window_notice_events(previous_active_window_ids=set(), current=upcoming_status)
+    duplicate_upcoming = quiet_window_notice_events(
+        previous_active_window_ids=set(),
+        current=duplicate_status,
+        emitted_notice_ids={"quiet-window-upcoming:street_sweeping:2026-05-18:13:00-15:00:60m"},
+    )
+    active = quiet_window_notice_events(previous_active_window_ids=set(), current=active_status)
+
+    assert upcoming_status.active is False
+    assert [event.event_type for event in upcoming] == [QuietWindowEventType.UPCOMING]
+    assert upcoming[0].event_id == "quiet-window-upcoming:street_sweeping:2026-05-18:13:00-15:00:60m"
+    assert upcoming[0].window_id == "street_sweeping:2026-05-18:13:00-15:00"
+    assert upcoming[0].reminder_minutes_before == 60
+    assert upcoming[0].to_dict() == {
+        "event_type": "quiet-window-upcoming",
+        "event_id": "quiet-window-upcoming:street_sweeping:2026-05-18:13:00-15:00:60m",
+        "window_id": "street_sweeping:2026-05-18:13:00-15:00",
+        "reminder_minutes_before": 60,
+    }
+    assert duplicate_upcoming == []
+    assert [event.event_type for event in active] == [QuietWindowEventType.STARTED]
 
 
 def test_naive_datetime_is_rejected() -> None:

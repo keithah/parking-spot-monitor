@@ -15,6 +15,7 @@ class RuntimePaths:
     latest_frame: Path
     snapshots_dir: Path
     health_file: Path
+    vehicle_history_dir: Path
 
 
 def resolve_runtime_paths(settings: RuntimeSettings, data_dir: str | Path) -> RuntimePaths:
@@ -34,6 +35,7 @@ def resolve_runtime_paths(settings: RuntimeSettings, data_dir: str | Path) -> Ru
         latest_frame=effective_data_dir / "latest.jpg",
         snapshots_dir=snapshots_dir,
         health_file=health_file,
+        vehicle_history_dir=effective_data_dir / "vehicle-history",
     )
 
 

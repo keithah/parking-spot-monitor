@@ -45,6 +45,9 @@ def test_dockerfile_installs_runtime_and_defaults_to_package_entrypoint() -> Non
 
     assert "FROM python:3.12-slim" in dockerfile or "FROM python:3.11-slim" in dockerfile
     assert "ffmpeg" in dockerfile
+    assert "intel-media-va-driver" in dockerfile
+    assert "vainfo" in dockerfile
+    assert "LIBVA_DRIVER_NAME=iHD" in dockerfile
     assert "COPY requirements.txt ./" in dockerfile
     assert "pip install --no-cache-dir -r requirements.txt" in dockerfile
     assert "ultralytics>=8" in requirements
@@ -60,7 +63,7 @@ def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
     assert "./config.yaml:/config/config.yaml:ro" in service["volumes"]
     assert "./data:/data" in service["volumes"]
     assert "env_file" not in service
-    assert "environment" not in service
+    assert service["environment"] == ["RTSP_URL", "MATRIX_ACCESS_TOKEN", "TZ=America/Los_Angeles"]
     assert service["command"] == [
         "python",
         "-m",
@@ -92,11 +95,18 @@ def test_readme_documents_final_operator_verification_contract() -> None:
         "python -m parking_spot_monitor --config config.yaml --validate-config",
         "python -m parking_spot_monitor --config config.yaml --data-dir ./data --capture-once",
         "python scripts/verify_live_proof.py",
+        "python scripts/verify_hardware_decode.py --json",
         "python -m json.tool data/health.json",
         "find data/snapshots",
         "docker build -t parking-spot-monitor:test .",
         "docker compose config",
         "R015 evidence",
+        "VAAPI should initialize on Intel Iris Xe",
+        "QSV may still fail",
+        "selected_mode=vaapi",
+        "hardware_decode_status=vaapi_supported_qsv_unavailable",
+        "qsv_required_but_unavailable",
+        "verifier_timeout",
     ]:
         assert required in readme
 
@@ -109,6 +119,8 @@ def test_readme_pins_health_shape_retention_and_live_proof_markers() -> None:
         "iteration",
         "last_frame_at",
         "selected_decode_mode",
+        '"capture"',
+        "last_success_at",
         "consecutive_capture_failures",
         "consecutive_detection_failures",
         "last_matrix_error",

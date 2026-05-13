@@ -143,9 +143,20 @@ def test_sanitized_summary_never_contains_secret_values() -> None:
             "ordinals": [1, 3],
             "start": "13:00",
             "end": "15:00",
+            "reminder_minutes_before": 60,
         }
     ]
     assert summary["storage"]["snapshot_retention_count"] == 50
+
+
+def test_quiet_window_reminder_minutes_before_must_be_positive(tmp_path: Path) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace("reminder_minutes_before: 60", "reminder_minutes_before: 0")
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert "reminder_minutes_before" in str(exc_info.value)
 
 
 def test_storage_snapshot_retention_count_must_be_positive(tmp_path: Path) -> None:
@@ -292,7 +303,7 @@ runtime:
 def test_polygon_boundary_points_are_accepted(tmp_path: Path) -> None:
     config = Path("config.yaml.example").read_text(encoding="utf-8")
     config = config.replace("[300, 180]", "[0, 0]")
-    config = config.replace("[610, 160]", "[1458, 806]")
+    config = config.replace("[650, 215]", "[1458, 806]")
     path = write_config(tmp_path, config)
 
     settings = load_settings(path, environ=fake_environ())
@@ -390,3 +401,31 @@ def test_invalid_quiet_window_config_is_rejected_without_secret_leaks(
     assert FAKE_RTSP_URL not in message
     assert FAKE_MATRIX_TOKEN not in message
     assert SECRET_MARKER not in message
+
+
+def test_matrix_command_config_defaults_to_prefix_and_empty_allowlist_when_omitted(tmp_path: Path) -> None:
+    base = Path("config.yaml.example").read_text(encoding="utf-8")
+    config = base.replace('  command_prefix: "!parking"\n', "").replace("  # Empty means inbound correction mutation commands are disabled/reject-all by default.\n  command_authorized_senders: []\n", "")
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(path, environ=fake_environ())
+
+    assert settings.matrix.command_prefix == "!parking"
+    assert settings.matrix.command_authorized_senders == []
+    matrix_summary = settings.sanitized_summary()["matrix"]
+    assert matrix_summary["command_prefix"] == "!parking"
+    assert matrix_summary["command_authorized_senders_count"] == 0
+
+
+def test_matrix_command_authorized_senders_are_configurable_without_secret_leaks(tmp_path: Path) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "  command_authorized_senders: []",
+        '  command_authorized_senders:\n    - "@operator:example.org"',
+    )
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(path, environ=fake_environ())
+
+    assert settings.matrix.command_authorized_senders == ["@operator:example.org"]
+    assert settings.sanitized_summary()["matrix"]["command_authorized_senders_count"] == 1
+    assert FAKE_MATRIX_TOKEN not in repr(settings.sanitized_summary()["matrix"])

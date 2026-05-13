@@ -8,6 +8,8 @@ from typing import Any, TextIO
 
 
 _LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+_SECRET_KEY_PATTERN = re.compile(r"(?i)(access[_-]?token|matrix[_-]?token|token|password|passwd|pwd|secret|authorization)")
+
 _SECRET_PATTERNS = (
     re.compile(r"\b(rtsp://)\S+", re.IGNORECASE),
     re.compile(r"(?i)(access[_-]?token|matrix[_-]?token|token)(\s*[:=]\s*)\S+"),
@@ -67,7 +69,7 @@ def redact_diagnostic_value(value: Any) -> Any:
     if isinstance(value, str):
         return redact_diagnostic_text(value)
     if isinstance(value, Mapping):
-        return {key: redact_diagnostic_value(item) for key, item in value.items()}
+        return {key: _redact_mapping_item(key, item) for key, item in value.items()}
     if isinstance(value, tuple):
         return tuple(redact_diagnostic_value(item) for item in value)
     if isinstance(value, list):
@@ -75,6 +77,21 @@ def redact_diagnostic_value(value: Any) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [redact_diagnostic_value(item) for item in value]
     return value
+
+
+def _redact_mapping_item(key: object, item: Any) -> Any:
+    if not _is_secret_value_key(key):
+        return redact_diagnostic_value(item)
+    if isinstance(item, Mapping) and "env_var" in item:
+        return redact_diagnostic_value(item)
+    return "<redacted>"
+
+
+def _is_secret_value_key(key: object) -> bool:
+    text = str(key).lower()
+    if "env" in text:
+        return False
+    return _SECRET_KEY_PATTERN.search(text) is not None
 
 
 def setup_logging(*, level: str = "INFO", stream: TextIO | None = None) -> StructuredLogger:

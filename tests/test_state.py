@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import stat
 from io import StringIO
 from pathlib import Path
 
@@ -71,6 +72,7 @@ def test_state_json_round_trips_occupancy_and_quiet_window_markers(tmp_path: Pat
     loaded = load_runtime_state(path, ["left_spot", "right_spot"])
 
     assert loaded == original
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
     raw = json.loads(path.read_text())
     assert raw == {
         "schema_version": 1,

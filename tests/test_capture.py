@@ -7,6 +7,7 @@ from typing import Sequence
 import pytest
 
 from parking_spot_monitor.capture import (
+    DEFAULT_DECODE_MODES,
     CaptureError,
     DecodeMode,
     FrameCaptureResult,
@@ -37,8 +38,9 @@ def combined_failure_text(exc: CaptureError) -> str:
     return str(exc) + repr(exc.diagnostics())
 
 
-def test_decode_modes_are_attempted_in_hardware_then_software_order() -> None:
-    assert [mode.value for mode in DecodeMode] == ["qsv", "vaapi", "drm", "software"]
+def test_default_decode_modes_use_vaapi_not_qsv_for_intel_hardware_path() -> None:
+    assert [mode.value for mode in DEFAULT_DECODE_MODES] == ["vaapi", "drm", "software"]
+    assert DecodeMode.QSV not in DEFAULT_DECODE_MODES
 
 
 def test_ffmpeg_command_builder_returns_argv_lists_not_shell_strings(tmp_path: Path) -> None:
@@ -54,6 +56,16 @@ def test_ffmpeg_command_builder_returns_argv_lists_not_shell_strings(tmp_path: P
     assert str(output_path) == argv[-1]
     assert "-hwaccel" in argv
     assert "qsv" in argv
+
+
+
+def test_vaapi_capture_downloads_hardware_frames_before_jpeg_encoding(tmp_path: Path) -> None:
+    output_path = tmp_path / "latest.jpg"
+
+    argv = build_ffmpeg_argv(FAKE_RTSP_VALUE, output_path, DecodeMode.VAAPI)
+
+    assert "format=nv12|vaapi,hwdownload,format=nv12" in argv
+    assert argv.index("-vf") < argv.index("-frames:v")
 
 
 def test_redaction_removes_resolved_rtsp_and_credential_like_substrings() -> None:
@@ -86,7 +98,7 @@ def test_capture_latest_returns_result_shape_after_valid_jpeg_write(tmp_path: Pa
     assert isinstance(result, FrameCaptureResult)
     assert result.timestamp == "2025-01-01T00:00:00Z"
     assert result.latest_path == tmp_path / "latest.jpg"
-    assert result.selected_mode is DecodeMode.QSV
+    assert result.selected_mode is DecodeMode.VAAPI
     assert result.duration_seconds >= 0
     assert result.byte_size == len(jpeg_bytes())
     assert calls and isinstance(calls[0], list)
@@ -121,8 +133,8 @@ def test_capture_latest_falls_back_from_hardware_failures_to_software_success(tm
     result = capture_latest(settings, tmp_path, logger=logger, runner=runner)
 
     assert result.selected_mode is DecodeMode.SOFTWARE
-    assert attempted == [DecodeMode.QSV, DecodeMode.VAAPI, DecodeMode.DRM, DecodeMode.SOFTWARE]
-    assert events.count("capture-decode-attempt") == 4
+    assert attempted == [DecodeMode.VAAPI, DecodeMode.DRM, DecodeMode.SOFTWARE]
+    assert events.count("capture-decode-attempt") == 3
     assert "capture-decode-fallback" in events
     assert "capture-frame-written" in events
 
