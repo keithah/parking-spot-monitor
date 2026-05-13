@@ -477,7 +477,7 @@ def test_runtime_loop_matrix_open_event_sends_text_and_raw_snapshot(
     open_images = [image for image in matrix_client.images if image["txn_id"].startswith("occupancy-open-event:")]
     assert len(open_texts) == 1
     assert open_texts[0]["txn_id"].endswith(":text")
-    assert open_texts[0]["body"] == "Parking spot open: left_spot at 2026-05-18T12:00:00-07:00"
+    assert open_texts[0]["body"] == "Parking spot open: left_spot at 2026-05-18 12:00:00 PM PDT"
     assert len(open_uploads) == 1
     assert open_uploads[0]["content_type"] == "image/jpeg"
     assert open_uploads[0]["data"] == snapshot_files[0].read_bytes()
@@ -616,7 +616,7 @@ def test_runtime_loop_occupied_alert_sends_text_image_with_seeded_vehicle_estima
     text_body = occupied_texts[0]["body"]
     assert "Likely vehicle: Blue Civic (profile prof_civic)" in text_body
     assert "Estimated dwell: 1 hr–1 hr 10 min (typical 1 hr 5 min)" in text_body
-    assert "Usual leave window: 20:00–20:15" in text_body
+    assert "Usual leave window: 8:00 PM–8:15 PM" in text_body
     assert "History: 2 samples, estimate confidence low" in text_body
     assert active_payload["profile_id"] == profile_id
     assert active_payload["profile_confidence"] == pytest.approx(1.0)
@@ -805,7 +805,7 @@ def test_runtime_loop_vehicle_history_final_integrated_regression_includes_reten
     assert "Likely vehicle: Corrected Fleet (profile prof_source)" in occupied_body
     assert "Estimated dwell: 1 hr–1 hr 10 min (typical 1 hr 5 min)" in occupied_body
     assert "History: 2 samples, estimate confidence low" in occupied_body
-    assert open_texts[0]["body"] == "Parking spot open: left_spot at 2026-05-18T12:00:00-07:00"
+    assert open_texts[0]["body"] == "Parking spot open: left_spot at 2026-05-18 12:00:00 PM PDT"
     assert occupied_uploads[0]["data"] == Path(current_payload["occupied_snapshot_path"]).read_bytes()
     assert open_uploads[0]["data"] == (tmp_path / "snapshots" / open_uploads[0]["filename"]).read_bytes()
 

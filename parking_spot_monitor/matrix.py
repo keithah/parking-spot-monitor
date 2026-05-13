@@ -975,8 +975,15 @@ def _display_observed_at(value: object) -> str:
     if observed_at is None:
         return _format_observed_at(value).replace("Z", "+00:00")
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
-        return observed_at.isoformat()
-    return observed_at.astimezone(DISPLAY_TIMEZONE).isoformat()
+        return _format_display_datetime(observed_at)
+    return _format_display_datetime(observed_at.astimezone(DISPLAY_TIMEZONE))
+
+
+def _format_display_datetime(value: datetime) -> str:
+    time_text = _format_12_hour_time(value.hour, value.minute, value.second)
+    timezone_name = value.tzname() if value.tzinfo is not None and value.utcoffset() is not None else ""
+    suffix = f" {timezone_name}" if timezone_name else ""
+    return f"{value:%Y-%m-%d} {time_text}{suffix}"
 
 
 def _parse_observed_at(value: object) -> datetime | None:
@@ -1032,7 +1039,8 @@ def format_occupied_spot_alert(event: Mapping[str, Any]) -> str:
     estimate_status = _safe_text(_first_present(estimate, "status"), default="insufficient_history")
     sample_count = _int_field(estimate, "sample_count", default=0)
     estimate_confidence = _safe_text(_first_present(estimate, "confidence"), default="unknown")
-    has_useful_vehicle_context = label != "unknown vehicle" or sample_count > 0 or estimate_status == "estimated" or match_status != "new_profile"
+    estimate_has_high_signal = estimate_status == "estimated" and sample_count >= 3 and estimate_confidence not in {"low", "unknown"}
+    has_useful_vehicle_context = _has_meaningful_vehicle_label(label, profile_id) or estimate_has_high_signal
     if not has_useful_vehicle_context:
         return "\n".join(lines)
 
@@ -1124,7 +1132,27 @@ def _format_leave_window(leave_window: Mapping[str, Any]) -> str:
 
 def _format_minute_of_day(value: int) -> str:
     minute = value % (24 * 60)
-    return f"{minute // 60:02d}:{minute % 60:02d}"
+    return _format_12_hour_time(minute // 60, minute % 60)
+
+
+def _format_12_hour_time(hour: int, minute: int, second: int | None = None) -> str:
+    suffix = "AM" if hour < 12 else "PM"
+    display_hour = hour % 12 or 12
+    if second is None:
+        return f"{display_hour}:{minute:02d} {suffix}"
+    return f"{display_hour}:{minute:02d}:{second:02d} {suffix}"
+
+
+def _has_meaningful_vehicle_label(label: str, profile_id: str) -> bool:
+    normalized_label = label.strip().lower()
+    normalized_profile = profile_id.strip().lower()
+    if normalized_label in {"", "unknown", "unknown vehicle"}:
+        return False
+    if normalized_profile and normalized_label == normalized_profile:
+        return False
+    if normalized_label.startswith("prof_sess-"):
+        return False
+    return True
 
 
 def _plural(word: str, count: int) -> str:

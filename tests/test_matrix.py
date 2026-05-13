@@ -152,7 +152,7 @@ def test_matrix_delivery_live_proof_sends_labelled_text_and_raw_image(tmp_path: 
 
     assert [item["kind"] for item in seen] == ["text", "upload", "image"]
     assert seen[0]["txn_id"] == "live-proof:2026-05-18T19:00:00Z:text"
-    assert seen[0]["body"] == "LIVE PROOF / TEST MESSAGE: RTSP capture succeeded at 2026-05-18T12:00:00-07:00 (decode mode: software)."
+    assert seen[0]["body"] == "LIVE PROOF / TEST MESSAGE: RTSP capture succeeded at 2026-05-18 12:00:00 PM PDT (decode mode: software)."
     assert seen[1]["content_type"] == "image/jpeg"
     assert seen[1]["data"] == raw_bytes
     assert seen[2]["txn_id"] == "live-proof:2026-05-18T19:00:00Z:image"
@@ -162,7 +162,7 @@ def test_matrix_delivery_live_proof_sends_labelled_text_and_raw_image(tmp_path: 
 
 def test_format_live_proof_text_is_visibly_labelled() -> None:
     assert format_live_proof_text(observed_at="2026-05-18T19:00:00Z", selected_mode="software") == (
-        "LIVE PROOF / TEST MESSAGE: RTSP capture succeeded at 2026-05-18T12:00:00-07:00 (decode mode: software)."
+        "LIVE PROOF / TEST MESSAGE: RTSP capture succeeded at 2026-05-18 12:00:00 PM PDT (decode mode: software)."
     )
 
 
@@ -312,11 +312,11 @@ def test_format_occupied_spot_alert_includes_vehicle_and_estimate_context_withou
     body = format_occupied_spot_alert(event)
 
     assert body == (
-        "Parking spot occupied: left_spot at 2026-05-18T13:01:02-07:00\n"
+        "Parking spot occupied: left_spot at 2026-05-18 1:01:02 PM PDT\n"
         "Likely vehicle: silver hatchback (profile prof_repeat)\n"
         "Match: matched, confidence 0.92\n"
         "Estimated dwell: 1 hr–1 hr 30 min (typical 1 hr 15 min)\n"
-        "Usual leave window: 23:45–00:15 (typical 00:00; crosses midnight)\n"
+        "Usual leave window: 11:45 PM–12:15 AM (typical 12:00 AM; crosses midnight)\n"
         "History: 4 samples, estimate confidence medium"
     )
     rendered = body.lower()
@@ -341,13 +341,7 @@ def test_format_occupied_spot_alert_is_honest_about_insufficient_history() -> No
         "leave_time_window": None,
     }
 
-    assert format_occupied_spot_alert(event) == (
-        "Parking spot occupied: left_spot at 2026-05-18T13:01:02-07:00\n"
-        "Likely vehicle: unknown vehicle (profile prof_repeat)\n"
-        "Match: new_profile, confidence unknown\n"
-        "Estimate unavailable: insufficient-samples\n"
-        "History: 1 sample, estimate confidence low"
-    )
+    assert format_occupied_spot_alert(event) == "Parking spot occupied: left_spot at 2026-05-18 1:01:02 PM PDT"
 
 
 def test_format_occupied_spot_alert_omits_unavailable_new_profile_history_noise() -> None:
@@ -367,7 +361,34 @@ def test_format_occupied_spot_alert_omits_unavailable_new_profile_history_noise(
         "leave_time_window": None,
     }
 
-    assert format_occupied_spot_alert(event) == "Parking spot occupied: left_spot at 2026-05-18T13:01:02-07:00"
+    assert format_occupied_spot_alert(event) == "Parking spot occupied: left_spot at 2026-05-18 1:01:02 PM PDT"
+
+
+def test_format_occupied_spot_alert_omits_low_confidence_profile_only_estimate_noise() -> None:
+    event = occupied_event()
+    event["spot_id"] = "right_spot"
+    event["observed_at"] = "2026-05-12T17:16:48.322925-07:00"
+    event["likely_vehicle"] = {
+        "label": "prof_sess-right-spot-2026-05-12t16-14-03-187234-00-00",
+        "profile_id": "prof_sess-right-spot-2026-05-12t16-14-03-187234-00-00",
+        "match_status": "matched",
+        "confidence": 0.82,
+    }
+    event["vehicle_history_estimate"] = {
+        "status": "estimated",
+        "profile_id": "prof_sess-right-spot-2026-05-12t16-14-03-187234-00-00",
+        "sample_count": 2,
+        "confidence": "low",
+        "dwell_range": {"lower_seconds": 8700, "upper_seconds": 18600, "typical_seconds": 13500},
+        "leave_time_window": {
+            "start_minute": 21 * 60 + 15,
+            "end_minute": 0,
+            "typical_minute": 22 * 60 + 45,
+            "crosses_midnight": True,
+        },
+    }
+
+    assert format_occupied_spot_alert(event) == "Parking spot occupied: right_spot at 2026-05-12 5:16:48 PM PDT"
 
 
 def test_matrix_delivery_occupied_alert_sends_text_upload_and_raw_occupied_image(tmp_path: Path) -> None:
@@ -415,7 +436,7 @@ def test_matrix_delivery_occupied_alert_sends_text_upload_and_raw_occupied_image
     assert seen[1]["data"] == raw_bytes
     assert seen[1]["filename"] == "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
     assert seen[2]["txn_id"] == f"{event_id}:image"
-    assert seen[2]["body"] == "Raw occupied full-frame snapshot for left_spot at 2026-05-18T13:01:02-07:00"
+    assert seen[2]["body"] == "Raw occupied full-frame snapshot for left_spot at 2026-05-18 1:01:02 PM PDT"
     assert seen[2]["content_uri"] == "mxc://example.org/occupied"
     assert seen[2]["info"] == {"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 9, "h": 7}
 
@@ -477,12 +498,12 @@ def test_prepare_event_snapshot_copies_raw_latest_jpeg_with_metadata_and_stable_
 
     assert format_open_spot_alert(
         {"spot_id": "left_spot", "observed_at": observed_at, "snapshot_path": str(snapshot.path)}
-    ) == "Parking spot open: left_spot at 2026-05-18T13:01:02-07:00"
+    ) == "Parking spot open: left_spot at 2026-05-18 1:01:02 PM PDT"
 
 
-def test_format_open_spot_alert_displays_iso_string_in_los_angeles_time() -> None:
+def test_format_open_spot_alert_displays_12_hour_string_in_los_angeles_time() -> None:
     assert format_open_spot_alert({"spot_id": "right_spot", "observed_at": "2026-05-12T16:04:08.223073+00:00"}) == (
-        "Parking spot open: right_spot at 2026-05-12T09:04:08.223073-07:00"
+        "Parking spot open: right_spot at 2026-05-12 9:04:08 AM PDT"
     )
 
 
