@@ -18,6 +18,8 @@ from parking_spot_monitor.matrix import (
     format_occupied_spot_alert,
     format_open_spot_alert,
     format_quiet_window_notice,
+    format_owner_vehicle_quiet_window_alert,
+    owner_vehicle_quiet_window_event_id,
     occupied_spot_event_id,
     prepare_event_snapshot,
     prune_event_snapshots,
@@ -722,6 +724,29 @@ def test_quiet_notice_text_is_deterministic_and_contextual() -> None:
         }
     ) == "Street sweeping ended: street_sweeping:2026-05-18:13:00-15:00"
 
+
+
+
+def test_owner_vehicle_quiet_window_alert_text_and_event_id_are_concise() -> None:
+    event = {
+        "event_type": "owner-vehicle-quiet-window-alert",
+        "spot_id": "right_spot",
+        "observed_at": "2026-05-18T20:05:06Z",
+        "window_id": "street_sweeping:2026-05-18:13:00-15:00",
+        "profile_id": "prof_tesla",
+        "owner_vehicle": {
+            "label": "Keith's black Tesla",
+            "description": "black Tesla, tinted windows, roof rack",
+        },
+    }
+
+    assert owner_vehicle_quiet_window_event_id(event) == (
+        "owner-vehicle-quiet-window-alert:right_spot:prof_tesla:street_sweeping:2026-05-18:13:00-15:00"
+    )
+    assert format_owner_vehicle_quiet_window_alert(event) == (
+        "Street cleaning alert: Keith's black Tesla is parked in right_spot at "
+        "2026-05-18 1:05:06 PM PDT during street_sweeping:2026-05-18:13:00-15:00."
+    )
 
 def test_send_text_retries_transient_http_statuses_and_logs_retry_decisions() -> None:
     from io import StringIO

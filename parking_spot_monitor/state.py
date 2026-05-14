@@ -28,6 +28,7 @@ class RuntimeState:
     state_by_spot: dict[str, SpotOccupancyState] = field(default_factory=dict)
     active_quiet_window_ids: frozenset[str] = field(default_factory=frozenset)
     quiet_window_notice_ids: frozenset[str] = field(default_factory=frozenset)
+    owner_quiet_window_alert_ids: frozenset[str] = field(default_factory=frozenset)
 
     @classmethod
     def default(cls, spot_ids: Iterable[str]) -> RuntimeState:
@@ -39,6 +40,7 @@ class RuntimeState:
             "spots": {spot_id: _spot_state_to_json(state) for spot_id, state in self.state_by_spot.items()},
             "active_quiet_window_ids": sorted(self.active_quiet_window_ids),
             "quiet_window_notice_ids": sorted(self.quiet_window_notice_ids),
+            "owner_quiet_window_alert_ids": sorted(self.owner_quiet_window_alert_ids),
         }
 
 
@@ -150,6 +152,7 @@ def _state_from_json(payload: Any, configured_spot_ids: list[str]) -> RuntimeSta
         state_by_spot=state_by_spot,
         active_quiet_window_ids=frozenset(_string_list(payload.get("active_quiet_window_ids"), "active_quiet_window_ids")),
         quiet_window_notice_ids=frozenset(_string_list(payload.get("quiet_window_notice_ids"), "quiet_window_notice_ids")),
+        owner_quiet_window_alert_ids=frozenset(_string_list(payload.get("owner_quiet_window_alert_ids"), "owner_quiet_window_alert_ids")),
     )
 
 
