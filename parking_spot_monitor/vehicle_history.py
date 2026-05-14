@@ -13,6 +13,7 @@ from typing import Any, Mapping, Sequence
 
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
+from parking_spot_monitor.owner_vehicles import load_owner_vehicle_registry
 from parking_spot_monitor.vehicle_estimates import VehicleHistoryEstimate, estimate_vehicle_history
 from parking_spot_monitor.vehicle_history_images import VehicleHistoryImageError, capture_occupied_images
 from parking_spot_monitor.vehicle_profiles import (
@@ -31,6 +32,7 @@ MAX_CORRECTION_LINE_BYTES = 16_000
 MAX_CORRECTION_TEXT_LENGTH = 160
 MAX_CORRECTION_INVALID_LINES = 200
 PROFILE_STATUS_ACTIVE = "active"
+OWNER_PROFILE_MIN_ASSIGNMENT_CONFIDENCE = 0.95
 
 CORRECTION_ACTION_RENAME_PROFILE = "rename_profile"
 CORRECTION_ACTION_MERGE_PROFILES = "merge_profiles"
@@ -657,6 +659,18 @@ class VehicleHistoryArchive:
 
         if result.status is MatchStatus.MATCHED and result.profile_id is not None:
             matched = next(profile for profile in profiles if profile.profile_id == result.profile_id)
+            if _is_owner_profile_low_confidence_match(self.root, matched.profile_id, result.confidence):
+                self._log(
+                    "info",
+                    "vehicle-session-profile-owner-match-skipped",
+                    spot_id=record.spot_id,
+                    session_id=record.session_id,
+                    profile_id=matched.profile_id,
+                    profile_confidence=result.confidence,
+                    min_profile_confidence=OWNER_PROFILE_MIN_ASSIGNMENT_CONFIDENCE,
+                    reason="owner-profile-confidence-too-low",
+                )
+                return ProfileAssignment(record.session_id, MatchStatus.UNKNOWN.value, None, None, "owner-profile-confidence-too-low")
             updated_profile = _profile_with_sample(matched, descriptor=descriptor, session_id=record.session_id, crop_path=record.occupied_crop_path)
             self._write_profile(self.active_profiles_dir / f"{updated_profile.profile_id}.json", updated_profile, phase="profile-match")
             updated_record = _session_with_profile(record, profile_id=result.profile_id, confidence=result.confidence)
@@ -1837,6 +1851,11 @@ def _session_with_profile(record: SessionRecord, *, profile_id: str, confidence:
         created_at=record.created_at,
         updated_at=_utc_now(),
     )
+
+
+def _is_owner_profile_low_confidence_match(root: Path, profile_id: str, confidence: float) -> bool:
+    owner = load_owner_vehicle_registry(root / "owner-vehicles.json").owner_for_profile(profile_id)
+    return owner is not None and confidence < OWNER_PROFILE_MIN_ASSIGNMENT_CONFIDENCE
 
 
 def _profile_with_sample(
