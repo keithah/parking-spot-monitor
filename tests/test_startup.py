@@ -414,6 +414,83 @@ def test_runtime_loop_owner_vehicle_in_quiet_window_sends_deduped_alert(
     assert output.count("owner-vehicle-quiet-window-alert") >= 1
     assert_no_secret_leak(output)
 
+
+
+def test_runtime_loop_owner_vehicle_quiet_window_ignores_low_confidence_profile_match(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path
+    owner_profile_id = "prof_tesla"
+    archive_root = data_dir / "vehicle-history"
+    active_dir = archive_root / "sessions" / "active"
+    active_dir.mkdir(parents=True)
+    active_dir.joinpath("sess_low_confidence_left.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_id": "sess_low_confidence_left",
+                "spot_id": "left_spot",
+                "started_at": "2026-05-18T19:30:00+00:00",
+                "ended_at": None,
+                "duration_seconds": None,
+                "start_event": {"event_type": "occupancy-state-changed"},
+                "close_event": None,
+                "source_snapshot_path": str(data_dir / "latest.jpg"),
+                "candidate_summary": None,
+                "occupied_snapshot_path": str(data_dir / "latest.jpg"),
+                "occupied_crop_path": str(data_dir / "crop.jpg"),
+                "profile_id": owner_profile_id,
+                "profile_confidence": 0.90,
+                "created_at": "2026-05-18T19:30:00Z",
+                "updated_at": "2026-05-18T19:30:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    archive_root.joinpath("owner-vehicles.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "owner_vehicles": [
+                    {
+                        "profile_id": owner_profile_id,
+                        "label": "Keith's black Tesla",
+                        "description": "black Tesla, tinted windows, roof rack",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    delivery = FakeMatrixDelivery()
+
+    class EmptyDetector:
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            return []
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(data_dir)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir: captured_frame(data_dir, timestamp="2026-05-18T20:05:06Z"),
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: EmptyDetector(),
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
+        sleep=lambda _seconds: None,
+        max_iterations=2,
+        now=lambda: datetime(2026, 5, 18, 20, 5, 6, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    state_payload = runtime_state_payload(data_dir / "state.json")
+
+    assert exit_code == 0
+    assert delivery.owner_alerts == []
+    assert state_payload["owner_quiet_window_alert_ids"] == []
+    assert "owner-vehicle-quiet-window-alert" not in output
+    assert_no_secret_leak(output)
+
+
 def test_runtime_loop_matrix_quiet_window_start_notice_sent_once_by_event_id(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
