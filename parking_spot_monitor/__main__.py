@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -45,6 +46,7 @@ from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
 DEFAULT_CONFIG_PATH = "/config/config.yaml"
 DEFAULT_DATA_DIR = "/data"
+OWNER_VEHICLE_MIN_PROFILE_CONFIDENCE = 0.95
 
 
 @dataclass(frozen=True)
@@ -691,6 +693,17 @@ def _owner_vehicle_quiet_window_alerts(
         owner = registry.owner_for_profile(session.profile_id)
         if owner is None:
             continue
+        if not _owner_vehicle_profile_confidence_is_high_enough(session.profile_confidence):
+            logger.info(
+                "owner-vehicle-alert-skipped",
+                reason="profile-confidence-too-low",
+                spot_id=session.spot_id,
+                session_id=session.session_id,
+                profile_id=session.profile_id,
+                profile_confidence=session.profile_confidence,
+                min_profile_confidence=OWNER_VEHICLE_MIN_PROFILE_CONFIDENCE,
+            )
+            continue
         payload = {
             "event_type": OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
             "spot_id": session.spot_id,
@@ -706,6 +719,17 @@ def _owner_vehicle_quiet_window_alerts(
         payload["event_id"] = event_id
         alerts.append(payload)
     return alerts
+
+
+def _owner_vehicle_profile_confidence_is_high_enough(confidence: float | None) -> bool:
+    if confidence is None:
+        return False
+    try:
+        value = float(confidence)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and value >= OWNER_VEHICLE_MIN_PROFILE_CONFIDENCE
+
 
 def _occupancy_history_event_id(event: OccupancyEvent) -> str:
     payload = event.to_dict()
