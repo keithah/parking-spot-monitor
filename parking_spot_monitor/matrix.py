@@ -21,6 +21,7 @@ MEDIA_API_PREFIX = "/_matrix/media/v3"
 JPEG_MIMETYPE = "image/jpeg"
 OPEN_SPOT_EVENT_TYPE = "occupancy-open-event"
 OCCUPIED_SPOT_EVENT_TYPE = "occupancy-occupied-event"
+OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE = "owner-vehicle-quiet-window-alert"
 DISPLAY_TIMEZONE = ZoneInfo("America/Los_Angeles")
 
 
@@ -229,6 +230,13 @@ class MatrixDelivery:
                 spot_id=spot_id,
                 operation="occupied-alert",
             )
+
+    def send_owner_vehicle_quiet_window_alert(self, event: Mapping[str, Any]) -> str:
+        return self.client.send_text(
+            room_id=self.room_id,
+            txn_id=owner_vehicle_quiet_window_event_id(event),
+            body=format_owner_vehicle_quiet_window_alert(event),
+        )
 
     def send_live_proof(self, *, latest_path: str | Path, observed_at: object, selected_mode: object) -> None:
         self.send_live_proof_text(observed_at=observed_at, selected_mode=selected_mode)
@@ -1163,6 +1171,23 @@ def _plural(word: str, count: int) -> str:
 
 def _occupied_snapshot_body(*, spot_id: str, observed_at: object) -> str:
     return f"Raw occupied full-frame snapshot for {redact_diagnostic_text(spot_id)} at {_display_observed_at(observed_at)}"
+
+
+
+def owner_vehicle_quiet_window_event_id(event: Mapping[str, Any]) -> str:
+    spot_id = _require_non_empty("spot_id", redact_diagnostic_text(event.get("spot_id", "")))
+    profile_id = _safe_text(event.get("profile_id"), default="unknown")
+    window_id = _safe_text(event.get("window_id"), default="quiet-window")
+    return f"{OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE}:{spot_id}:{profile_id}:{window_id}"
+
+
+def format_owner_vehicle_quiet_window_alert(event: Mapping[str, Any]) -> str:
+    spot_id = _require_non_empty("spot_id", redact_diagnostic_text(event.get("spot_id", "")))
+    observed_at = _display_observed_at(event.get("observed_at"))
+    window_id = _safe_text(event.get("window_id"), default="street cleaning")
+    owner_vehicle = _mapping_field(event, "owner_vehicle")
+    label = _safe_text(owner_vehicle.get("label") or event.get("label"), default="your car")
+    return f"Street cleaning alert: {label} is parked in {spot_id} at {observed_at} during {window_id}."
 
 def format_quiet_window_notice(event: Mapping[str, Any]) -> str:
     """Return deterministic Matrix text for a street-sweeping start/end notice."""

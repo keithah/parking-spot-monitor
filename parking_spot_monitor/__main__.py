@@ -29,12 +29,15 @@ from parking_spot_monitor.matrix import (
     MatrixClient,
     MatrixCommandService,
     MatrixDelivery,
+    OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
+    owner_vehicle_quiet_window_event_id,
     MatrixError,
     occupied_spot_event_id,
     open_spot_event_id,
     prune_event_snapshots,
 )
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus, update_occupancy
+from parking_spot_monitor.owner_vehicles import load_owner_vehicle_registry
 from parking_spot_monitor.paths import RuntimePaths, resolve_runtime_paths
 from parking_spot_monitor.scheduler import QuietWindowEventType, evaluate_quiet_windows, quiet_window_notice_events
 from parking_spot_monitor.state import RuntimeState, load_runtime_state, save_runtime_state
@@ -595,6 +598,25 @@ def _update_runtime_state_for_frame(
         logger=logger,
     )
     history_errors = history_result.errors
+    owner_alert_ids = set(runtime_state.owner_quiet_window_alert_ids)
+    owner_alerts = _owner_vehicle_quiet_window_alerts(
+        history_archive,
+        quiet_status=quiet_status,
+        observed_at=observed_at,
+        emitted_alert_ids=owner_alert_ids,
+        configured_spot_ids=configured_spot_ids,
+        logger=logger,
+    )
+
+    for owner_alert in owner_alerts:
+        event_name = str(owner_alert.get("event_type", OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE))
+        logger.info(event_name, **{key: value for key, value in owner_alert.items() if key != "event_type"})
+        matrix_error = _dispatch_matrix_event(matrix_delivery, event_name, owner_alert, logger=logger)
+        if matrix_error is not None:
+            matrix_errors.append(matrix_error)
+        event_id = owner_alert.get("event_id")
+        if isinstance(event_id, str) and event_id:
+            owner_alert_ids.add(event_id)
 
     for occupied_alert in history_result.occupied_alerts:
         matrix_error = _dispatch_matrix_event(
@@ -618,6 +640,7 @@ def _update_runtime_state_for_frame(
         state_by_spot=occupancy_update.state_by_spot,
         active_quiet_window_ids=quiet_status.active_window_ids,
         quiet_window_notice_ids=frozenset(emitted_notice_ids),
+        owner_quiet_window_alert_ids=frozenset(owner_alert_ids),
     )
     try:
         save_runtime_state(state_path, updated_state, logger=logger)
@@ -631,6 +654,58 @@ def _update_runtime_state_for_frame(
     return FrameUpdateResult(runtime_state=updated_state, matrix_errors=matrix_errors, history_errors=history_errors)
 
 
+
+
+
+def _owner_vehicle_quiet_window_alerts(
+    history_archive: VehicleHistoryArchive | None,
+    *,
+    quiet_status: Any,
+    observed_at: datetime,
+    emitted_alert_ids: set[str],
+    configured_spot_ids: Sequence[str],
+    logger: StructuredLogger,
+) -> list[dict[str, Any]]:
+    if history_archive is None or not getattr(quiet_status, "active", False):
+        return []
+    window_id = getattr(quiet_status, "active_window_id", None)
+    if not isinstance(window_id, str) or not window_id:
+        return []
+    registry = load_owner_vehicle_registry(history_archive.root / "owner-vehicles.json")
+    configured = set(configured_spot_ids)
+    alerts: list[dict[str, Any]] = []
+    try:
+        sessions = history_archive.load_active_sessions()
+    except Exception as exc:
+        logger.warning(
+            "owner-vehicle-alert-scan-failed",
+            phase="owner-vehicle",
+            action="scan-active-sessions",
+            error_type=type(exc).__name__,
+            error_message=redact_diagnostic_text(exc),
+        )
+        return []
+    for session in sessions:
+        if session.spot_id not in configured:
+            continue
+        owner = registry.owner_for_profile(session.profile_id)
+        if owner is None:
+            continue
+        payload = {
+            "event_type": OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
+            "spot_id": session.spot_id,
+            "observed_at": observed_at.isoformat(),
+            "window_id": window_id,
+            "profile_id": owner.profile_id,
+            "session_id": session.session_id,
+            "owner_vehicle": owner.to_alert_payload(),
+        }
+        event_id = owner_vehicle_quiet_window_event_id(payload)
+        if event_id in emitted_alert_ids:
+            continue
+        payload["event_id"] = event_id
+        alerts.append(payload)
+    return alerts
 
 def _occupancy_history_event_id(event: OccupancyEvent) -> str:
     payload = event.to_dict()
@@ -989,6 +1064,16 @@ def _presence_by_spot(result: DetectionFilterResult) -> dict[str, bool]:
 def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: Mapping[str, Any], *, logger: StructuredLogger) -> dict[str, Any] | None:
     if matrix_delivery is None:
         logger.info("matrix-delivery-skipped", event_type=event_name, reason="not-configured")
+        return None
+
+    if event_name == OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE:
+        txn_id = str(event.get("event_id") or owner_vehicle_quiet_window_event_id(event))
+        logger.info("matrix-delivery-attempt", event_type=event_name, event_id=txn_id, txn_id=txn_id, attempt=1)
+        try:
+            matrix_delivery.send_owner_vehicle_quiet_window_alert(dict(event))
+        except Exception as exc:
+            return _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
+        logger.info("matrix-delivery-succeeded", event_type=event_name, event_id=txn_id, txn_id=txn_id, attempt=1)
         return None
 
     if event_name in {QuietWindowEventType.UPCOMING.value, QuietWindowEventType.STARTED.value, QuietWindowEventType.ENDED.value}:

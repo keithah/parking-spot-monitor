@@ -29,6 +29,7 @@ def test_missing_state_file_returns_default_unknown_spots_and_logs_loaded(tmp_pa
     assert state.state_by_spot["right_spot"].status is OccupancyStatus.UNKNOWN
     assert state.active_quiet_window_ids == frozenset()
     assert state.quiet_window_notice_ids == frozenset()
+    assert state.owner_quiet_window_alert_ids == frozenset()
     assert logger_records(stream) == [
         {
             "event": "state-loaded",
@@ -66,6 +67,11 @@ def test_state_json_round_trips_occupancy_and_quiet_window_markers(tmp_path: Pat
                 "quiet-window-ended:street_sweeping:2026-05-18:13:00-15:00",
             }
         ),
+        owner_quiet_window_alert_ids=frozenset(
+            {
+                "owner-vehicle-quiet-window-alert:right_spot:prof_tesla:street_sweeping:2026-05-18:13:00-15:00",
+            }
+        ),
     )
 
     save_runtime_state(path, original)
@@ -96,6 +102,9 @@ def test_state_json_round_trips_occupancy_and_quiet_window_markers(tmp_path: Pat
         "quiet_window_notice_ids": [
             "quiet-window-ended:street_sweeping:2026-05-18:13:00-15:00",
             "quiet-window-started:street_sweeping:2026-05-18:13:00-15:00",
+        ],
+        "owner_quiet_window_alert_ids": [
+            "owner-vehicle-quiet-window-alert:right_spot:prof_tesla:street_sweeping:2026-05-18:13:00-15:00",
         ],
     }
 
