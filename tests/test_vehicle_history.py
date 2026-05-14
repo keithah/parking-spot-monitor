@@ -23,6 +23,7 @@ from parking_spot_monitor.vehicle_history import (
     estimate_session_history,
 )
 from parking_spot_monitor.vehicle_history_images import VehicleHistoryImageError, clamp_crop_box
+from parking_spot_monitor.vehicle_profiles import MatchResult, MatchStatus
 
 
 def logger_records(stream: StringIO) -> list[dict[str, object]]:
@@ -688,6 +689,59 @@ def test_match_or_create_profile_matches_existing_profile_and_is_idempotent(tmp_
     records = logger_records(stream)
     assert any(record["event"] == "vehicle-session-profile-matched" for record in records)
     assert any(record["event"] == "vehicle-session-profile-noop" for record in records)
+
+
+def test_match_or_create_profile_does_not_update_owner_profile_for_low_confidence_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stream = StringIO()
+    archive = VehicleHistoryArchive(tmp_path, logger=setup_logging(stream=stream))
+    first = archive.start_session(occupied_event(spot_id="owner", observed_at="2026-05-18T13:00:00Z"))
+    first_source = write_test_jpeg(tmp_path / "owner.jpg", size=(96, 48), color=(120, 40, 40))
+    archive.attach_occupied_images(session_id=first.session_id, source_frame_path=first_source, bbox=(0, 0, 96, 48))
+    created = archive.match_or_create_profile(session_id=first.session_id)
+    assert created.profile_id is not None
+    archive.close_session(open_event(spot_id="owner", observed_at="2026-05-18T13:02:00Z"))
+    owner_registry_path = tmp_path / "vehicle-history" / "owner-vehicles.json"
+    owner_registry_path.write_text(
+        json.dumps({"schema_version": 1, "owner_vehicles": [{"profile_id": created.profile_id, "label": "Keith's black Tesla"}]}),
+        encoding="utf-8",
+    )
+
+    candidate = archive.start_session(occupied_event(spot_id="left", observed_at="2026-05-18T13:03:00Z"))
+    candidate_source = write_test_jpeg(tmp_path / "candidate.jpg", size=(96, 48), color=(122, 42, 42))
+    archive.attach_occupied_images(session_id=candidate.session_id, source_frame_path=candidate_source, bbox=(0, 0, 96, 48))
+    profile_path = tmp_path / "vehicle-history" / "profiles" / "active" / f"{created.profile_id}.json"
+    active_path = tmp_path / "vehicle-history" / "sessions" / "active" / f"{candidate.session_id}.json"
+    before_profile = profile_path.read_text(encoding="utf-8")
+    before_session = active_path.read_text(encoding="utf-8")
+
+    def low_confidence_owner_match(_descriptor: object, _profiles: object) -> MatchResult:
+        return MatchResult(
+            status=MatchStatus.MATCHED,
+            profile_id=created.profile_id,
+            confidence=0.90,
+            distance=0.10,
+            reason="forced-low-confidence-owner-match",
+        )
+
+    monkeypatch.setattr("parking_spot_monitor.vehicle_history.match_vehicle_profile", low_confidence_owner_match)
+
+    assignment = archive.match_or_create_profile(session_id=candidate.session_id)
+
+    assert assignment.status == "unknown"
+    assert assignment.profile_id is None
+    assert assignment.profile_confidence is None
+    assert assignment.reason == "owner-profile-confidence-too-low"
+    assert profile_path.read_text(encoding="utf-8") == before_profile
+    assert active_path.read_text(encoding="utf-8") == before_session
+    records = logger_records(stream)
+    assert any(
+        record["event"] == "vehicle-session-profile-owner-match-skipped"
+        and record["reason"] == "owner-profile-confidence-too-low"
+        and record["profile_confidence"] == 0.90
+        for record in records
+    )
 
 
 def test_ambiguous_profile_match_leaves_session_and_profiles_unchanged(tmp_path: Path) -> None:
