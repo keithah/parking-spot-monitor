@@ -341,6 +341,7 @@ def test_example_config_exposes_operator_calibration_and_runtime_fields() -> Non
         ("spots", "left_spot", "polygon"),
         ("spots", "right_spot", "polygon"),
         ("detection", "confidence_threshold"),
+        ("detection", "inference_image_size"),
         ("detection", "min_bbox_area_px"),
         ("detection", "min_polygon_overlap_ratio"),
         ("detection", "vehicle_classes"),

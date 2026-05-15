@@ -158,13 +158,21 @@ class UltralyticsVehicleDetector:
                 phase="model_load",
             ) from exc
 
-    def detect(self, frame_path: str | PathLike[str], *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+    def detect(
+        self,
+        frame_path: str | PathLike[str],
+        *,
+        confidence_threshold: float | None = None,
+        inference_image_size: int | None = None,
+    ) -> list[VehicleDetection]:
         """Run one model prediction and normalize all result batches."""
 
         safe_frame_path = str(frame_path)
         predict_kwargs: dict[str, Any] = {"source": safe_frame_path, "verbose": False}
         if confidence_threshold is not None:
             predict_kwargs["conf"] = confidence_threshold
+        if inference_image_size is not None:
+            predict_kwargs["imgsz"] = inference_image_size
 
         try:
             results = self._model.predict(**predict_kwargs)

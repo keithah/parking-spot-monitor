@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import math
 import os
 import sys
@@ -510,7 +511,7 @@ def _process_detection_for_capture(
     mode: str,
     iteration: int | None = None,
 ) -> DetectionFilterResult:
-    detections = detector.detect(latest_path, confidence_threshold=settings.detection.confidence_threshold)
+    detections = _detect_vehicles_for_frame(settings, detector, latest_path)
     actual_frame_size = _image_size(latest_path)
     configured_frame_size = (settings.stream.frame_width, settings.stream.frame_height)
     frame_size_mismatch = actual_frame_size is not None and actual_frame_size != configured_frame_size
@@ -548,6 +549,25 @@ def _process_detection_for_capture(
         fields["iteration"] = iteration
     logger.info("detection-frame-processed", **fields)
     return result
+
+
+def _detect_vehicles_for_frame(settings: RuntimeSettings, detector: Any, latest_path: Path) -> list[Any]:
+    kwargs: dict[str, Any] = {"confidence_threshold": settings.detection.confidence_threshold}
+    if _detect_accepts_inference_image_size(detector):
+        kwargs["inference_image_size"] = settings.detection.inference_image_size
+    return detector.detect(latest_path, **kwargs)
+
+
+def _detect_accepts_inference_image_size(detector: Any) -> bool:
+    detect = getattr(detector, "detect", None)
+    try:
+        signature = inspect.signature(detect)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or name == "inference_image_size"
+        for name, parameter in signature.parameters.items()
+    )
 
 
 def _update_runtime_state_for_frame(
