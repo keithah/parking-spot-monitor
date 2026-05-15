@@ -40,6 +40,32 @@ def detection(
     return VehicleDetection(class_name=class_name, confidence=confidence, bbox=bbox)
 
 
+
+
+def test_translate_crop_detection_to_full_frame_coordinates() -> None:
+    from parking_spot_monitor.detection import translate_crop_detection
+
+    translated = translate_crop_detection(
+        VehicleDetection(class_name="car", confidence=0.81, bbox=(10, 20, 110, 220)),
+        offset_x=900,
+        offset_y=140,
+    )
+
+    assert translated == VehicleDetection(class_name="car", confidence=0.81, bbox=(910, 160, 1010, 360))
+
+
+def test_crop_region_for_polygon_clamps_margin_to_frame_bounds() -> None:
+    from parking_spot_monitor.detection import crop_region_for_polygon
+
+    region = crop_region_for_polygon(
+        [(5, 10), (40, 5), (45, 35), (12, 50)],
+        frame_size=(100, 80),
+        margin_px=12,
+    )
+
+    assert region.spot_id is None
+    assert (region.left, region.top, region.right, region.bottom) == (0, 0, 57, 62)
+
 def test_filter_spot_detections_accepts_left_and_right_candidates() -> None:
     result = filter_spot_detections(
         [detection((10, 10, 90, 90)), detection((210, 10, 290, 90), confidence=0.8)],

@@ -75,6 +75,17 @@ class RejectionReason(StrEnum):
 
 
 @dataclass(frozen=True)
+class DetectionCropRegion:
+    """Pixel rectangle used for optional spot-level detector inference."""
+
+    left: int
+    top: int
+    right: int
+    bottom: int
+    spot_id: str | None = None
+
+
+@dataclass(frozen=True)
 class VehicleDetection:
     """Detector-neutral vehicle bbox emitted by a model adapter."""
 
@@ -186,6 +197,43 @@ class UltralyticsVehicleDetector:
                 phase="predict",
                 frame_path=safe_frame_path,
             ) from exc
+
+
+def translate_crop_detection(detection: VehicleDetection, *, offset_x: int, offset_y: int) -> VehicleDetection:
+    """Translate a crop-relative detector bbox back into full-frame coordinates."""
+
+    x_min, y_min, x_max, y_max = detection.bbox
+    return VehicleDetection(
+        class_name=detection.class_name,
+        confidence=detection.confidence,
+        bbox=(x_min + offset_x, y_min + offset_y, x_max + offset_x, y_max + offset_y),
+    )
+
+
+def crop_region_for_polygon(
+    polygon: PolygonInput,
+    *,
+    frame_size: tuple[int, int],
+    margin_px: int,
+    spot_id: str | None = None,
+) -> DetectionCropRegion:
+    """Return a clamped crop rectangle around a configured spot polygon."""
+
+    if margin_px < 0:
+        raise ValueError("margin_px must be non-negative")
+    width, height = frame_size
+    if width <= 0 or height <= 0:
+        raise ValueError("frame_size must contain positive dimensions")
+    points = [(float(x), float(y)) for x, y in polygon]
+    if not points:
+        raise ValueError("polygon must contain at least one point")
+    left = max(0, int(math.floor(min(x for x, _ in points) - margin_px)))
+    top = max(0, int(math.floor(min(y for _, y in points) - margin_px)))
+    right = min(width, int(math.ceil(max(x for x, _ in points) + margin_px)))
+    bottom = min(height, int(math.ceil(max(y for _, y in points) + margin_px)))
+    if right <= left or bottom <= top:
+        raise ValueError("crop region must have positive area")
+    return DetectionCropRegion(left=left, top=top, right=right, bottom=bottom, spot_id=spot_id)
 
 
 def filter_spot_detections(

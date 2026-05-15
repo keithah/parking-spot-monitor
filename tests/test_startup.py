@@ -181,6 +181,62 @@ class FakeCommandPollResult:
 
 
 
+def test_process_detection_uses_spot_crop_inference_to_recover_full_frame_miss(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example").read_text(encoding="utf-8").replace("spot_crop_inference: false", "spot_crop_inference: true"),
+        encoding="utf-8",
+    )
+    frame = tmp_path / "latest.jpg"
+    Image.new("RGB", (1458, 806), (20, 30, 40)).save(frame, format="JPEG")
+
+    class FullMissCropDetector:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Path, tuple[int, int]]] = []
+
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            path = Path(frame_path)
+            with Image.open(path) as image:
+                size = image.size
+            self.calls.append((path, size))
+            assert confidence_threshold == 0.35
+            assert inference_image_size == 1280
+            if size == (1458, 806):
+                return []
+            if size == (531, 296):
+                return [VehicleDetection(class_name="car", confidence=0.88, bbox=(98, 93, 483, 233))]
+            return []
+
+    from parking_spot_monitor.__main__ import _process_detection_for_capture
+
+    settings = load_settings(config_path, environ=fake_environ())
+    detector = FullMissCropDetector()
+
+    result = _process_detection_for_capture(
+        settings,
+        detector,
+        frame,
+        logger=StructuredLogger(),
+        mode="test",
+    )
+
+    right = result.by_spot["right_spot"].accepted
+    assert right is not None
+    assert right.bbox == pytest.approx((1010, 215, 1395, 355))
+    assert [size for _path, size in detector.calls] == [(1458, 806), (526, 276), (531, 296)]
+    output = combined_output(capsys)
+    assert '"spot_crop_inference_enabled":true' in output
+    assert '"spot_crop_detection_count":1' in output
+
+
 def test_process_detection_scales_configured_polygons_to_actual_frame_size(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

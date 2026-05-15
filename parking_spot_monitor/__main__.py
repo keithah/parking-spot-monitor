@@ -5,6 +5,7 @@ import inspect
 import math
 import os
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -20,7 +21,9 @@ from parking_spot_monitor.detection import (
     RejectionReason,
     SpotDetectionCandidate,
     UltralyticsVehicleDetector,
+    crop_region_for_polygon,
     filter_spot_detections,
+    translate_crop_detection,
 )
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.health import HealthStatus, write_health_status
@@ -511,14 +514,23 @@ def _process_detection_for_capture(
     mode: str,
     iteration: int | None = None,
 ) -> DetectionFilterResult:
-    detections = _detect_vehicles_for_frame(settings, detector, latest_path)
     actual_frame_size = _image_size(latest_path)
     configured_frame_size = (settings.stream.frame_width, settings.stream.frame_height)
     frame_size_mismatch = actual_frame_size is not None and actual_frame_size != configured_frame_size
     scale = _frame_scale(configured_frame_size=configured_frame_size, actual_frame_size=actual_frame_size)
+    spot_polygons = _configured_spot_polygons(settings, scale=scale)
+    full_frame_detections = _detect_vehicles_for_frame(settings, detector, latest_path)
+    spot_crop_detections = _detect_spot_crop_vehicles_for_frame(
+        settings,
+        detector,
+        latest_path,
+        spot_polygons=spot_polygons,
+        actual_frame_size=actual_frame_size,
+    )
+    detections = [*full_frame_detections, *spot_crop_detections]
     result = filter_spot_detections(
         detections,
-        spots=_configured_spot_polygons(settings, scale=scale),
+        spots=spot_polygons,
         allowed_classes=settings.detection.vehicle_classes,
         confidence_threshold=settings.detection.confidence_threshold,
         min_bbox_area_px=_scaled_min_bbox_area(settings.detection.min_bbox_area_px, scale=scale),
@@ -531,6 +543,9 @@ def _process_detection_for_capture(
         "frame_path": str(latest_path),
         "spot_ids": list(result.by_spot.keys()),
         "detection_count": len(detections),
+        "full_frame_detection_count": len(full_frame_detections),
+        "spot_crop_inference_enabled": settings.detection.spot_crop_inference,
+        "spot_crop_detection_count": len(spot_crop_detections),
         "accepted_count": sum(1 for spot in result.by_spot.values() if spot.accepted is not None),
         "accepted_by_spot": _accepted_by_spot(result),
         "rejection_counts": _stringify_rejection_counts(result),
@@ -549,6 +564,42 @@ def _process_detection_for_capture(
         fields["iteration"] = iteration
     logger.info("detection-frame-processed", **fields)
     return result
+
+
+def _detect_spot_crop_vehicles_for_frame(
+    settings: RuntimeSettings,
+    detector: Any,
+    latest_path: Path,
+    *,
+    spot_polygons: Mapping[str, Sequence[tuple[float, float]]],
+    actual_frame_size: tuple[int, int] | None,
+) -> list[Any]:
+    if not settings.detection.spot_crop_inference or actual_frame_size is None:
+        return []
+
+    try:
+        from PIL import Image
+
+        translated: list[Any] = []
+        with tempfile.TemporaryDirectory(prefix="spot-crops-", dir=str(latest_path.parent)) as temp_dir:
+            temp_root = Path(temp_dir)
+            with Image.open(latest_path) as image:
+                for spot_id, polygon in spot_polygons.items():
+                    region = crop_region_for_polygon(
+                        polygon,
+                        frame_size=actual_frame_size,
+                        margin_px=settings.detection.spot_crop_margin_px,
+                        spot_id=spot_id,
+                    )
+                    crop_path = temp_root / f"{spot_id}.jpg"
+                    image.crop((region.left, region.top, region.right, region.bottom)).save(crop_path, format="JPEG")
+                    translated.extend(
+                        translate_crop_detection(detection, offset_x=region.left, offset_y=region.top)
+                        for detection in _detect_vehicles_for_frame(settings, detector, crop_path)
+                    )
+        return translated
+    except DetectionError:
+        raise
 
 
 def _detect_vehicles_for_frame(settings: RuntimeSettings, detector: Any, latest_path: Path) -> list[Any]:
