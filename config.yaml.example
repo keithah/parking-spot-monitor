@@ -28,6 +28,13 @@ detection:
   inference_image_size: 1280
   spot_crop_inference: false
   spot_crop_margin_px: 48
+  open_suppression_min_confidence: 0.1
+  open_suppression_classes:
+    - car
+    - truck
+    - bus
+    - suitcase
+    - umbrella
   min_bbox_area_px: 1200
   min_polygon_overlap_ratio: 0.2
   vehicle_classes:

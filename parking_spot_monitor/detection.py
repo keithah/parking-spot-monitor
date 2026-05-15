@@ -313,16 +313,39 @@ def _evaluate_detection_for_spot(
     membership_bbox = _lower_half_bbox(detection.bbox)
     centroid = bbox_centroid(membership_bbox)
 
+    centroid_inside = point_in_polygon(centroid, polygon)
+    overlap_ratio = bbox_polygon_overlap_ratio(membership_bbox, polygon) if centroid_inside else 0.0
+
     if detection.class_name not in allowed_classes:
-        return RejectedDetection(spot_id=spot_id, detection=detection, reason=RejectionReason.CLASS_NOT_ALLOWED, bbox_area_px=area, centroid=centroid)
+        return RejectedDetection(
+            spot_id=spot_id,
+            detection=detection,
+            reason=RejectionReason.CLASS_NOT_ALLOWED,
+            bbox_area_px=area,
+            centroid=centroid,
+            overlap_ratio=overlap_ratio,
+        )
     if detection.confidence < confidence_threshold:
-        return RejectedDetection(spot_id=spot_id, detection=detection, reason=RejectionReason.CONFIDENCE_TOO_LOW, bbox_area_px=area, centroid=centroid)
+        return RejectedDetection(
+            spot_id=spot_id,
+            detection=detection,
+            reason=RejectionReason.CONFIDENCE_TOO_LOW,
+            bbox_area_px=area,
+            centroid=centroid,
+            overlap_ratio=overlap_ratio,
+        )
     if area < min_bbox_area_px:
-        return RejectedDetection(spot_id=spot_id, detection=detection, reason=RejectionReason.AREA_TOO_SMALL, bbox_area_px=area, centroid=centroid)
-    if not point_in_polygon(centroid, polygon):
+        return RejectedDetection(
+            spot_id=spot_id,
+            detection=detection,
+            reason=RejectionReason.AREA_TOO_SMALL,
+            bbox_area_px=area,
+            centroid=centroid,
+            overlap_ratio=overlap_ratio,
+        )
+    if not centroid_inside:
         return RejectedDetection(spot_id=spot_id, detection=detection, reason=RejectionReason.CENTROID_OUTSIDE, bbox_area_px=area, centroid=centroid)
 
-    overlap_ratio = bbox_polygon_overlap_ratio(membership_bbox, polygon)
     if overlap_ratio < min_polygon_overlap_ratio:
         return RejectedDetection(
             spot_id=spot_id,

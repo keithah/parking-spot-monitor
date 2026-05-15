@@ -207,7 +207,7 @@ def test_process_detection_uses_spot_crop_inference_to_recover_full_frame_miss(
             with Image.open(path) as image:
                 size = image.size
             self.calls.append((path, size))
-            assert confidence_threshold == 0.35
+            assert confidence_threshold == 0.1
             assert inference_image_size == 1280
             if size == (1458, 806):
                 return []
@@ -2045,7 +2045,7 @@ def test_capture_once_success_writes_debug_overlay_then_spot_filtered_detection(
     class FakeDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
             assert Path(frame_path) == latest_path
-            assert confidence_threshold == 0.35
+            assert confidence_threshold == 0.1
             calls.append(("detect", Path(frame_path)))
             return [
                 VehicleDetection(class_name="car", confidence=0.9, bbox=(350, 200, 550, 330)),
@@ -2336,7 +2336,7 @@ def test_runtime_loop_success_logs_detection_frame_processed_with_metadata(
     class FakeDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
             assert Path(frame_path) == latest_path
-            assert confidence_threshold == 0.35
+            assert confidence_threshold == 0.1
             return [VehicleDetection(class_name="truck", confidence=0.88, bbox=(350, 200, 550, 330))]
 
     exit_code = _main(
@@ -3041,6 +3041,60 @@ def test_runtime_loop_matrix_upload_failure_logs_safe_context_and_retains_copied
     assert "Traceback" not in output
     assert "raw_image_bytes abc" not in output
     assert_no_secret_leak(output)
+
+
+def test_runtime_loop_low_confidence_in_spot_vehicle_suppresses_open_alert(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(Path("config.yaml.example").read_text(encoding="utf-8"), encoding="utf-8")
+    state_path = tmp_path / "state.json"
+    save_runtime_state(
+        state_path,
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(
+                    status=OccupancyStatus.OCCUPIED,
+                    hit_streak=3,
+                    miss_streak=0,
+                    last_bbox=(350.0, 200.0, 550.0, 330.0),
+                    open_event_emitted=False,
+                ),
+                "right_spot": SpotOccupancyState(),
+            }
+        ),
+    )
+
+    class LowConfidenceDetector:
+        def __init__(self) -> None:
+            self.thresholds: list[float | None] = []
+
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            self.thresholds.append(confidence_threshold)
+            return [VehicleDetection(class_name="car", confidence=0.12, bbox=(350, 200, 550, 330))]
+
+    detector = LowConfidenceDetector()
+
+    exit_code = _main(
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: detector,
+        sleep=lambda _seconds: None,
+        max_iterations=3,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    state = runtime_state_payload(state_path)["spots"]["left_spot"]
+    assert exit_code == 0
+    assert detector.thresholds == [0.1, 0.1, 0.1]
+    assert state["status"] == "occupied"
+    assert state["miss_streak"] == 0
+    assert '"event":"occupancy-open-event"' not in output
+    assert '"event":"spot-detection-miss-diagnostic"' in output
+    assert '"suppressing_presence":true' in output
 
 
 def test_presence_by_spot_treats_small_in_spot_vehicle_as_release_suppression() -> None:

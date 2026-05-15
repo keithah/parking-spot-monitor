@@ -80,6 +80,8 @@ class DetectionConfig(StrictModel):
     inference_image_size: int | None = Field(default=None, gt=0)
     spot_crop_inference: bool = False
     spot_crop_margin_px: int = Field(default=48, ge=0)
+    open_suppression_min_confidence: float = Field(default=0.1, ge=0, le=1)
+    open_suppression_classes: list[str] = Field(default_factory=lambda: ["car", "truck", "bus", "suitcase", "umbrella"])
     vehicle_classes: list[str] = Field(default_factory=list)
     min_bbox_area_px: float = Field(gt=0)
     min_polygon_overlap_ratio: float = Field(ge=0, le=1)
@@ -229,6 +231,8 @@ class RuntimeSettings(StrictModel):
                 "inference_image_size": self.detection.inference_image_size,
                 "spot_crop_inference": self.detection.spot_crop_inference,
                 "spot_crop_margin_px": self.detection.spot_crop_margin_px,
+                "open_suppression_min_confidence": self.detection.open_suppression_min_confidence,
+                "open_suppression_classes": list(self.detection.open_suppression_classes),
                 "vehicle_classes": list(self.detection.vehicle_classes),
                 "min_bbox_area_px": self.detection.min_bbox_area_px,
                 "min_polygon_overlap_ratio": self.detection.min_polygon_overlap_ratio,
