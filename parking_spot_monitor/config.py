@@ -77,6 +77,7 @@ class StreamConfig(StrictModel):
 class DetectionConfig(StrictModel):
     model: str = Field(min_length=1)
     confidence_threshold: float = Field(ge=0, le=1)
+    inference_image_size: int | None = Field(default=None, gt=0)
     vehicle_classes: list[str] = Field(default_factory=list)
     min_bbox_area_px: float = Field(gt=0)
     min_polygon_overlap_ratio: float = Field(ge=0, le=1)
@@ -223,6 +224,7 @@ class RuntimeSettings(StrictModel):
             "detection": {
                 "model": self.detection.model,
                 "confidence_threshold": self.detection.confidence_threshold,
+                "inference_image_size": self.detection.inference_image_size,
                 "vehicle_classes": list(self.detection.vehicle_classes),
                 "min_bbox_area_px": self.detection.min_bbox_area_px,
                 "min_polygon_overlap_ratio": self.detection.min_polygon_overlap_ratio,

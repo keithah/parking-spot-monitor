@@ -199,6 +199,7 @@ def test_detection_config_rejects_invalid_thresholds(kwargs: dict[str, float]) -
         "vehicle_classes": ["car"],
         "min_bbox_area_px": 500,
         "min_polygon_overlap_ratio": 0.25,
+        "inference_image_size": 1280,
     }
     values.update(kwargs)
 
@@ -277,6 +278,16 @@ class FakeTensor:
 
     def tolist(self) -> object:
         return self.value
+
+
+def test_ultralytics_detector_forwards_configured_inference_image_size(tmp_path) -> None:
+    detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
+
+    detector.detect(tmp_path / "frame.jpg", confidence_threshold=0.35, inference_image_size=1280)
+
+    assert detector._model.predict_calls == [  # type: ignore[attr-defined]
+        {"source": str(tmp_path / "frame.jpg"), "conf": 0.35, "imgsz": 1280, "verbose": False}
+    ]
 
 
 def test_ultralytics_detector_normalizes_fake_results_and_forwards_confidence(tmp_path) -> None:
