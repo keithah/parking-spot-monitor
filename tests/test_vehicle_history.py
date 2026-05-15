@@ -691,6 +691,100 @@ def test_match_or_create_profile_matches_existing_profile_and_is_idempotent(tmp_
     assert any(record["event"] == "vehicle-session-profile-noop" for record in records)
 
 
+def test_assign_owner_profile_to_active_spot_updates_session_and_profile_sample(tmp_path: Path) -> None:
+    stream = StringIO()
+    archive = VehicleHistoryArchive(tmp_path, logger=setup_logging(stream=stream))
+    first = archive.start_session(occupied_event(spot_id="right_spot", observed_at="2026-05-18T13:00:00Z"))
+    first_source = write_test_jpeg(tmp_path / "owner-first.jpg", size=(96, 48), color=(120, 40, 40))
+    archive.attach_occupied_images(session_id=first.session_id, source_frame_path=first_source, bbox=(0, 0, 96, 48))
+    created = archive.match_or_create_profile(session_id=first.session_id)
+    assert created.profile_id is not None
+    archive.close_session(open_event(spot_id="right_spot", observed_at="2026-05-18T13:02:00Z"))
+    (tmp_path / "vehicle-history" / "owner-vehicles.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "owner_vehicles": [
+                    {
+                        "profile_id": created.profile_id,
+                        "label": "Keith's black Tesla",
+                        "description": "black Tesla, tinted windows, roof rack",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    current = archive.start_session(occupied_event(spot_id="right_spot", observed_at="2026-05-18T13:03:00Z"))
+    current_source = write_test_jpeg(tmp_path / "owner-current.jpg", size=(120, 60), color=(121, 41, 41))
+    archive.attach_occupied_images(session_id=current.session_id, source_frame_path=current_source, bbox=(0, 0, 120, 60))
+
+    assignment = archive.assign_owner_profile_to_active_spot("right_spot")
+
+    assert assignment.status == "owner_assigned"
+    assert assignment.session_id == current.session_id
+    assert assignment.profile_id == created.profile_id
+    assert assignment.profile_confidence == pytest.approx(1.0)
+    active_path = tmp_path / "vehicle-history" / "sessions" / "active" / f"{current.session_id}.json"
+    active_payload = json.loads(active_path.read_text(encoding="utf-8"))
+    assert active_payload["profile_id"] == created.profile_id
+    assert active_payload["profile_confidence"] == pytest.approx(1.0)
+    profile_path = tmp_path / "vehicle-history" / "profiles" / "active" / f"{created.profile_id}.json"
+    profile_payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert profile_payload["sample_count"] == 2
+    assert profile_payload["sample_session_ids"] == [first.session_id, current.session_id]
+    records = logger_records(stream)
+    assert any(
+        record["event"] == "vehicle-session-owner-profile-assigned"
+        and record["spot_id"] == "right_spot"
+        and record["session_id"] == current.session_id
+        and record["profile_id"] == created.profile_id
+        for record in records
+    )
+
+
+def test_active_spot_assignments_summarizes_owner_and_unknown_active_sessions(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    owner_session = archive.start_session(occupied_event(spot_id="right_spot", observed_at="2026-05-18T13:00:00Z"))
+    owner_source = write_test_jpeg(tmp_path / "owner-current.jpg", size=(96, 48), color=(120, 40, 40))
+    archive.attach_occupied_images(session_id=owner_session.session_id, source_frame_path=owner_source, bbox=(0, 0, 96, 48))
+    created = archive.match_or_create_profile(session_id=owner_session.session_id)
+    assert created.profile_id is not None
+    (tmp_path / "vehicle-history" / "owner-vehicles.json").write_text(
+        json.dumps({"schema_version": 1, "owner_vehicles": [{"profile_id": created.profile_id, "label": "Keith's black Tesla"}]}),
+        encoding="utf-8",
+    )
+    unknown = archive.start_session(occupied_event(spot_id="left_spot", observed_at="2026-05-18T13:05:00Z"))
+    unknown_source = write_test_jpeg(tmp_path / "unknown.jpg", size=(96, 48), color=(90, 90, 90))
+    archive.attach_occupied_images(session_id=unknown.session_id, source_frame_path=unknown_source, bbox=(0, 0, 96, 48))
+
+    assignments = archive.active_spot_assignments()
+
+    assert assignments == [
+        {
+            "spot_id": "left_spot",
+            "session_id": unknown.session_id,
+            "profile_id": None,
+            "profile_label": None,
+            "profile_confidence": None,
+            "is_owner": False,
+            "owner_label": None,
+            "profile_sample_count": None,
+        },
+        {
+            "spot_id": "right_spot",
+            "session_id": owner_session.session_id,
+            "profile_id": created.profile_id,
+            "profile_label": "Keith's black Tesla",
+            "profile_confidence": 1.0,
+            "is_owner": True,
+            "owner_label": "Keith's black Tesla",
+            "profile_sample_count": 1,
+        },
+    ]
+
+
 def test_match_or_create_profile_does_not_update_owner_profile_for_low_confidence_match(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

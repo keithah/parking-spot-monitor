@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import time
@@ -562,6 +563,16 @@ class MatrixCommandService:
             session_id = self._resolve_wrong_match_subject(command.subject_id)
             applied = self.archive.mark_wrong_match(session_id, matrix_event_id=event.event_id, matrix_sender=event.sender, matrix_room_id=event.room_id)
             return f"Wrong match recorded for session {session_id}. Correction {applied.correction_id} recorded."
+        if command.action == "assign_owner":
+            assert command.subject_id is not None
+            assignment = self.archive.assign_owner_profile_to_active_spot(command.subject_id)
+            profile_id = _safe_text(getattr(assignment, "profile_id", None), default="unknown")
+            session_id = _safe_text(getattr(assignment, "session_id", None), default="unknown")
+            confidence = getattr(assignment, "profile_confidence", None)
+            confidence_text = _confidence_text(confidence)
+            return f"Owner vehicle assigned to {command.subject_id}: session {session_id}, profile {profile_id}, confidence {confidence_text}."
+        if command.action == "active_spot_assignments":
+            return _format_active_spot_assignments_reply(self.archive.active_spot_assignments())
         if command.action == "profile_summary":
             assert command.profile_id is not None
             summary = self._profile_summary(command.profile_id, event=event)
@@ -640,6 +651,14 @@ def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> Matr
         if len(parts) != 3:
             raise MatrixCommandParseError("usage: !parking wrong <spot_id|session_id>")
         return MatrixCommand(action="wrong_match", subject_id=_validate_subject_id(parts[2]))
+    if parts[1] == "owner":
+        if len(parts) != 3:
+            raise MatrixCommandParseError("usage: !parking owner <spot_id>")
+        return MatrixCommand(action="assign_owner", subject_id=_validate_subject_id(parts[2]))
+    if parts[1] == "who":
+        if len(parts) != 2:
+            raise MatrixCommandParseError("usage: !parking who")
+        return MatrixCommand(action="active_spot_assignments")
     raise MatrixCommandParseError("unknown command")
 
 
@@ -688,6 +707,30 @@ def _validate_label(value: str) -> str:
     if re.search(r"[\x00-\x1f\x7f]", label):
         raise MatrixCommandParseError("label contains control characters")
     return label
+
+
+def _format_active_spot_assignments_reply(assignments: Sequence[Mapping[str, Any]]) -> str:
+    if not assignments:
+        return "No active parking sessions."
+    lines = ["Active parking sessions:"]
+    for assignment in assignments:
+        spot_id = _safe_text(assignment.get("spot_id"), default="unknown_spot")
+        session_id = _safe_text(assignment.get("session_id"), default="unknown_session")
+        profile_label = _safe_text(assignment.get("profile_label"), default="unknown vehicle")
+        confidence_text = _confidence_text(assignment.get("profile_confidence"))
+        sample_count = assignment.get("profile_sample_count")
+        sample_text = "unknown" if not isinstance(sample_count, int) else str(sample_count)
+        if assignment.get("profile_id") is None:
+            lines.append(f"{spot_id}: occupied — unknown vehicle — session {session_id}")
+        else:
+            lines.append(f"{spot_id}: occupied — {profile_label} — confidence {confidence_text} — samples {sample_text} — session {session_id}")
+    return "\n".join(lines)
+
+
+def _confidence_text(value: object) -> str:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return f"{float(value):.2f}"
+    return "unknown"
 
 
 def _format_profile_summary_reply(summary: Mapping[str, Any]) -> str:
