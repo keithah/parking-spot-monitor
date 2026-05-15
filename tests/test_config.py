@@ -79,6 +79,8 @@ def test_example_config_loads_with_fake_env_values() -> None:
     assert settings.spots.left_spot.name == "Left spot"
     assert settings.spots.right_spot.name == "Right spot"
     assert settings.detection.inference_image_size == 1280
+    assert settings.detection.spot_crop_inference is False
+    assert settings.detection.spot_crop_margin_px == 48
 
 
 @pytest.mark.parametrize("model_value", ["yolov8n.pt", "models/custom-detector.pt"])
@@ -134,6 +136,8 @@ def test_sanitized_summary_never_contains_secret_values() -> None:
         "value": "**********",
     }
     assert summary["detection"]["inference_image_size"] == settings.detection.inference_image_size
+    assert summary["detection"]["spot_crop_inference"] == settings.detection.spot_crop_inference
+    assert summary["detection"]["spot_crop_margin_px"] == settings.detection.spot_crop_margin_px
     assert summary["detection"]["min_bbox_area_px"] == settings.detection.min_bbox_area_px
     assert summary["detection"]["min_polygon_overlap_ratio"] == settings.detection.min_polygon_overlap_ratio
     assert summary["quiet_windows"] == [
@@ -242,6 +246,7 @@ def test_missing_top_level_sections_are_rejected(tmp_path: Path, section: str) -
         ("detection", "min_bbox_area_px", "0"),
         ("detection", "min_polygon_overlap_ratio", "1.1"),
         ("detection", "inference_image_size", "0"),
+        ("detection", "spot_crop_margin_px", "-1"),
         ("occupancy", "iou_threshold", "-0.1"),
         ("occupancy", "confirm_frames", "0"),
     ],
@@ -256,6 +261,7 @@ def test_invalid_thresholds_and_counters_are_rejected(
         .replace(f"{field}: 1280", f"{field}: {bad_value}")
         .replace(f"{field}: 1200", f"{field}: {bad_value}")
         .replace(f"{field}: 0.2", f"{field}: {bad_value}")
+        .replace(f"{field}: 48", f"{field}: {bad_value}")
         .replace(f"{field}: 3", f"{field}: {bad_value}"),
     )
 

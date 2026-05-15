@@ -26,6 +26,8 @@ detection:
   model: yolov8n.pt
   confidence_threshold: 0.35
   inference_image_size: 1280
+  spot_crop_inference: false
+  spot_crop_margin_px: 48
   min_bbox_area_px: 1200
   min_polygon_overlap_ratio: 0.2
   vehicle_classes:
