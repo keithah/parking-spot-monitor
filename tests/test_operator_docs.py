@@ -53,6 +53,7 @@ def test_readme_documents_clean_machine_setup_sequence_and_operator_commands() -
             "docker compose logs -f parking-spot-monitor",
             "docker compose restart parking-spot-monitor",
             "docker compose down",
+            "!parking help",
             "!parking who",
             "!parking owner <spot_id>",
             "!parking wrong <spot_id|session_id>",

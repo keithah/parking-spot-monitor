@@ -573,6 +573,8 @@ class MatrixCommandService:
             return f"Owner vehicle assigned to {command.subject_id}: session {session_id}, profile {profile_id}, confidence {confidence_text}."
         if command.action == "active_spot_assignments":
             return _format_active_spot_assignments_reply(self.archive.active_spot_assignments())
+        if command.action == "help":
+            return _format_command_help_reply(self.command_prefix)
         if command.action == "profile_summary":
             assert command.profile_id is not None
             summary = self._profile_summary(command.profile_id, event=event)
@@ -659,6 +661,10 @@ def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> Matr
         if len(parts) != 2:
             raise MatrixCommandParseError("usage: !parking who")
         return MatrixCommand(action="active_spot_assignments")
+    if parts[1] == "help":
+        if len(parts) != 2:
+            raise MatrixCommandParseError("usage: !parking help")
+        return MatrixCommand(action="help")
     raise MatrixCommandParseError("unknown command")
 
 
@@ -707,6 +713,19 @@ def _validate_label(value: str) -> str:
     if re.search(r"[\x00-\x1f\x7f]", label):
         raise MatrixCommandParseError("label contains control characters")
     return label
+
+
+def _format_command_help_reply(command_prefix: str) -> str:
+    return (
+        "Parking monitor commands:\n"
+        f"{command_prefix} help — show this help text\n"
+        f"{command_prefix} who — list active parking sessions by spot\n"
+        f"{command_prefix} owner <spot_id> — mark the active vehicle in a spot as the configured owner vehicle\n"
+        f"{command_prefix} wrong <spot_id|session_id> — mark a vehicle profile match as wrong\n"
+        f"{command_prefix} profile summary <profile_id> — show a safe vehicle profile summary\n"
+        f"{command_prefix} profile rename <profile_id> <label> — set a human label for a profile\n"
+        f"{command_prefix} profile merge <source_profile_id> <target_profile_id> — merge one profile into another"
+    )
 
 
 def _format_active_spot_assignments_reply(assignments: Sequence[Mapping[str, Any]]) -> str:
