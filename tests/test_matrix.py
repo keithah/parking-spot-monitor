@@ -946,6 +946,10 @@ def test_parse_matrix_commands_are_strict_and_normalize_labels() -> None:
     assert (merge.action, merge.source_profile_id, merge.target_profile_id) == ("merge_profiles", "prof_source", "prof_target")
     wrong = parse_matrix_command("!parking wrong sess_123")
     assert (wrong.action, wrong.subject_id) == ("wrong_match", "sess_123")
+    owner = parse_matrix_command("!parking owner right_spot")
+    assert (owner.action, owner.subject_id) == ("assign_owner", "right_spot")
+    who = parse_matrix_command("!parking who")
+    assert who.action == "active_spot_assignments"
     summary = parse_matrix_command("!parking profile summary prof_target")
     assert (summary.action, summary.profile_id) == ("profile_summary", "prof_target")
 
@@ -1019,6 +1023,35 @@ class FakeCommandArchive:
         self.corrections.append(correction)
         return {"profile_id": args[0], "label": "Blue hatchback", "closed_session_count": 2, "active_session_count": 1, "wrong_match_excluded_session_count": 0, "estimate_status": "estimated", "estimate_sample_count": 3}
 
+    def assign_owner_profile_to_active_spot(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append(("assign_owner_profile_to_active_spot", args, kwargs))
+        return type("Assignment", (), {"session_id": "sess_current", "profile_id": "prof_owner", "profile_confidence": 1.0})()
+
+    def active_spot_assignments(self) -> list[dict[str, Any]]:
+        self.calls.append(("active_spot_assignments", (), {}))
+        return [
+            {
+                "spot_id": "left_spot",
+                "session_id": "sess_left",
+                "profile_id": None,
+                "profile_label": None,
+                "profile_confidence": None,
+                "is_owner": False,
+                "owner_label": None,
+                "profile_sample_count": None,
+            },
+            {
+                "spot_id": "right_spot",
+                "session_id": "sess_current",
+                "profile_id": "prof_owner",
+                "profile_label": "Keith's black Tesla",
+                "profile_confidence": 1.0,
+                "is_owner": True,
+                "owner_label": "Keith's black Tesla",
+                "profile_sample_count": 7,
+            },
+        ]
+
     def load_active_sessions(self) -> list[FakeSession]:
         return self.sessions
 
@@ -1062,6 +1095,8 @@ def test_command_service_authorizes_applies_and_replies_safely() -> None:
                     MatrixTextEvent(event_id="$rename", sender="@op:example", room_id=ROOM_ID, body="!parking profile rename prof_a Blue hatchback"),
                     MatrixTextEvent(event_id="$merge", sender="@op:example", room_id=ROOM_ID, body="!parking profile merge prof_a prof_b"),
                     MatrixTextEvent(event_id="$wrong", sender="@op:example", room_id=ROOM_ID, body="!parking wrong left_spot"),
+                    MatrixTextEvent(event_id="$owner", sender="@op:example", room_id=ROOM_ID, body="!parking owner right_spot"),
+                    MatrixTextEvent(event_id="$who", sender="@op:example", room_id=ROOM_ID, body="!parking who"),
                     MatrixTextEvent(event_id="$summary", sender="@op:example", room_id=ROOM_ID, body="!parking profile summary prof_b"),
                 ),
             )
@@ -1075,16 +1110,19 @@ def test_command_service_authorizes_applies_and_replies_safely() -> None:
 
     result = service.poll_once()
 
-    assert result.processed_count == 4
+    assert result.processed_count == 6
     assert result.error_count == 1
-    assert [call[0] for call in archive.calls] == ["rename_profile", "merge_profiles", "mark_wrong_match", "profile_summary"]
+    assert [call[0] for call in archive.calls] == ["rename_profile", "merge_profiles", "mark_wrong_match", "assign_owner_profile_to_active_spot", "active_spot_assignments", "profile_summary"]
     assert archive.calls[0][1] == ("prof_a", "Blue hatchback")
     assert archive.calls[0][2]["matrix_event_id"] == "$rename"
     assert archive.calls[2][1] == ("sess_current",)
     assert archive.cursor_writes[-1] == {"next_batch": "s3"}
-    assert len(replies) == 5
+    assert len(replies) == 7
     rendered_replies = "\n".join(reply["body"] for reply in replies)
     assert "not authorized" in rendered_replies
+    assert "Owner vehicle assigned to right_spot" in rendered_replies
+    assert "left_spot: occupied — unknown vehicle" in rendered_replies
+    assert "right_spot: occupied — Keith's black Tesla — confidence 1.00 — samples 7" in rendered_replies
     assert "Profile prof_b: Blue hatchback" in rendered_replies
     assert ACCESS_TOKEN not in rendered_replies
 

@@ -724,6 +724,73 @@ class VehicleHistoryArchive:
         )
         return ProfileAssignment(record.session_id, result.status.value, None, None, result.reason)
 
+    def assign_owner_profile_to_active_spot(self, spot_id: str) -> ProfileAssignment:
+        """Mark the active session in a spot as the configured owner vehicle."""
+
+        normalized_spot_id = _bounded_string(spot_id, "spot_id", max_length=220)
+        active_sessions = [record for record in self.load_active_sessions() if record.spot_id == normalized_spot_id]
+        if not active_sessions:
+            raise ArchiveSchemaError(f"no active session for spot {normalized_spot_id}")
+        active_sessions.sort(key=lambda record: record.started_at)
+        record = active_sessions[-1]
+        if record.occupied_crop_path is None:
+            raise ArchiveSchemaError("active session is missing occupied_crop_path")
+
+        owner_registry = load_owner_vehicle_registry(self.root / "owner-vehicles.json")
+        owner_profile_ids = sorted(owner_registry.vehicles_by_profile_id.keys())
+        if len(owner_profile_ids) != 1:
+            raise ArchiveSchemaError("exactly one owner vehicle profile is required")
+        owner_profile_id = owner_profile_ids[0]
+        profiles = {profile.profile_id: profile for profile in self.load_active_profiles()}
+        profile = profiles.get(owner_profile_id)
+        if profile is None:
+            raise ArchiveSchemaError("owner vehicle profile is missing")
+
+        try:
+            descriptor = extract_vehicle_descriptor(record.occupied_crop_path)
+        except (VehicleProfileDescriptorError, ValueError, OSError) as exc:
+            self._record_failure(phase="profile-match", path_name=Path(record.occupied_crop_path).name, error=exc, session_id=record.session_id)
+            raise ArchiveWriteError(_safe_error_message(exc)) from exc
+
+        updated_profile = _profile_with_sample(profile, descriptor=descriptor, session_id=record.session_id, crop_path=record.occupied_crop_path)
+        self._write_profile(self.active_profiles_dir / f"{updated_profile.profile_id}.json", updated_profile, phase="profile-match")
+        updated_record = _session_with_profile(record, profile_id=owner_profile_id, confidence=1.0)
+        self._write_record(self.active_dir / f"{record.session_id}.json", updated_record, phase="profile-match")
+        self._log(
+            "info",
+            "vehicle-session-owner-profile-assigned",
+            spot_id=record.spot_id,
+            session_id=record.session_id,
+            profile_id=owner_profile_id,
+            profile_confidence=1.0,
+        )
+        return ProfileAssignment(record.session_id, "owner_assigned", owner_profile_id, 1.0, "operator-confirmed-owner")
+
+    def active_spot_assignments(self) -> list[dict[str, Any]]:
+        """Return a safe operator summary of active sessions by spot."""
+
+        owner_registry = load_owner_vehicle_registry(self.root / "owner-vehicles.json")
+        profiles = {profile.profile_id: profile for profile in self.load_active_profiles()}
+        assignments: list[dict[str, Any]] = []
+        for record in self.load_active_sessions():
+            owner = owner_registry.owner_for_profile(record.profile_id)
+            profile = profiles.get(record.profile_id) if record.profile_id is not None else None
+            label = owner.label if owner is not None else self.effective_label(record.profile_id)
+            assignments.append(
+                {
+                    "spot_id": record.spot_id,
+                    "session_id": record.session_id,
+                    "profile_id": record.profile_id,
+                    "profile_label": label,
+                    "profile_confidence": record.profile_confidence,
+                    "is_owner": owner is not None,
+                    "owner_label": None if owner is None else owner.label,
+                    "profile_sample_count": None if profile is None else profile.sample_count,
+                }
+            )
+        assignments.sort(key=lambda item: str(item["spot_id"]))
+        return assignments
+
     def load_active_profiles(self) -> list[StoredVehicleProfile]:
         self.active_profiles_dir.mkdir(parents=True, exist_ok=True)
         profiles: list[StoredVehicleProfile] = []
