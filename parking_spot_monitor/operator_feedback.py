@@ -30,6 +30,7 @@ VALID_FEEDBACK_STATES = frozenset({"open", "occupied"})
 
 LoadState = Literal["available", "missing", "unavailable"]
 SpotState = Literal["open", "occupied"]
+FeedbackAppendStatus = Literal["appended", "duplicate", "failed"]
 
 _SENSITIVE_TOKEN_PATTERN = re.compile(r"(?i)\b(?:syt|mxt|ghp|glpat|sk|xox[baprs])-?[a-z0-9_./+=-]{8,}\b")
 _RAW_IMAGE_PREFIX_PATTERN = re.compile(r"\xff\xd8[\s\S]*")
@@ -117,6 +118,17 @@ class FeedbackLabelLoad:
     labels: tuple[FeedbackLabel, ...] = ()
     error_type: str | None = None
     quarantined_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class FeedbackAppendResult:
+    """Outcome from appending an operator feedback label."""
+
+    status: FeedbackAppendStatus
+    label_id: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.status != "failed"
 
 
 @dataclass(frozen=True)
@@ -215,7 +227,8 @@ class OperatorFeedbackLabeler:
             matrix_event_id=matrix_event_id,
             matrix_room_id_hash=hash_operator_identifier(matrix_room_id),
         )
-        if not append_feedback_label(self.labels_path, label, logger=self.logger):
+        append_result = append_feedback_label(self.labels_path, label, logger=self.logger)
+        if not append_result:
             reply = "Parking correction not recorded\nFeedback store unavailable (feedback_store_unavailable)."
             return FeedbackRecordResult(
                 recorded=False,
@@ -225,6 +238,16 @@ class OperatorFeedbackLabeler:
                 reported_state=candidate.reported_state,
                 evidence=evidence,
                 error_type="feedback_store_unavailable",
+            )
+        if append_result.status == "duplicate":
+            return FeedbackRecordResult(
+                recorded=True,
+                reply_text=format_duplicate_correction_reply(safe_spot, candidate.reported_state, state, evidence),
+                spot_id=safe_spot,
+                actual_state=state,
+                reported_state=candidate.reported_state,
+                evidence=evidence,
+                label_id=label_id,
             )
 
         append_decision_memory_record(
@@ -308,7 +331,7 @@ def append_feedback_label(
     max_labels: int = MAX_FEEDBACK_LABELS,
     max_file_bytes: int = MAX_FEEDBACK_FILE_BYTES,
     logger: StructuredLogger | None = None,
-) -> bool:
+) -> FeedbackAppendResult:
     """Append one sanitized feedback label with atomic write and bounded retention."""
 
     labels_path = Path(path)
@@ -318,16 +341,16 @@ def append_feedback_label(
         retained = list(loaded.labels)
         if new_label.matrix_event_id and any(existing.matrix_event_id == new_label.matrix_event_id for existing in retained):
             _log(logger, "debug", "operator-feedback-label-duplicate-skipped", path=labels_path, matrix_event_id=new_label.matrix_event_id)
-            return True
+            return FeedbackAppendResult(status="duplicate", label_id=new_label.label_id)
         retained.append(new_label)
         retained = retained[-_positive_limit(max_labels, MAX_FEEDBACK_LABELS) :]
         _write_feedback_labels(labels_path, retained)
     except Exception as exc:
         _log(logger, "warning", "operator-feedback-label-append-failed", path=labels_path, error_type=type(exc).__name__, error=str(exc))
-        return False
+        return FeedbackAppendResult(status="failed")
 
     _log(logger, "debug", "operator-feedback-label-appended", path=labels_path, label_count=len(retained), label_id=new_label.label_id)
-    return True
+    return FeedbackAppendResult(status="appended", label_id=new_label.label_id)
 
 
 def load_feedback_labels(
@@ -430,6 +453,16 @@ def validate_feedback_evidence(*, data_dir: str | Path, snapshot_path: str | Non
         return FeedbackEvidence("alert_snapshot", safe_relative, False, False, None, None, None, "invalid_jpeg")
 
     return FeedbackEvidence("alert_snapshot", safe_relative, True, True, width, height, byte_size, None)
+
+
+def format_duplicate_correction_reply(spot_id: str, reported_state: str, actual_state: str, evidence: FeedbackEvidence) -> str:
+    """Format an idempotent acknowledgement for a replayed Matrix correction event."""
+
+    return format_correction_reply(spot_id, reported_state, actual_state, evidence).replace(
+        "Parking correction recorded",
+        "Command already applied; acknowledgement repeated.",
+        1,
+    )
 
 
 def format_correction_reply(spot_id: str, reported_state: str, actual_state: str, evidence: FeedbackEvidence) -> str:

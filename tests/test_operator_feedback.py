@@ -284,6 +284,58 @@ def test_labeler_records_correction_from_latest_alert_with_retained_snapshot(tmp
     assert "@operator:example" not in (tmp_path / "operator-feedback-labels.json").read_text(encoding="utf-8")
 
 
+def test_labeler_repeats_duplicate_correction_ack_without_duplicate_label_or_memory(tmp_path: Path) -> None:
+    from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, load_decision_memory, make_decision_memory_record
+    from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler, feedback_labels_path, load_feedback_labels
+
+    memory_path = decision_memory_path(tmp_path)
+    assert append_decision_memory_record(
+        memory_path,
+        make_decision_memory_record(
+            "alert",
+            observed_at="2026-05-15T21:42:39Z",
+            spot_id="left_spot",
+            summary="occupancy-occupied-event sent",
+            details={
+                "event_type": "occupancy-occupied-event",
+                "event_id": "occupancy-occupied-event:left_spot:2026-05-15T21:42:39Z",
+                "outcome": "sent",
+                "snapshot_path": "snapshots/missing.jpg",
+            },
+        ),
+    )
+    labeler = OperatorFeedbackLabeler(data_dir=tmp_path)
+
+    first = labeler.record_correction(
+        spot_id="left_spot",
+        actual_state="open",
+        matrix_event_id="$duplicate-correct",
+        matrix_sender="@operator:example",
+        matrix_room_id="!room:example",
+        corrected_at="2026-05-16T17:42:39Z",
+    )
+    second = labeler.record_correction(
+        spot_id="left_spot",
+        actual_state="open",
+        matrix_event_id="$duplicate-correct",
+        matrix_sender="@operator:example",
+        matrix_room_id="!room:example",
+        corrected_at="2026-05-16T17:42:39Z",
+    )
+
+    assert first.recorded is True
+    assert second.recorded is True
+    assert "already applied" in second.reply_text.lower()
+    assert "acknowledgement repeated" in second.reply_text.lower()
+
+    loaded_labels = load_feedback_labels(feedback_labels_path(tmp_path))
+    assert len(loaded_labels.labels) == 1
+
+    loaded_memory = load_decision_memory(memory_path)
+    feedback_records = [record for record in loaded_memory.records if record.kind == "feedback"]
+    assert len(feedback_records) == 1
+
+
 def test_labeler_binds_correction_to_latest_sent_alert_not_newer_failed_alert(tmp_path: Path) -> None:
     from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, make_decision_memory_record
     from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler, feedback_labels_path, load_feedback_labels
