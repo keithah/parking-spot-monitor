@@ -15,6 +15,7 @@ from typing import Any
 
 from parking_spot_monitor.capture import CaptureError, capture_latest
 from parking_spot_monitor.config import RuntimeSettings, SpotConfig, load_settings
+from parking_spot_monitor.detection_lab import DetectionLabManager
 from parking_spot_monitor.detection import (
     DetectionError,
     DetectionFilterResult,
@@ -34,6 +35,7 @@ from parking_spot_monitor.matrix import (
     MatrixClient,
     MatrixCommandService,
     MatrixDelivery,
+    MatrixOperatorCockpitContext,
     OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
     owner_vehicle_quiet_window_event_id,
     MatrixError,
@@ -42,6 +44,7 @@ from parking_spot_monitor.matrix import (
     prune_event_snapshots,
 )
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus, update_occupancy
+from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, make_decision_memory_record
 from parking_spot_monitor.owner_vehicles import load_owner_vehicle_registry
 from parking_spot_monitor.paths import RuntimePaths, resolve_runtime_paths
 from parking_spot_monitor.scheduler import QuietWindowEventType, evaluate_quiet_windows, quiet_window_notice_events
@@ -312,6 +315,7 @@ def _capture_loop(
                     logger=logger,
                     mode="runtime-loop",
                     iteration=iteration,
+                    decision_memory_path=data_dir / "operator-decision-memory.json",
                 )
             except DetectionError as exc:
                 consecutive_detection_failures += 1
@@ -332,6 +336,7 @@ def _capture_loop(
                     state_path=state_path,
                     configured_spot_ids=spot_ids,
                     history_archive=effective_history_archive,
+                    decision_memory_path=data_dir / "operator-decision-memory.json",
                 )
                 runtime_state = frame_update.runtime_state
                 if frame_update.matrix_errors:
@@ -348,6 +353,7 @@ def _capture_loop(
                     matrix_command_service,
                     logger=logger,
                     iteration=iteration,
+                    decision_memory_path=data_dir / "operator-decision-memory.json",
                 )
                 if command_error is not None:
                     vehicle_history_failure_count += 1
@@ -433,7 +439,7 @@ def _default_matrix_delivery_factory(settings: RuntimeSettings, data_dir: Path, 
 
 def _default_matrix_command_service_factory(
     settings: RuntimeSettings,
-    _data_dir: Path,
+    data_dir: Path,
     logger: StructuredLogger,
     archive: VehicleHistoryArchive,
 ) -> MatrixCommandService | None:
@@ -445,6 +451,7 @@ def _default_matrix_command_service_factory(
             reason="no-authorized-senders",
         )
         return None
+    paths = resolve_runtime_paths(settings, data_dir)
     client = MatrixClient(
         homeserver=settings.matrix.homeserver,
         access_token=settings.matrix.access_token.value,
@@ -461,7 +468,29 @@ def _default_matrix_command_service_factory(
         command_prefix=settings.matrix.command_prefix,
         bot_user_id=settings.matrix.user_id,
         logger=logger,
+        cockpit_context=MatrixOperatorCockpitContext(
+            settings=settings,
+            data_dir=paths.data_dir,
+            health_path=paths.health_file,
+            state_path=paths.state_file,
+            latest_path=paths.latest_frame,
+            snapshots_dir=paths.snapshots_dir,
+            detection_lab_manager=_default_detection_lab_manager(settings, paths, logger),
+        ),
     )
+
+
+def _default_detection_lab_manager(
+    settings: RuntimeSettings,
+    paths: RuntimePaths,
+    logger: StructuredLogger,
+) -> DetectionLabManager:
+    del settings
+
+    def record_outcome(status_payload: Mapping[str, Any]) -> None:
+        _append_lab_outcome_memory(paths.decision_memory_file, status_payload, data_dir=paths.data_dir, logger=logger)
+
+    return DetectionLabManager(paths.data_dir, logger=logger, outcome_recorder=record_outcome)
 
 
 def _poll_matrix_commands_once(
@@ -469,13 +498,14 @@ def _poll_matrix_commands_once(
     *,
     logger: StructuredLogger,
     iteration: int,
+    decision_memory_path: Path | None = None,
 ) -> dict[str, Any] | None:
     if matrix_command_service is None:
         return None
     logger.info(
         "matrix-command-poll-attempt",
         phase="matrix-command",
-        action="vehicle-history-correction",
+        action="matrix-command",
         iteration=iteration,
     )
     try:
@@ -485,22 +515,48 @@ def _poll_matrix_commands_once(
             "matrix-command",
             exc,
             extra={
-                "action": "vehicle-history-correction",
+                "action": "matrix-command",
                 "iteration": iteration,
             },
         )
         logger.warning("matrix-command-poll-failed", **context)
+        _append_matrix_event_memory(
+            decision_memory_path,
+            event_name="matrix-command",
+            event={"event_id": f"poll:{iteration}"},
+            outcome="failed",
+            error_type=context.get("error_type"),
+            logger=logger,
+        )
         return context
     logger.info(
         "matrix-command-poll-succeeded",
         phase="matrix-command",
-        action="vehicle-history-correction",
+        action="matrix-command",
         iteration=iteration,
         processed_count=getattr(result, "processed_count", None),
         ignored_count=getattr(result, "ignored_count", None),
         error_count=getattr(result, "error_count", None),
         bootstrapped=getattr(result, "bootstrapped", None),
     )
+    if decision_memory_path is not None:
+        _append_decision_memory(
+            decision_memory_path,
+            "command_outcome",
+            spot_id=None,
+            observed_at=None,
+            summary="matrix-command poll polled",
+            details={
+                "event_type": "matrix-command",
+                "event_id": f"poll:{iteration}",
+                "outcome": "polled",
+                "processed_count": getattr(result, "processed_count", None),
+                "ignored_count": getattr(result, "ignored_count", None),
+                "error_count": getattr(result, "error_count", None),
+                "bootstrapped": getattr(result, "bootstrapped", None),
+            },
+            logger=logger,
+        )
     return None
 
 
@@ -513,6 +569,7 @@ def _process_detection_for_capture(
     logger: StructuredLogger,
     mode: str,
     iteration: int | None = None,
+    decision_memory_path: Path | None = None,
 ) -> DetectionFilterResult:
     actual_frame_size = _image_size(latest_path)
     configured_frame_size = (settings.stream.frame_width, settings.stream.frame_height)
@@ -563,6 +620,14 @@ def _process_detection_for_capture(
     if iteration is not None:
         fields["iteration"] = iteration
     logger.info("detection-frame-processed", **fields)
+    _append_detection_memory_records(
+        decision_memory_path,
+        result,
+        observed_at=frame_timestamp,
+        logger=logger,
+        mode=mode,
+        iteration=iteration,
+    )
     return result
 
 
@@ -638,6 +703,7 @@ def _update_runtime_state_for_frame(
     state_path: Path,
     configured_spot_ids: Sequence[str],
     history_archive: VehicleHistoryArchive | None = None,
+    decision_memory_path: Path | None = None,
 ) -> FrameUpdateResult:
     matrix_errors: list[dict[str, Any]] = []
     quiet_status = evaluate_quiet_windows(settings.quiet_windows, observed_at)
@@ -653,7 +719,13 @@ def _update_runtime_state_for_frame(
         payload = notice.to_dict()
         event_name = str(payload.pop("event_type"))
         logger.info(event_name, **payload)
-        matrix_error = _dispatch_matrix_event(matrix_delivery, event_name, payload | {"event_type": event_name}, logger=logger)
+        matrix_error = _dispatch_matrix_event(
+            matrix_delivery,
+            event_name,
+            payload | {"event_type": event_name},
+            logger=logger,
+            decision_memory_path=decision_memory_path,
+        )
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
         emitted_notice_ids.add(notice.event_id)
@@ -666,6 +738,11 @@ def _update_runtime_state_for_frame(
         min_polygon_overlap_ratio=settings.detection.min_polygon_overlap_ratio,
     )
 
+    presence_by_spot = _presence_by_spot(
+        detection_result,
+        open_suppression_classes=settings.detection.open_suppression_classes,
+        min_polygon_overlap_ratio=settings.detection.min_polygon_overlap_ratio,
+    )
     occupancy_update = update_occupancy(
         runtime_state.state_by_spot,
         {spot_id: spot_result.accepted for spot_id, spot_result in detection_result.by_spot.items()},
@@ -674,11 +751,18 @@ def _update_runtime_state_for_frame(
         quiet_status,
         snapshot_path,
         configured_spot_ids=configured_spot_ids,
-        presence_by_spot=_presence_by_spot(
-            detection_result,
-            open_suppression_classes=settings.detection.open_suppression_classes,
-            min_polygon_overlap_ratio=settings.detection.min_polygon_overlap_ratio,
-        ),
+        presence_by_spot=presence_by_spot,
+    )
+    _append_runtime_state_memory_records(
+        decision_memory_path,
+        previous_state=runtime_state,
+        next_state=occupancy_update.state_by_spot,
+        detection_result=detection_result,
+        quiet_status=quiet_status,
+        observed_at=observed_at,
+        configured_spot_ids=configured_spot_ids,
+        presence_by_spot=presence_by_spot,
+        logger=logger,
     )
     history_result = _record_vehicle_history_events(
         history_archive,
@@ -701,7 +785,13 @@ def _update_runtime_state_for_frame(
     for owner_alert in owner_alerts:
         event_name = str(owner_alert.get("event_type", OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE))
         logger.info(event_name, **{key: value for key, value in owner_alert.items() if key != "event_type"})
-        matrix_error = _dispatch_matrix_event(matrix_delivery, event_name, owner_alert, logger=logger)
+        matrix_error = _dispatch_matrix_event(
+            matrix_delivery,
+            event_name,
+            owner_alert,
+            logger=logger,
+            decision_memory_path=decision_memory_path,
+        )
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
         event_id = owner_alert.get("event_id")
@@ -714,6 +804,7 @@ def _update_runtime_state_for_frame(
             str(occupied_alert.get("event_type", OCCUPIED_SPOT_EVENT_TYPE)),
             occupied_alert,
             logger=logger,
+            decision_memory_path=decision_memory_path,
         )
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
@@ -722,7 +813,13 @@ def _update_runtime_state_for_frame(
         payload = event.to_dict()
         event_name = str(payload.pop("event_type"))
         logger.info(event_name, **payload)
-        matrix_error = _dispatch_matrix_event(matrix_delivery, event_name, payload | {"event_type": event_name}, logger=logger)
+        matrix_error = _dispatch_matrix_event(
+            matrix_delivery,
+            event_name,
+            payload | {"event_type": event_name},
+            logger=logger,
+            decision_memory_path=decision_memory_path,
+        )
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
 
@@ -1251,9 +1348,246 @@ def _best_rejected_detection(rejections: Sequence[Any]) -> Any | None:
     )[0]
 
 
-def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: Mapping[str, Any], *, logger: StructuredLogger) -> dict[str, Any] | None:
+def _append_detection_memory_records(
+    path: Path | None,
+    result: DetectionFilterResult,
+    *,
+    observed_at: Any | None,
+    logger: StructuredLogger,
+    mode: str,
+    iteration: int | None,
+) -> None:
+    if path is None:
+        return
+    for spot_id, spot_result in result.by_spot.items():
+        accepted = spot_result.accepted
+        rejected = list(spot_result.rejected)
+        common_details: dict[str, Any] = {
+            "mode": mode,
+            "iteration": iteration,
+            "rejected_count": len(rejected),
+            "weak_evidence_count": len(rejected),
+            "rejection_reasons": _rejection_reason_counts(rejected),
+        }
+        if accepted is not None:
+            _append_decision_memory(
+                path,
+                "accepted_evidence",
+                spot_id=spot_id,
+                observed_at=observed_at,
+                summary=f"accepted {accepted.class_name} evidence confidence={accepted.confidence:.2f}",
+                details=common_details | {"candidate": _candidate_summary(accepted)},
+                logger=logger,
+            )
+        elif rejected:
+            best = _best_rejected_detection(rejected)
+            _append_decision_memory(
+                path,
+                "rejected_evidence",
+                spot_id=spot_id,
+                observed_at=observed_at,
+                summary="no accepted candidate; rejected vehicle-like evidence present",
+                details=common_details | {"best_rejected": _rejected_summary(best) if best is not None else None},
+                logger=logger,
+            )
+        else:
+            _append_decision_memory(
+                path,
+                "miss",
+                spot_id=spot_id,
+                observed_at=observed_at,
+                summary="no vehicle evidence for configured spot",
+                details=common_details,
+                logger=logger,
+            )
+
+
+def _append_runtime_state_memory_records(
+    path: Path | None,
+    *,
+    previous_state: RuntimeState,
+    next_state: Mapping[str, Any],
+    detection_result: DetectionFilterResult,
+    quiet_status: Any,
+    observed_at: Any,
+    configured_spot_ids: Sequence[str],
+    presence_by_spot: Mapping[str, bool],
+    logger: StructuredLogger,
+) -> None:
+    if path is None:
+        return
+    for spot_id in configured_spot_ids:
+        prior = previous_state.state_by_spot.get(spot_id)
+        current = next_state.get(spot_id)
+        spot_result = detection_result.by_spot.get(spot_id)
+        accepted = None if spot_result is None else spot_result.accepted
+        has_presence = bool(presence_by_spot.get(spot_id))
+        kind = "accepted_evidence" if accepted is not None else "suppression" if has_presence else "miss"
+        prior_status = None if prior is None else prior.status.value
+        current_status = getattr(getattr(current, "status", None), "value", None)
+        hit_streak = getattr(current, "hit_streak", None)
+        miss_streak = getattr(current, "miss_streak", None)
+        reason = "accepted-candidate" if accepted is not None else "weak-open-suppression" if has_presence else "no-presence-evidence"
+        _append_decision_memory(
+            path,
+            kind,
+            spot_id=spot_id,
+            observed_at=observed_at,
+            summary=f"runtime state {prior_status or 'unknown'} -> {current_status or 'unknown'} ({reason})",
+            details={
+                "previous_status": prior_status,
+                "new_status": current_status,
+                "hit_streak": hit_streak,
+                "miss_streak": miss_streak,
+                "reason": reason,
+                "quiet_window_active": bool(getattr(quiet_status, "active", False)),
+                "suppressed_reason": getattr(quiet_status, "suppressed_reason", None),
+            },
+            logger=logger,
+        )
+
+
+def _append_matrix_event_memory(
+    path: Path | None,
+    *,
+    event_name: str,
+    event: Mapping[str, Any],
+    outcome: str,
+    logger: StructuredLogger,
+    error_type: str | None = None,
+    reason: str | None = None,
+) -> None:
+    if path is None:
+        return
+    spot_id = event.get("spot_id") if isinstance(event.get("spot_id"), str) else None
+    _append_decision_memory(
+        path,
+        "alert" if event_name != "matrix-command" else "command_outcome",
+        spot_id=spot_id,
+        observed_at=event.get("observed_at") if isinstance(event.get("observed_at"), str) else None,
+        summary=f"{event_name} {outcome}",
+        details={
+            "event_type": event_name,
+            "event_id": event.get("event_id"),
+            "outcome": outcome,
+            "reason": reason,
+            "error_type": error_type,
+            "suppressed_reason": event.get("suppressed_reason"),
+        },
+        logger=logger,
+    )
+
+
+def _append_lab_outcome_memory(
+    path: Path,
+    status_payload: Mapping[str, Any],
+    *,
+    data_dir: Path,
+    logger: StructuredLogger,
+) -> None:
+    job_id = status_payload.get("job_id")
+    kind = status_payload.get("kind")
+    status = status_payload.get("status")
+    phase = status_payload.get("phase")
+    summary_payload = status_payload.get("summary") if isinstance(status_payload.get("summary"), Mapping) else {}
+    error_payload = status_payload.get("error") if isinstance(status_payload.get("error"), Mapping) else {}
+    report_name = status_payload.get("report_path") if isinstance(status_payload.get("report_path"), str) else None
+    report_path = None
+    if isinstance(job_id, str) and report_name:
+        report_path = str(Path("detection-lab") / "jobs" / job_id / report_name)
+    details: dict[str, Any] = {
+        "job_id": job_id,
+        "kind": kind,
+        "status": status,
+        "phase": phase,
+        "created_at": status_payload.get("created_at"),
+        "updated_at": status_payload.get("updated_at"),
+        "report_path": report_path,
+        "status_counts": summary_payload.get("status_counts"),
+        "coverage": summary_payload.get("coverage"),
+        "decision": summary_payload.get("decision"),
+        "metric_delta_totals": summary_payload.get("metric_delta_totals"),
+        "error_code": error_payload.get("code"),
+        "error_message": error_payload.get("message"),
+    }
+    if summary_payload.get("shared_threshold_sufficiency") is not None:
+        details["shared_threshold_sufficiency"] = summary_payload.get("shared_threshold_sufficiency")
+    if summary_payload.get("redaction") is not None:
+        details["redaction"] = summary_payload.get("redaction")
+    if summary_payload.get("missing_inputs") is not None:
+        details["missing_inputs"] = summary_payload.get("missing_inputs")
+    _append_decision_memory(
+        path,
+        "lab_outcome",
+        spot_id=None,
+        observed_at=status_payload.get("updated_at"),
+        summary=f"detection lab {kind or 'unknown'} {status or 'unknown'}",
+        details={key: value for key, value in details.items() if value is not None},
+        logger=logger,
+    )
+    logger.info(
+        "detection-lab-outcome-recorded",
+        phase="detection-lab",
+        job_id=job_id,
+        kind=kind,
+        status=status,
+        lab_dir=str(data_dir / "detection-lab"),
+    )
+
+
+def _append_decision_memory(
+    path: Path,
+    kind: str,
+    *,
+    spot_id: str | None,
+    observed_at: Any | None,
+    summary: str,
+    details: Mapping[str, Any],
+    logger: StructuredLogger,
+) -> None:
+    append_decision_memory_record(
+        path,
+        make_decision_memory_record(kind, observed_at=observed_at, spot_id=spot_id, summary=summary, details=details),
+        logger=logger,
+    )
+
+
+def _rejection_reason_counts(rejections: Sequence[Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for rejected in rejections:
+        reason = str(getattr(rejected, "reason", "unknown"))
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
+def _rejected_summary(rejected: Any) -> dict[str, Any]:
+    return {
+        "class_name": getattr(rejected.detection, "class_name", None),
+        "confidence": getattr(rejected.detection, "confidence", None),
+        "reason": str(getattr(rejected, "reason", "unknown")),
+        "bbox_area_px": getattr(rejected, "bbox_area_px", None),
+        "overlap_ratio": getattr(rejected, "overlap_ratio", None),
+    }
+
+
+def _dispatch_matrix_event(
+    matrix_delivery: Any | None,
+    event_name: str,
+    event: Mapping[str, Any],
+    *,
+    logger: StructuredLogger,
+    decision_memory_path: Path | None = None,
+) -> dict[str, Any] | None:
     if matrix_delivery is None:
         logger.info("matrix-delivery-skipped", event_type=event_name, reason="not-configured")
+        _append_matrix_event_memory(
+            decision_memory_path,
+            event_name=event_name,
+            event=event,
+            outcome="skipped",
+            reason="not-configured",
+            logger=logger,
+        )
         return None
 
     if event_name == OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE:
@@ -1262,8 +1596,11 @@ def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: 
         try:
             matrix_delivery.send_owner_vehicle_quiet_window_alert(dict(event))
         except Exception as exc:
-            return _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
+            context = _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
+            _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="failed", error_type=context.get("error_type"), logger=logger)
+            return context
         logger.info("matrix-delivery-succeeded", event_type=event_name, event_id=txn_id, txn_id=txn_id, attempt=1)
+        _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="sent", logger=logger)
         return None
 
     if event_name in {QuietWindowEventType.UPCOMING.value, QuietWindowEventType.STARTED.value, QuietWindowEventType.ENDED.value}:
@@ -1272,8 +1609,11 @@ def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: 
         try:
             matrix_delivery.send_quiet_window_notice(dict(event))
         except Exception as exc:
-            return _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
+            context = _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
+            _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="failed", error_type=context.get("error_type"), logger=logger)
+            return context
         logger.info("matrix-delivery-succeeded", event_type=event_name, event_id=txn_id, txn_id=txn_id, attempt=1)
+        _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="sent", logger=logger)
         return None
 
     if event_name == OCCUPIED_SPOT_EVENT_TYPE:
@@ -1293,7 +1633,9 @@ def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: 
         try:
             matrix_delivery.send_occupied_spot_alert(dict(event))
         except Exception as exc:
-            return _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
+            context = _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
+            _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="failed", error_type=context.get("error_type"), logger=logger)
+            return context
         logger.info(
             "matrix-delivery-succeeded",
             event_type=event_name,
@@ -1306,6 +1648,7 @@ def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: 
             occupied_snapshot_path=event.get("occupied_snapshot_path"),
             attempt=1,
         )
+        _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="sent", logger=logger)
         return None
 
     if event_name == OccupancyEventType.OPEN_EVENT.value:
@@ -1321,7 +1664,9 @@ def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: 
         try:
             matrix_delivery.send_open_spot_alert(dict(event))
         except Exception as exc:
-            return _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
+            context = _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
+            _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="failed", error_type=context.get("error_type"), logger=logger)
+            return context
         logger.info(
             "matrix-delivery-succeeded",
             event_type=event_name,
@@ -1330,6 +1675,7 @@ def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: 
             snapshot_path=event.get("snapshot_path"),
             attempt=1,
         )
+        _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="sent", logger=logger)
         return None
 
     reason = "suppressed" if event_name == OccupancyEventType.OPEN_SUPPRESSED.value else "unsupported-event-type"
@@ -1347,6 +1693,14 @@ def _dispatch_matrix_event(matrix_delivery: Any | None, event_name: str, event: 
         event_id=event.get("event_id"),
         reason=reason,
         **extra_fields,
+    )
+    _append_matrix_event_memory(
+        decision_memory_path,
+        event_name=event_name,
+        event=event,
+        outcome="skipped",
+        reason=reason,
+        logger=logger,
     )
     return None
 
@@ -1637,6 +1991,8 @@ def _effective_sanitized_summary(settings: RuntimeSettings, *, paths: RuntimePat
     storage["latest_frame"] = str(paths.latest_frame)
     storage["snapshots_dir"] = str(paths.snapshots_dir)
     storage["vehicle_history_dir"] = str(paths.vehicle_history_dir)
+    storage["decision_memory_file"] = str(paths.decision_memory_file)
+    storage["detection_lab_dir"] = str(paths.detection_lab_dir)
     summary["storage"] = storage
     runtime = dict(summary.get("runtime", {}))
     runtime["health_file"] = str(paths.health_file)

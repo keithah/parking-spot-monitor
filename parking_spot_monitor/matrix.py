@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 import shutil
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +55,96 @@ class MatrixCommand:
     source_profile_id: str | None = None
     target_profile_id: str | None = None
     subject_id: str | None = None
+    spot_id: str | None = None
+    lab_kind: str | None = None
+    lab_job_id: str | None = None
+
+
+@dataclass(frozen=True)
+class MatrixCommandResponse:
+    """Matrix command reply with optional local JPEG media evidence."""
+
+    text: str
+    image_path: Path | None = None
+    image_info: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class MatrixOperatorCockpitContext:
+    """Immutable local runtime inputs for read-only Matrix cockpit commands."""
+
+    settings: Any
+    data_dir: Path
+    health_path: Path
+    state_path: Path
+    latest_path: Path | None = None
+    snapshots_dir: Path | None = None
+    detection_lab_manager: Any | None = None
+
+    def format_reply(
+        self,
+        action: str,
+        *,
+        spot_id: str | None = None,
+        lab_kind: str | None = None,
+        lab_job_id: str | None = None,
+        logger: StructuredLogger | None = None,
+    ) -> MatrixCommandResponse:
+        if action == "status":
+            return MatrixCommandResponse(
+                text=format_operator_status_reply(
+                    settings=self.settings,
+                    health_path=self.health_path,
+                    state_path=self.state_path,
+                    logger=logger,
+                )
+            )
+        if action == "config":
+            return MatrixCommandResponse(
+                text=format_operator_config_reply(
+                    settings=self.settings,
+                    data_dir=self.data_dir,
+                    logger=logger,
+                )
+            )
+        if action == "latest":
+            if self.latest_path is None:
+                return MatrixCommandResponse(text="Parking monitor latest unavailable: latest.jpg path is not configured")
+            latest = build_latest_snapshot_response(
+                settings=self.settings,
+                latest_path=self.latest_path,
+                health_path=self.health_path,
+                state_path=self.state_path,
+                logger=logger,
+            )
+            return MatrixCommandResponse(text=latest.text, image_path=latest.image_path, image_info=latest.image_info)
+        if action == "why":
+            if spot_id is None:
+                raise MatrixCommandParseError("usage: !parking why <spot_id>")
+            return MatrixCommandResponse(text=format_operator_why_reply(data_dir=self.data_dir, spot_id=spot_id, logger=logger))
+        if action == "recent":
+            return MatrixCommandResponse(text=format_operator_recent_reply(data_dir=self.data_dir, logger=logger))
+        if action == "lab_run":
+            if lab_kind is None:
+                raise MatrixCommandParseError("usage: !parking lab run <replay|tuning>")
+            return MatrixCommandResponse(
+                text=format_detection_lab_run_reply(
+                    data_dir=self.data_dir,
+                    kind=lab_kind,
+                    manager=self.detection_lab_manager,
+                    logger=logger,
+                )
+            )
+        if action == "lab_status":
+            return MatrixCommandResponse(
+                text=format_detection_lab_status_reply(
+                    data_dir=self.data_dir,
+                    job_id=lab_job_id or "latest",
+                    manager=self.detection_lab_manager,
+                    logger=logger,
+                )
+            )
+        raise MatrixCommandParseError("unknown cockpit command")
 
 
 @dataclass(frozen=True)
@@ -481,6 +572,8 @@ class MatrixCommandService:
         logger: StructuredLogger | None = None,
         sync_timeout_ms: int = 0,
         sync_limit: int = 20,
+        cockpit_provider: Callable[[str], str | MatrixCommandResponse] | None = None,
+        cockpit_context: MatrixOperatorCockpitContext | None = None,
     ) -> None:
         self.client = client
         self.archive = archive
@@ -491,6 +584,8 @@ class MatrixCommandService:
         self.logger = logger
         self.sync_timeout_ms = sync_timeout_ms
         self.sync_limit = sync_limit
+        self.cockpit_provider = cockpit_provider
+        self.cockpit_context = cockpit_context
 
     def poll_once(self) -> MatrixCommandPollResult:
         cursor = self.archive.read_matrix_cursor()
@@ -537,18 +632,31 @@ class MatrixCommandService:
             self._send_reply(event, f"Command rejected: {exc}")
             return "error"
         try:
-            reply = self._apply_command(command, event=event)
+            response = self._apply_command(command, event=event)
+            self._send_command_response(event, response)
         except Exception as exc:
             self._log("warning", "matrix-command-apply-failed", action=command.action, error_type=exc.__class__.__name__, **context)
-            self._send_reply(event, f"Command failed: {redact_diagnostic_text(exc.__class__.__name__)}")
+            try:
+                self._send_reply(event, f"Command failed: {redact_diagnostic_text(exc.__class__.__name__)}")
+            except Exception as reply_exc:
+                self._log("warning", "matrix-command-failure-reply-failed", action=command.action, error_type=reply_exc.__class__.__name__, **context)
             return "error"
-        self._send_reply(event, reply)
         self._log("info", "matrix-command-applied", action=command.action, **context)
         return "processed"
 
-    def _apply_command(self, command: MatrixCommand, *, event: MatrixTextEvent) -> str:
+    def _apply_command(self, command: MatrixCommand, *, event: MatrixTextEvent) -> str | MatrixCommandResponse:
         metadata = {"matrix_event_id": event.event_id, "matrix_sender": event.sender, "matrix_room_id": event.room_id}
-        if self._correction_already_seen(event.event_id):
+        if command.action in {"status", "config", "latest", "recent"}:
+            return self._format_cockpit_reply(command.action)
+        if command.action == "lab_run":
+            assert command.lab_kind is not None
+            return self._format_cockpit_reply(command.action, lab_kind=command.lab_kind)
+        if command.action == "lab_status":
+            return self._format_cockpit_reply(command.action, lab_job_id=command.lab_job_id or "latest")
+        if command.action == "why":
+            assert command.spot_id is not None
+            return self._format_cockpit_reply(command.action, spot_id=command.spot_id)
+        if command.action in {"rename_profile", "merge_profiles", "wrong_match"} and self._correction_already_seen(event.event_id):
             return "Command already applied; acknowledgement repeated."
         if command.action == "rename_profile":
             assert command.profile_id is not None and command.label is not None
@@ -581,6 +689,27 @@ class MatrixCommandService:
             return _format_profile_summary_reply(summary)
         raise MatrixCommandParseError("unknown command")
 
+    def _format_cockpit_reply(
+        self,
+        action: str,
+        *,
+        spot_id: str | None = None,
+        lab_kind: str | None = None,
+        lab_job_id: str | None = None,
+    ) -> str | MatrixCommandResponse:
+        if self.cockpit_provider is not None:
+            kwargs: dict[str, str] = {}
+            if spot_id is not None:
+                kwargs["spot_id"] = spot_id
+            if lab_kind is not None:
+                kwargs["lab_kind"] = lab_kind
+            if lab_job_id is not None:
+                kwargs["lab_job_id"] = lab_job_id
+            return self.cockpit_provider(action, **kwargs)  # type: ignore[call-arg]
+        if self.cockpit_context is not None:
+            return self.cockpit_context.format_reply(action, spot_id=spot_id, lab_kind=lab_kind, lab_job_id=lab_job_id, logger=self.logger)
+        raise RuntimeError("operator cockpit provider is not configured")
+
     def _profile_summary(self, profile_id: str, *, event: MatrixTextEvent) -> Mapping[str, Any]:
         try:
             return self.archive.profile_summary(profile_id, matrix_event_id=event.event_id, matrix_sender=event.sender, matrix_room_id=event.room_id)
@@ -606,6 +735,27 @@ class MatrixCommandService:
         except Exception:
             return False
 
+    def _send_command_response(self, event: MatrixTextEvent, response: str | MatrixCommandResponse) -> None:
+        command_response = _coerce_command_response(response)
+        if command_response.image_path is None:
+            self._send_reply(event, command_response.text)
+            return
+        image_info = _validate_command_image_info(command_response.image_info)
+        image_path = Path(command_response.image_path)
+        self.client.send_text(room_id=self.room_id, txn_id=f"command:{event.event_id}:text", body=command_response.text)
+        content_uri = self.client.upload_image(
+            filename=image_path.name,
+            data=image_path.read_bytes(),
+            content_type=JPEG_MIMETYPE,
+        )
+        self.client.send_image(
+            room_id=self.room_id,
+            txn_id=f"command:{event.event_id}:image",
+            body=f"Raw full-frame {image_path.name} evidence",
+            content_uri=content_uri,
+            info=image_info,
+        )
+
     def _send_reply(self, event: MatrixTextEvent, body: str) -> None:
         self.client.send_text(room_id=self.room_id, txn_id=f"command:{event.event_id}", body=body)
 
@@ -616,6 +766,123 @@ class MatrixCommandService:
         log = getattr(self.logger, level)
         log(event_name, **safe_fields)
 
+
+def _coerce_command_response(response: str | MatrixCommandResponse) -> MatrixCommandResponse:
+    if isinstance(response, MatrixCommandResponse):
+        return response
+    if isinstance(response, str):
+        return MatrixCommandResponse(text=response)
+    raise MatrixCommandParseError("operator cockpit response was malformed")
+
+
+def _validate_command_image_info(info: Mapping[str, Any] | None) -> dict[str, int | str]:
+    if not isinstance(info, Mapping):
+        raise MatrixCommandParseError("operator cockpit image metadata was malformed")
+    mimetype = info.get("mimetype")
+    size = info.get("size")
+    width = info.get("w")
+    height = info.get("h")
+    if mimetype != JPEG_MIMETYPE or not all(isinstance(value, int) and value > 0 for value in (size, width, height)):
+        raise MatrixCommandParseError("operator cockpit image metadata was malformed")
+    return {"mimetype": JPEG_MIMETYPE, "size": int(size), "w": int(width), "h": int(height)}
+
+
+def build_latest_snapshot_response(
+    *,
+    settings: Any,
+    latest_path: str | Path,
+    health_path: str | Path,
+    state_path: str | Path,
+    now: datetime | None = None,
+    logger: StructuredLogger | None = None,
+) -> Any:
+    from parking_spot_monitor.operator_cockpit import build_latest_snapshot_response as _build_latest_snapshot_response
+
+    return _build_latest_snapshot_response(
+        settings=settings,
+        latest_path=latest_path,
+        health_path=health_path,
+        state_path=state_path,
+        now=now,
+        logger=logger,
+    )
+
+
+def format_operator_status_reply(
+    *,
+    settings: Any,
+    health_path: str | Path,
+    state_path: str | Path,
+    now: datetime | None = None,
+    logger: StructuredLogger | None = None,
+) -> str:
+    from parking_spot_monitor.operator_cockpit import format_operator_status_reply as _format_operator_status_reply
+
+    return _format_operator_status_reply(
+        settings=settings,
+        health_path=health_path,
+        state_path=state_path,
+        now=now,
+        logger=logger,
+    )
+
+
+def format_operator_config_reply(
+    *,
+    settings: Any,
+    data_dir: str | Path,
+    now: datetime | None = None,
+    logger: StructuredLogger | None = None,
+) -> str:
+    from parking_spot_monitor.operator_cockpit import format_operator_config_reply as _format_operator_config_reply
+
+    return _format_operator_config_reply(settings=settings, data_dir=data_dir, now=now, logger=logger)
+
+
+
+def format_operator_why_reply(
+    *,
+    data_dir: str | Path,
+    spot_id: str,
+    logger: StructuredLogger | None = None,
+) -> str:
+    from parking_spot_monitor.operator_cockpit import format_operator_why_reply as _format_operator_why_reply
+
+    return _format_operator_why_reply(data_dir=data_dir, spot_id=spot_id, logger=logger)
+
+
+def format_operator_recent_reply(
+    *,
+    data_dir: str | Path,
+    logger: StructuredLogger | None = None,
+) -> str:
+    from parking_spot_monitor.operator_cockpit import format_operator_recent_reply as _format_operator_recent_reply
+
+    return _format_operator_recent_reply(data_dir=data_dir, logger=logger)
+
+
+def format_detection_lab_run_reply(
+    *,
+    data_dir: str | Path,
+    kind: str,
+    manager: Any | None = None,
+    logger: StructuredLogger | None = None,
+) -> str:
+    from parking_spot_monitor.operator_cockpit import format_detection_lab_run_reply as _format_detection_lab_run_reply
+
+    return _format_detection_lab_run_reply(data_dir=data_dir, kind=kind, manager=manager, logger=logger)
+
+
+def format_detection_lab_status_reply(
+    *,
+    data_dir: str | Path,
+    job_id: str = "latest",
+    manager: Any | None = None,
+    logger: StructuredLogger | None = None,
+) -> str:
+    from parking_spot_monitor.operator_cockpit import format_detection_lab_status_reply as _format_detection_lab_status_reply
+
+    return _format_detection_lab_status_reply(data_dir=data_dir, job_id=job_id, manager=manager, logger=logger)
 
 def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> MatrixCommand:
     if not isinstance(body, str):
@@ -631,6 +898,38 @@ def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> Matr
     parts = text.split(" ")
     if len(parts) < 2:
         raise MatrixCommandParseError("command action is required")
+    if parts[1] == "status":
+        if len(parts) != 2:
+            raise MatrixCommandParseError("usage: !parking status")
+        return MatrixCommand(action="status")
+    if parts[1] == "config":
+        if len(parts) != 2:
+            raise MatrixCommandParseError("usage: !parking config")
+        return MatrixCommand(action="config")
+    if parts[1] == "latest":
+        if len(parts) != 2:
+            raise MatrixCommandParseError("usage: !parking latest")
+        return MatrixCommand(action="latest")
+    if parts[1] == "why":
+        if len(parts) != 3:
+            raise MatrixCommandParseError("usage: !parking why <spot_id>")
+        return MatrixCommand(action="why", spot_id=_validate_spot_id(parts[2]))
+    if parts[1] == "recent":
+        if len(parts) != 2:
+            raise MatrixCommandParseError("usage: !parking recent")
+        return MatrixCommand(action="recent")
+    if parts[1] == "lab":
+        if parts[1:3] == ["lab", "run"]:
+            if len(parts) != 4:
+                raise MatrixCommandParseError("usage: !parking lab run <replay|tuning>")
+            return MatrixCommand(action="lab_run", lab_kind=_validate_lab_kind(parts[3]))
+        if parts[1:3] == ["lab", "status"]:
+            if len(parts) == 3:
+                return MatrixCommand(action="lab_status", lab_job_id="latest")
+            if len(parts) == 4:
+                return MatrixCommand(action="lab_status", lab_job_id=_validate_lab_job_id(parts[3]))
+            raise MatrixCommandParseError("usage: !parking lab status [job_id|latest]")
+        raise MatrixCommandParseError("unknown lab command")
     if parts[1:3] == ["profile", "rename"]:
         if len(parts) < 5:
             raise MatrixCommandParseError("usage: !parking profile rename <profile_id> <label>")
@@ -704,6 +1003,26 @@ def _validate_subject_id(value: str) -> str:
     return value
 
 
+def _validate_spot_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}", value):
+        raise MatrixCommandParseError("invalid spot id")
+    return value
+
+
+def _validate_lab_kind(value: str) -> str:
+    if value not in {"replay", "tuning"}:
+        raise MatrixCommandParseError("invalid lab job kind")
+    return value
+
+
+def _validate_lab_job_id(value: str) -> str:
+    if value == "latest":
+        return value
+    if not re.fullmatch(r"lab-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}", value):
+        raise MatrixCommandParseError("invalid lab job id")
+    return value
+
+
 def _validate_label(value: str) -> str:
     label = " ".join(value.strip().split())
     if not label:
@@ -719,6 +1038,14 @@ def _format_command_help_reply(command_prefix: str) -> str:
     return (
         "Parking monitor commands:\n"
         f"{command_prefix} help — show this help text\n"
+        f"{command_prefix} status — show runtime health and spot status\n"
+        f"{command_prefix} config — show safe monitor configuration\n"
+        f"{command_prefix} latest — show latest runtime summary and raw full-frame image evidence\n"
+        f"{command_prefix} why <spot_id> — explain recent parking decisions for one spot from bounded local memory\n"
+        f"{command_prefix} recent — show recent decision, alert, suppression, command, and lab records from bounded local memory\n"
+        f"{command_prefix} lab run replay — start a bounded local replay lab job using fixed inputs\n"
+        f"{command_prefix} lab run tuning — start a bounded local tuning lab job using fixed inputs\n"
+        f"{command_prefix} lab status [job_id|latest] — show the latest or selected redacted lab job status\n"
         f"{command_prefix} who — list active parking sessions by spot\n"
         f"{command_prefix} owner <spot_id> — mark the active vehicle in a spot as the configured owner vehicle\n"
         f"{command_prefix} wrong <spot_id|session_id> — mark a vehicle profile match as wrong\n"
