@@ -12,8 +12,8 @@ from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureR
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import load_decision_memory
-from parking_spot_monitor.matrix import MatrixDelivery
-from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _main, _presence_by_spot, main
+from parking_spot_monitor.matrix import MatrixDelivery, MatrixSnapshot
+from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _dispatch_matrix_event, _main, _presence_by_spot, main
 from parking_spot_monitor.detection import DetectionError, DetectionFilterResult, RejectedDetection, RejectionReason, SpotDetectionResult, VehicleDetection
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
@@ -170,6 +170,73 @@ class FakeMatrixDelivery:
         self.owner_alerts.append(dict(event))
         if self.fail:
             raise RuntimeError(f"matrix failure {SECRET_MARKER}")
+
+
+def test_dispatch_matrix_open_alert_feedback_uses_retained_snapshot_not_latest(tmp_path: Path) -> None:
+    from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler, feedback_labels_path, load_feedback_labels
+
+    latest_path = tmp_path / "latest.jpg"
+    Image.new("RGB", (10, 8), (12, 34, 56)).save(latest_path, format="JPEG")
+    retained_path = tmp_path / "snapshots" / "occupancy-open-event-left-spot-retained.jpg"
+    retained_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (17, 11), (78, 90, 12)).save(retained_path, format="JPEG")
+
+    class RetainedSnapshotDelivery:
+        def __init__(self) -> None:
+            self.open_alerts: list[dict[str, Any]] = []
+
+        def send_open_spot_alert(self, event: dict[str, Any]) -> MatrixSnapshot:
+            self.open_alerts.append(dict(event))
+            return MatrixSnapshot(
+                path=retained_path,
+                filename=retained_path.name,
+                txn_id="snapshot-retained",
+                body="retained open alert snapshot",
+                info={"mimetype": "image/jpeg", "size": retained_path.stat().st_size, "w": 17, "h": 11},
+                log_context={"snapshot_path": str(retained_path)},
+            )
+
+    event = {
+        "event_type": "occupancy-open-event",
+        "event_id": "occupancy-open-event:left_spot:2026-05-18T20:01:02Z",
+        "spot_id": "left_spot",
+        "observed_at": "2026-05-18T20:01:02Z",
+        "snapshot_path": str(latest_path),
+    }
+
+    error = _dispatch_matrix_event(
+        RetainedSnapshotDelivery(),
+        "occupancy-open-event",
+        event,
+        logger=StructuredLogger(),
+        decision_memory_path=tmp_path / "operator-decision-memory.json",
+    )
+
+    assert error is None
+    result = OperatorFeedbackLabeler(data_dir=tmp_path).record_correction(
+        spot_id="left_spot",
+        actual_state="occupied",
+        matrix_event_id="$correction",
+        matrix_sender="@operator:example",
+        matrix_room_id="!room:example",
+        corrected_at="2026-05-18T20:02:00Z",
+    )
+
+    assert result.recorded is True
+    assert result.reported_state == "open"
+    assert result.evidence.available is True
+    assert result.evidence.validated_jpeg is True
+    assert result.evidence.path == "snapshots/occupancy-open-event-left-spot-retained.jpg"
+    assert result.evidence.path != str(latest_path)
+    assert result.evidence.width == 17
+    assert result.evidence.height == 11
+
+    loaded = load_feedback_labels(feedback_labels_path(tmp_path))
+    assert loaded.state == "available"
+    assert len(loaded.labels) == 1
+    assert loaded.labels[0].evidence.available is True
+    assert loaded.labels[0].evidence.validated_jpeg is True
+    assert loaded.labels[0].evidence.path == "snapshots/occupancy-open-event-left-spot-retained.jpg"
 
 
 class FakeCommandPollResult:

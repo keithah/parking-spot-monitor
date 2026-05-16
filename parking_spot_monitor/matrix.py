@@ -217,7 +217,7 @@ class MatrixDelivery:
         event_id = _require_non_empty("event_id", str(event.get("event_id", "")))
         self.client.send_text(room_id=self.room_id, txn_id=event_id, body=format_quiet_window_notice(event))
 
-    def send_open_spot_alert(self, event: Mapping[str, Any]) -> None:
+    def send_open_spot_alert(self, event: Mapping[str, Any]) -> MatrixSnapshot:
         event_id = open_spot_event_id(event)
         self.client.send_text(
             room_id=self.room_id,
@@ -249,8 +249,9 @@ class MatrixDelivery:
             content_uri=content_uri,
             info=snapshot.info,
         )
+        return snapshot
 
-    def send_occupied_spot_alert(self, event: Mapping[str, Any]) -> None:
+    def send_occupied_spot_alert(self, event: Mapping[str, Any]) -> MatrixSnapshot:
         event_id = occupied_spot_event_id(event)
         spot_id = _require_non_empty("spot_id", str(event.get("spot_id", "")))
         observed_at = event.get("observed_at")
@@ -323,6 +324,7 @@ class MatrixDelivery:
                 spot_id=spot_id,
                 operation="occupied-alert",
             )
+        return snapshot
 
     def send_owner_vehicle_quiet_window_alert(self, event: Mapping[str, Any]) -> str:
         return self.client.send_text(

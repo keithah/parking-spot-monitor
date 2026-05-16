@@ -426,7 +426,7 @@ def test_matrix_delivery_occupied_alert_sends_text_upload_and_raw_occupied_image
         logger=None,  # type: ignore[arg-type]
     )
 
-    delivery.send_occupied_spot_alert(occupied_event(source))
+    snapshot = delivery.send_occupied_spot_alert(occupied_event(source))
 
     event_id = "occupancy-occupied-event:left_spot:2026-05-18T20:01:02Z"
     assert [item["kind"] for item in seen] == ["text", "upload", "image"]
@@ -435,6 +435,8 @@ def test_matrix_delivery_occupied_alert_sends_text_upload_and_raw_occupied_image
     assert seen[1]["content_type"] == "image/jpeg"
     assert seen[1]["data"] == raw_bytes
     assert seen[1]["filename"] == "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
+    assert snapshot.path == tmp_path / "snapshots" / "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
+    assert snapshot.filename == "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
     assert seen[2]["txn_id"] == f"{event_id}:image"
     assert seen[2]["body"] == "Raw occupied full-frame snapshot for left_spot at 2026-05-18 1:01:02 PM PDT"
     assert seen[2]["content_uri"] == "mxc://example.org/occupied"

@@ -169,8 +169,9 @@ class FeedbackRecordResult:
 class OperatorFeedbackLabeler:
     """High-level API for Matrix operator spot-state correction labels."""
 
-    def __init__(self, *, data_dir: str | Path, logger: StructuredLogger | None = None) -> None:
+    def __init__(self, *, data_dir: str | Path, snapshots_dir: str | Path | None = None, logger: StructuredLogger | None = None) -> None:
         self.data_dir = Path(data_dir)
+        self.snapshots_dir = Path(snapshots_dir) if snapshots_dir is not None else None
         self.logger = logger
         self.labels_path = feedback_labels_path(self.data_dir)
         self.memory_path = decision_memory_path(self.data_dir)
@@ -224,7 +225,12 @@ class OperatorFeedbackLabeler:
                 error_type="no_recent_alert",
             )
 
-        evidence = validate_feedback_evidence(data_dir=self.data_dir, snapshot_path=candidate.snapshot_path, logger=self.logger)
+        evidence = validate_feedback_evidence(
+            data_dir=self.data_dir,
+            snapshots_dir=self.snapshots_dir,
+            snapshot_path=candidate.snapshot_path,
+            logger=self.logger,
+        )
         label_id = make_label_id(corrected_at=corrected_text, spot_id=safe_spot, matrix_event_id=matrix_event_id)
         label = FeedbackLabel(
             label_id=label_id,
@@ -443,12 +449,18 @@ def resolve_latest_alert_candidate(path: str | Path, spot_id: str, *, logger: St
             reported_at=record.observed_at,
             alert_event_type=_safe_optional_text(event_type, limit=120),
             alert_event_id=_safe_optional_text(details.get("event_id"), limit=180),
-            snapshot_path=_safe_optional_text(details.get("snapshot_path"), limit=240),
+            snapshot_path=_safe_optional_text(details.get("retained_snapshot_path") or details.get("snapshot_path"), limit=240),
         )
     return None
 
 
-def validate_feedback_evidence(*, data_dir: str | Path, snapshot_path: str | None, logger: StructuredLogger | None = None) -> FeedbackEvidence:
+def validate_feedback_evidence(
+    *,
+    data_dir: str | Path,
+    snapshot_path: str | None,
+    snapshots_dir: str | Path | None = None,
+    logger: StructuredLogger | None = None,
+) -> FeedbackEvidence:
     """Validate safe, local retained alert snapshot metadata without reading image bytes into labels."""
 
     if not snapshot_path:
@@ -460,13 +472,8 @@ def validate_feedback_evidence(*, data_dir: str | Path, snapshot_path: str | Non
     if safe_relative is None:
         return FeedbackEvidence("alert_snapshot", None, False, False, None, None, None, "missing")
 
-    base = Path(data_dir).resolve()
-    candidate = (base / safe_relative).resolve()
-    try:
-        candidate.relative_to(base)
-    except ValueError:
-        return FeedbackEvidence("alert_snapshot", None, False, False, None, None, None, "unsafe_path")
-    if not candidate.exists():
+    candidate = _resolve_feedback_evidence_path(data_dir=Path(data_dir), snapshots_dir=snapshots_dir, safe_relative=safe_relative)
+    if candidate is None:
         return FeedbackEvidence("alert_snapshot", safe_relative, False, False, None, None, None, "missing")
 
     try:
@@ -482,6 +489,33 @@ def validate_feedback_evidence(*, data_dir: str | Path, snapshot_path: str | Non
         return FeedbackEvidence("alert_snapshot", safe_relative, False, False, None, None, None, "invalid_jpeg")
 
     return FeedbackEvidence("alert_snapshot", safe_relative, True, True, width, height, byte_size, None)
+
+
+def _resolve_feedback_evidence_path(*, data_dir: Path, snapshots_dir: str | Path | None, safe_relative: str) -> Path | None:
+    """Resolve a safe relative alert snapshot path under accepted runtime evidence roots."""
+
+    relative = Path(safe_relative)
+    roots: list[Path] = [data_dir.resolve()]
+    if snapshots_dir is not None:
+        root = Path(snapshots_dir).resolve()
+        roots.append(root)
+        roots.append(root.parent)
+    else:
+        roots.append((data_dir / "snapshots").resolve())
+
+    seen: set[Path] = set()
+    for root in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            continue
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def format_duplicate_correction_reply(spot_id: str, reported_state: str, actual_state: str, evidence: FeedbackEvidence) -> str:

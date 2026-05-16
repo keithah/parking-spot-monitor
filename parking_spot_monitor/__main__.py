@@ -454,7 +454,7 @@ def _default_matrix_command_service_factory(
         )
         return None
     paths = resolve_runtime_paths(settings, data_dir)
-    feedback_labeler = OperatorFeedbackLabeler(data_dir=paths.data_dir, logger=logger)
+    feedback_labeler = OperatorFeedbackLabeler(data_dir=paths.data_dir, snapshots_dir=paths.snapshots_dir, logger=logger)
 
     def who_snapshot_provider(base_text: str) -> Any:
         return build_who_snapshot_response(
@@ -1487,7 +1487,8 @@ def _append_matrix_event_memory(
             "reason": reason,
             "error_type": error_type,
             "suppressed_reason": event.get("suppressed_reason"),
-            "snapshot_path": event.get("snapshot_path") or event.get("occupied_snapshot_path"),
+            "snapshot_path": event.get("retained_snapshot_path") or event.get("snapshot_path") or event.get("occupied_snapshot_path"),
+            "retained_snapshot_path": event.get("retained_snapshot_path"),
         },
         logger=logger,
     )
@@ -1585,6 +1586,35 @@ def _rejected_summary(rejected: Any) -> dict[str, Any]:
     }
 
 
+def _event_with_retained_snapshot_path(event: Mapping[str, Any], snapshot: Any | None) -> Mapping[str, Any]:
+    retained_path = _safe_retained_snapshot_memory_path(snapshot)
+    if retained_path is None:
+        return event
+    enriched = dict(event)
+    enriched["retained_snapshot_path"] = retained_path
+    return enriched
+
+
+def _safe_retained_snapshot_memory_path(snapshot: Any | None) -> str | None:
+    snapshot_path = getattr(snapshot, "path", None)
+    if snapshot_path is None:
+        return None
+    path = Path(snapshot_path)
+    if path.is_absolute():
+        parts = path.parts
+        for marker in ("snapshots", "matrix-snapshots"):
+            if marker in parts:
+                index = parts.index(marker)
+                relative = Path(*parts[index:])
+                return relative.as_posix()
+        if not path.name:
+            return None
+        return path.name
+    if ".." in path.parts:
+        return None
+    return path.as_posix()
+
+
 def _dispatch_matrix_event(
     matrix_delivery: Any | None,
     event_name: str,
@@ -1646,7 +1676,7 @@ def _dispatch_matrix_event(
             attempt=1,
         )
         try:
-            matrix_delivery.send_occupied_spot_alert(dict(event))
+            retained_snapshot = matrix_delivery.send_occupied_spot_alert(dict(event))
         except Exception as exc:
             context = _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
             _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="failed", error_type=context.get("error_type"), logger=logger)
@@ -1663,7 +1693,8 @@ def _dispatch_matrix_event(
             occupied_snapshot_path=event.get("occupied_snapshot_path"),
             attempt=1,
         )
-        _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="sent", logger=logger)
+        sent_event = _event_with_retained_snapshot_path(event, retained_snapshot)
+        _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=sent_event, outcome="sent", logger=logger)
         return None
 
     if event_name == OccupancyEventType.OPEN_EVENT.value:
@@ -1677,7 +1708,7 @@ def _dispatch_matrix_event(
             attempt=1,
         )
         try:
-            matrix_delivery.send_open_spot_alert(dict(event))
+            retained_snapshot = matrix_delivery.send_open_spot_alert(dict(event))
         except Exception as exc:
             context = _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
             _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="failed", error_type=context.get("error_type"), logger=logger)
@@ -1690,7 +1721,8 @@ def _dispatch_matrix_event(
             snapshot_path=event.get("snapshot_path"),
             attempt=1,
         )
-        _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="sent", logger=logger)
+        sent_event = _event_with_retained_snapshot_path(event, retained_snapshot)
+        _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=sent_event, outcome="sent", logger=logger)
         return None
 
     reason = "suppressed" if event_name == OccupancyEventType.OPEN_SUPPRESSED.value else "unsupported-event-type"
