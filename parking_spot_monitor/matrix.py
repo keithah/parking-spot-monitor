@@ -56,6 +56,7 @@ class MatrixCommand:
     target_profile_id: str | None = None
     subject_id: str | None = None
     spot_id: str | None = None
+    actual_state: str | None = None
     lab_kind: str | None = None
     lab_job_id: str | None = None
 
@@ -574,6 +575,7 @@ class MatrixCommandService:
         sync_limit: int = 20,
         cockpit_provider: Callable[[str], str | MatrixCommandResponse] | None = None,
         cockpit_context: MatrixOperatorCockpitContext | None = None,
+        feedback_labeler: Any | None = None,
     ) -> None:
         self.client = client
         self.archive = archive
@@ -586,6 +588,7 @@ class MatrixCommandService:
         self.sync_limit = sync_limit
         self.cockpit_provider = cockpit_provider
         self.cockpit_context = cockpit_context
+        self.feedback_labeler = feedback_labeler
 
     def poll_once(self) -> MatrixCommandPollResult:
         cursor = self.archive.read_matrix_cursor()
@@ -656,6 +659,18 @@ class MatrixCommandService:
         if command.action == "why":
             assert command.spot_id is not None
             return self._format_cockpit_reply(command.action, spot_id=command.spot_id)
+        if command.action == "correct_spot_state":
+            if self.feedback_labeler is None:
+                raise RuntimeError("operator feedback labeler is not configured")
+            assert command.spot_id is not None and command.actual_state is not None
+            result = self.feedback_labeler.record_correction(
+                spot_id=command.spot_id,
+                actual_state=command.actual_state,
+                matrix_event_id=event.event_id,
+                matrix_sender=event.sender,
+                matrix_room_id=event.room_id,
+            )
+            return result.reply_text
         if command.action in {"rename_profile", "merge_profiles", "wrong_match"} and self._correction_already_seen(event.event_id):
             return "Command already applied; acknowledgement repeated."
         if command.action == "rename_profile":
@@ -914,6 +929,14 @@ def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> Matr
         if len(parts) != 3:
             raise MatrixCommandParseError("usage: !parking why <spot_id>")
         return MatrixCommand(action="why", spot_id=_validate_spot_id(parts[2]))
+    if parts[1] == "correct":
+        if len(parts) != 4:
+            raise MatrixCommandParseError("usage: !parking correct <spot_id> <open|occupied>")
+        return MatrixCommand(
+            action="correct_spot_state",
+            spot_id=_validate_spot_id(parts[2]),
+            actual_state=_validate_actual_state(parts[3]),
+        )
     if parts[1] == "recent":
         if len(parts) != 2:
             raise MatrixCommandParseError("usage: !parking recent")
@@ -1009,6 +1032,12 @@ def _validate_spot_id(value: str) -> str:
     return value
 
 
+def _validate_actual_state(value: str) -> str:
+    if value not in {"open", "occupied"}:
+        raise MatrixCommandParseError("invalid actual state")
+    return value
+
+
 def _validate_lab_kind(value: str) -> str:
     if value not in {"replay", "tuning"}:
         raise MatrixCommandParseError("invalid lab job kind")
@@ -1042,6 +1071,7 @@ def _format_command_help_reply(command_prefix: str) -> str:
         f"{command_prefix} config — show safe monitor configuration\n"
         f"{command_prefix} latest — show latest runtime summary and raw full-frame image evidence\n"
         f"{command_prefix} why <spot_id> — explain recent parking decisions for one spot from bounded local memory\n"
+        f"{command_prefix} correct <spot_id> <open|occupied> — record the actual spot state for a wrong alert\n"
         f"{command_prefix} recent — show recent decision, alert, suppression, command, and lab records from bounded local memory\n"
         f"{command_prefix} lab run replay — start a bounded local replay lab job using fixed inputs\n"
         f"{command_prefix} lab run tuning — start a bounded local tuning lab job using fixed inputs\n"

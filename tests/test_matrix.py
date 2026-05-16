@@ -954,6 +954,10 @@ def test_parse_matrix_commands_are_strict_and_normalize_labels() -> None:
     assert help_command.action == "help"
     summary = parse_matrix_command("!parking profile summary prof_target")
     assert (summary.action, summary.profile_id) == ("profile_summary", "prof_target")
+    correct = parse_matrix_command("  !parking   correct   left_spot   open  ")
+    assert (correct.action, correct.spot_id, correct.actual_state) == ("correct_spot_state", "left_spot", "open")
+    occupied_correct = parse_matrix_command("!parking correct right_spot occupied")
+    assert (occupied_correct.action, occupied_correct.spot_id, occupied_correct.actual_state) == ("correct_spot_state", "right_spot", "occupied")
 
     with pytest.raises(MatrixCommandParseError):
         parse_matrix_command("!parking profile merge prof_a prof_b extra")
@@ -967,6 +971,19 @@ def test_parse_matrix_commands_are_strict_and_normalize_labels() -> None:
         parse_matrix_command("!parking profile rename prof_a " + "x" * 161)
     with pytest.raises(MatrixCommandParseError):
         parse_matrix_command("   ")
+
+    rejected_correct_commands = [
+        "!parking correct",
+        "!parking correct left_spot",
+        "!parking correct left_spot open extra",
+        "!parking correct left_spot closed",
+        "!parking correct ../left_spot open",
+        "!parking correct left/spot occupied",
+        "!parking correct . open",
+    ]
+    for body in rejected_correct_commands:
+        with pytest.raises(MatrixCommandParseError):
+            parse_matrix_command(body)
 
 
 def test_parse_matrix_operator_cockpit_commands_are_exact_and_bounded() -> None:
@@ -1155,6 +1172,121 @@ def test_command_service_authorizes_applies_and_replies_safely() -> None:
     assert "!parking owner <spot_id>" in rendered_replies
     assert "Profile prof_b: Blue hatchback" in rendered_replies
     assert ACCESS_TOKEN not in rendered_replies
+
+
+def test_command_service_authorized_correct_records_feedback_label() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(MatrixTextEvent(event_id="$correct", sender="@op:example", room_id=ROOM_ID, body="!parking correct left_spot open"),),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(dict(kwargs))
+            return "$reply"
+
+    class FeedbackLabeler:
+        def record_correction(self, **kwargs: Any) -> Any:
+            calls.append(dict(kwargs))
+            return type("FeedbackResult", (), {"reply_text": "Parking correction recorded for left_spot: actual open."})()
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    archive.corrections.append(FakeCorrection("existing", matrix_event_id="$correct"))
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        feedback_labeler=FeedbackLabeler(),
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 1
+    assert result.error_count == 0
+    assert archive.calls == []
+    assert calls == [
+        {
+            "spot_id": "left_spot",
+            "actual_state": "open",
+            "matrix_event_id": "$correct",
+            "matrix_sender": "@op:example",
+            "matrix_room_id": ROOM_ID,
+        }
+    ]
+    assert replies == [{"room_id": ROOM_ID, "txn_id": "command:$correct", "body": "Parking correction recorded for left_spot: actual open."}]
+
+
+def test_command_service_correct_requires_authorization_and_configured_labeler() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    unauthorized_replies: list[dict[str, Any]] = []
+    labeler_calls: list[dict[str, Any]] = []
+
+    class UnauthorizedClient:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(MatrixTextEvent(event_id="$denied", sender="@intruder:example", room_id=ROOM_ID, body="!parking correct left_spot occupied"),),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            unauthorized_replies.append(dict(kwargs))
+            return "$reply"
+
+    class FeedbackLabeler:
+        def record_correction(self, **kwargs: Any) -> Any:
+            labeler_calls.append(dict(kwargs))
+            raise AssertionError("unauthorized correction must not reach labeler")
+
+    unauthorized = MatrixCommandService(
+        client=UnauthorizedClient(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        feedback_labeler=FeedbackLabeler(),
+    )
+
+    unauthorized_result = unauthorized.poll_once()
+
+    assert unauthorized_result.processed_count == 0
+    assert unauthorized_result.error_count == 1
+    assert labeler_calls == []
+    assert unauthorized_replies == [{"room_id": ROOM_ID, "txn_id": "command:$denied", "body": "Command rejected: sender is not authorized."}]
+
+    missing_labeler_replies: list[dict[str, Any]] = []
+
+    class MissingLabelerClient:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(MatrixTextEvent(event_id="$missing", sender="@op:example", room_id=ROOM_ID, body="!parking correct left_spot occupied"),),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            missing_labeler_replies.append(dict(kwargs))
+            return "$reply"
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    missing_labeler = MatrixCommandService(
+        client=MissingLabelerClient(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+    )
+
+    missing_labeler_result = missing_labeler.poll_once()
+
+    assert missing_labeler_result.processed_count == 0
+    assert missing_labeler_result.error_count == 1
+    assert archive.calls == []
+    assert missing_labeler_replies == [{"room_id": ROOM_ID, "txn_id": "command:$missing", "body": "Command failed: RuntimeError"}]
 
 
 def test_command_service_default_empty_allowlist_rejects_mutations() -> None:
