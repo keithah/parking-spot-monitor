@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
+
+import pytest
 
 from parking_spot_monitor.logging import StructuredLogger
 
@@ -17,6 +20,78 @@ def _assert_no_sensitive_text(rendered: str) -> None:
     assert FAKE_MATRIX_TOKEN not in rendered
     assert RAW_IMAGE_MARKER not in rendered
     assert "Traceback" not in rendered
+
+
+def _sample_feedback_label(**overrides):
+    from parking_spot_monitor.operator_feedback import FeedbackEvidence, FeedbackLabel
+
+    values = {
+        "label_id": "feedback-20260516T174239Z-left_spot-abc12345",
+        "spot_id": "left_spot",
+        "reported_state": "occupied",
+        "actual_state": "open",
+        "source": "matrix_command",
+        "operator_sender_hash": "sha256:operator",
+        "corrected_at": "2026-05-16T17:42:39Z",
+        "reported_at": "2026-05-15T21:42:39Z",
+        "alert_event_type": "occupancy-occupied-event",
+        "alert_event_id": "$alert",
+        "evidence": FeedbackEvidence(
+            kind="alert_snapshot",
+            path="snapshots/occupied.jpg",
+            available=True,
+            validated_jpeg=True,
+            width=11,
+            height=7,
+            byte_size=633,
+            error_type=None,
+        ),
+        "notes": "",
+        "matrix_event_id": "$correct",
+    }
+    values.update(overrides)
+    return FeedbackLabel(**values)
+
+
+def test_make_label_id_is_deterministic_from_timestamp_spot_and_matrix_event() -> None:
+    from parking_spot_monitor.operator_feedback import make_label_id
+
+    corrected_at = datetime(2026, 5, 16, 17, 42, 39, tzinfo=timezone.utc)
+
+    first = make_label_id(corrected_at=corrected_at, spot_id="left spot", matrix_event_id="$event-1")
+    second = make_label_id(corrected_at=corrected_at, spot_id="left spot", matrix_event_id="$event-1")
+    different_event = make_label_id(corrected_at=corrected_at, spot_id="left spot", matrix_event_id="$event-2")
+
+    assert first == second
+    assert first != different_event
+    assert first.startswith("feedback-20260516T174239Z-left_spot-")
+
+
+def test_feedback_label_serialization_rejects_invalid_reported_or_actual_state() -> None:
+    from parking_spot_monitor.operator_feedback import FeedbackLabelSchemaError
+
+    with pytest.raises(FeedbackLabelSchemaError):
+        _sample_feedback_label(reported_state="blocked").to_json_dict()
+
+    with pytest.raises(FeedbackLabelSchemaError):
+        _sample_feedback_label(actual_state="available").to_json_dict()
+
+
+def test_feedback_label_load_quarantines_invalid_state(tmp_path: Path) -> None:
+    from parking_spot_monitor.operator_feedback import load_feedback_labels
+
+    path = tmp_path / "operator-feedback-labels.json"
+    raw_label = _sample_feedback_label().to_json_dict() | {"actual_state": "blocked"}
+    payload = {"schema_version": 1, "labels": [raw_label]}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_feedback_labels(path)
+
+    assert loaded.state == "unavailable"
+    assert loaded.error_type == "FeedbackLabelSchemaError"
+    assert loaded.quarantined_path is not None
+    assert loaded.quarantined_path.exists()
+    assert not path.exists()
 
 
 def test_feedback_store_appends_sanitized_label_and_loads_tail(tmp_path: Path) -> None:

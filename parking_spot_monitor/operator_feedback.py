@@ -18,6 +18,7 @@ FEEDBACK_LABELS_FILENAME = "operator-feedback-labels.json"
 MAX_FEEDBACK_FILE_BYTES = 512_000
 MAX_FEEDBACK_LABELS = 500
 MAX_TEXT_FIELD_CHARS = 500
+VALID_FEEDBACK_STATES = frozenset({"open", "occupied"})
 
 LoadState = Literal["available", "missing", "unavailable"]
 
@@ -80,8 +81,8 @@ class FeedbackLabel:
         payload: dict[str, Any] = {
             "label_id": _safe_required_text(self.label_id, "label_id", limit=160),
             "spot_id": _safe_required_text(self.spot_id, "spot_id", limit=80),
-            "reported_state": _safe_required_text(self.reported_state, "reported_state", limit=40),
-            "actual_state": _safe_required_text(self.actual_state, "actual_state", limit=40),
+            "reported_state": _feedback_state(self.reported_state, "reported_state"),
+            "actual_state": _feedback_state(self.actual_state, "actual_state"),
             "source": _safe_required_text(self.source, "source", limit=80),
             "operator_sender_hash": _safe_required_text(self.operator_sender_hash, "operator_sender_hash", limit=120),
             "corrected_at": _safe_required_text(self.corrected_at, "corrected_at", limit=80),
@@ -139,12 +140,15 @@ def reformat_timestamp_for_id(value: datetime | str | None) -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def make_label_id(*, corrected_at: datetime | str | None, spot_id: str, operator_identifier: object) -> str:
-    """Create a deterministic, safe label id prefix from timestamp, spot, and operator."""
+def make_label_id(*, corrected_at: datetime | str | None, spot_id: str, matrix_event_id: str | None) -> str:
+    """Create a deterministic, safe label id from timestamp, spot, and Matrix event id."""
 
+    timestamp = reformat_timestamp_for_id(corrected_at)
     safe_spot = _SAFE_ID_PATTERN.sub("_", _safe_required_text(spot_id, "spot_id", limit=80)).strip("_") or "spot"
-    operator_hash = hash_operator_identifier(operator_identifier).split(":", 1)[1][:8]
-    return f"feedback-{reformat_timestamp_for_id(corrected_at)}-{safe_spot}-{operator_hash}"
+    event_id = _safe_optional_text(matrix_event_id, limit=180) or ""
+    suffix_material = "\0".join((timestamp, safe_spot, event_id))
+    suffix = hashlib.sha256(suffix_material.encode("utf-8")).hexdigest()[:8]
+    return f"feedback-{timestamp}-{safe_spot}-{suffix}"
 
 
 def append_feedback_label(
@@ -274,8 +278,8 @@ def _label_from_any(value: FeedbackLabel | Mapping[str, Any]) -> FeedbackLabel:
     return FeedbackLabel(
         label_id=_safe_required_text(value.get("label_id"), "label_id", limit=160),
         spot_id=_safe_required_text(value.get("spot_id"), "spot_id", limit=80),
-        reported_state=_safe_required_text(value.get("reported_state"), "reported_state", limit=40),
-        actual_state=_safe_required_text(value.get("actual_state"), "actual_state", limit=40),
+        reported_state=_feedback_state(value.get("reported_state"), "reported_state"),
+        actual_state=_feedback_state(value.get("actual_state"), "actual_state"),
         source=_safe_required_text(value.get("source"), "source", limit=80),
         operator_sender_hash=_safe_required_text(value.get("operator_sender_hash"), "operator_sender_hash", limit=120),
         corrected_at=_safe_required_text(value.get("corrected_at"), "corrected_at", limit=80),
@@ -286,6 +290,13 @@ def _label_from_any(value: FeedbackLabel | Mapping[str, Any]) -> FeedbackLabel:
         notes=_safe_optional_text(value.get("notes"), limit=MAX_TEXT_FIELD_CHARS) or "",
         matrix_event_id=_safe_optional_text(value.get("matrix_event_id"), limit=180),
     )
+
+
+def _feedback_state(value: object, field: str) -> str:
+    state = _safe_required_text(value, field, limit=40)
+    if state not in VALID_FEEDBACK_STATES:
+        raise FeedbackLabelSchemaError(f"feedback label {field} must be open or occupied")
+    return state
 
 
 def _safe_required_text(value: object, field: str, *, limit: int) -> str:
