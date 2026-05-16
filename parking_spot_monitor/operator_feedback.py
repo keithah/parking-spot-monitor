@@ -23,7 +23,7 @@ VALID_FEEDBACK_STATES = frozenset({"open", "occupied"})
 LoadState = Literal["available", "missing", "unavailable"]
 
 _SENSITIVE_TOKEN_PATTERN = re.compile(r"(?i)\b(?:syt|mxt|ghp|glpat|sk|xox[baprs])-?[a-z0-9_./+=-]{8,}\b")
-_RAW_IMAGE_PREFIX_PATTERN = re.compile(r"[\xff\xd8][\xff\xe0].*", re.IGNORECASE)
+_RAW_IMAGE_PREFIX_PATTERN = re.compile(r"\xff\xd8[\s\S]*")
 _SAFE_ID_PATTERN = re.compile(r"[^A-Za-z0-9_.:-]+")
 
 

@@ -19,6 +19,10 @@ def _assert_no_sensitive_text(rendered: str) -> None:
     assert "user:pass" not in rendered
     assert FAKE_MATRIX_TOKEN not in rendered
     assert RAW_IMAGE_MARKER not in rendered
+    assert "\xff\xd8" not in rendered
+    assert "\xff" not in rendered
+    assert "\\u00ff" not in rendered
+    assert "\\u00d8" not in rendered.lower()
     assert "Traceback" not in rendered
 
 
