@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 from pathlib import Path
 
 import yaml
@@ -206,3 +208,73 @@ def test_docker_contract_docs_and_compose_do_not_embed_secret_values() -> None:
         assert secret_like not in rendered
     for sentinel in FORBIDDEN_SPAM_SENTINELS:
         assert sentinel not in rendered
+
+
+def _load_closeout_script_module():
+    script_path = Path("scripts/verify_s05_operator_cockpit_closeout.py")
+    spec = importlib.util.spec_from_file_location("verify_s05_operator_cockpit_closeout", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_s05_closeout_smoke_script_contract_is_bounded_and_redacted() -> None:
+    script_path = Path("scripts/verify_s05_operator_cockpit_closeout.py")
+    script = script_path.read_text(encoding="utf-8")
+    module = _load_closeout_script_module()
+
+    assert script_path.exists()
+    assert "shell=True" not in script
+    assert "subprocess.run(" in script
+    assert "timeout=" in script
+    assert "stdout=subprocess.PIPE" in script
+    assert "stderr=subprocess.PIPE" in script
+    assert "S05_CLOSEOUT_START" in script
+    assert "S05_CLOSEOUT_PASS" in script
+    assert "S05_CLOSEOUT_FAIL" in script
+    assert "S05_CLOSEOUT_RESULT" in script
+
+    commands = {command.label: command.argv for command in module.COMMANDS}
+    assert commands["pytest-docs-matrix"] == (
+        module.sys.executable,
+        "-m",
+        "pytest",
+        "tests/test_operator_docs.py",
+        "tests/test_matrix.py",
+        "-q",
+    )
+    assert "tests/test_matrix_operator_cockpit.py" in commands["pytest-cockpit-lab-memory"]
+    assert "tests/test_detection_lab.py" in commands["pytest-cockpit-lab-memory"]
+    assert "tests/test_operator_decision_memory.py" in commands["pytest-cockpit-lab-memory"]
+    assert "tests/test_startup.py" in commands["pytest-runtime-docker-config-state"]
+    assert "tests/test_docker_contract.py" in commands["pytest-runtime-docker-config-state"]
+    assert "tests/test_config.py" in commands["pytest-runtime-docker-config-state"]
+    assert "tests/test_health.py" in commands["pytest-runtime-docker-config-state"]
+    assert "tests/test_state.py" in commands["pytest-runtime-docker-config-state"]
+    assert commands["validate-config-entrypoint"] == (
+        module.sys.executable,
+        "-m",
+        "parking_spot_monitor",
+        "--config",
+        "config.yaml.example",
+        "--validate-config",
+    )
+    assert commands["docker-compose-config"] == ("docker", "compose", "config", "--quiet")
+
+    env = module._smoke_env({})
+    assert env["RTSP_URL"] == module.PLACEHOLDER_RTSP_URL
+    assert env["MATRIX_ACCESS_TOKEN"] == module.PLACEHOLDER_MATRIX_TOKEN
+
+    redacted = module._safe_output(
+        "rtsp://camera.local/stream MATRIX_ACCESS_TOKEN=matrix-secret Authorization: bearer-secret",
+        f"{module.PLACEHOLDER_RTSP_URL} {module.PLACEHOLDER_MATRIX_TOKEN} Traceback (most recent call last)",
+    )
+    assert module.PLACEHOLDER_RTSP_URL not in redacted
+    assert module.PLACEHOLDER_MATRIX_TOKEN not in redacted
+    assert "rtsp://camera.local" not in redacted
+    assert "matrix-secret" not in redacted
+    assert "bearer-secret" not in redacted
+    assert "Traceback (most recent call last)" not in redacted

@@ -39,6 +39,7 @@ def test_runtime_paths_resolve_relative_values_under_effective_data_dir() -> Non
     assert paths.latest_frame == Path("/data/latest.jpg")
     assert paths.snapshots_dir == Path("/data/snapshots")
     assert paths.health_file == Path("/data/health.json")
+    assert paths.detection_lab_dir == Path("/data/detection-lab")
 
 
 def test_runtime_paths_preserve_absolute_operator_overrides(tmp_path: Path) -> None:

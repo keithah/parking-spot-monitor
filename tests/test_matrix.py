@@ -969,6 +969,31 @@ def test_parse_matrix_commands_are_strict_and_normalize_labels() -> None:
         parse_matrix_command("   ")
 
 
+def test_parse_matrix_operator_cockpit_commands_are_exact_and_bounded() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandParseError, parse_matrix_command
+
+    status = parse_matrix_command("  !parking   status  ")
+    config = parse_matrix_command("\n!parking config\t")
+
+    assert status.action == "status"
+    assert config.action == "config"
+
+    rejected = [
+        "!parking status now",
+        "!parking config verbose",
+        "!parking stat",
+        "!parking settings",
+        "!park status",
+        "parking status",
+        "!!parking status",
+        "!parking",
+        "!parking status " + "x" * 513,
+    ]
+    for body in rejected:
+        with pytest.raises(MatrixCommandParseError):
+            parse_matrix_command(body)
+
+
 class FakeCorrection:
     def __init__(self, correction_id: str = "corr_1", matrix_event_id: str | None = None) -> None:
         self.correction_id = correction_id
@@ -1154,3 +1179,858 @@ def test_command_service_default_empty_allowlist_rejects_mutations() -> None:
     assert result.error_count == 1
     assert archive.calls == []
     assert replies == ["Command rejected: sender is not authorized."]
+
+
+def test_command_service_rejects_unauthorized_status_before_application() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(MatrixTextEvent(event_id="$status", sender="@intruder:example", room_id=ROOM_ID, body="!parking status"),),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(dict(kwargs))
+            return "$reply"
+
+    class Service(MatrixCommandService):
+        def _apply_command(self, *args: Any, **kwargs: Any) -> str:
+            raise AssertionError("unauthorized status must be rejected before application")
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    service = Service(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@operator:example"])  # type: ignore[arg-type]
+
+    result = service.poll_once()
+
+    assert result.processed_count == 0
+    assert result.error_count == 1
+    assert archive.calls == []
+    assert replies == [{"room_id": ROOM_ID, "txn_id": "command:$status", "body": "Command rejected: sender is not authorized."}]
+
+
+def test_command_service_authorized_status_and_config_reply_via_command_txn_path() -> None:
+    from parking_spot_monitor.matrix import MatrixCommand, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    applied_actions: list[str] = []
+    replies: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$status", sender="@operator:example", room_id=ROOM_ID, body="!parking status"),
+                    MatrixTextEvent(event_id="$config", sender="@operator:example", room_id=ROOM_ID, body="!parking config"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(dict(kwargs))
+            return "$reply"
+
+    class Service(MatrixCommandService):
+        def _apply_command(self, command: MatrixCommand, *, event: MatrixTextEvent) -> str:
+            applied_actions.append(command.action)
+            return f"reply for {command.action}"
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    service = Service(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@operator:example"])  # type: ignore[arg-type]
+
+    result = service.poll_once()
+
+    assert result.processed_count == 2
+    assert result.error_count == 0
+    assert applied_actions == ["status", "config"]
+    assert replies == [
+        {"room_id": ROOM_ID, "txn_id": "command:$status", "body": "reply for status"},
+        {"room_id": ROOM_ID, "txn_id": "command:$config", "body": "reply for config"},
+    ]
+
+
+
+def test_command_service_status_and_config_use_cockpit_provider_without_archive_corrections() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[dict[str, Any]] = []
+    provider_actions: list[str] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$repeat", sender="@op:example", room_id=ROOM_ID, body="!parking status"),
+                    MatrixTextEvent(event_id="$repeat", sender="@op:example", room_id=ROOM_ID, body="!parking config"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(dict(kwargs))
+            return "$reply"
+
+    def cockpit_provider(action: str) -> str:
+        provider_actions.append(action)
+        return f"cockpit {action} reply"
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    archive.corrections.append(FakeCorrection("existing", matrix_event_id="$repeat"))
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_provider=cockpit_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 2
+    assert result.error_count == 0
+    assert provider_actions == ["status", "config"]
+    assert archive.calls == []
+    assert [reply["body"] for reply in replies] == ["cockpit status reply", "cockpit config reply"]
+
+
+def test_command_service_status_provider_failure_replies_safe_failure() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(MatrixTextEvent(event_id="$status", sender="@op:example", room_id=ROOM_ID, body="!parking status"),),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(dict(kwargs))
+            return "$reply"
+
+    def failing_provider(action: str) -> str:
+        raise RuntimeError(f"boom {ACCESS_TOKEN} {action}")
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_provider=failing_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 0
+    assert result.error_count == 1
+    assert replies == [{"room_id": ROOM_ID, "txn_id": "command:$status", "body": "Command failed: RuntimeError"}]
+    assert ACCESS_TOKEN not in replies[0]["body"]
+
+
+def test_command_service_missing_cockpit_provider_is_deterministic_configuration_failure() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[str] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(MatrixTextEvent(event_id="$config", sender="@op:example", room_id=ROOM_ID, body="!parking config"),),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(kwargs["body"])
+            return "$reply"
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 0
+    assert result.error_count == 1
+    assert replies == ["Command failed: RuntimeError"]
+
+
+
+def test_parse_matrix_latest_command_is_exact_and_rejects_arguments() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandParseError, parse_matrix_command
+
+    latest = parse_matrix_command("  !parking   latest  ")
+
+    assert latest.action == "latest"
+    for body in ["!parking latest now", "!parking latest debug", "!parking latest ../debug_latest.jpg"]:
+        with pytest.raises(MatrixCommandParseError):
+            parse_matrix_command(body)
+
+
+def test_command_service_authorized_latest_sends_text_and_one_raw_image_without_archive_correction(tmp_path: Path) -> None:
+    from parking_spot_monitor.matrix import MatrixCommandResponse, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    latest_path = tmp_path / "latest.jpg"
+    raw_bytes = write_jpeg(latest_path, size=(11, 7))
+    calls: list[dict[str, Any]] = []
+    provider_actions: list[str] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$latest1", sender="@op:example", room_id=ROOM_ID, body="!parking latest"),
+                    MatrixTextEvent(event_id="$latest1", sender="@op:example", room_id=ROOM_ID, body="!parking latest"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            calls.append({"kind": "upload", **dict(kwargs)})
+            return "mxc://example.org/latest"
+
+        def send_image(self, **kwargs: Any) -> str:
+            calls.append({"kind": "image", **dict(kwargs)})
+            return "$image"
+
+    def cockpit_provider(action: str) -> MatrixCommandResponse:
+        provider_actions.append(action)
+        return MatrixCommandResponse(
+            text="Parking monitor latest\nSnapshot: fresh raw latest.jpg; 11x7; 632 bytes",
+            image_path=latest_path,
+            image_info={"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 11, "h": 7},
+        )
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    archive.corrections.append(FakeCorrection("existing", matrix_event_id="$latest1"))
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_provider=cockpit_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 2
+    assert result.error_count == 0
+    assert provider_actions == ["latest", "latest"]
+    assert archive.calls == []
+    assert [call["kind"] for call in calls] == ["text", "upload", "image", "text", "upload", "image"]
+    assert calls[0]["txn_id"] == "command:$latest1:text"
+    assert calls[0]["body"].startswith("Parking monitor latest")
+    assert calls[1]["filename"] == "latest.jpg"
+    assert calls[1]["content_type"] == "image/jpeg"
+    assert calls[1]["data"] == raw_bytes
+    assert calls[2]["txn_id"] == "command:$latest1:image"
+    assert calls[2]["body"] == "Raw full-frame latest.jpg evidence"
+    assert calls[2]["info"] == {"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 11, "h": 7}
+
+
+def test_command_service_latest_failure_and_unauthorized_latest_are_text_only(tmp_path: Path) -> None:
+    from parking_spot_monitor.matrix import MatrixCommandResponse, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    calls: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$deny", sender="@intruder:example", room_id=ROOM_ID, body="!parking latest"),
+                    MatrixTextEvent(event_id="$latest", sender="@op:example", room_id=ROOM_ID, body="!parking latest"),
+                    MatrixTextEvent(event_id="$status", sender="@op:example", room_id=ROOM_ID, body="!parking status"),
+                    MatrixTextEvent(event_id="$config", sender="@op:example", room_id=ROOM_ID, body="!parking config"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("text-only latest/status/config replies must not upload media")
+
+        def send_image(self, **kwargs: Any) -> str:
+            raise AssertionError("text-only latest/status/config replies must not send media")
+
+    def cockpit_provider(action: str) -> str | MatrixCommandResponse:
+        if action == "latest":
+            return MatrixCommandResponse(text="Parking monitor latest unavailable: latest.jpg missing", image_path=None, image_info=None)
+        return f"cockpit {action} reply"
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_provider=cockpit_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 3
+    assert result.error_count == 1
+    assert [call["body"] for call in calls] == [
+        "Command rejected: sender is not authorized.",
+        "Parking monitor latest unavailable: latest.jpg missing",
+        "cockpit status reply",
+        "cockpit config reply",
+    ]
+    assert all(call["kind"] == "text" for call in calls)
+
+
+
+def test_parse_matrix_why_and_recent_commands_are_exact_and_bounded() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandParseError, parse_matrix_command
+
+    why = parse_matrix_command("  !parking   why   right_spot  ")
+    recent = parse_matrix_command("\n!parking recent\t")
+
+    assert (why.action, why.spot_id) == ("why", "right_spot")
+    assert recent.action == "recent"
+
+    rejected = [
+        "!parking why",
+        "!parking why right_spot extra",
+        "!parking why ../state.json",
+        "!parking why /tmp/right_spot",
+        "!parking why " + "x" * 161,
+        "!parking recent now",
+        "!parking recent verbose",
+    ]
+    for body in rejected:
+        with pytest.raises(MatrixCommandParseError):
+            parse_matrix_command(body)
+
+
+def test_command_service_why_recent_use_provider_text_only_repeatably_without_archive_correction() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandResponse, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    calls: list[dict[str, Any]] = []
+    provider_calls: list[tuple[str, str | None]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$why", sender="@op:example", room_id=ROOM_ID, body="!parking why right_spot"),
+                    MatrixTextEvent(event_id="$why", sender="@op:example", room_id=ROOM_ID, body="!parking why right_spot"),
+                    MatrixTextEvent(event_id="$recent", sender="@op:example", room_id=ROOM_ID, body="!parking recent"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("why/recent replies must not upload media")
+
+        def send_image(self, **kwargs: Any) -> str:
+            raise AssertionError("why/recent replies must not send media")
+
+    def cockpit_provider(action: str, *, spot_id: str | None = None) -> MatrixCommandResponse:
+        provider_calls.append((action, spot_id))
+        text = f"decision {action}" + (f" {spot_id}" if spot_id else "")
+        return MatrixCommandResponse(text=text)
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    archive.corrections.append(FakeCorrection("existing", matrix_event_id="$why"))
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_provider=cockpit_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 3
+    assert result.error_count == 0
+    assert provider_calls == [("why", "right_spot"), ("why", "right_spot"), ("recent", None)]
+    assert archive.calls == []
+    assert [call["kind"] for call in calls] == ["text", "text", "text"]
+    assert [call["body"] for call in calls] == ["decision why right_spot", "decision why right_spot", "decision recent"]
+    assert [call["txn_id"] for call in calls] == ["command:$why", "command:$why", "command:$recent"]
+
+
+def test_command_service_rejects_unauthorized_why_before_memory_or_provider_paths() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[str] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(MatrixTextEvent(event_id="$why", sender="@intruder:example", room_id=ROOM_ID, body="!parking why right_spot"),),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(kwargs["body"])
+            return "$reply"
+
+    def cockpit_provider(action: str, *, spot_id: str | None = None) -> str:
+        raise AssertionError("unauthorized why must not touch provider or memory paths")
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@operator:example"],
+        cockpit_provider=cockpit_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 0
+    assert result.error_count == 1
+    assert replies == ["Command rejected: sender is not authorized."]
+
+
+def test_command_service_why_recent_context_reads_decision_memory_safely_text_only(tmp_path: Path) -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixOperatorCockpitContext, MatrixSyncResult, MatrixTextEvent
+    from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, make_decision_memory_record
+
+    memory_path = decision_memory_path(tmp_path)
+    assert append_decision_memory_record(
+        memory_path,
+        make_decision_memory_record(
+            "accepted_evidence",
+            observed_at="2026-05-18T19:00:00Z",
+            spot_id="right_spot",
+            summary="accepted parked vehicle evidence",
+            details={"hit_streak": 4, "token": ACCESS_TOKEN, "rtsp_url": "rtsp://user:pass@example/camera"},
+        ),
+    )
+    assert append_decision_memory_record(
+        memory_path,
+        make_decision_memory_record("command_outcome", observed_at="2026-05-18T19:01:00Z", summary="command processed", details={"outcome": "ok"}),
+    )
+    calls: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$why", sender="@op:example", room_id=ROOM_ID, body="!parking why right_spot"),
+                    MatrixTextEvent(event_id="$unknown", sender="@op:example", room_id=ROOM_ID, body="!parking why unknown_spot"),
+                    MatrixTextEvent(event_id="$recent", sender="@op:example", room_id=ROOM_ID, body="!parking recent"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("why/recent context replies must not upload media")
+
+        def send_image(self, **kwargs: Any) -> str:
+            raise AssertionError("why/recent context replies must not send media")
+
+    context = MatrixOperatorCockpitContext(
+        settings=object(),
+        data_dir=tmp_path,
+        health_path=tmp_path / "health.json",
+        state_path=tmp_path / "state.json",
+    )
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_context=context,
+    )
+
+    result = service.poll_once()
+    rendered = "\n".join(call["body"] for call in calls)
+
+    assert result.processed_count == 3
+    assert result.error_count == 0
+    assert "Parking decision memory for right_spot" in rendered
+    assert "accepted parked vehicle evidence" in rendered
+    assert "hit_streak: 4" in rendered
+    assert "Parking decision memory for unknown_spot" in rendered
+    assert "No recent decision memory for this spot" in rendered
+    assert "Parking decision memory recent" in rendered
+    assert "command_outcome" in rendered
+    assert ACCESS_TOKEN not in rendered
+    assert "rtsp://" not in rendered
+    assert all(call["kind"] == "text" for call in calls)
+    assert all(len(call["body"].encode("utf-8")) <= 4096 for call in calls)
+
+
+def test_command_service_recent_missing_context_is_safe_configuration_failure() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[str] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(next_batch="s3", events=(MatrixTextEvent(event_id="$recent", sender="@op:example", room_id=ROOM_ID, body="!parking recent"),))
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(kwargs["body"])
+            return "$reply"
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 0
+    assert result.error_count == 1
+    assert replies == ["Command failed: RuntimeError"]
+
+
+
+def test_parse_matrix_lab_commands_are_exact_and_reject_untrusted_arguments() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandParseError, parse_matrix_command
+
+    replay = parse_matrix_command("  !parking   lab   run   replay  ")
+    tuning = parse_matrix_command("!parking lab run tuning")
+    status = parse_matrix_command("!parking lab status")
+    latest = parse_matrix_command("!parking lab status latest")
+    specific = parse_matrix_command("!parking lab status lab-20260518T190000Z-abcdef12")
+
+    assert (replay.action, replay.lab_kind) == ("lab_run", "replay")
+    assert (tuning.action, tuning.lab_kind) == ("lab_run", "tuning")
+    assert (status.action, status.lab_job_id) == ("lab_status", "latest")
+    assert (latest.action, latest.lab_job_id) == ("lab_status", "latest")
+    assert (specific.action, specific.lab_job_id) == ("lab_status", "lab-20260518T190000Z-abcdef12")
+
+    rejected = [
+        "!parking lab",
+        "!parking lab run",
+        "!parking lab run replay now",
+        "!parking lab run /tmp/replay",
+        "!parking lab run ../replay",
+        "!parking lab run unknown",
+        "!parking lab status latest extra",
+        "!parking lab status ../status.json",
+        "!parking lab status /tmp/status.json",
+        "!parking lab status lab-20260518T190000Z-ABCDEF12",
+        "!parking lab status lab-20260518T190000Z-abc",
+        "!parking lab status " + "x" * 600,
+    ]
+    for body in rejected:
+        with pytest.raises(MatrixCommandParseError):
+            parse_matrix_command(body)
+
+
+def test_command_service_lab_commands_use_provider_text_only_repeatably_without_archive_correction() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandResponse, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    calls: list[dict[str, Any]] = []
+    provider_calls: list[tuple[str, str | None, str | None]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$lab", sender="@op:example", room_id=ROOM_ID, body="!parking lab run replay"),
+                    MatrixTextEvent(event_id="$lab", sender="@op:example", room_id=ROOM_ID, body="!parking lab run replay"),
+                    MatrixTextEvent(event_id="$status", sender="@op:example", room_id=ROOM_ID, body="!parking lab status lab-20260518T190000Z-abcdef12"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("lab command replies must not upload media")
+
+        def send_image(self, **kwargs: Any) -> str:
+            raise AssertionError("lab command replies must not send media")
+
+    def cockpit_provider(action: str, *, lab_kind: str | None = None, lab_job_id: str | None = None) -> MatrixCommandResponse:
+        provider_calls.append((action, lab_kind, lab_job_id))
+        if action == "lab_run":
+            return MatrixCommandResponse(text=f"Detection lab job started\nKind: {lab_kind}\nJob: lab-20260518T190000Z-abcdef12")
+        return MatrixCommandResponse(text=f"Detection lab status\nJob: {lab_job_id}\nStatus: succeeded")
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    archive.corrections.append(FakeCorrection("existing", matrix_event_id="$lab"))
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_provider=cockpit_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 3
+    assert result.error_count == 0
+    assert provider_calls == [
+        ("lab_run", "replay", None),
+        ("lab_run", "replay", None),
+        ("lab_status", None, "lab-20260518T190000Z-abcdef12"),
+    ]
+    assert archive.calls == []
+    assert [call["kind"] for call in calls] == ["text", "text", "text"]
+    assert [call["txn_id"] for call in calls] == ["command:$lab", "command:$lab", "command:$status"]
+    assert all("Detection lab" in call["body"] for call in calls)
+
+
+def test_command_service_rejects_unauthorized_lab_before_provider_or_paths() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[str] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$run", sender="@intruder:example", room_id=ROOM_ID, body="!parking lab run replay"),
+                    MatrixTextEvent(event_id="$status", sender="@intruder:example", room_id=ROOM_ID, body="!parking lab status latest"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(kwargs["body"])
+            return "$reply"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("unauthorized lab replies must not upload media")
+
+    def cockpit_provider(action: str, **kwargs: Any) -> str:
+        raise AssertionError("unauthorized lab command must not touch provider or lab paths")
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@operator:example"],
+        cockpit_provider=cockpit_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 0
+    assert result.error_count == 2
+    assert replies == ["Command rejected: sender is not authorized.", "Command rejected: sender is not authorized."]
+
+
+def test_command_service_lab_context_routes_to_manager_safely_text_only(tmp_path: Path) -> None:
+    from parking_spot_monitor.detection_lab import REPLAY_CONFIG_FILENAME, REPLAY_LABELS_FILENAME
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixOperatorCockpitContext, MatrixSyncResult, MatrixTextEvent
+
+    lab_root = tmp_path / "detection-lab"
+    lab_root.mkdir()
+    (lab_root / REPLAY_LABELS_FILENAME).write_text("{}", encoding="utf-8")
+    (lab_root / REPLAY_CONFIG_FILENAME).write_text("{}", encoding="utf-8")
+    calls: list[dict[str, Any]] = []
+
+    def replay_runner(inputs: dict[str, Path]) -> dict[str, Any]:
+        report = inputs["job_dir"] / "replay-report.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "schema_version": "test.v1",
+                    "status_counts": {"passed": 2, "failed": 1},
+                    "coverage": {"assessed_frames": 3, "blocked_frames": 0, "not_assessed_frames": 0},
+                    "redaction_scan": {"passed": True, "findings": []},
+                    "token": ACCESS_TOKEN,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return report
+
+    from parking_spot_monitor.detection_lab import DetectionLabManager
+
+    manager = DetectionLabManager(tmp_path, replay_runner=replay_runner)
+
+    class Client:
+        poll = 0
+
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            self.poll += 1
+            if self.poll == 1:
+                return MatrixSyncResult(next_batch="s3", events=(MatrixTextEvent(event_id="$run", sender="@op:example", room_id=ROOM_ID, body="!parking lab run replay"),))
+            return MatrixSyncResult(next_batch="s4", events=(MatrixTextEvent(event_id="$status", sender="@op:example", room_id=ROOM_ID, body="!parking lab status latest"),))
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("lab context replies must not upload media")
+
+        def send_image(self, **kwargs: Any) -> str:
+            raise AssertionError("lab context replies must not send media")
+
+    context = MatrixOperatorCockpitContext(
+        settings=object(),
+        data_dir=tmp_path,
+        health_path=tmp_path / "health.json",
+        state_path=tmp_path / "state.json",
+        detection_lab_manager=manager,
+    )
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_context=context,
+    )
+
+    first = service.poll_once()
+    import time
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if "Detection lab status\n" in context.format_reply("lab_status").text and "Status: succeeded" in context.format_reply("lab_status").text:
+            break
+        time.sleep(0.01)
+    second = service.poll_once()
+    rendered = "\n".join(call["body"] for call in calls)
+
+    assert first.processed_count == 1
+    assert second.processed_count == 1
+    assert "Detection lab job started" in rendered
+    assert "Detection lab status" in rendered
+    assert "passed=2" in rendered
+    assert "coverage: assessed 3" in rendered
+    assert ACCESS_TOKEN not in rendered
+    assert all(call["kind"] == "text" for call in calls)
+    assert all(len(call["body"].encode("utf-8")) <= 4096 for call in calls)
+
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "!parking status extra",
+        "!parking config verbose",
+        "!parking latest ../debug_latest.jpg",
+        "!parking why ../state.json",
+        "!parking recent now",
+        "!parking lab run replay; rm -rf /",
+        "!parking lab status ../../status.json",
+        "!parking profile summary prof_a extra",
+        "!parking profile merge prof_a prof_a",
+        "!parking owner ../left_spot",
+        "!parking who now",
+        "!parking help please",
+    ],
+)
+def test_command_service_malformed_authorized_commands_fail_closed_before_provider_or_archive(body: str) -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[str] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(next_batch="s3", events=(MatrixTextEvent(event_id="$bad", sender="@op:example", room_id=ROOM_ID, body=body),))
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(kwargs["body"])
+            return "$reply"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("malformed commands must not upload media")
+
+        def send_image(self, **kwargs: Any) -> str:
+            raise AssertionError("malformed commands must not send media")
+
+    def cockpit_provider(action: str, **kwargs: Any) -> str:
+        raise AssertionError("malformed commands must not reach cockpit provider")
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_provider=cockpit_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 0
+    assert result.error_count == 1
+    assert archive.calls == []
+    assert len(replies) == 1
+    assert replies[0].startswith("Command rejected: ")
+    assert ACCESS_TOKEN not in replies[0]
+
+
+def test_command_service_latest_media_delivery_failure_is_sanitized_text_failure(tmp_path: Path) -> None:
+    from io import StringIO
+
+    from parking_spot_monitor.logging import StructuredLogger
+    from parking_spot_monitor.matrix import MatrixCommandResponse, MatrixCommandService, MatrixError, MatrixSyncResult, MatrixTextEvent
+
+    latest_path = tmp_path / "latest.jpg"
+    raw_bytes = write_jpeg(latest_path, size=(9, 5))
+    log_stream = StringIO()
+    calls: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(next_batch="s3", events=(MatrixTextEvent(event_id="$latest", sender="@op:example", room_id=ROOM_ID, body="!parking latest"),))
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            calls.append({"kind": "upload", "filename": kwargs["filename"], "data_len": len(kwargs["data"])})
+            raise MatrixError("upload failed", error_type="http_status", status_code=500, access_token=ACCESS_TOKEN, response_body="raw body " + ACCESS_TOKEN)
+
+        def send_image(self, **kwargs: Any) -> str:
+            raise AssertionError("image event must not be sent after upload failure")
+
+    def cockpit_provider(action: str) -> MatrixCommandResponse:
+        assert action == "latest"
+        return MatrixCommandResponse(
+            text="Parking monitor latest\nSnapshot: fresh raw latest.jpg; 9x5",
+            image_path=latest_path,
+            image_info={"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 9, "h": 5},
+        )
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_provider=cockpit_provider,
+        logger=StructuredLogger(stream=log_stream),
+    )
+
+    result = service.poll_once()
+    rendered = json.dumps(calls) + log_stream.getvalue()
+
+    assert result.processed_count == 0
+    assert result.error_count == 1
+    assert [call["kind"] for call in calls] == ["text", "upload", "text"]
+    assert calls[0]["txn_id"] == "command:$latest:text"
+    assert calls[2] == {"kind": "text", "room_id": ROOM_ID, "txn_id": "command:$latest", "body": "Command failed: MatrixError"}
+    assert ACCESS_TOKEN not in rendered
+    assert "raw body" not in rendered
+    assert raw_bytes.hex() not in rendered

@@ -54,6 +54,15 @@ def test_readme_documents_clean_machine_setup_sequence_and_operator_commands() -
             "docker compose restart parking-spot-monitor",
             "docker compose down",
             "!parking help",
+            "!parking status",
+            "!parking config",
+            "!parking latest",
+            "!parking why <spot_id>",
+            "!parking recent",
+            "!parking lab run replay",
+            "!parking lab run tuning",
+            "!parking lab status",
+            "!parking lab status <job_id|latest>",
             "!parking who",
             "!parking owner <spot_id>",
             "!parking wrong <spot_id|session_id>",
@@ -74,6 +83,288 @@ def test_readme_documents_clean_machine_setup_sequence_and_operator_commands() -
     ]
     positions = [readme.index(token) for token in sequence]
     assert positions == sorted(positions)
+
+
+def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_secret_safe() -> None:
+    readme = read_tracked("README.md")
+    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+
+    assert_contains_all(
+        readme,
+        [
+            "The read-only cockpit commands are `!parking status`, `!parking config`, `!parking latest`, `!parking why <spot_id>`, and `!parking recent`",
+            "Empty `matrix.command_authorized_senders` default-denies all Matrix commands",
+            "Missing, corrupt, or unreadable health/state files are reported as `unavailable`",
+            "`!parking why <spot_id>` explains the bounded recent decision memory",
+            "`!parking recent` returns a compact bounded timeline",
+            "operator-decision-memory.json",
+            "Decision memory unavailable",
+            "No recent decision memory for this spot",
+            "old health timestamps are called `stale`",
+            "safe error classes such as `error_type`",
+            "redact resolved camera URLs",
+            "Matrix access-token values",
+            "raw Matrix response bodies",
+            "tracebacks",
+            "YAML dumps",
+            "image bytes",
+            "raw JPEG bytes",
+            "raw Matrix event bodies",
+            "unbounded detector payloads",
+            "do not start capture, detector, model, upload preparation, Matrix-sync, shell, browser, dashboard, detection-lab, or live-proof work",
+            "never mutate live spot state or vehicle-history records",
+            "owner/wrong/profile commands are the explicit mutation boundary",
+            "!parking latest",
+        ],
+    )
+    assert_contains_all(
+        matrix_source,
+        [
+            "{command_prefix} status — show runtime health and spot status",
+            "{command_prefix} config — show safe monitor configuration",
+            "{command_prefix} latest — show latest runtime summary and raw full-frame image evidence",
+            "{command_prefix} why <spot_id> — explain recent parking decisions for one spot from bounded local memory",
+            "{command_prefix} recent — show recent decision, alert, suppression, command, and lab records from bounded local memory",
+        ],
+    )
+
+    forbidden_promises = [
+        "run shell commands",
+        "open a dashboard",
+        "unredacted secret",
+        "mutate live spot state with `!parking status`",
+        "mutate live spot state with `!parking config`",
+    ]
+    for marker in forbidden_promises:
+        assert marker not in readme
+
+
+
+def test_detection_lab_command_docs_cover_bounded_authorized_local_artifact_boundary() -> None:
+    readme = read_tracked("README.md")
+    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
+    lab_source = read_tracked("parking_spot_monitor/detection_lab.py")
+    startup_source = read_tracked("parking_spot_monitor/__main__.py")
+
+    assert_contains_all(
+        readme,
+        [
+            "`!parking lab run replay`",
+            "`!parking lab run tuning`",
+            "`!parking lab status`",
+            "`!parking lab status <job_id|latest>`",
+            "authorized cockpit commands",
+            "authorization/default-deny boundary",
+            "empty `matrix.command_authorized_senders` list denies lab starts",
+            "exact lab grammar",
+            "malformed job IDs",
+            "path traversal strings",
+            "shell snippets",
+            "Matrix-supplied filesystem paths",
+            "asynchronous, non-blocking local replay job",
+            "returns immediately with a bounded job ID",
+            "data/detection-lab/labels.json",
+            "data/detection-lab/replay-config.json",
+            "data/detection-lab/baseline-config.json",
+            "data/detection-lab/proposed-config.json",
+            "data/detection-lab/jobs/<job_id>/",
+            "persisted redacted `status.json`",
+            "replay-report.json",
+            "tuning-report.json",
+            "`!parking lab status` is the same as `!parking lab status latest`",
+            "Detection lab status unavailable",
+            "missing_fixed_inputs",
+            "status_unreadable",
+            "malformed_report",
+            "runner_unavailable",
+            "text-only and do not upload media",
+            "does not mutate live occupancy",
+            "camera capture",
+            "live detector/model execution",
+            "live Matrix delivery",
+            "safe `lab_outcome` records",
+            "`!parking recent` may show lab outcomes",
+            "RTSP URLs",
+            "Matrix tokens",
+            "Authorization headers",
+            "raw Matrix response bodies",
+            "tracebacks",
+            "image bytes",
+        ],
+    )
+    assert_contains_all(
+        matrix_source,
+        [
+            "{command_prefix} lab run replay — start a bounded local replay lab job using fixed inputs",
+            "{command_prefix} lab run tuning — start a bounded local tuning lab job using fixed inputs",
+            "{command_prefix} lab status [job_id|latest] — show the latest or selected redacted lab job status",
+            "usage: !parking lab run <replay|tuning>",
+            "usage: !parking lab status [job_id|latest]",
+            "invalid lab job kind",
+            "invalid lab job id",
+        ],
+    )
+    assert_contains_all(
+        cockpit_source,
+        [
+            "Detection lab job started",
+            "use !parking lab status latest",
+            "Inputs: fixed local detection-lab files under the runtime data directory.",
+            "Detection lab status unavailable",
+            "No detector, camera, shell, or live occupancy work was run by this reply path.",
+            "Report:",
+            "missing fixed inputs",
+        ],
+    )
+    assert_contains_all(
+        lab_source,
+        [
+            "LAB_DIR_NAME = \"detection-lab\"",
+            "JOBS_DIR_NAME = \"jobs\"",
+            "STATUS_FILENAME = \"status.json\"",
+            "REPLAY_REPORT_FILENAME = \"replay-report.json\"",
+            "TUNING_REPORT_FILENAME = \"tuning-report.json\"",
+            "REPLAY_LABELS_FILENAME = \"labels.json\"",
+            "REPLAY_CONFIG_FILENAME = \"replay-config.json\"",
+            "TUNING_BASELINE_CONFIG_FILENAME = \"baseline-config.json\"",
+            "TUNING_PROPOSED_CONFIG_FILENAME = \"proposed-config.json\"",
+            "missing_fixed_inputs",
+            "runner_unavailable",
+            "malformed_report",
+            "status_unreadable",
+            "path_outside_lab",
+            "outcome_recorder",
+        ],
+    )
+    assert "record_outcome" in startup_source
+    assert "_append_lab_outcome_memory" in startup_source
+
+    forbidden_lab_doc_claims = [
+        "lab command accepts a path",
+        "lab command uploads media",
+        "lab command mutates live occupancy",
+        "lab command runs a live camera",
+        "lab command changes production thresholds",
+        "lab status reads arbitrary paths",
+    ]
+    for marker in forbidden_lab_doc_claims:
+        assert marker not in readme
+
+def test_why_recent_command_docs_cover_memory_boundaries_and_safe_failures() -> None:
+    readme = read_tracked("README.md")
+    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    memory_source = read_tracked("parking_spot_monitor/operator_decision_memory.py")
+
+    assert_contains_all(
+        readme,
+        [
+            "`!parking why <spot_id>` explains the bounded recent decision memory",
+            "`!parking recent` returns a compact bounded timeline",
+            "accepted/rejected evidence",
+            "hit/miss streak context",
+            "quiet-window or weak-open suppression",
+            "alert outcomes",
+            "command/lab outcomes",
+            "Invalid spot IDs or extra arguments are rejected",
+            "Missing, corrupt, oversized, unsupported, or unreadable `operator-decision-memory.json`",
+            "Decision memory unavailable",
+            "no detector or camera work was run",
+            "No recent decision memory for this spot",
+            "bounded local `operator-decision-memory.json` under the effective runtime data directory",
+            "Matrix arguments cannot choose arbitrary files",
+            "They are text-only commands",
+            "do not upload media",
+            "mutate archive corrections",
+            "start capture",
+            "run the detector/model",
+            "invoke detection-lab work",
+            "raw JPEG bytes",
+            "raw Matrix event bodies",
+            "unbounded detector payloads",
+        ],
+    )
+    assert_contains_all(
+        matrix_source,
+        [
+            "usage: !parking why <spot_id>",
+            "usage: !parking recent",
+            "invalid spot id",
+            "{command_prefix} why <spot_id> — explain recent parking decisions for one spot from bounded local memory",
+            "{command_prefix} recent — show recent decision, alert, suppression, command, and lab records from bounded local memory",
+        ],
+    )
+    assert_contains_all(
+        memory_source,
+        [
+            "operator-decision-memory.json",
+            "Decision memory unavailable",
+            "No recent decision memory for this spot",
+            "no detector or camera work was run",
+            "operator-decision-memory-quarantined",
+            "MAX_REPLY_BYTES",
+        ],
+    )
+
+    forbidden_why_recent_claims = [
+        "why starts a capture",
+        "recent starts a capture",
+        "why uploads media",
+        "recent uploads media",
+        "why runs the detector",
+        "recent runs detection-lab",
+    ]
+    for marker in forbidden_why_recent_claims:
+        assert marker not in readme
+
+
+def test_latest_command_docs_cover_raw_image_failure_and_retention_boundaries() -> None:
+    readme = read_tracked("README.md")
+    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+
+    assert_contains_all(
+        readme,
+        [
+            "`!parking latest` sends a concise runtime summary plus one Matrix image",
+            "already-existing local `latest.jpg` passes validation",
+            "Parking monitor latest unavailable",
+            "Snapshot: unavailable",
+            "missing",
+            "too large",
+            "invalid JPEG",
+            "health freshness including `stale`",
+            "capture/detection failure counts",
+            "per-spot decisions",
+            "raw full-frame `data/latest.jpg`",
+            "must not use `data/debug_latest.jpg`",
+            "polygon overlays",
+            "not invoke a new capture",
+            "detector/model run",
+            "Raw full-frame latest.jpg evidence",
+            "does not create or prune retained files under `data/snapshots/`",
+            "retention boundaries remain for Matrix event/live-proof snapshots",
+            "read-only cockpit commands never mutate live spot state",
+            "snapshot retention",
+            "runtime artifacts",
+        ],
+    )
+    assert_contains_all(
+        matrix_source,
+        [
+            "{command_prefix} latest — show latest runtime summary and raw full-frame image evidence",
+            "Raw full-frame {image_path.name} evidence",
+            "command:{event.event_id}:image",
+        ],
+    )
+
+    forbidden_latest_claims = [
+        "latest uses debug_latest.jpg",
+        "latest creates retained snapshots",
+        "latest starts a capture",
+        "latest mutates live spot state",
+    ]
+    for marker in forbidden_latest_claims:
+        assert marker not in readme
 
 
 def test_readme_and_compose_agree_on_service_mount_command_and_device_contract() -> None:
@@ -241,6 +532,7 @@ def test_s04_docs_contract_stays_grounded_in_tracked_source_events() -> None:
             "parking_spot_monitor/health.py",
             "parking_spot_monitor/debug_overlay.py",
             "parking_spot_monitor/occupancy.py",
+            "parking_spot_monitor/operator_decision_memory.py",
         ]
     )
 
@@ -264,6 +556,7 @@ def test_s04_docs_contract_stays_grounded_in_tracked_source_events() -> None:
         "occupancy-open-suppressed",
         "/dev/dri:/dev/dri",
         "snapshot_retention_count",
+        "operator-decision-memory-quarantined",
     ]
     for token in source_backed_tokens:
         assert token in tracked_sources, f"tracked source no longer backs documented token: {token}"
@@ -430,6 +723,7 @@ def test_readme_calibration_artifact_and_safety_contract_is_grounded() -> None:
             "data/snapshots/",
             "data/health.json",
             "data/state.json",
+            "data/operator-decision-memory.json",
             "debug-overlay-written",
             "capture-frame-written",
             "detection-frame-processed",

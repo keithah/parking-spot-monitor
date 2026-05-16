@@ -11,8 +11,9 @@ from PIL import Image
 from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.logging import StructuredLogger
+from parking_spot_monitor.operator_decision_memory import load_decision_memory
 from parking_spot_monitor.matrix import MatrixDelivery
-from parking_spot_monitor.__main__ import _main, _presence_by_spot, main
+from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _main, _presence_by_spot, main
 from parking_spot_monitor.detection import DetectionError, DetectionFilterResult, RejectedDetection, RejectionReason, SpotDetectionResult, VehicleDetection
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
@@ -1218,7 +1219,7 @@ def test_runtime_loop_matrix_command_failure_is_non_blocking_and_redacted(
     assert len(delivery.occupied_alerts) == 1
     assert health["status"] == "degraded"
     assert health["last_vehicle_history_error"]["phase"] == "matrix-command"
-    assert health["last_vehicle_history_error"]["action"] == "vehicle-history-correction"
+    assert health["last_vehicle_history_error"]["action"] == "matrix-command"
     assert '"event":"matrix-command-poll-failed"' in output
     assert_no_secret_leak(output)
 
@@ -3140,3 +3141,114 @@ def test_presence_by_spot_does_not_count_centroid_outside_vehicle() -> None:
     )
 
     assert _presence_by_spot(result) == {"left_spot": False}
+
+def test_runtime_loop_appends_sanitized_decision_memory_records(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    detections = [[left_spot_vehicle()]]
+    delivery = FakeMatrixDelivery()
+
+    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+        return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
+
+    class SequencedDetector:
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            return detections.pop(0)
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: SequencedDetector(),
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    memory_path = tmp_path / "operator-decision-memory.json"
+    loaded = load_decision_memory(memory_path)
+    rendered = memory_path.read_text(encoding="utf-8")
+
+    assert exit_code == 0
+    assert loaded.state == "available"
+    assert any(record.kind == "accepted_evidence" and record.spot_id == "left_spot" for record in loaded.records)
+    assert any(record.kind == "miss" and record.spot_id == "right_spot" for record in loaded.records)
+    assert any(record.details and record.details.get("hit_streak") == 1 for record in loaded.records)
+    assert_no_secret_leak(output + rendered)
+
+
+def test_runtime_loop_decision_memory_append_failure_is_non_fatal(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    (tmp_path / "operator-decision-memory.json").mkdir()
+    (tmp_path / "operator-decision-memory.json.quarantine").mkdir()
+    ((tmp_path / "operator-decision-memory.json.quarantine") / "existing").write_text("block quarantine", encoding="utf-8")
+
+    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+        return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: FakeMatrixDelivery(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+
+    assert exit_code == 0
+    assert (tmp_path / "state.json").exists()
+    assert "operator-decision-memory-append-failed" in output
+    assert_no_secret_leak(output)
+
+def test_default_matrix_command_service_wires_detection_lab_to_effective_paths_and_memory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
+
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "matrix": settings.matrix.model_copy(update={"command_authorized_senders": ["@operator:example.org"]})
+        }
+    )
+    logger = StructuredLogger()
+    archive = VehicleHistoryArchive(tmp_path / "vehicle-history", logger=logger)
+
+    service = _default_matrix_command_service_factory(settings, tmp_path, logger, archive)
+
+    assert service is not None
+    context = service.cockpit_context
+    assert context is not None
+    assert context.data_dir == tmp_path
+    assert context.detection_lab_manager is not None
+    assert context.detection_lab_manager.lab_root == tmp_path / "detection-lab"
+
+    response = context.format_reply("lab_run", lab_kind="replay", logger=logger)
+    loaded = load_decision_memory(tmp_path / "operator-decision-memory.json")
+    output = combined_output(capsys)
+
+    assert "Detection lab job started" in response.text
+    assert loaded.state == "available"
+    lab_records = [record for record in loaded.records if record.kind == "lab_outcome"]
+    assert lab_records
+    assert lab_records[-1].details is not None
+    assert lab_records[-1].details.get("kind") == "replay"
+    assert lab_records[-1].details.get("status") == "blocked"
+    assert lab_records[-1].details.get("phase") == "validate_inputs"
+    assert "detection-lab-outcome-recorded" in output
+    assert not (tmp_path / "state.json").exists()
+    assert_no_secret_leak(output + (tmp_path / "operator-decision-memory.json").read_text(encoding="utf-8"))
+
+
+def test_startup_summary_includes_sanitized_detection_lab_dir(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = _main(["--config", "config.yaml.example", "--data-dir", "/tmp/parking-data", "--validate-config"], environ=fake_environ())
+
+    output = combined_output(capsys)
+
+    assert exit_code == 0
+    assert '"detection_lab_dir":"/tmp/parking-data/detection-lab"' in output
+    assert_no_secret_leak(output)
+

@@ -16,6 +16,8 @@ class RuntimePaths:
     snapshots_dir: Path
     health_file: Path
     vehicle_history_dir: Path
+    decision_memory_file: Path
+    detection_lab_dir: Path
 
 
 def resolve_runtime_paths(settings: RuntimeSettings, data_dir: str | Path) -> RuntimePaths:
@@ -36,6 +38,8 @@ def resolve_runtime_paths(settings: RuntimeSettings, data_dir: str | Path) -> Ru
         snapshots_dir=snapshots_dir,
         health_file=health_file,
         vehicle_history_dir=effective_data_dir / "vehicle-history",
+        decision_memory_file=effective_data_dir / "operator-decision-memory.json",
+        detection_lab_dir=effective_data_dir / "detection-lab",
     )
 
 
