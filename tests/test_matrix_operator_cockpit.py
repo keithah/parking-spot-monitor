@@ -635,3 +635,64 @@ def test_operator_cockpit_detection_lab_status_failures_are_safe_and_redacted(tm
     assert len(invalid.encode("utf-8")) <= 4096
     assert len(bad_kind.encode("utf-8")) <= 4096
     _assert_no_sensitive_text(rendered)
+
+
+def test_build_who_snapshot_response_captures_once_and_attaches_validated_image(tmp_path: Path) -> None:
+    from parking_spot_monitor.capture import DecodeMode, FrameCaptureResult
+    from parking_spot_monitor.operator_cockpit import build_who_snapshot_response
+
+    latest_path = tmp_path / "latest.jpg"
+    raw_bytes = len(_write_test_jpeg(latest_path, size=(13, 9)))
+    calls: list[tuple[object, Path]] = []
+
+    def capture_func(settings: object, data_dir: Path, **kwargs: object) -> FrameCaptureResult:
+        calls.append((settings, Path(data_dir)))
+        return FrameCaptureResult(
+            timestamp="2026-05-16T17:42:39Z",
+            latest_path=latest_path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=0.25,
+            byte_size=raw_bytes,
+        )
+
+    settings = object()
+    response = build_who_snapshot_response(
+        settings=settings,
+        data_dir=tmp_path,
+        base_text="Parking monitor who\n- left_spot: occupied — unknown vehicle",
+        capture_func=capture_func,
+        now=datetime(2026, 5, 16, 17, 42, 40, tzinfo=timezone.utc),
+    )
+
+    assert calls == [(settings, tmp_path)]
+    assert response.image_path == latest_path
+    assert response.image_info == {"mimetype": "image/jpeg", "size": raw_bytes, "w": 13, "h": 9}
+    assert response.text.startswith("Parking monitor who\nSnapshot: fresh capture")
+    assert "left_spot: occupied" in response.text
+
+
+def test_build_who_snapshot_response_falls_back_to_text_on_capture_failure(tmp_path: Path) -> None:
+    from parking_spot_monitor.capture import CaptureError, DecodeMode
+    from parking_spot_monitor.operator_cockpit import build_who_snapshot_response
+
+    def capture_func(settings: object, data_dir: Path, **kwargs: object) -> object:
+        raise CaptureError(
+            reason="ffmpeg-timeout",
+            mode=DecodeMode.SOFTWARE,
+            output_path=tmp_path / "latest.jpg",
+            message="capture failed with token syt_secret_matrix_token",
+            timeout_seconds=2,
+        )
+
+    response = build_who_snapshot_response(
+        settings=object(),
+        data_dir=tmp_path,
+        base_text="Parking monitor who\n- right_spot: open; no active vehicle session",
+        capture_func=capture_func,
+    )
+
+    assert response.image_path is None
+    assert response.image_info is None
+    assert "Snapshot: fresh capture unavailable (ffmpeg-timeout); no live state was changed." in response.text
+    assert "right_spot: open" in response.text
+    assert "syt_secret" not in response.text

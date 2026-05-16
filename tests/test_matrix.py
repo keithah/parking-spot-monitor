@@ -265,8 +265,6 @@ def write_jpeg(path: Path, *, size: tuple[int, int] = (4, 3)) -> bytes:
     return path.read_bytes()
 
 
-
-
 def occupied_event(snapshot_path: Path | str = "unused.jpg") -> dict[str, Any]:
     return {
         "event_type": OCCUPIED_SPOT_EVENT_TYPE,
@@ -723,8 +721,6 @@ def test_quiet_notice_text_is_deterministic_and_contextual() -> None:
             "window_id": "street_sweeping:2026-05-18:13:00-15:00",
         }
     ) == "Street sweeping ended: street_sweeping:2026-05-18:13:00-15:00"
-
-
 
 
 def test_owner_vehicle_quiet_window_alert_text_and_event_id_are_concise() -> None:
@@ -1383,7 +1379,6 @@ def test_command_service_authorized_status_and_config_reply_via_command_txn_path
     ]
 
 
-
 def test_command_service_status_and_config_use_cockpit_provider_without_archive_corrections() -> None:
     from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
 
@@ -1492,7 +1487,6 @@ def test_command_service_missing_cockpit_provider_is_deterministic_configuration
     assert replies == ["Command failed: RuntimeError"]
 
 
-
 def test_parse_matrix_latest_command_is_exact_and_rejects_arguments() -> None:
     from parking_spot_monitor.matrix import MatrixCommandParseError, parse_matrix_command
 
@@ -1569,6 +1563,59 @@ def test_command_service_authorized_latest_sends_text_and_one_raw_image_without_
     assert calls[2]["info"] == {"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 11, "h": 7}
 
 
+def test_command_service_who_can_send_active_assignments_with_fresh_snapshot(tmp_path: Path) -> None:
+    from parking_spot_monitor.matrix import MatrixCommandResponse, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    latest_path = tmp_path / "latest.jpg"
+    raw_bytes = write_jpeg(latest_path, size=(13, 9))
+    calls: list[dict[str, Any]] = []
+    provider_inputs: list[str] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(next_batch="s3", events=(MatrixTextEvent(event_id="$who", sender="@op:example", room_id=ROOM_ID, body="!parking who"),))
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            calls.append({"kind": "upload", **dict(kwargs)})
+            return "mxc://example.org/who"
+
+        def send_image(self, **kwargs: Any) -> str:
+            calls.append({"kind": "image", **dict(kwargs)})
+            return "$image"
+
+    def who_snapshot_provider(base_text: str) -> MatrixCommandResponse:
+        provider_inputs.append(base_text)
+        return MatrixCommandResponse(
+            text="Parking monitor who\nSnapshot: fresh capture at 2026-05-16 10:42:39 AM PDT\n\n" + "\n".join(base_text.splitlines()[1:]),
+            image_path=latest_path,
+            image_info={"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 13, "h": 9},
+        )
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        who_snapshot_provider=who_snapshot_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 1
+    assert result.error_count == 0
+    assert provider_inputs and provider_inputs[0].startswith("Active parking sessions:")
+    assert [call["kind"] for call in calls] == ["text", "upload", "image"]
+    assert calls[0]["txn_id"] == "command:$who:text"
+    assert "Snapshot: fresh capture" in calls[0]["body"]
+    assert calls[1]["filename"] == "latest.jpg"
+    assert calls[1]["data"] == raw_bytes
+    assert calls[2]["txn_id"] == "command:$who:image"
+    assert calls[2]["body"] == "Raw full-frame latest.jpg evidence"
+
 def test_command_service_latest_failure_and_unauthorized_latest_are_text_only(tmp_path: Path) -> None:
     from parking_spot_monitor.matrix import MatrixCommandResponse, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
 
@@ -1620,7 +1667,6 @@ def test_command_service_latest_failure_and_unauthorized_latest_are_text_only(tm
         "cockpit config reply",
     ]
     assert all(call["kind"] == "text" for call in calls)
-
 
 
 def test_parse_matrix_why_and_recent_commands_are_exact_and_bounded() -> None:
@@ -1832,7 +1878,6 @@ def test_command_service_recent_missing_context_is_safe_configuration_failure() 
     assert result.processed_count == 0
     assert result.error_count == 1
     assert replies == ["Command failed: RuntimeError"]
-
 
 
 def test_parse_matrix_lab_commands_are_exact_and_reject_untrusted_arguments() -> None:

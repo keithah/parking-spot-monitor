@@ -574,6 +574,7 @@ class MatrixCommandService:
         sync_timeout_ms: int = 0,
         sync_limit: int = 20,
         cockpit_provider: Callable[[str], str | MatrixCommandResponse] | None = None,
+        who_snapshot_provider: Callable[[str], str | MatrixCommandResponse] | None = None,
         cockpit_context: MatrixOperatorCockpitContext | None = None,
         feedback_labeler: Any | None = None,
     ) -> None:
@@ -587,6 +588,7 @@ class MatrixCommandService:
         self.sync_timeout_ms = sync_timeout_ms
         self.sync_limit = sync_limit
         self.cockpit_provider = cockpit_provider
+        self.who_snapshot_provider = who_snapshot_provider
         self.cockpit_context = cockpit_context
         self.feedback_labeler = feedback_labeler
 
@@ -695,7 +697,10 @@ class MatrixCommandService:
             confidence_text = _confidence_text(confidence)
             return f"Owner vehicle assigned to {command.subject_id}: session {session_id}, profile {profile_id}, confidence {confidence_text}."
         if command.action == "active_spot_assignments":
-            return _format_active_spot_assignments_reply(self.archive.active_spot_assignments())
+            base_reply = _format_active_spot_assignments_reply(self.archive.active_spot_assignments())
+            if self.who_snapshot_provider is not None:
+                return self.who_snapshot_provider(base_reply)
+            return base_reply
         if command.action == "help":
             return _format_command_help_reply(self.command_prefix)
         if command.action == "profile_summary":
@@ -1076,7 +1081,7 @@ def _format_command_help_reply(command_prefix: str) -> str:
         f"{command_prefix} lab run replay — start a bounded local replay lab job using fixed inputs\n"
         f"{command_prefix} lab run tuning — start a bounded local tuning lab job using fixed inputs\n"
         f"{command_prefix} lab status [job_id|latest] — show the latest or selected redacted lab job status\n"
-        f"{command_prefix} who — list active parking sessions by spot\n"
+        f"{command_prefix} who — list active parking sessions by spot and attach a fresh current snapshot when configured\n"
         f"{command_prefix} owner <spot_id> — mark the active vehicle in a spot as the configured owner vehicle\n"
         f"{command_prefix} wrong <spot_id|session_id> — mark a vehicle profile match as wrong\n"
         f"{command_prefix} profile summary <profile_id> — show a safe vehicle profile summary\n"

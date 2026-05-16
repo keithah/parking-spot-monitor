@@ -9,8 +9,10 @@ from typing import Any, Literal
 
 from PIL import Image, UnidentifiedImageError
 
+from parking_spot_monitor.capture import CaptureError, capture_latest
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
+from parking_spot_monitor.matrix import MatrixCommandResponse
 from parking_spot_monitor.paths import resolve_runtime_paths
 
 MAX_REPLY_BYTES = 4096
@@ -128,6 +130,47 @@ def build_latest_snapshot_response(
     )
 
 
+def build_who_snapshot_response(
+    *,
+    settings: RuntimeSettings,
+    data_dir: str | Path,
+    base_text: str,
+    capture_func: Any = capture_latest,
+    now: datetime | None = None,
+    logger: StructuredLogger | None = None,
+) -> MatrixCommandResponse:
+    """Build a Matrix who reply enriched by one fresh raw capture when available.
+
+    This helper intentionally performs only capture and JPEG validation. It does
+    not run detector/model inference and does not read or mutate occupancy
+    state.
+    """
+
+    observed_now = _utc_now(now)
+    try:
+        capture = capture_func(settings, Path(data_dir), logger=logger)
+        latest_path = Path(capture.latest_path)
+        snapshot = _validate_latest_snapshot(latest_path, now=observed_now, logger=logger)
+    except CaptureError as exc:
+        reason = redact_diagnostic_text(exc.reason or exc.__class__.__name__)
+        _log_snapshot_failure(logger, reason=reason, error_type=exc.__class__.__name__)
+        return MatrixCommandResponse(text=_prepend_who_snapshot_line(base_text, _who_snapshot_unavailable_line(reason)))
+    except Exception as exc:
+        reason = redact_diagnostic_text(exc.__class__.__name__)
+        _log_snapshot_failure(logger, reason=reason, error_type=exc.__class__.__name__)
+        return MatrixCommandResponse(text=_prepend_who_snapshot_line(base_text, _who_snapshot_unavailable_line(reason)))
+
+    if snapshot.state != "available" or snapshot.path is None or snapshot.info is None:
+        reason = redact_diagnostic_text(snapshot.error_type or "unavailable")
+        _log_snapshot_failure(logger, reason=reason, error_type="invalid_snapshot")
+        return MatrixCommandResponse(text=_prepend_who_snapshot_line(base_text, _who_snapshot_unavailable_line(reason)))
+
+    return MatrixCommandResponse(
+        text=_prepend_who_snapshot_line(base_text, f"Snapshot: fresh capture at {_display_time(getattr(capture, 'timestamp', None))}"),
+        image_path=snapshot.path,
+        image_info=dict(snapshot.info),
+    )
+
 def format_operator_status_reply(
     *,
     settings: RuntimeSettings,
@@ -230,7 +273,6 @@ def format_operator_config_reply(
         lines.append("Quiet windows: none")
 
     return _bounded_reply(lines)
-
 
 
 def format_operator_why_reply(
@@ -384,6 +426,43 @@ def summarize_state(*, settings: RuntimeSettings, state_path: str | Path, logger
     )
 
 
+def _prepend_who_snapshot_line(base_text: str, snapshot_line: str) -> str:
+    lines = base_text.splitlines()
+    if not lines:
+        return _bounded_multiline_reply(["Parking monitor who", snapshot_line])
+    return _bounded_multiline_reply([lines[0], snapshot_line, "", *lines[1:]])
+
+
+def _bounded_multiline_reply(lines: Sequence[str]) -> str:
+    rendered = "\n".join(redact_diagnostic_text(line) for line in lines[: MAX_LINES_PER_SECTION * 3])
+    encoded = rendered.encode("utf-8")
+    if len(encoded) <= MAX_REPLY_BYTES:
+        return rendered
+    return encoded[: MAX_REPLY_BYTES - 3].decode("utf-8", errors="ignore") + "..."
+
+
+def _who_snapshot_unavailable_line(reason: str) -> str:
+    safe_reason = redact_diagnostic_text(reason)[:120] or "unavailable"
+    return f"Snapshot: fresh capture unavailable ({safe_reason}); no live state was changed."
+
+
+def _display_time(value: object) -> str:
+    parsed: datetime | None = None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return redact_diagnostic_text(value)[:80] or "unknown"
+    if parsed is None:
+        return "unknown"
+    return _utc_now(parsed).isoformat().replace("+00:00", "Z")
+
+
+def _log_snapshot_failure(logger: StructuredLogger | None, **fields: Any) -> None:
+    if logger is not None:
+        logger.warning("operator-who-snapshot-unavailable", **redact_diagnostic_value(fields))
 
 def _validate_latest_snapshot(path: Path, *, now: datetime, logger: StructuredLogger | None) -> LatestSnapshotValidation:
     if path.name != "latest.jpg":
