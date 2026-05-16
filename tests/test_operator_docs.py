@@ -142,18 +142,49 @@ def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_se
 
 def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -> None:
     readme = read_tracked("README.md")
+    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
+    feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
 
     assert_contains_all(
         readme,
         [
-            "!parking correct <spot_id> <open|occupied>",
-            "operator-feedback-labels.json",
-            "reported state",
-            "actual state",
-            "!parking who",
-            "fresh current snapshot",
+            "Use `!parking correct <spot_id> <open|occupied>`",
+            "records a bounded local label in `data/operator-feedback-labels.json`",
+            "does not store image bytes, camera URLs, Matrix tokens, raw Matrix bodies, or tracebacks",
+            "Feedback labels are training and replay evidence only",
             "does not mutate live occupancy state",
-            "does not automatically change detector thresholds",
+            "does not automatically change detector thresholds or train a model",
+            "Use `!parking who` to list active parking sessions by spot and request a fresh current snapshot",
+            "Snapshot: fresh capture unavailable",
+            "does not run detector/model inference or mutate live occupancy state",
+        ],
+    )
+    assert_contains_all(
+        matrix_source,
+        [
+            "usage: !parking correct <spot_id> <open|occupied>",
+            "{command_prefix} correct <spot_id> <open|occupied> — record the actual spot state for a wrong alert",
+            "usage: !parking who",
+            "{command_prefix} who — list active parking sessions by spot and attach a fresh current snapshot when configured",
+        ],
+    )
+    assert_contains_all(
+        cockpit_source,
+        [
+            "Build a Matrix who reply enriched by one fresh raw capture when available.",
+            "not run detector/model inference and does not read or mutate occupancy",
+            "Snapshot: fresh capture unavailable",
+            "no live state was changed",
+        ],
+    )
+    assert_contains_all(
+        feedback_source,
+        [
+            "FEEDBACK_LABELS_FILENAME = \"operator-feedback-labels.json\"",
+            "reported_state",
+            "actual_state",
+            "operator correction recorded",
         ],
     )
 
