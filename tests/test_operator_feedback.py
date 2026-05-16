@@ -284,6 +284,61 @@ def test_labeler_records_correction_from_latest_alert_with_retained_snapshot(tmp
     assert "@operator:example" not in (tmp_path / "operator-feedback-labels.json").read_text(encoding="utf-8")
 
 
+def test_labeler_binds_correction_to_latest_sent_alert_not_newer_failed_alert(tmp_path: Path) -> None:
+    from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, make_decision_memory_record
+    from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler, feedback_labels_path, load_feedback_labels
+
+    memory_path = decision_memory_path(tmp_path)
+    assert append_decision_memory_record(
+        memory_path,
+        make_decision_memory_record(
+            "alert",
+            observed_at="2026-05-15T21:40:00Z",
+            spot_id="left_spot",
+            summary="occupancy-occupied-event sent",
+            details={
+                "event_type": "occupancy-occupied-event",
+                "event_id": "sent-occupied-alert",
+                "outcome": "sent",
+                "snapshot_path": "snapshots/sent-occupied.jpg",
+            },
+        ),
+    )
+    assert append_decision_memory_record(
+        memory_path,
+        make_decision_memory_record(
+            "alert",
+            observed_at="2026-05-15T21:45:00Z",
+            spot_id="left_spot",
+            summary="occupancy-open-event failed",
+            details={
+                "event_type": "occupancy-open-event",
+                "event_id": "failed-open-alert",
+                "outcome": "failed",
+                "snapshot_path": "snapshots/failed-open.jpg",
+            },
+        ),
+    )
+
+    result = OperatorFeedbackLabeler(data_dir=tmp_path).record_correction(
+        spot_id="left_spot",
+        actual_state="open",
+        matrix_event_id="$correct",
+        matrix_sender="@operator:example",
+        matrix_room_id="!room:example",
+        corrected_at="2026-05-16T17:42:39Z",
+    )
+
+    assert result.recorded is True
+    assert result.reported_state == "occupied"
+
+    loaded = load_feedback_labels(feedback_labels_path(tmp_path))
+    assert loaded.state == "available"
+    assert len(loaded.labels) == 1
+    assert loaded.labels[0].reported_state == "occupied"
+    assert loaded.labels[0].alert_event_id == "sent-occupied-alert"
+
+
 def test_labeler_rejects_when_no_recent_alert_exists(tmp_path: Path) -> None:
     from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler, feedback_labels_path
 
