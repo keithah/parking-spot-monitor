@@ -194,6 +194,20 @@ class OperatorFeedbackLabeler:
                 actual_state="open",
                 error_type="invalid_spot",
             )
+        existing_label = find_feedback_label_by_matrix_event_id(self.labels_path, matrix_event_id, logger=self.logger)
+        if existing_label is not None:
+            reported_state = _feedback_state(existing_label.reported_state, "reported_state")
+            stored_actual_state = _feedback_state(existing_label.actual_state, "actual_state")
+            return FeedbackRecordResult(
+                recorded=True,
+                reply_text=format_duplicate_correction_reply(existing_label.spot_id, reported_state, stored_actual_state, existing_label.evidence),
+                spot_id=existing_label.spot_id,
+                actual_state=stored_actual_state,
+                reported_state=reported_state,
+                evidence=existing_label.evidence,
+                label_id=existing_label.label_id,
+            )
+
         state = _feedback_state(actual_state, "actual_state")
         corrected_text = _feedback_timestamp_text(corrected_at)
         candidate = resolve_latest_alert_candidate(self.memory_path, safe_spot, logger=self.logger)
@@ -390,6 +404,21 @@ def load_feedback_labels(
     bounded = tuple(labels[-_positive_limit(max_labels, MAX_FEEDBACK_LABELS) :])
     _log(logger, "debug", "operator-feedback-labels-loaded", path=labels_path, label_count=len(bounded), state="available")
     return FeedbackLabelLoad(state="available", labels=bounded)
+
+
+def find_feedback_label_by_matrix_event_id(path: str | Path, matrix_event_id: str | None, *, logger: StructuredLogger | None = None) -> FeedbackLabel | None:
+    """Return the stored feedback label for an already-processed Matrix event id."""
+
+    safe_event_id = _safe_optional_text(matrix_event_id, limit=180)
+    if not safe_event_id:
+        return None
+    loaded = load_feedback_labels(path, logger=logger)
+    if loaded.state != "available":
+        return None
+    for label in reversed(loaded.labels):
+        if label.matrix_event_id == safe_event_id:
+            return label
+    return None
 
 
 def resolve_latest_alert_candidate(path: str | Path, spot_id: str, *, logger: StructuredLogger | None = None) -> AlertEvidenceCandidate | None:

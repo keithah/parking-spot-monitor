@@ -298,7 +298,7 @@ def test_labeler_repeats_duplicate_correction_ack_without_duplicate_label_or_mem
             summary="occupancy-occupied-event sent",
             details={
                 "event_type": "occupancy-occupied-event",
-                "event_id": "occupancy-occupied-event:left_spot:2026-05-15T21:42:39Z",
+                "event_id": "sent-occupied-alert",
                 "outcome": "sent",
                 "snapshot_path": "snapshots/missing.jpg",
             },
@@ -314,19 +314,36 @@ def test_labeler_repeats_duplicate_correction_ack_without_duplicate_label_or_mem
         matrix_room_id="!room:example",
         corrected_at="2026-05-16T17:42:39Z",
     )
+    assert append_decision_memory_record(
+        memory_path,
+        make_decision_memory_record(
+            "alert",
+            observed_at="2026-05-15T21:45:00Z",
+            spot_id="left_spot",
+            summary="occupancy-open-event sent",
+            details={
+                "event_type": "occupancy-open-event",
+                "event_id": "sent-open-alert",
+                "outcome": "sent",
+                "snapshot_path": "snapshots/missing-open.jpg",
+            },
+        ),
+    )
     second = labeler.record_correction(
         spot_id="left_spot",
-        actual_state="open",
+        actual_state="occupied",
         matrix_event_id="$duplicate-correct",
         matrix_sender="@operator:example",
         matrix_room_id="!room:example",
-        corrected_at="2026-05-16T17:42:39Z",
+        corrected_at="2026-05-16T17:43:39Z",
     )
 
     assert first.recorded is True
     assert second.recorded is True
     assert "already applied" in second.reply_text.lower()
     assert "acknowledgement repeated" in second.reply_text.lower()
+    assert second.reported_state == "occupied"
+    assert second.actual_state == "open"
 
     loaded_labels = load_feedback_labels(feedback_labels_path(tmp_path))
     assert len(loaded_labels.labels) == 1
