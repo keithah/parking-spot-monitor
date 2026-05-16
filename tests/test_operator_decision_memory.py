@@ -96,6 +96,7 @@ def test_recent_timeline_includes_supported_record_kinds_and_is_bounded(tmp_path
         "alert",
         "command_outcome",
         "lab_outcome",
+        "feedback",
     ]
     for index, kind in enumerate(kinds):
         assert append_decision_memory_record(
@@ -108,6 +109,7 @@ def test_recent_timeline_includes_supported_record_kinds_and_is_bounded(tmp_path
     assert "Parking decision memory recent" in reply
     assert "command_outcome" in reply
     assert "lab_outcome" in reply
+    assert "feedback" in reply
     assert "accepted_evidence" not in reply
     assert len(reply.encode("utf-8")) <= 600
 

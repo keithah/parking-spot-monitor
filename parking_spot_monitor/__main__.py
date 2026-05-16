@@ -1473,6 +1473,7 @@ def _append_matrix_event_memory(
             "reason": reason,
             "error_type": error_type,
             "suppressed_reason": event.get("suppressed_reason"),
+            "snapshot_path": event.get("snapshot_path") or event.get("occupied_snapshot_path"),
         },
         logger=logger,
     )

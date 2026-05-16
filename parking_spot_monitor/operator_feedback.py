@@ -11,7 +11,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from PIL import Image, UnidentifiedImageError
+
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
+from parking_spot_monitor.operator_decision_memory import (
+    append_decision_memory_record,
+    decision_memory_path,
+    load_decision_memory,
+    make_decision_memory_record,
+)
 
 SCHEMA_VERSION = 1
 FEEDBACK_LABELS_FILENAME = "operator-feedback-labels.json"
@@ -21,6 +29,7 @@ MAX_TEXT_FIELD_CHARS = 500
 VALID_FEEDBACK_STATES = frozenset({"open", "occupied"})
 
 LoadState = Literal["available", "missing", "unavailable"]
+SpotState = Literal["open", "occupied"]
 
 _SENSITIVE_TOKEN_PATTERN = re.compile(r"(?i)\b(?:syt|mxt|ghp|glpat|sk|xox[baprs])-?[a-z0-9_./+=-]{8,}\b")
 _RAW_IMAGE_PREFIX_PATTERN = re.compile(r"\xff\xd8[\s\S]*")
@@ -76,6 +85,7 @@ class FeedbackLabel:
     evidence: FeedbackEvidence
     notes: str = ""
     matrix_event_id: str | None = None
+    matrix_room_id_hash: str | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -94,6 +104,8 @@ class FeedbackLabel:
         }
         if self.matrix_event_id is not None:
             payload["matrix_event_id"] = _safe_optional_text(self.matrix_event_id, limit=180)
+        if self.matrix_room_id_hash is not None:
+            payload["matrix_room_id_hash"] = _safe_optional_text(self.matrix_room_id_hash, limit=120)
         return payload
 
 
@@ -105,6 +117,144 @@ class FeedbackLabelLoad:
     labels: tuple[FeedbackLabel, ...] = ()
     error_type: str | None = None
     quarantined_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class AlertEvidenceCandidate:
+    """Latest alert memory usable as correction evidence."""
+
+    spot_id: str
+    reported_state: SpotState
+    reported_at: str | None
+    alert_event_type: str | None
+    alert_event_id: str | None
+    snapshot_path: str | None
+
+
+@dataclass(frozen=True)
+class FeedbackRecordResult:
+    """Result returned to Matrix command handling after a correction attempt."""
+
+    recorded: bool
+    reply_text: str
+    spot_id: str
+    actual_state: SpotState
+    reported_state: SpotState | None = None
+    evidence: FeedbackEvidence = FeedbackEvidence(
+        kind="none",
+        path=None,
+        available=False,
+        validated_jpeg=False,
+        width=None,
+        height=None,
+        byte_size=None,
+        error_type="missing",
+    )
+    label_id: str | None = None
+    error_type: str | None = None
+
+
+class OperatorFeedbackLabeler:
+    """High-level API for Matrix operator spot-state correction labels."""
+
+    def __init__(self, *, data_dir: str | Path, logger: StructuredLogger | None = None) -> None:
+        self.data_dir = Path(data_dir)
+        self.logger = logger
+        self.labels_path = feedback_labels_path(self.data_dir)
+        self.memory_path = decision_memory_path(self.data_dir)
+
+    def record_correction(
+        self,
+        *,
+        spot_id: str,
+        actual_state: str,
+        matrix_event_id: str,
+        matrix_sender: str,
+        matrix_room_id: str,
+        corrected_at: datetime | str | None = None,
+    ) -> FeedbackRecordResult:
+        safe_spot = _safe_spot_id(spot_id)
+        if safe_spot is None:
+            return FeedbackRecordResult(
+                recorded=False,
+                reply_text="Parking correction not recorded\nInvalid spot id.",
+                spot_id="",
+                actual_state="open",
+                error_type="invalid_spot",
+            )
+        state = _feedback_state(actual_state, "actual_state")
+        corrected_text = _feedback_timestamp_text(corrected_at)
+        candidate = resolve_latest_alert_candidate(self.memory_path, safe_spot, logger=self.logger)
+        if candidate is None:
+            reply = (
+                "Parking correction not recorded\n"
+                f"No recent alert was found for {safe_spot}; use !parking latest or !parking who to inspect current evidence."
+            )
+            return FeedbackRecordResult(
+                recorded=False,
+                reply_text=reply,
+                spot_id=safe_spot,
+                actual_state=state,
+                error_type="no_recent_alert",
+            )
+
+        evidence = validate_feedback_evidence(data_dir=self.data_dir, snapshot_path=candidate.snapshot_path, logger=self.logger)
+        label_id = make_label_id(corrected_at=corrected_text, spot_id=safe_spot, matrix_event_id=matrix_event_id)
+        label = FeedbackLabel(
+            label_id=label_id,
+            spot_id=safe_spot,
+            reported_state=candidate.reported_state,
+            actual_state=state,
+            source="matrix_command",
+            operator_sender_hash=hash_operator_identifier(matrix_sender),
+            corrected_at=corrected_text,
+            reported_at=candidate.reported_at,
+            alert_event_type=candidate.alert_event_type,
+            alert_event_id=candidate.alert_event_id,
+            evidence=evidence,
+            matrix_event_id=matrix_event_id,
+            matrix_room_id_hash=hash_operator_identifier(matrix_room_id),
+        )
+        if not append_feedback_label(self.labels_path, label, logger=self.logger):
+            reply = "Parking correction not recorded\nFeedback store unavailable (feedback_store_unavailable)."
+            return FeedbackRecordResult(
+                recorded=False,
+                reply_text=reply,
+                spot_id=safe_spot,
+                actual_state=state,
+                reported_state=candidate.reported_state,
+                evidence=evidence,
+                error_type="feedback_store_unavailable",
+            )
+
+        append_decision_memory_record(
+            self.memory_path,
+            make_decision_memory_record(
+                "feedback",
+                observed_at=corrected_text,
+                spot_id=safe_spot,
+                summary=f"operator correction recorded: reported {candidate.reported_state}; actual {state}",
+                details={
+                    "label_id": label_id,
+                    "reported_state": candidate.reported_state,
+                    "actual_state": state,
+                    "alert_event_type": candidate.alert_event_type,
+                    "alert_event_id": candidate.alert_event_id,
+                    "evidence_available": evidence.available,
+                    "evidence_error_type": evidence.error_type,
+                },
+            ),
+            logger=self.logger,
+        )
+        return FeedbackRecordResult(
+            recorded=True,
+            reply_text=format_correction_reply(safe_spot, candidate.reported_state, state, evidence),
+            spot_id=safe_spot,
+            actual_state=state,
+            reported_state=candidate.reported_state,
+            evidence=evidence,
+            label_id=label_id,
+        )
 
 
 def feedback_labels_path(data_dir: str | Path) -> Path:
@@ -219,6 +369,116 @@ def load_feedback_labels(
     return FeedbackLabelLoad(state="available", labels=bounded)
 
 
+def resolve_latest_alert_candidate(path: str | Path, spot_id: str, *, logger: StructuredLogger | None = None) -> AlertEvidenceCandidate | None:
+    """Return the newest alert memory record for a spot with a recognized reported state."""
+
+    loaded = load_decision_memory(path, logger=logger)
+    if loaded.state != "available":
+        return None
+    for record in reversed(loaded.records):
+        if record.kind != "alert" or record.spot_id != spot_id:
+            continue
+        details = record.details if isinstance(record.details, Mapping) else {}
+        event_type = details.get("event_type")
+        reported_state = _reported_state_from_event_type(event_type)
+        if reported_state is None:
+            continue
+        return AlertEvidenceCandidate(
+            spot_id=spot_id,
+            reported_state=reported_state,
+            reported_at=record.observed_at,
+            alert_event_type=_safe_optional_text(event_type, limit=120),
+            alert_event_id=_safe_optional_text(details.get("event_id"), limit=180),
+            snapshot_path=_safe_optional_text(details.get("snapshot_path"), limit=240),
+        )
+    return None
+
+
+def validate_feedback_evidence(*, data_dir: str | Path, snapshot_path: str | None, logger: StructuredLogger | None = None) -> FeedbackEvidence:
+    """Validate safe, local retained alert snapshot metadata without reading image bytes into labels."""
+
+    if not snapshot_path:
+        return FeedbackEvidence("alert_snapshot", None, False, False, None, None, None, "missing")
+    try:
+        safe_relative = _safe_optional_path_text(snapshot_path)
+    except FeedbackLabelSchemaError:
+        return FeedbackEvidence("alert_snapshot", None, False, False, None, None, None, "unsafe_path")
+    if safe_relative is None:
+        return FeedbackEvidence("alert_snapshot", None, False, False, None, None, None, "missing")
+
+    base = Path(data_dir).resolve()
+    candidate = (base / safe_relative).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return FeedbackEvidence("alert_snapshot", None, False, False, None, None, None, "unsafe_path")
+    if not candidate.exists():
+        return FeedbackEvidence("alert_snapshot", safe_relative, False, False, None, None, None, "missing")
+
+    try:
+        byte_size = candidate.stat().st_size
+        with Image.open(candidate) as image:
+            image.verify()
+        with Image.open(candidate) as image:
+            width, height = image.size
+            if image.format != "JPEG":
+                return FeedbackEvidence("alert_snapshot", safe_relative, False, False, None, None, byte_size, "invalid_jpeg")
+    except (OSError, UnidentifiedImageError) as exc:
+        _log(logger, "warning", "operator-feedback-evidence-invalid", path=safe_relative, error_type=type(exc).__name__)
+        return FeedbackEvidence("alert_snapshot", safe_relative, False, False, None, None, None, "invalid_jpeg")
+
+    return FeedbackEvidence("alert_snapshot", safe_relative, True, True, width, height, byte_size, None)
+
+
+def format_correction_reply(spot_id: str, reported_state: str, actual_state: str, evidence: FeedbackEvidence) -> str:
+    """Format a bounded operator-visible correction acknowledgement."""
+
+    if evidence.available and evidence.validated_jpeg:
+        evidence_line = "linked evidence: retained alert snapshot"
+    else:
+        reason = evidence.error_type or "unavailable"
+        evidence_line = f"linked evidence: unavailable; alert snapshot was not retained ({reason})"
+    return (
+        "Parking correction recorded\n"
+        f"- spot: {spot_id}\n"
+        f"- reported: {reported_state}\n"
+        f"- actual: {actual_state}\n"
+        f"- {evidence_line}\n"
+        "- next: run !parking lab run replay after labels are reviewed"
+    )
+
+
+def _reported_state_from_event_type(value: object) -> SpotState | None:
+    text = str(value or "")
+    if text == "occupancy-occupied-event":
+        return "occupied"
+    if text == "occupancy-open-event":
+        return "open"
+    return None
+
+
+def _safe_spot_id(value: str) -> str | None:
+    try:
+        text = _safe_required_text(value, "spot_id", limit=80)
+    except FeedbackLabelSchemaError:
+        return None
+    if text.startswith("/") or "\\" in text or ".." in Path(text).parts:
+        return None
+    return text
+
+
+def _feedback_timestamp_text(value: datetime | str | None) -> str:
+    if isinstance(value, datetime):
+        selected = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return selected.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        parsed = datetime.fromisoformat(normalized)
+        selected = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return selected.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
 def _write_feedback_labels(path: Path, labels: Sequence[FeedbackLabel]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"schema_version": SCHEMA_VERSION, "labels": [label.to_json_dict() for label in labels]}
@@ -289,6 +549,7 @@ def _label_from_any(value: FeedbackLabel | Mapping[str, Any]) -> FeedbackLabel:
         evidence=evidence,
         notes=_safe_optional_text(value.get("notes"), limit=MAX_TEXT_FIELD_CHARS) or "",
         matrix_event_id=_safe_optional_text(value.get("matrix_event_id"), limit=180),
+        matrix_room_id_hash=_safe_optional_text(value.get("matrix_room_id_hash"), limit=120),
     )
 
 

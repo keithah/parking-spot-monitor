@@ -31,6 +31,7 @@ RecordKind = Literal[
     "alert",
     "command_outcome",
     "lab_outcome",
+    "feedback",
 ]
 LoadState = Literal["available", "missing", "unavailable", "partial"]
 
@@ -43,6 +44,7 @@ _SUPPORTED_KINDS = {
     "alert",
     "command_outcome",
     "lab_outcome",
+    "feedback",
 }
 
 

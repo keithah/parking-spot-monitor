@@ -223,3 +223,117 @@ def test_feedback_store_quarantines_corrupt_and_oversized_without_leaking(tmp_pa
     assert oversized.error_type == "oversized"
     assert oversized.quarantined_path is not None
     _assert_no_sensitive_text(logger_stream.getvalue())
+
+
+def _write_jpeg(path: Path, *, size: tuple[int, int] = (11, 7)) -> int:
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.new("RGB", size, color=(128, 64, 32))
+    image.save(path, format="JPEG")
+    return path.stat().st_size
+
+
+def test_labeler_records_correction_from_latest_alert_with_retained_snapshot(tmp_path: Path) -> None:
+    from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, make_decision_memory_record
+    from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler, feedback_labels_path, load_feedback_labels
+
+    snapshot_path = tmp_path / "snapshots" / "occupancy-occupied-event-left_spot.jpg"
+    byte_size = _write_jpeg(snapshot_path, size=(13, 9))
+    assert append_decision_memory_record(
+        decision_memory_path(tmp_path),
+        make_decision_memory_record(
+            "alert",
+            observed_at="2026-05-15T21:42:39Z",
+            spot_id="left_spot",
+            summary="occupancy-occupied-event sent",
+            details={
+                "event_type": "occupancy-occupied-event",
+                "event_id": "occupancy-occupied-event:left_spot:2026-05-15T21:42:39Z",
+                "outcome": "sent",
+                "snapshot_path": "snapshots/occupancy-occupied-event-left_spot.jpg",
+            },
+        ),
+    )
+
+    result = OperatorFeedbackLabeler(data_dir=tmp_path).record_correction(
+        spot_id="left_spot",
+        actual_state="open",
+        matrix_event_id="$correct",
+        matrix_sender="@operator:example",
+        matrix_room_id="!room:example",
+        corrected_at="2026-05-16T17:42:39Z",
+    )
+
+    assert result.recorded is True
+    assert result.reported_state == "occupied"
+    assert result.evidence.available is True
+    assert result.evidence.validated_jpeg is True
+    assert result.evidence.path == "snapshots/occupancy-occupied-event-left_spot.jpg"
+    assert result.evidence.width == 13
+    assert result.evidence.height == 9
+    assert result.evidence.byte_size == byte_size
+    assert "Parking correction recorded" in result.reply_text
+    assert "linked evidence: retained alert snapshot" in result.reply_text
+
+    loaded = load_feedback_labels(feedback_labels_path(tmp_path))
+    assert len(loaded.labels) == 1
+    assert loaded.labels[0].reported_state == "occupied"
+    assert loaded.labels[0].actual_state == "open"
+    assert loaded.labels[0].operator_sender_hash.startswith("sha256:")
+    assert "@operator:example" not in (tmp_path / "operator-feedback-labels.json").read_text(encoding="utf-8")
+
+
+def test_labeler_rejects_when_no_recent_alert_exists(tmp_path: Path) -> None:
+    from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler, feedback_labels_path
+
+    result = OperatorFeedbackLabeler(data_dir=tmp_path).record_correction(
+        spot_id="left_spot",
+        actual_state="open",
+        matrix_event_id="$correct",
+        matrix_sender="@operator:example",
+        matrix_room_id="!room:example",
+        corrected_at="2026-05-16T17:42:39Z",
+    )
+
+    assert result.recorded is False
+    assert result.error_type == "no_recent_alert"
+    assert "Parking correction not recorded" in result.reply_text
+    assert "No recent alert was found for left_spot" in result.reply_text
+    assert not feedback_labels_path(tmp_path).exists()
+
+
+def test_labeler_records_with_unavailable_evidence_when_snapshot_is_pruned(tmp_path: Path) -> None:
+    from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, make_decision_memory_record
+    from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler
+
+    assert append_decision_memory_record(
+        decision_memory_path(tmp_path),
+        make_decision_memory_record(
+            "alert",
+            observed_at="2026-05-15T21:42:39Z",
+            spot_id="right_spot",
+            summary="occupancy-open-event sent",
+            details={
+                "event_type": "occupancy-open-event",
+                "event_id": "occupancy-open-event:right_spot:2026-05-15T21:42:39Z",
+                "outcome": "sent",
+                "snapshot_path": "snapshots/missing.jpg",
+            },
+        ),
+    )
+
+    result = OperatorFeedbackLabeler(data_dir=tmp_path).record_correction(
+        spot_id="right_spot",
+        actual_state="occupied",
+        matrix_event_id="$correct",
+        matrix_sender="@operator:example",
+        matrix_room_id="!room:example",
+        corrected_at="2026-05-16T17:42:39Z",
+    )
+
+    assert result.recorded is True
+    assert result.reported_state == "open"
+    assert result.evidence.available is False
+    assert result.evidence.error_type == "missing"
+    assert "linked evidence: unavailable" in result.reply_text
