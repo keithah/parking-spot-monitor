@@ -140,6 +140,24 @@ def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_se
 
 
 
+def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -> None:
+    readme = read_tracked("README.md")
+
+    assert_contains_all(
+        readme,
+        [
+            "!parking correct <spot_id> <open|occupied>",
+            "operator-feedback-labels.json",
+            "reported state",
+            "actual state",
+            "!parking who",
+            "fresh current snapshot",
+            "does not mutate live occupancy state",
+            "does not automatically change detector thresholds",
+        ],
+    )
+
+
 def test_detection_lab_command_docs_cover_bounded_authorized_local_artifact_boundary() -> None:
     readme = read_tracked("README.md")
     matrix_source = read_tracked("parking_spot_monitor/matrix.py")
