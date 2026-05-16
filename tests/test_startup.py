@@ -3243,6 +3243,24 @@ def test_default_matrix_command_service_wires_detection_lab_to_effective_paths_a
     assert_no_secret_leak(output + (tmp_path / "operator-decision-memory.json").read_text(encoding="utf-8"))
 
 
+def test_default_matrix_command_service_wires_feedback_and_who_snapshot(tmp_path: Path) -> None:
+    from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
+
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={"matrix": settings.matrix.model_copy(update={"command_authorized_senders": ["@op:example"]})}
+    )
+    logger = StructuredLogger()
+    archive = VehicleHistoryArchive(tmp_path / "vehicle-history", logger=logger)
+
+    service = _default_matrix_command_service_factory(settings, tmp_path, logger, archive)
+
+    assert service is not None
+    assert service.feedback_labeler is not None
+    assert service.who_snapshot_provider is not None
+    assert service.cockpit_context is not None
+
+
 def test_startup_summary_includes_sanitized_detection_lab_dir(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = _main(["--config", "config.yaml.example", "--data-dir", "/tmp/parking-data", "--validate-config"], environ=fake_environ())
 

@@ -44,7 +44,9 @@ from parking_spot_monitor.matrix import (
     prune_event_snapshots,
 )
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus, update_occupancy
+from parking_spot_monitor.operator_cockpit import build_who_snapshot_response
 from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, make_decision_memory_record
+from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler
 from parking_spot_monitor.owner_vehicles import load_owner_vehicle_registry
 from parking_spot_monitor.paths import RuntimePaths, resolve_runtime_paths
 from parking_spot_monitor.scheduler import QuietWindowEventType, evaluate_quiet_windows, quiet_window_notice_events
@@ -452,6 +454,16 @@ def _default_matrix_command_service_factory(
         )
         return None
     paths = resolve_runtime_paths(settings, data_dir)
+    feedback_labeler = OperatorFeedbackLabeler(data_dir=paths.data_dir, logger=logger)
+
+    def who_snapshot_provider(base_text: str) -> Any:
+        return build_who_snapshot_response(
+            settings=settings,
+            data_dir=paths.data_dir,
+            base_text=base_text,
+            logger=logger,
+        )
+
     client = MatrixClient(
         homeserver=settings.matrix.homeserver,
         access_token=settings.matrix.access_token.value,
@@ -477,6 +489,8 @@ def _default_matrix_command_service_factory(
             snapshots_dir=paths.snapshots_dir,
             detection_lab_manager=_default_detection_lab_manager(settings, paths, logger),
         ),
+        feedback_labeler=feedback_labeler,
+        who_snapshot_provider=who_snapshot_provider,
     )
 
 
