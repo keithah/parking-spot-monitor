@@ -18,6 +18,11 @@ from parking_spot_monitor.paths import resolve_runtime_paths
 MAX_REPLY_BYTES = 4096
 MAX_FILE_BYTES = 256_000
 MAX_LATEST_IMAGE_BYTES = 300_000
+MAX_WHO_MATRIX_IMAGE_BYTES = MAX_LATEST_IMAGE_BYTES
+WHO_MATRIX_SNAPSHOT_FILENAME = "who_latest.jpg"
+WHO_MATRIX_INITIAL_MAX_DIMENSION = 960
+WHO_MATRIX_MIN_DIMENSION = 320
+WHO_MATRIX_JPEG_QUALITIES = (85, 75, 65, 55, 45, 35)
 MAX_LINES_PER_SECTION = 24
 STALE_INTERVAL_MULTIPLIER = 3
 STALE_MIN_SECONDS = 60
@@ -150,7 +155,7 @@ def build_who_snapshot_response(
     try:
         capture = capture_func(settings, Path(data_dir), logger=logger)
         latest_path = Path(capture.latest_path)
-        snapshot = _validate_latest_snapshot(latest_path, now=observed_now, logger=logger)
+        snapshot = _prepare_who_snapshot_for_matrix(latest_path, data_dir=Path(data_dir), now=observed_now, logger=logger)
     except CaptureError as exc:
         reason = redact_diagnostic_text(exc.reason or exc.__class__.__name__)
         _log_snapshot_failure(logger, reason=reason, error_type=exc.__class__.__name__)
@@ -463,6 +468,67 @@ def _display_time(value: object) -> str:
 def _log_snapshot_failure(logger: StructuredLogger | None, **fields: Any) -> None:
     if logger is not None:
         logger.warning("operator-who-snapshot-unavailable", **redact_diagnostic_value(fields))
+
+def _prepare_who_snapshot_for_matrix(path: Path, *, data_dir: Path, now: datetime, logger: StructuredLogger | None) -> LatestSnapshotValidation:
+    snapshot = _validate_latest_snapshot(path, now=now, logger=logger)
+    if snapshot.state == "available":
+        return snapshot
+    if snapshot.error_type != "too large":
+        return snapshot
+
+    destination = data_dir / WHO_MATRIX_SNAPSHOT_FILENAME
+    try:
+        return _resize_who_snapshot_for_matrix(path, destination=destination, now=now, logger=logger)
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        error_type = redact_diagnostic_text(exc.__class__.__name__)
+        _log_snapshot_failure(logger, reason="resize_failed", error_type=error_type)
+        return LatestSnapshotValidation(state="error", error_type="resize failed")
+
+
+def _resize_who_snapshot_for_matrix(path: Path, *, destination: Path, now: datetime, logger: StructuredLogger | None) -> LatestSnapshotValidation:
+    with Image.open(path) as image:
+        working = image.convert("RGB")
+    width, height = working.size
+    if width <= 0 or height <= 0:
+        raise ValueError("invalid image dimensions")
+
+    max_dimension = min(max(width, height), WHO_MATRIX_INITIAL_MAX_DIMENSION)
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    while max_dimension >= WHO_MATRIX_MIN_DIMENSION:
+        resized = working.copy()
+        resized.thumbnail((max_dimension, max_dimension), resampling)
+        for quality in WHO_MATRIX_JPEG_QUALITIES:
+            resized.save(destination, format="JPEG", quality=quality, optimize=True)
+            stat = destination.stat()
+            if stat.st_size <= MAX_WHO_MATRIX_IMAGE_BYTES:
+                output_width, output_height = resized.size
+                _log_who_snapshot_resized(
+                    logger,
+                    source_path=path,
+                    destination_path=destination,
+                    source_width=width,
+                    source_height=height,
+                    output_width=output_width,
+                    output_height=output_height,
+                    byte_size=stat.st_size,
+                    quality=quality,
+                )
+                return LatestSnapshotValidation(
+                    state="available",
+                    path=destination,
+                    info={"mimetype": "image/jpeg", "size": stat.st_size, "w": output_width, "h": output_height},
+                    freshness="fresh",
+                    age=_age_label(datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc), now),
+                )
+        max_dimension = int(max_dimension * 0.85)
+    raise ValueError("resized image exceeds Matrix upload budget")
+
+
+def _log_who_snapshot_resized(logger: StructuredLogger | None, **fields: Any) -> None:
+    if logger is not None:
+        logger.info("operator-who-snapshot-resized", **redact_diagnostic_value(fields))
+
 
 def _validate_latest_snapshot(path: Path, *, now: datetime, logger: StructuredLogger | None) -> LatestSnapshotValidation:
     if path.name != "latest.jpg":

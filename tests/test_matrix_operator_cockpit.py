@@ -671,6 +671,47 @@ def test_build_who_snapshot_response_captures_once_and_attaches_validated_image(
     assert "left_spot: occupied" in response.text
 
 
+def test_build_who_snapshot_response_resizes_oversized_fresh_capture_for_matrix(tmp_path: Path) -> None:
+    from parking_spot_monitor.capture import DecodeMode, FrameCaptureResult
+    from parking_spot_monitor.operator_cockpit import build_who_snapshot_response
+
+    latest_path = tmp_path / "latest.jpg"
+    noisy = Image.effect_noise((1280, 720), 80).convert("RGB")
+    noisy.save(latest_path, format="JPEG", quality=95)
+    raw_size = latest_path.stat().st_size
+    assert raw_size > 300_000
+
+    def capture_func(settings: object, data_dir: Path, **kwargs: object) -> FrameCaptureResult:
+        return FrameCaptureResult(
+            timestamp="2026-05-16T17:42:39Z",
+            latest_path=latest_path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=0.25,
+            byte_size=raw_size,
+        )
+
+    response = build_who_snapshot_response(
+        settings=object(),
+        data_dir=tmp_path,
+        base_text="Active parking sessions:\n- left_spot: occupied — unknown vehicle",
+        capture_func=capture_func,
+        now=datetime(2026, 5, 16, 17, 42, 40, tzinfo=timezone.utc),
+    )
+
+    assert response.image_path is not None
+    assert response.image_path != latest_path
+    assert response.image_path.name == "who_latest.jpg"
+    assert response.image_path.stat().st_size <= 300_000
+    assert latest_path.stat().st_size == raw_size
+    assert response.image_info is not None
+    assert response.image_info["size"] == response.image_path.stat().st_size
+    assert response.image_info["w"] < 1280
+    assert response.image_info["h"] < 720
+    assert "Snapshot: fresh capture" in response.text
+    assert "too large" not in response.text
+
+
+
 def test_build_who_snapshot_response_falls_back_to_text_on_capture_failure(tmp_path: Path) -> None:
     from parking_spot_monitor.capture import CaptureError, DecodeMode
     from parking_spot_monitor.operator_cockpit import build_who_snapshot_response
