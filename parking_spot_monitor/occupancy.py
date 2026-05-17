@@ -50,6 +50,7 @@ class SpotOccupancyState:
     miss_streak: int = 0
     last_bbox: BBoxTuple | None = None
     open_event_emitted: bool = False
+    last_status_changed_at: Any | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +59,7 @@ class SpotOccupancyState:
             "miss_streak": self.miss_streak,
             "last_bbox": self.last_bbox,
             "open_event_emitted": self.open_event_emitted,
+            "last_status_changed_at": self.last_status_changed_at,
         }
 
 
@@ -169,6 +171,7 @@ def _advance_presence_hold(*, prior: SpotOccupancyState) -> tuple[SpotOccupancyS
             miss_streak=0,
             last_bbox=prior.last_bbox,
             open_event_emitted=prior.open_event_emitted,
+            last_status_changed_at=prior.last_status_changed_at,
         ),
         [],
     )
@@ -197,6 +200,7 @@ def _advance_hit(
         miss_streak=0,
         last_bbox=_normalize_bbox(candidate.bbox),
         open_event_emitted=open_event_emitted,
+        last_status_changed_at=observed_at if new_status != previous_status else prior.last_status_changed_at,
     )
 
     events: list[OccupancyEvent] = []
@@ -268,6 +272,7 @@ def _advance_miss(
         miss_streak=miss_streak,
         last_bbox=prior.last_bbox,
         open_event_emitted=open_event_emitted,
+        last_status_changed_at=observed_at if new_status != previous_status else prior.last_status_changed_at,
     ), events
 
 
@@ -315,6 +320,7 @@ def _copy_state(state: SpotOccupancyState) -> SpotOccupancyState:
         miss_streak=state.miss_streak,
         last_bbox=tuple(state.last_bbox) if state.last_bbox is not None else None,
         open_event_emitted=state.open_event_emitted,
+        last_status_changed_at=state.last_status_changed_at,
     )
 
 

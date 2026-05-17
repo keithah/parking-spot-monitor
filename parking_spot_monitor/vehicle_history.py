@@ -786,6 +786,7 @@ class VehicleHistoryArchive:
                     "is_owner": owner is not None,
                     "owner_label": None if owner is None else owner.label,
                     "profile_sample_count": None if profile is None else profile.sample_count,
+                    "started_at": record.started_at,
                 }
             )
         assignments.sort(key=lambda item: str(item["spot_id"]))

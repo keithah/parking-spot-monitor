@@ -73,6 +73,7 @@ def test_stable_hits_confirm_occupied_transition(occupancy_config: OccupancyConf
 
     assert second.state_by_spot["left_spot"].status is OccupancyStatus.OCCUPIED
     assert second.state_by_spot["left_spot"].hit_streak == 2
+    assert second.state_by_spot["left_spot"].last_status_changed_at == OBSERVED_AT
     assert [event.event_type for event in second.events] == [OccupancyEventType.STATE_CHANGED]
     assert second.events[0].spot_id == "left_spot"
     assert second.events[0].previous_status is OccupancyStatus.UNKNOWN

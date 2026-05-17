@@ -771,6 +771,7 @@ def test_active_spot_assignments_summarizes_owner_and_unknown_active_sessions(tm
             "is_owner": False,
             "owner_label": None,
             "profile_sample_count": None,
+            "started_at": unknown.started_at,
         },
         {
             "spot_id": "right_spot",
@@ -781,6 +782,7 @@ def test_active_spot_assignments_summarizes_owner_and_unknown_active_sessions(tm
             "is_owner": True,
             "owner_label": "Keith's black Tesla",
             "profile_sample_count": 1,
+            "started_at": owner_session.started_at,
         },
     ]
 

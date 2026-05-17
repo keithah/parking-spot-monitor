@@ -172,6 +172,7 @@ def _spot_state_from_json(spot_id: str, payload: Any) -> SpotOccupancyState:
         miss_streak=_non_negative_int(payload.get("miss_streak"), f"spot {spot_id} miss_streak"),
         last_bbox=_bbox_or_none(payload.get("last_bbox"), f"spot {spot_id} last_bbox"),
         open_event_emitted=_bool(payload.get("open_event_emitted"), f"spot {spot_id} open_event_emitted"),
+        last_status_changed_at=_optional_string(payload.get("last_status_changed_at"), f"spot {spot_id} last_status_changed_at"),
     )
 
 
@@ -182,6 +183,7 @@ def _spot_state_to_json(state: SpotOccupancyState) -> dict[str, Any]:
         "miss_streak": int(state.miss_streak),
         "last_bbox": list(state.last_bbox) if state.last_bbox is not None else None,
         "open_event_emitted": bool(state.open_event_emitted),
+        "last_status_changed_at": state.last_status_changed_at,
     }
 
 
@@ -194,6 +196,14 @@ def _non_negative_int(value: Any, field_name: str) -> int:
 def _bool(value: Any, field_name: str) -> bool:
     if not isinstance(value, bool):
         raise StateSchemaError(f"{field_name} must be a boolean")
+    return value
+
+
+def _optional_string(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise StateSchemaError(f"{field_name} must be null or a string")
     return value
 
 

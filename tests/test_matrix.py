@@ -1101,6 +1101,89 @@ class FakeCommandArchive:
         return []
 
 
+def test_active_spot_assignments_reply_includes_occupied_and_open_durations() -> None:
+    from parking_spot_monitor.matrix import _format_active_spot_assignments_reply
+
+    reply = _format_active_spot_assignments_reply(
+        [
+            {
+                "spot_id": "left_spot",
+                "status": "occupied",
+                "session_id": "sess_left",
+                "profile_id": None,
+                "profile_label": None,
+                "profile_confidence": None,
+                "profile_sample_count": None,
+                "started_at": "2026-05-17T15:30:00Z",
+            },
+            {
+                "spot_id": "right_spot",
+                "status": "open",
+                "last_status_changed_at": "2026-05-17T16:35:00Z",
+            },
+        ],
+        now="2026-05-17T17:40:00Z",
+    )
+
+    assert "left_spot: occupied for 2 hr 10 min — unknown vehicle — session sess_left" in reply
+    assert "right_spot: open for 1 hr 5 min" in reply
+
+
+
+def test_active_spot_assignments_merge_runtime_open_spots_with_duration(tmp_path: Path) -> None:
+    from parking_spot_monitor.matrix import MatrixOperatorCockpitContext, _active_spot_assignments_with_runtime_status
+    from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
+    from parking_spot_monitor.state import RuntimeState, save_runtime_state
+
+    settings = type(
+        "Settings",
+        (),
+        {
+            "spots": type("Spots", (), {"left_spot": object(), "right_spot": object()})(),
+        },
+    )()
+    state_path = tmp_path / "state.json"
+    save_runtime_state(
+        state_path,
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(status=OccupancyStatus.OCCUPIED, last_status_changed_at="2026-05-17T15:30:00Z"),
+                "right_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY, last_status_changed_at="2026-05-17T16:35:00Z"),
+            }
+        ),
+    )
+    context = MatrixOperatorCockpitContext(settings=settings, data_dir=tmp_path, health_path=tmp_path / "health.json", state_path=state_path)
+
+    assignments = _active_spot_assignments_with_runtime_status(
+        [
+            {
+                "spot_id": "left_spot",
+                "session_id": "sess_left",
+                "profile_id": None,
+                "started_at": "2026-05-17T15:30:00Z",
+            }
+        ],
+        cockpit_context=context,
+    )
+
+    assert assignments == [
+        {
+            "spot_id": "left_spot",
+            "session_id": "sess_left",
+            "profile_id": None,
+            "started_at": "2026-05-17T15:30:00Z",
+            "status": "occupied",
+            "last_status_changed_at": "2026-05-17T15:30:00Z",
+        },
+        {
+            "spot_id": "right_spot",
+            "status": "open",
+            "last_status_changed_at": "2026-05-17T16:35:00Z",
+        },
+    ]
+
+
+
 def test_command_service_bootstraps_cursor_without_processing_backlog() -> None:
     from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
 

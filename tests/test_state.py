@@ -51,6 +51,7 @@ def test_state_json_round_trips_occupancy_and_quiet_window_markers(tmp_path: Pat
                 miss_streak=0,
                 last_bbox=(1.0, 2.0, 30.0, 40.0),
                 open_event_emitted=False,
+                last_status_changed_at="2026-05-18T13:00:00Z",
             ),
             "right_spot": SpotOccupancyState(
                 status=OccupancyStatus.EMPTY,
@@ -89,6 +90,7 @@ def test_state_json_round_trips_occupancy_and_quiet_window_markers(tmp_path: Pat
                 "miss_streak": 0,
                 "last_bbox": [1.0, 2.0, 30.0, 40.0],
                 "open_event_emitted": False,
+                "last_status_changed_at": "2026-05-18T13:00:00Z",
             },
             "right_spot": {
                 "status": "empty",
@@ -96,6 +98,7 @@ def test_state_json_round_trips_occupancy_and_quiet_window_markers(tmp_path: Pat
                 "miss_streak": 4,
                 "last_bbox": None,
                 "open_event_emitted": True,
+                "last_status_changed_at": None,
             },
         },
         "active_quiet_window_ids": ["street_sweeping:2026-05-18:13:00-15:00"],

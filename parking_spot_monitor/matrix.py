@@ -699,7 +699,8 @@ class MatrixCommandService:
             confidence_text = _confidence_text(confidence)
             return f"Owner vehicle assigned to {command.subject_id}: session {session_id}, profile {profile_id}, confidence {confidence_text}."
         if command.action == "active_spot_assignments":
-            base_reply = _format_active_spot_assignments_reply(self.archive.active_spot_assignments())
+            assignments = _active_spot_assignments_with_runtime_status(self.archive.active_spot_assignments(), cockpit_context=self.cockpit_context, logger=self.logger)
+            base_reply = _format_active_spot_assignments_reply(assignments)
             if self.who_snapshot_provider is not None:
                 return self.who_snapshot_provider(base_reply)
             return base_reply
@@ -1092,22 +1093,113 @@ def _format_command_help_reply(command_prefix: str) -> str:
     )
 
 
-def _format_active_spot_assignments_reply(assignments: Sequence[Mapping[str, Any]]) -> str:
+def _active_spot_assignments_with_runtime_status(
+    assignments: Sequence[Mapping[str, Any]],
+    *,
+    cockpit_context: MatrixOperatorCockpitContext | None,
+    logger: StructuredLogger | None = None,
+) -> list[dict[str, Any]]:
+    enriched = [dict(assignment, status="occupied") for assignment in assignments]
+    if cockpit_context is None:
+        return enriched
+
+    configured_spot_ids = _configured_spot_ids(getattr(cockpit_context, "settings", None))
+    if not configured_spot_ids:
+        return enriched
+    try:
+        from parking_spot_monitor.occupancy import OccupancyStatus
+        from parking_spot_monitor.state import load_runtime_state
+
+        runtime_state = load_runtime_state(cockpit_context.state_path, configured_spot_ids, logger=logger)
+    except Exception:
+        return enriched
+
+    by_spot = {str(item.get("spot_id")): item for item in enriched}
+    for spot_id in configured_spot_ids:
+        state = runtime_state.state_by_spot.get(spot_id)
+        if state is None:
+            continue
+        if spot_id in by_spot:
+            by_spot[spot_id]["last_status_changed_at"] = state.last_status_changed_at
+            continue
+        status = "open" if state.status in {OccupancyStatus.EMPTY, OccupancyStatus.UNKNOWN} else "occupied"
+        by_spot[spot_id] = {
+            "spot_id": spot_id,
+            "status": status,
+            "last_status_changed_at": state.last_status_changed_at,
+        }
+    return [by_spot[spot_id] for spot_id in sorted(by_spot)]
+
+
+def _configured_spot_ids(settings: object) -> list[str]:
+    spots = getattr(settings, "spots", None)
+    if spots is None:
+        return []
+    return [spot_id for spot_id in ("left_spot", "right_spot") if getattr(spots, spot_id, None) is not None]
+
+
+def _format_active_spot_assignments_reply(assignments: Sequence[Mapping[str, Any]], *, now: object | None = None) -> str:
     if not assignments:
         return "No active parking sessions."
+    observed_now = _parse_display_time(now) or datetime.now(timezone.utc)
     lines = ["Active parking sessions:"]
     for assignment in assignments:
         spot_id = _safe_text(assignment.get("spot_id"), default="unknown_spot")
+        status = _safe_text(assignment.get("status"), default="occupied")
+        duration = _duration_suffix(_first_present(assignment, "started_at", "last_status_changed_at"), observed_now)
+        if status in {"open", "empty"}:
+            lines.append(f"{spot_id}: open{duration}")
+            continue
         session_id = _safe_text(assignment.get("session_id"), default="unknown_session")
         profile_label = _safe_text(assignment.get("profile_label"), default="unknown vehicle")
         confidence_text = _confidence_text(assignment.get("profile_confidence"))
         sample_count = assignment.get("profile_sample_count")
         sample_text = "unknown" if not isinstance(sample_count, int) else str(sample_count)
         if assignment.get("profile_id") is None:
-            lines.append(f"{spot_id}: occupied — unknown vehicle — session {session_id}")
+            lines.append(f"{spot_id}: occupied{duration} — unknown vehicle — session {session_id}")
         else:
-            lines.append(f"{spot_id}: occupied — {profile_label} — confidence {confidence_text} — samples {sample_text} — session {session_id}")
+            lines.append(f"{spot_id}: occupied{duration} — {profile_label} — confidence {confidence_text} — samples {sample_text} — session {session_id}")
     return "\n".join(lines)
+
+
+def _duration_suffix(since: object, now: datetime) -> str:
+    started = _parse_display_time(since)
+    if started is None:
+        return ""
+    seconds = int(max(0, (now - started).total_seconds()))
+    return f" for {_human_duration(seconds)}"
+
+
+def _parse_display_time(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _human_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds} sec"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours < 24:
+        if remaining_minutes:
+            return f"{hours} hr {remaining_minutes} min"
+        return f"{hours} hr"
+    days, remaining_hours = divmod(hours, 24)
+    if remaining_hours:
+        return f"{days} day{'s' if days != 1 else ''} {remaining_hours} hr"
+    return f"{days} day{'s' if days != 1 else ''}"
 
 
 def _confidence_text(value: object) -> str:
