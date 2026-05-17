@@ -189,6 +189,40 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
     )
 
 
+def test_operator_docs_include_timeline_frame_buffer_contract() -> None:
+    readme = read_tracked("README.md")
+    timeline_source = read_tracked("parking_spot_monitor/timeline_buffer.py")
+    startup_source = read_tracked("parking_spot_monitor/__main__.py")
+
+    assert_contains_all(
+        readme,
+        [
+            "data/timeline/frames/",
+            "one raw full-frame JPEG per UTC minute",
+            "12 hours",
+            "missed-alert review",
+            "about 150–250 MiB",
+            "not a continuous video archive",
+        ],
+    )
+    assert_contains_all(
+        timeline_source,
+        [
+            "DEFAULT_TIMELINE_INTERVAL_SECONDS = 60",
+            "DEFAULT_TIMELINE_RETENTION_HOURS = 12",
+            "already-sampled",
+            "timeline-unavailable",
+        ],
+    )
+    assert_contains_all(
+        startup_source,
+        [
+            "record_timeline_frame",
+            "timeline-frame-retained",
+        ],
+    )
+
+
 def test_detection_lab_command_docs_cover_bounded_authorized_local_artifact_boundary() -> None:
     readme = read_tracked("README.md")
     matrix_source = read_tracked("parking_spot_monitor/matrix.py")

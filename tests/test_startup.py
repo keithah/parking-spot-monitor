@@ -2570,6 +2570,11 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
     assert health["consecutive_detection_failures"] == 0
     assert health["last_matrix_error"] is None
     assert health["last_error"] is None
+    timeline_frames = sorted((tmp_path / "timeline" / "frames").glob("*.jpg"))
+    assert [path.name for path in timeline_frames] == ["20260518T180000Z.jpg"]
+    assert timeline_frames[0].read_bytes() == (tmp_path / "latest.jpg").read_bytes()
+    assert '"event":"timeline-frame-retained"' in output
+    assert '"reason":"already-sampled"' in output
     assert '"event":"capture-loop-paced"' in output
     assert '"sleep_seconds":2' in output
     assert_no_secret_leak(output)

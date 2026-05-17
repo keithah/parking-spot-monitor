@@ -51,6 +51,7 @@ from parking_spot_monitor.owner_vehicles import load_owner_vehicle_registry
 from parking_spot_monitor.paths import RuntimePaths, resolve_runtime_paths
 from parking_spot_monitor.scheduler import QuietWindowEventType, evaluate_quiet_windows, quiet_window_notice_events
 from parking_spot_monitor.state import RuntimeState, load_runtime_state, save_runtime_state
+from parking_spot_monitor.timeline_buffer import record_timeline_frame
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
 DEFAULT_CONFIG_PATH = "/config/config.yaml"
@@ -306,6 +307,8 @@ def _capture_loop(
             last_frame_at = _format_health_timestamp(result.timestamp)
             selected_decode_mode = str(result.selected_mode.value if hasattr(result.selected_mode, "value") else result.selected_mode)
             _write_overlay_for_capture(settings, result.latest_path, data_dir, logger=logger, overlay=overlay)
+            timeline_result = record_timeline_frame(result.latest_path, data_dir=data_dir, observed_at=result.timestamp)
+            logger.info("timeline-frame-retained", iteration=iteration, **timeline_result.diagnostics())
             try:
                 if detector is None:
                     detector = detector_factory(settings)
