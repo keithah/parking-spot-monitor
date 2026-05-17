@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -25,6 +26,10 @@ OPEN_SPOT_EVENT_TYPE = "occupancy-open-event"
 OCCUPIED_SPOT_EVENT_TYPE = "occupancy-occupied-event"
 OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE = "owner-vehicle-quiet-window-alert"
 DISPLAY_TIMEZONE = ZoneInfo("America/Los_Angeles")
+MAX_MATRIX_UPLOAD_IMAGE_BYTES = 300_000
+MATRIX_UPLOAD_INITIAL_MAX_DIMENSION = 960
+MATRIX_UPLOAD_MIN_DIMENSION = 320
+MATRIX_UPLOAD_JPEG_QUALITIES = (85, 75, 65, 55, 45, 35)
 
 
 @dataclass(frozen=True)
@@ -237,9 +242,10 @@ class MatrixDelivery:
             retention_trigger="matrix-event",
         )
         self.logger.info("matrix-snapshot-copied", **snapshot.log_context, txn_id=snapshot.txn_id)
+        upload = _matrix_snapshot_upload(snapshot, logger=self.logger)
         content_uri = self.client.upload_image(
             filename=snapshot.filename,
-            data=snapshot.path.read_bytes(),
+            data=upload["data"],
             content_type=JPEG_MIMETYPE,
         )
         self.client.send_image(
@@ -247,7 +253,7 @@ class MatrixDelivery:
             txn_id=f"{event_id}:image",
             body=snapshot.body,
             content_uri=content_uri,
-            info=snapshot.info,
+            info=upload["info"],
         )
         return snapshot
 
@@ -293,9 +299,10 @@ class MatrixDelivery:
             )
             if self.logger is not None:
                 self.logger.info("matrix-snapshot-copied", **snapshot.log_context, txn_id=snapshot.txn_id)
+            upload = _matrix_snapshot_upload(snapshot, logger=self.logger)
             content_uri = self.client.upload_image(
                 filename=snapshot.filename,
-                data=snapshot.path.read_bytes(),
+                data=upload["data"],
                 content_type=JPEG_MIMETYPE,
             )
             self.client.send_image(
@@ -303,7 +310,7 @@ class MatrixDelivery:
                 txn_id=f"{event_id}:image",
                 body=_occupied_snapshot_body(spot_id=spot_id, observed_at=observed_at),
                 content_uri=content_uri,
-                info=snapshot.info,
+                info=upload["info"],
             )
         except Exception as exc:
             if self.logger is not None:
@@ -1221,6 +1228,47 @@ def _format_profile_summary_reply(summary: Mapping[str, Any]) -> str:
         f"Sessions: {closed} closed, {active} active, {excluded} wrong-match excluded\n"
         f"Estimate: {estimate_status} from {estimate_samples} samples"
     )
+
+def _matrix_snapshot_upload(snapshot: MatrixSnapshot, *, logger: StructuredLogger | None) -> dict[str, Any]:
+    raw = snapshot.path.read_bytes()
+    if len(raw) <= MAX_MATRIX_UPLOAD_IMAGE_BYTES:
+        return {"data": raw, "info": dict(snapshot.info)}
+
+    data, info = _resize_jpeg_for_matrix_upload(snapshot.path)
+    if logger is not None:
+        logger.info(
+            "matrix-snapshot-upload-resized",
+            snapshot_path=str(snapshot.path),
+            source_size=len(raw),
+            upload_size=info["size"],
+            width=info["w"],
+            height=info["h"],
+        )
+    return {"data": data, "info": info}
+
+
+def _resize_jpeg_for_matrix_upload(path: Path) -> tuple[bytes, dict[str, int | str]]:
+    with Image.open(path) as image:
+        working = image.convert("RGB")
+    width, height = working.size
+    if width <= 0 or height <= 0:
+        raise MatrixError("Matrix snapshot dimensions are invalid", error_type="snapshot_resize_failed", snapshot_path=str(path))
+
+    max_dimension = min(max(width, height), MATRIX_UPLOAD_INITIAL_MAX_DIMENSION)
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    while max_dimension >= MATRIX_UPLOAD_MIN_DIMENSION:
+        resized = working.copy()
+        resized.thumbnail((max_dimension, max_dimension), resampling)
+        for quality in MATRIX_UPLOAD_JPEG_QUALITIES:
+            buffer = BytesIO()
+            resized.save(buffer, format="JPEG", quality=quality, optimize=True)
+            data = buffer.getvalue()
+            if len(data) <= MAX_MATRIX_UPLOAD_IMAGE_BYTES:
+                output_width, output_height = resized.size
+                return data, {"mimetype": JPEG_MIMETYPE, "size": len(data), "w": output_width, "h": output_height}
+        max_dimension = int(max_dimension * 0.85)
+    raise MatrixError("Matrix snapshot could not be resized under upload budget", error_type="snapshot_resize_failed", snapshot_path=str(path))
+
 
 def prepare_event_snapshot(
     *,

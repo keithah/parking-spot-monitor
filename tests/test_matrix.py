@@ -11,6 +11,7 @@ from PIL import Image
 
 from parking_spot_monitor.matrix import (
     OCCUPIED_SPOT_EVENT_TYPE,
+    OPEN_SPOT_EVENT_TYPE,
     MatrixClient,
     MatrixDelivery,
     MatrixError,
@@ -265,6 +266,17 @@ def write_jpeg(path: Path, *, size: tuple[int, int] = (4, 3)) -> bytes:
     return path.read_bytes()
 
 
+def open_event(snapshot_path: Path | str = "unused.jpg") -> dict[str, Any]:
+    return {
+        "event_type": OPEN_SPOT_EVENT_TYPE,
+        "spot_id": "left_spot",
+        "previous_status": "occupied",
+        "new_status": "empty",
+        "observed_at": datetime(2026, 5, 18, 20, 1, 2, tzinfo=timezone.utc),
+        "snapshot_path": str(snapshot_path),
+    }
+
+
 def occupied_event(snapshot_path: Path | str = "unused.jpg") -> dict[str, Any]:
     return {
         "event_type": OCCUPIED_SPOT_EVENT_TYPE,
@@ -390,6 +402,61 @@ def test_format_occupied_spot_alert_omits_low_confidence_profile_only_estimate_n
 
     assert format_occupied_spot_alert(event) == "Parking spot occupied: right_spot at 2026-05-12 5:16:48 PM PDT"
 
+
+
+def test_matrix_delivery_open_alert_uploads_resized_image_without_mutating_retained_raw_snapshot(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    noisy = Image.effect_noise((1280, 720), 80).convert("RGB")
+    noisy.save(source, format="JPEG", quality=95)
+    raw_bytes = source.read_bytes()
+    assert len(raw_bytes) > 300_000
+    seen: list[dict[str, Any]] = []
+
+    class FakeClient:
+        def send_text(self, *, room_id: str, txn_id: str, body: str) -> str:
+            seen.append({"kind": "text", "room_id": room_id, "txn_id": txn_id, "body": body})
+            return "$text:example.org"
+
+        def upload_image(self, *, filename: str, data: bytes, content_type: str) -> str:
+            seen.append({"kind": "upload", "filename": filename, "data": data, "content_type": content_type})
+            return "mxc://example.org/open"
+
+        def send_image(self, *, room_id: str, txn_id: str, body: str, content_uri: str, info: dict[str, Any]) -> str:
+            seen.append({
+                "kind": "image",
+                "room_id": room_id,
+                "txn_id": txn_id,
+                "body": body,
+                "content_uri": content_uri,
+                "info": dict(info),
+            })
+            return "$image:example.org"
+
+    from parking_spot_monitor.logging import StructuredLogger
+
+    delivery = MatrixDelivery(
+        client=FakeClient(),  # type: ignore[arg-type]
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        logger=StructuredLogger(),
+    )
+
+    snapshot = delivery.send_open_spot_alert(open_event(source))
+
+    uploads = [item for item in seen if item["kind"] == "upload"]
+    images = [item for item in seen if item["kind"] == "image"]
+    assert len(uploads) == 1
+    assert len(images) == 1
+    assert snapshot.path.read_bytes() == raw_bytes
+    assert uploads[0]["filename"] == snapshot.filename
+    assert uploads[0]["content_type"] == "image/jpeg"
+    assert uploads[0]["data"] != raw_bytes
+    assert len(uploads[0]["data"]) <= 300_000
+    assert images[0]["info"]["size"] == len(uploads[0]["data"])
+    assert images[0]["info"]["w"] < 1280
+    assert images[0]["info"]["h"] < 720
+    assert images[0]["body"].startswith("Raw full-frame snapshot for left_spot")
 
 def test_matrix_delivery_occupied_alert_sends_text_upload_and_raw_occupied_image(tmp_path: Path) -> None:
     source = tmp_path / "occupied.jpg"
