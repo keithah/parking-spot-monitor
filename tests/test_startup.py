@@ -3315,7 +3315,7 @@ def test_default_matrix_command_service_wires_detection_lab_to_effective_paths_a
     assert_no_secret_leak(output + (tmp_path / "operator-decision-memory.json").read_text(encoding="utf-8"))
 
 
-def test_default_matrix_command_service_wires_feedback_and_who_snapshot(tmp_path: Path) -> None:
+def test_default_matrix_command_service_wires_feedback_who_snapshot_and_incident_replay_detector(tmp_path: Path) -> None:
     from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
     settings = load_settings("config.yaml.example", environ=fake_environ())
@@ -3331,6 +3331,68 @@ def test_default_matrix_command_service_wires_feedback_and_who_snapshot(tmp_path
     assert service.feedback_labeler is not None
     assert service.who_snapshot_provider is not None
     assert service.cockpit_context is not None
+    assert service.cockpit_context.incident_detector is not None
+    assert not (tmp_path / "latest.jpg").exists()
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_default_matrix_command_service_defers_incident_detector_construction_until_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
+
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={"matrix": settings.matrix.model_copy(update={"command_authorized_senders": ["@op:example"]})}
+    )
+    logger = StructuredLogger()
+    archive = VehicleHistoryArchive(tmp_path / "vehicle-history", logger=logger)
+    factory_calls: list[Any] = []
+    detect_calls: list[Path] = []
+
+    class Detector:
+        def detect(self, frame_path: str | Path, **kwargs: Any) -> list[Any]:
+            detect_calls.append(Path(frame_path))
+            return []
+
+    def detector_factory(loaded_settings: object) -> Detector:
+        factory_calls.append(loaded_settings)
+        return Detector()
+
+    monkeypatch.setattr("parking_spot_monitor.__main__._default_detector_factory", detector_factory)
+
+    service = _default_matrix_command_service_factory(settings, tmp_path, logger, archive)
+
+    assert service is not None
+    assert service.cockpit_context is not None
+    assert service.cockpit_context.incident_detector is not None
+    assert factory_calls == []
+
+    missing_frame_response = service.cockpit_context.format_reply(
+        "incident_review",
+        spot_id="left_spot",
+        incident_time="2026-05-18T02:39:00Z",
+        logger=logger,
+    )
+    assert "Nearest retained frame: unavailable" in missing_frame_response.text
+    assert factory_calls == []
+
+    frames_dir = tmp_path / "timeline" / "frames"
+    frames_dir.mkdir(parents=True)
+    frame = frames_dir / "20260518T023900Z.jpg"
+    Image.new("RGB", (1458, 806), (20, 30, 40)).save(frame, format="JPEG")
+
+    replay_response = service.cockpit_context.format_reply(
+        "incident_review",
+        spot_id="left_spot",
+        incident_time="2026-05-18T02:39:00Z",
+        logger=logger,
+    )
+
+    assert factory_calls == [settings]
+    assert detect_calls == [frame]
+    assert "Detector replay: no vehicle evidence" in replay_response.text
 
 
 def test_startup_summary_includes_sanitized_detection_lab_dir(capsys: pytest.CaptureFixture[str]) -> None:

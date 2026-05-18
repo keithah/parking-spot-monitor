@@ -506,6 +506,138 @@ def test_latest_snapshot_summary_handles_missing_stale_and_malformed_runtime_fil
 
 
 
+
+def test_operator_cockpit_confidence_summary_reports_artifact_derived_spot_signals_and_delivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from parking_spot_monitor.operator_cockpit import format_operator_confidence_reply
+    from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, make_decision_memory_record
+
+    settings = _settings(tmp_path)
+    health_path = tmp_path / "health.json"
+    state_path = tmp_path / "state.json"
+    health_path.write_text(
+        json.dumps(
+            {
+                "status": "degraded",
+                "updated_at": "2026-05-18T19:00:00Z",
+                "last_matrix_error": {
+                    "error_type": "timeout",
+                    "diagnostic": FAKE_MATRIX_TOKEN,
+                    "path": str(tmp_path),
+                    "nested": {"secret": NESTED_SECRET_MARKER},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    original_state = json.dumps(
+        {
+            "schema_version": 1,
+            "spots": {
+                "left_spot": {"status": "occupied", "hit_streak": 4, "miss_streak": 0, "open_event_emitted": False},
+                "right_spot": {"status": "empty", "hit_streak": 0, "miss_streak": 5, "open_event_emitted": True},
+            },
+        },
+        sort_keys=True,
+    )
+    state_path.write_text(original_state, encoding="utf-8")
+    original_state_mtime_ns = state_path.stat().st_mtime_ns
+    frames_dir = tmp_path / "timeline" / "frames"
+    frames_dir.mkdir(parents=True)
+    (frames_dir / "20260518T185800Z.jpg").write_bytes((RAW_IMAGE_MARKER * 20).encode("utf-8"))
+    (frames_dir / "20260518T185900Z.jpg").write_bytes((RAW_IMAGE_MARKER * 20).encode("utf-8"))
+    (frames_dir / "not-a-timestamp.jpg").write_bytes((RAW_IMAGE_MARKER * 20).encode("utf-8"))
+    memory_path = decision_memory_path(tmp_path)
+    assert append_decision_memory_record(
+        memory_path,
+        make_decision_memory_record(
+            "confidence_dip",
+            observed_at="2026-05-18T18:59:10Z",
+            spot_id="left_spot",
+            summary="confidence dipped below stable threshold",
+            details={"token": FAKE_MATRIX_TOKEN, "raw_image": RAW_IMAGE_MARKER},
+        ),
+    )
+    assert append_decision_memory_record(
+        memory_path,
+        make_decision_memory_record("suppression", observed_at="2026-05-18T18:59:20Z", spot_id="right_spot", summary="quiet-window suppression active"),
+    )
+    assert append_decision_memory_record(
+        memory_path,
+        make_decision_memory_record("command_outcome", observed_at="2026-05-18T18:59:30Z", summary="Matrix status command delivered"),
+    )
+
+    def fail_side_effect(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("confidence summary must only read local artifacts")
+
+    monkeypatch.setattr("parking_spot_monitor.capture.capture_latest", fail_side_effect)
+    monkeypatch.setattr("parking_spot_monitor.state.save_runtime_state", fail_side_effect)
+    monkeypatch.setattr("parking_spot_monitor.matrix.MatrixClient.send_text", fail_side_effect)
+    monkeypatch.setattr("PIL.Image.open", fail_side_effect)
+
+    reply = format_operator_confidence_reply(
+        settings=settings,
+        data_dir=tmp_path,
+        health_path=health_path,
+        state_path=state_path,
+        now=datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    assert "Parking confidence report" in reply
+    assert "conservative and artifact-derived" in reply
+    assert "not a calibrated model score" in reply
+    assert "left_spot: stable occupied" in reply
+    assert "hit streak 4/4" in reply
+    assert "right_spot: stable open" in reply
+    assert "miss streak 5/5" in reply
+    assert "confidence_dip: confidence dipped below stable threshold" in reply
+    assert "suppression: quiet-window suppression active" in reply
+    assert "retained timestamped frames 2" in reply
+    assert "newest 1m ago" in reply
+    assert "filename scan only; image bytes were not opened; ignored 1" in reply
+    assert "last Matrix error: timeout" in reply
+    assert "recent delivery memory: command_outcome: Matrix status command delivered" in reply
+    assert "Read-only: no detector, camera, media upload, alert emission, or state mutation was run." in reply
+    assert state_path.read_text(encoding="utf-8") == original_state
+    assert state_path.stat().st_mtime_ns == original_state_mtime_ns
+    assert len(reply.encode("utf-8")) <= 4096
+    assert str(tmp_path) not in reply
+    _assert_no_sensitive_text(reply)
+
+
+def test_operator_cockpit_confidence_summary_degrades_for_missing_and_malformed_artifacts(tmp_path: Path) -> None:
+    from parking_spot_monitor.operator_cockpit import format_operator_confidence_reply
+    from parking_spot_monitor.operator_decision_memory import decision_memory_path
+
+    settings = _settings(tmp_path)
+    health_path = tmp_path / "health.json"
+    state_path = tmp_path / "state.json"
+    health_path.write_text("not json " + FAKE_MATRIX_TOKEN + " " + str(tmp_path), encoding="utf-8")
+    state_path.write_text(json.dumps({"schema_version": 1, "spots": [], "secret": FAKE_RTSP_URL}), encoding="utf-8")
+    memory_path = decision_memory_path(tmp_path)
+    memory_path.write_text("not json " + RAW_IMAGE_MARKER + " " + NESTED_SECRET_MARKER, encoding="utf-8")
+
+    reply = format_operator_confidence_reply(
+        settings=settings,
+        data_dir=tmp_path,
+        health_path=health_path,
+        state_path=state_path,
+        now=datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    assert "Parking confidence report" in reply
+    assert "left_spot: unavailable" in reply
+    assert "right_spot: unavailable" in reply
+    assert "State artifacts: unavailable (schema_error); configured spot fallbacks shown." in reply
+    assert "decision memory unavailable (JSONDecodeError)" in reply
+    assert "Timeline health:" in reply
+    assert "unavailable (missing timeline frames directory)" in reply
+    assert "health unavailable (JSONDecodeError); Matrix error status unknown" in reply
+    assert "delivery memory unavailable" in reply
+    assert "Traceback" not in reply
+    assert str(tmp_path) not in reply
+    assert len(reply.encode("utf-8")) <= 4096
+    _assert_no_sensitive_text(reply)
+
 def test_operator_cockpit_decision_memory_wrappers_are_bounded_redacted_and_local_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from parking_spot_monitor.operator_cockpit import format_operator_recent_reply, format_operator_why_reply
     from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, make_decision_memory_record
@@ -623,6 +755,172 @@ def test_operator_cockpit_incident_review_handles_missing_timeline_safely(tmp_pa
     assert "Incident review: left_spot" in response.text
     assert "Nearest retained frame: unavailable" in response.text
     assert "No retained timeline frames were found." in response.text
+
+
+
+def _write_incident_runtime_state(path: Path, *, corrupt: bool = False) -> str:
+    if corrupt:
+        payload = "not json " + FAKE_MATRIX_TOKEN + " " + RAW_IMAGE_MARKER
+        path.write_text(payload, encoding="utf-8")
+        return payload
+    payload = {
+        "schema_version": 1,
+        "spots": {
+            "left_spot": {
+                "status": "occupied",
+                "hit_streak": 4,
+                "miss_streak": 0,
+                "open_event_emitted": False,
+                "last_bbox": [30, 40, 260, 320],
+            },
+            "right_spot": {
+                "status": "empty",
+                "hit_streak": 0,
+                "miss_streak": 5,
+                "open_event_emitted": True,
+            },
+        },
+    }
+    rendered = json.dumps(payload, sort_keys=True)
+    path.write_text(rendered, encoding="utf-8")
+    return rendered
+
+
+def _write_incident_timeline_frame(tmp_path: Path, name: str = "20260518T023900Z.jpg", *, corrupt: bool = False) -> Path:
+    frames_dir = tmp_path / "timeline" / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    frame = frames_dir / name
+    if corrupt:
+        frame.write_bytes(b"not a jpeg " + RAW_IMAGE_MARKER.encode("utf-8"))
+    else:
+        _write_test_jpeg(frame, size=(1458, 806))
+    return frame
+
+
+class _IncidentReplayDetector:
+    def __init__(self, detections: list[Any] | Exception) -> None:
+        self.detections = detections
+        self.calls: list[dict[str, Any]] = []
+
+    def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None, inference_image_size: int | None = None) -> list[Any]:
+        self.calls.append({"frame_path": Path(frame_path), "confidence_threshold": confidence_threshold, "inference_image_size": inference_image_size})
+        if isinstance(self.detections, Exception):
+            raise self.detections
+        return self.detections
+
+
+def test_operator_cockpit_incident_review_contract_replays_detector_and_simulates_state_without_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from parking_spot_monitor.detection import VehicleDetection
+    from parking_spot_monitor.operator_cockpit import build_incident_review_response
+    from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, make_decision_memory_record
+
+    settings = _settings(tmp_path)
+    frame = _write_incident_timeline_frame(tmp_path)
+    state_path = tmp_path / "state.json"
+    original_state = _write_incident_runtime_state(state_path)
+    original_state_mtime_ns = state_path.stat().st_mtime_ns
+    detector = _IncidentReplayDetector([VehicleDetection(class_name="car", confidence=0.91, bbox=(25, 30, 275, 325))])
+    assert append_decision_memory_record(
+        decision_memory_path(tmp_path),
+        make_decision_memory_record(
+            "accepted_evidence",
+            observed_at="2026-05-18T02:39:10Z",
+            spot_id="left_spot",
+            summary="left_spot accepted vehicle evidence before operator review",
+            details={"matrix_token": FAKE_MATRIX_TOKEN, "raw_image": RAW_IMAGE_MARKER},
+        ),
+    )
+
+    def fail_side_effect(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("incident review must not capture, write state, alert, or mutate vehicle history")
+
+    monkeypatch.setattr("parking_spot_monitor.capture.capture_latest", fail_side_effect)
+    monkeypatch.setattr("parking_spot_monitor.state.save_runtime_state", fail_side_effect)
+    monkeypatch.setattr("parking_spot_monitor.matrix.MatrixClient.send_text", fail_side_effect)
+
+    response = build_incident_review_response(
+        settings=settings,
+        data_dir=tmp_path,
+        state_path=state_path,
+        spot_id="left_spot",
+        time_text="7:39pm",
+        detector=detector,
+        now=datetime(2026, 5, 18, 4, 0, tzinfo=timezone.utc),
+    )
+
+    assert detector.calls == [{"frame_path": frame, "confidence_threshold": 0.42, "inference_image_size": 960}]
+    assert state_path.read_text(encoding="utf-8") == original_state
+    assert state_path.stat().st_mtime_ns == original_state_mtime_ns
+    assert response.image_path is not None
+    assert response.image_path.name == "incident_left_spot.jpg"
+    assert response.image_info is not None
+    assert response.image_info["mimetype"] == "image/jpeg"
+    assert response.image_info["size"] == response.image_path.stat().st_size
+    assert "Detector replay:" in response.text
+    assert "left_spot: accepted car confidence 0.91" in response.text
+    assert "right_spot: rejected centroid_outside" in response.text
+    assert "State simulation:" in response.text
+    assert "left_spot: occupied would remain occupied" in response.text
+    assert "no live state was changed" in response.text
+    assert "left_spot accepted vehicle evidence before operator review" in response.text
+    assert len(response.text.encode("utf-8")) <= 4096
+    assert str(tmp_path) not in response.text
+    assert "Traceback" not in response.text
+    _assert_no_sensitive_text(response.text)
+
+
+@pytest.mark.parametrize(
+    "case,corrupt_frame,corrupt_state,detections,expected",
+    [
+        ("no_evidence", False, False, [], ["Detector replay: no vehicle evidence", "would increment miss streak"]),
+        ("corrupt_frame", True, False, [], ["Nearest retained frame: unavailable", "corrupt_frame"]),
+        (
+            "detector_exception",
+            False,
+            False,
+            RuntimeError("predict failed token=" + FAKE_MATRIX_TOKEN + " raw " + RAW_IMAGE_MARKER),
+            ["Detector replay unavailable", "RuntimeError"],
+        ),
+        ("corrupt_state", False, True, [], ["Runtime state unavailable", "JSONDecodeError", "simulated from unknown/default state"]),
+    ],
+)
+def test_operator_cockpit_incident_review_contract_degrades_safely_for_negative_paths(
+    tmp_path: Path,
+    case: str,
+    corrupt_frame: bool,
+    corrupt_state: bool,
+    detections: list[Any] | Exception,
+    expected: list[str],
+) -> None:
+    from parking_spot_monitor.operator_cockpit import build_incident_review_response
+
+    settings = _settings(tmp_path)
+    _write_incident_timeline_frame(tmp_path, corrupt=corrupt_frame)
+    state_path = tmp_path / "state.json"
+    original_state = _write_incident_runtime_state(state_path, corrupt=corrupt_state)
+    original_state_mtime_ns = state_path.stat().st_mtime_ns
+    detector = _IncidentReplayDetector(detections)
+
+    response = build_incident_review_response(
+        settings=settings,
+        data_dir=tmp_path,
+        state_path=state_path,
+        spot_id="left_spot",
+        time_text="7:39pm",
+        detector=detector,
+        now=datetime(2026, 5, 18, 4, 0, tzinfo=timezone.utc),
+    )
+
+    assert state_path.read_text(encoding="utf-8") == original_state
+    assert state_path.stat().st_mtime_ns == original_state_mtime_ns
+    assert len(response.text.encode("utf-8")) <= 4096
+    assert str(tmp_path) not in response.text
+    assert "Traceback" not in response.text
+    for snippet in expected:
+        assert snippet in response.text, case
+    _assert_no_sensitive_text(response.text)
 
 def test_operator_cockpit_detection_lab_wrappers_are_bounded_redacted_and_local_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from parking_spot_monitor.detection_lab import DetectionLabManager, REPLAY_CONFIG_FILENAME, REPLAY_LABELS_FILENAME

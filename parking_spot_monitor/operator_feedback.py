@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 from PIL import Image, UnidentifiedImageError
 
+from parking_spot_monitor.incident_review import build_incident_replay
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
 from parking_spot_monitor.operator_decision_memory import (
     append_decision_memory_record,
@@ -31,6 +32,12 @@ VALID_FEEDBACK_STATES = frozenset({"open", "occupied"})
 LoadState = Literal["available", "missing", "unavailable"]
 SpotState = Literal["open", "occupied"]
 FeedbackAppendStatus = Literal["appended", "duplicate", "failed"]
+FeedbackLabelType = Literal["correction", "learn"]
+
+MAX_REPLAY_CONTEXT_LINES = 12
+MAX_REPLAY_LINE_CHARS = 240
+MAX_DEGRADATION_REASONS = 8
+MAX_METADATA_ITEMS = 16
 
 _SENSITIVE_TOKEN_PATTERN = re.compile(r"(?i)\b(?:syt|mxt|ghp|glpat|sk|xox[baprs])-?[a-z0-9_./+=-]{8,}\b")
 _RAW_IMAGE_PREFIX_PATTERN = re.compile(r"\xff\xd8[\s\S]*")
@@ -71,7 +78,7 @@ class FeedbackEvidence:
 
 @dataclass(frozen=True)
 class FeedbackLabel:
-    """Schema-stable operator correction label for later replay or tuning review."""
+    """Schema-stable operator label for correction and learn-command replay review."""
 
     label_id: str
     spot_id: str
@@ -87,8 +94,15 @@ class FeedbackLabel:
     notes: str = ""
     matrix_event_id: str | None = None
     matrix_room_id_hash: str | None = None
+    label_type: FeedbackLabelType = "correction"
+    target_state: str | None = None
+    learned_at: str | None = None
+    replay_context: tuple[str, ...] = ()
+    degradation_reasons: tuple[str, ...] = ()
+    source_metadata: Mapping[str, Any] | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
+        label_type = _feedback_label_type(self.label_type)
         payload: dict[str, Any] = {
             "label_id": _safe_required_text(self.label_id, "label_id", limit=160),
             "spot_id": _safe_required_text(self.spot_id, "spot_id", limit=80),
@@ -102,11 +116,18 @@ class FeedbackLabel:
             "alert_event_id": _safe_optional_text(self.alert_event_id, limit=180),
             "evidence": self.evidence.to_json_dict(),
             "notes": _clip_text(self.notes, MAX_TEXT_FIELD_CHARS),
+            "label_type": label_type,
         }
         if self.matrix_event_id is not None:
             payload["matrix_event_id"] = _safe_optional_text(self.matrix_event_id, limit=180)
         if self.matrix_room_id_hash is not None:
             payload["matrix_room_id_hash"] = _safe_optional_text(self.matrix_room_id_hash, limit=120)
+        if label_type == "learn":
+            payload["target_state"] = _feedback_state(self.target_state, "target_state")
+            payload["learned_at"] = _safe_required_text(self.learned_at or self.corrected_at, "learned_at", limit=80)
+            payload["replay_context"] = _safe_text_list(self.replay_context, max_items=MAX_REPLAY_CONTEXT_LINES, item_limit=MAX_REPLAY_LINE_CHARS)
+            payload["degradation_reasons"] = _safe_text_list(self.degradation_reasons, max_items=MAX_DEGRADATION_REASONS, item_limit=120)
+            payload["source_metadata"] = _safe_metadata(self.source_metadata)
         return payload
 
 
@@ -164,6 +185,32 @@ class FeedbackRecordResult:
     )
     label_id: str | None = None
     error_type: str | None = None
+
+
+@dataclass(frozen=True)
+class LearnLabelRecordResult:
+    """Result returned after recording a learn-command replay label."""
+
+    recorded: bool
+    reply_text: str
+    spot_id: str
+    target_state: SpotState
+    requested_at: str | None = None
+    evidence: FeedbackEvidence = FeedbackEvidence(
+        kind="timeline_frame",
+        path=None,
+        available=False,
+        validated_jpeg=False,
+        width=None,
+        height=None,
+        byte_size=None,
+        error_type="missing",
+    )
+    replay_context: tuple[str, ...] = ()
+    degradation_reasons: tuple[str, ...] = ()
+    label_id: str | None = None
+    error_type: str | None = None
+    duplicate: bool = False
 
 
 class OperatorFeedbackLabeler:
@@ -299,11 +346,349 @@ class OperatorFeedbackLabeler:
             label_id=label_id,
         )
 
+    def record_learn_label(
+        self,
+        *,
+        spot_id: str,
+        target_state: str,
+        requested_time: datetime | str,
+        settings: Any | None,
+        state_path: str | Path | None,
+        detector: Any | None,
+        matrix_event_id: str,
+        matrix_sender: str,
+        matrix_room_id: str,
+        learned_at: datetime | str | None = None,
+        now: datetime | None = None,
+    ) -> LearnLabelRecordResult:
+        """Record a learn-command label from retained timeline evidence and copied-state replay only."""
+
+        safe_spot = _safe_spot_id(spot_id)
+        if safe_spot is None or not _learn_spot_is_configured(settings, safe_spot):
+            return LearnLabelRecordResult(
+                recorded=False,
+                reply_text="Parking learn label not recorded\nInvalid spot id.",
+                spot_id="",
+                target_state="open",
+                error_type="invalid_spot",
+            )
+        try:
+            state = _feedback_state(target_state, "target_state")
+        except FeedbackLabelSchemaError:
+            return LearnLabelRecordResult(
+                recorded=False,
+                reply_text="Parking learn label not recorded\nInvalid target state; use open or occupied.",
+                spot_id=safe_spot,
+                target_state="open",
+                error_type="invalid_state",
+            )
+
+        existing_label = find_feedback_label_by_matrix_event_id(self.labels_path, matrix_event_id, logger=self.logger)
+        if existing_label is not None:
+            existing_state = _feedback_state(existing_label.target_state or existing_label.actual_state, "target_state")
+            return LearnLabelRecordResult(
+                recorded=True,
+                reply_text=format_duplicate_learn_reply(existing_label),
+                spot_id=existing_label.spot_id,
+                target_state=existing_state,
+                requested_at=existing_label.learned_at or existing_label.corrected_at,
+                evidence=existing_label.evidence,
+                replay_context=tuple(existing_label.replay_context),
+                degradation_reasons=tuple(existing_label.degradation_reasons),
+                label_id=existing_label.label_id,
+                duplicate=True,
+            )
+
+        try:
+            target_time = _parse_learn_requested_time(requested_time, now=now)
+        except ValueError:
+            return LearnLabelRecordResult(
+                recorded=False,
+                reply_text="Parking learn label not recorded\nInvalid time; use ISO time or h:mmam/pm.",
+                spot_id=safe_spot,
+                target_state=state,
+                error_type="invalid_time",
+            )
+
+        nearest = _nearest_learn_timeline_frame(self.data_dir, target_time)
+        if nearest is None:
+            evidence = FeedbackEvidence("timeline_frame", None, False, False, None, None, None, "missing")
+            return LearnLabelRecordResult(
+                recorded=False,
+                reply_text=format_learn_reply(safe_spot, state, evidence, (), ("timeline_missing",), recorded=False),
+                spot_id=safe_spot,
+                target_state=state,
+                requested_at=target_time.isoformat().replace("+00:00", "Z"),
+                evidence=evidence,
+                degradation_reasons=("timeline_missing",),
+                error_type="timeline_missing",
+            )
+
+        frame_path, frame_time = nearest
+        evidence = validate_timeline_feedback_evidence(data_dir=self.data_dir, frame_path=frame_path, logger=self.logger)
+        if not (evidence.available and evidence.validated_jpeg):
+            reasons = tuple(_learn_degradation_reasons(evidence=evidence, replay=None))
+            return LearnLabelRecordResult(
+                recorded=False,
+                reply_text=format_learn_reply(safe_spot, state, evidence, (), reasons, recorded=False),
+                spot_id=safe_spot,
+                target_state=state,
+                requested_at=target_time.isoformat().replace("+00:00", "Z"),
+                evidence=evidence,
+                degradation_reasons=reasons,
+                error_type=evidence.error_type or "invalid_evidence",
+            )
+
+        replay = build_incident_replay(
+            settings=settings,
+            frame_path=frame_path,
+            frame_time=frame_time,
+            requested_spot_id=safe_spot,
+            state_path=state_path,
+            detector=detector,
+        )
+        if replay.unavailable_reason == "corrupt_frame":
+            evidence = FeedbackEvidence(
+                "timeline_frame",
+                evidence.path,
+                False,
+                False,
+                evidence.width,
+                evidence.height,
+                evidence.byte_size,
+                "corrupt_frame",
+            )
+            reasons = ("corrupt_frame",)
+            return LearnLabelRecordResult(
+                recorded=False,
+                reply_text=format_learn_reply(safe_spot, state, evidence, replay.lines, reasons, recorded=False),
+                spot_id=safe_spot,
+                target_state=state,
+                requested_at=target_time.isoformat().replace("+00:00", "Z"),
+                evidence=evidence,
+                replay_context=tuple(replay.lines),
+                degradation_reasons=reasons,
+                error_type="corrupt_frame",
+            )
+
+        reasons = tuple(_learn_degradation_reasons(evidence=evidence, replay=replay))
+        learned_text = _feedback_timestamp_text(learned_at or target_time)
+        delta_seconds = abs(int((frame_time - target_time).total_seconds()))
+        source_metadata = {
+            "command": "learn",
+            "requested_at": target_time.isoformat().replace("+00:00", "Z"),
+            "frame_observed_at": frame_time.isoformat().replace("+00:00", "Z"),
+            "frame_delta_seconds": str(delta_seconds),
+            "replay_unavailable_reason": replay.unavailable_reason or "",
+            "detector_error_type": replay.detector_error_type or "",
+            "state_error_type": replay.state_error_type or "",
+        }
+        label = make_learn_feedback_label(
+            spot_id=safe_spot,
+            target_state=state,
+            learned_at=learned_text,
+            matrix_event_id=matrix_event_id,
+            matrix_sender=matrix_sender,
+            matrix_room_id=matrix_room_id,
+            evidence=evidence,
+            replay_context=replay.lines,
+            degradation_reasons=reasons,
+            source_metadata=source_metadata,
+        )
+        append_result = append_feedback_label(self.labels_path, label, logger=self.logger)
+        if not append_result:
+            return LearnLabelRecordResult(
+                recorded=False,
+                reply_text="Parking learn label not recorded\nFeedback store unavailable (feedback_store_unavailable).",
+                spot_id=safe_spot,
+                target_state=state,
+                requested_at=target_time.isoformat().replace("+00:00", "Z"),
+                evidence=evidence,
+                replay_context=tuple(replay.lines),
+                degradation_reasons=reasons,
+                error_type="feedback_store_unavailable",
+            )
+        if append_result.status == "duplicate":
+            return LearnLabelRecordResult(
+                recorded=True,
+                reply_text=format_learn_reply(safe_spot, state, evidence, replay.lines, reasons, recorded=True, duplicate=True),
+                spot_id=safe_spot,
+                target_state=state,
+                requested_at=target_time.isoformat().replace("+00:00", "Z"),
+                evidence=evidence,
+                replay_context=tuple(replay.lines),
+                degradation_reasons=reasons,
+                label_id=label.label_id,
+                duplicate=True,
+            )
+
+        append_decision_memory_record(
+            self.memory_path,
+            make_decision_memory_record(
+                "feedback",
+                observed_at=learned_text,
+                spot_id=safe_spot,
+                summary=f"operator learn label recorded: target {state}; replay {'degraded' if reasons else 'available'}",
+                details={
+                    "label_id": label.label_id,
+                    "label_type": "learn",
+                    "target_state": state,
+                    "evidence_available": evidence.available,
+                    "evidence_path": evidence.path,
+                    "replay_line_count": len(replay.lines),
+                    "degradation_reasons": list(reasons),
+                },
+            ),
+            logger=self.logger,
+        )
+        return LearnLabelRecordResult(
+            recorded=True,
+            reply_text=format_learn_reply(safe_spot, state, evidence, replay.lines, reasons, recorded=True),
+            spot_id=safe_spot,
+            target_state=state,
+            requested_at=target_time.isoformat().replace("+00:00", "Z"),
+            evidence=evidence,
+            replay_context=tuple(replay.lines),
+            degradation_reasons=reasons,
+            label_id=label.label_id,
+        )
+
 
 def feedback_labels_path(data_dir: str | Path) -> Path:
     """Return the durable operator-feedback artifact path for a runtime data directory."""
 
     return Path(data_dir) / FEEDBACK_LABELS_FILENAME
+
+
+def validate_timeline_feedback_evidence(
+    *,
+    data_dir: str | Path,
+    frame_path: str | Path | None,
+    logger: StructuredLogger | None = None,
+) -> FeedbackEvidence:
+    """Validate safe metadata for one retained timeline JPEG frame."""
+
+    if frame_path is None:
+        return FeedbackEvidence("timeline_frame", None, False, False, None, None, None, "missing")
+    root = Path(data_dir).resolve()
+    path = Path(frame_path)
+    try:
+        resolved = path.resolve()
+        relative = resolved.relative_to(root).as_posix()
+        safe_relative = _safe_optional_path_text(relative)
+    except (OSError, ValueError, FeedbackLabelSchemaError):
+        return FeedbackEvidence("timeline_frame", None, False, False, None, None, None, "unsafe_path")
+    if safe_relative is None or not safe_relative.startswith("timeline/frames/"):
+        return FeedbackEvidence("timeline_frame", safe_relative, False, False, None, None, None, "unsafe_path")
+    try:
+        byte_size = resolved.stat().st_size
+        with Image.open(resolved) as image:
+            image.verify()
+        with Image.open(resolved) as image:
+            width, height = image.size
+            if image.format != "JPEG" or width <= 0 or height <= 0:
+                return FeedbackEvidence("timeline_frame", safe_relative, False, False, None, None, byte_size, "invalid_jpeg")
+    except (OSError, UnidentifiedImageError, ValueError) as exc:
+        _log(logger, "warning", "operator-feedback-timeline-evidence-invalid", path=safe_relative, error_type=type(exc).__name__)
+        return FeedbackEvidence("timeline_frame", safe_relative, False, False, None, None, None, "invalid_jpeg")
+    return FeedbackEvidence("timeline_frame", safe_relative, True, True, width, height, byte_size, None)
+
+
+def format_learn_reply(
+    spot_id: str,
+    target_state: str,
+    evidence: FeedbackEvidence,
+    replay_context: Sequence[str],
+    degradation_reasons: Sequence[str],
+    *,
+    recorded: bool,
+    duplicate: bool = False,
+) -> str:
+    """Format a bounded operator-visible learn-label acknowledgement."""
+
+    if duplicate:
+        heading = "Command already applied; learn acknowledgement repeated."
+    else:
+        heading = "Parking learn label recorded" if recorded else "Parking learn label not recorded"
+    if evidence.available and evidence.validated_jpeg:
+        evidence_line = f"linked evidence: retained timeline frame ({evidence.width}x{evidence.height})"
+    else:
+        evidence_line = f"linked evidence: unavailable; retained timeline frame unavailable ({evidence.error_type or 'unavailable'})"
+    replay_line = "replay: available" if replay_context else "replay: unavailable"
+    safe_reasons = _safe_text_list(degradation_reasons, max_items=MAX_DEGRADATION_REASONS, item_limit=120)
+    if safe_reasons:
+        replay_line += "; degraded " + ", ".join(safe_reasons[:MAX_DEGRADATION_REASONS])
+    return _bounded_feedback_reply([
+        heading,
+        f"- spot: {spot_id}",
+        f"- target: {target_state}",
+        f"- {evidence_line}",
+        f"- {replay_line}",
+        "- next: run !parking lab run replay after labels are reviewed",
+    ])
+
+
+def format_duplicate_learn_reply(label: FeedbackLabel) -> str:
+    """Format an idempotent acknowledgement for a replayed Matrix learn event."""
+
+    return format_learn_reply(
+        label.spot_id,
+        label.target_state or label.actual_state,
+        label.evidence,
+        label.replay_context,
+        label.degradation_reasons,
+        recorded=True,
+        duplicate=True,
+    )
+
+
+def _parse_learn_requested_time(value: datetime | str, *, now: datetime | None) -> datetime:
+    if isinstance(value, datetime):
+        selected = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return selected.astimezone(timezone.utc)
+    from parking_spot_monitor.operator_cockpit import _parse_incident_time
+
+    return _parse_incident_time(str(value), now=_utc_now(now))
+
+
+def _nearest_learn_timeline_frame(data_dir: str | Path, target_time: datetime) -> tuple[Path, datetime] | None:
+    from parking_spot_monitor.operator_cockpit import _nearest_timeline_frame
+
+    return _nearest_timeline_frame(Path(data_dir), target_time)
+
+
+def _utc_now(value: datetime | None) -> datetime:
+    selected = value if value is not None else datetime.now(timezone.utc)
+    if selected.tzinfo is None:
+        return selected.replace(tzinfo=timezone.utc)
+    return selected.astimezone(timezone.utc)
+
+
+def _learn_spot_is_configured(settings: Any | None, spot_id: str) -> bool:
+    spots = getattr(settings, "spots", None)
+    if spots is None:
+        return spot_id in {"left_spot", "right_spot"}
+    return any(getattr(spots, candidate, None) is not None and spot_id == candidate for candidate in ("left_spot", "right_spot"))
+
+
+def _learn_degradation_reasons(*, evidence: FeedbackEvidence, replay: Any | None) -> list[str]:
+    reasons: list[str] = []
+    if not evidence.available or not evidence.validated_jpeg:
+        reasons.append(evidence.error_type or "evidence_unavailable")
+    if replay is not None:
+        for value in (getattr(replay, "unavailable_reason", None), getattr(replay, "detector_error_type", None), getattr(replay, "state_error_type", None)):
+            text = _safe_optional_text(value, limit=120)
+            if text and text not in reasons:
+                reasons.append(text)
+    return reasons[:MAX_DEGRADATION_REASONS]
+
+
+def _bounded_feedback_reply(lines: Sequence[str]) -> str:
+    rendered = redact_diagnostic_text("\n".join(_clip_text(line, MAX_REPLAY_LINE_CHARS) for line in lines[:MAX_REPLAY_CONTEXT_LINES]))
+    encoded = rendered.encode("utf-8")
+    if len(encoded) <= 4096:
+        return rendered
+    return encoded[:4093].decode("utf-8", errors="ignore") + "..."
 
 
 def hash_operator_identifier(identifier: object) -> str:
@@ -342,6 +727,49 @@ def make_label_id(*, corrected_at: datetime | str | None, spot_id: str, matrix_e
     suffix_material = "\0".join((timestamp, safe_spot, event_id))
     suffix = hashlib.sha256(suffix_material.encode("utf-8")).hexdigest()[:8]
     return f"feedback-{timestamp}-{safe_spot}-{suffix}"
+
+
+def make_learn_feedback_label(
+    *,
+    spot_id: str,
+    target_state: str,
+    learned_at: datetime | str | None,
+    matrix_event_id: str,
+    matrix_sender: str,
+    matrix_room_id: str,
+    evidence: FeedbackEvidence,
+    replay_context: Sequence[str] = (),
+    degradation_reasons: Sequence[str] = (),
+    source_metadata: Mapping[str, Any] | None = None,
+) -> FeedbackLabel:
+    """Build a sanitized learn-command label linked to retained evidence and replay context."""
+
+    safe_spot = _safe_spot_id(spot_id)
+    if safe_spot is None:
+        raise FeedbackLabelSchemaError("feedback label spot_id is required")
+    state = _feedback_state(target_state, "target_state")
+    learned_text = _feedback_timestamp_text(learned_at)
+    return FeedbackLabel(
+        label_id=make_label_id(corrected_at=learned_text, spot_id=safe_spot, matrix_event_id=matrix_event_id),
+        spot_id=safe_spot,
+        reported_state=state,
+        actual_state=state,
+        source="matrix_learn_command",
+        operator_sender_hash=hash_operator_identifier(matrix_sender),
+        corrected_at=learned_text,
+        reported_at=learned_text,
+        alert_event_type=None,
+        alert_event_id=None,
+        evidence=evidence,
+        matrix_event_id=matrix_event_id,
+        matrix_room_id_hash=hash_operator_identifier(matrix_room_id),
+        label_type="learn",
+        target_state=state,
+        learned_at=learned_text,
+        replay_context=tuple(replay_context),
+        degradation_reasons=tuple(degradation_reasons),
+        source_metadata=source_metadata,
+    )
 
 
 def append_feedback_label(
@@ -633,6 +1061,7 @@ def _label_from_any(value: FeedbackLabel | Mapping[str, Any]) -> FeedbackLabel:
         byte_size=_optional_non_negative_int(evidence_value.get("byte_size")),
         error_type=_safe_optional_text(evidence_value.get("error_type"), limit=80),
     )
+    label_type = _feedback_label_type(value.get("label_type", "correction"))
     return FeedbackLabel(
         label_id=_safe_required_text(value.get("label_id"), "label_id", limit=160),
         spot_id=_safe_required_text(value.get("spot_id"), "spot_id", limit=80),
@@ -648,7 +1077,20 @@ def _label_from_any(value: FeedbackLabel | Mapping[str, Any]) -> FeedbackLabel:
         notes=_safe_optional_text(value.get("notes"), limit=MAX_TEXT_FIELD_CHARS) or "",
         matrix_event_id=_safe_optional_text(value.get("matrix_event_id"), limit=180),
         matrix_room_id_hash=_safe_optional_text(value.get("matrix_room_id_hash"), limit=120),
+        label_type=label_type,
+        target_state=_feedback_state(value.get("target_state"), "target_state") if label_type == "learn" else _safe_optional_text(value.get("target_state"), limit=40),
+        learned_at=_safe_required_text(value.get("learned_at") or value.get("corrected_at"), "learned_at", limit=80) if label_type == "learn" else _safe_optional_text(value.get("learned_at"), limit=80),
+        replay_context=tuple(_safe_text_list(value.get("replay_context", ()), max_items=MAX_REPLAY_CONTEXT_LINES, item_limit=MAX_REPLAY_LINE_CHARS)) if label_type == "learn" else (),
+        degradation_reasons=tuple(_safe_text_list(value.get("degradation_reasons", ()), max_items=MAX_DEGRADATION_REASONS, item_limit=120)) if label_type == "learn" else (),
+        source_metadata=_safe_metadata(value.get("source_metadata")) if label_type == "learn" else None,
     )
+
+
+def _feedback_label_type(value: object) -> FeedbackLabelType:
+    label_type = _safe_required_text(value, "label_type", limit=40)
+    if label_type not in {"correction", "learn"}:
+        raise FeedbackLabelSchemaError("feedback label label_type must be correction or learn")
+    return label_type  # type: ignore[return-value]
 
 
 def _feedback_state(value: object, field: str) -> str:
@@ -656,6 +1098,41 @@ def _feedback_state(value: object, field: str) -> str:
     if state not in VALID_FEEDBACK_STATES:
         raise FeedbackLabelSchemaError(f"feedback label {field} must be open or occupied")
     return state
+
+
+def _safe_text_list(value: object, *, max_items: int, item_limit: int) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise FeedbackLabelSchemaError("feedback label replay fields must be lists")
+    bounded: list[str] = []
+    for item in list(value)[:_positive_limit(max_items, max_items)]:
+        text = _safe_optional_text(item, limit=item_limit)
+        if text:
+            bounded.append(text)
+    return bounded
+
+
+def _safe_metadata(value: object) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise FeedbackLabelSchemaError("feedback label source_metadata must be an object")
+    sanitized: dict[str, str] = {}
+    for raw_key, raw_value in list(value.items())[:MAX_METADATA_ITEMS]:
+        key = _safe_optional_text(raw_key, limit=80)
+        if not key:
+            continue
+        sanitized[key] = _safe_metadata_value(key, raw_value)
+    return sanitized
+
+
+def _safe_metadata_value(key: str, value: object) -> str:
+    text = _safe_optional_text(value, limit=160) or ""
+    lower_key = key.lower()
+    if lower_key in {"sender", "room", "matrix_sender", "matrix_room_id", "operator"} or text.startswith(("@", "!")):
+        return hash_operator_identifier(text)
+    return text
 
 
 def _safe_required_text(value: object, field: str, *, limit: int) -> str:

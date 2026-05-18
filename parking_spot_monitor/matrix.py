@@ -86,6 +86,7 @@ class MatrixOperatorCockpitContext:
     latest_path: Path | None = None
     snapshots_dir: Path | None = None
     detection_lab_manager: Any | None = None
+    incident_detector: Any | None = None
 
     def format_reply(
         self,
@@ -131,10 +132,20 @@ class MatrixOperatorCockpitContext:
             return MatrixCommandResponse(text=format_operator_why_reply(data_dir=self.data_dir, spot_id=spot_id, logger=logger))
         if action == "recent":
             return MatrixCommandResponse(text=format_operator_recent_reply(data_dir=self.data_dir, logger=logger))
+        if action == "confidence":
+            return MatrixCommandResponse(
+                text=format_operator_confidence_reply(
+                    settings=self.settings,
+                    data_dir=self.data_dir,
+                    health_path=self.health_path,
+                    state_path=self.state_path,
+                    logger=logger,
+                )
+            )
         if action == "incident_review":
             if spot_id is None or incident_time is None:
                 raise MatrixCommandParseError("usage: !parking at <time> <spot_id>")
-            return build_incident_review_response(data_dir=self.data_dir, spot_id=spot_id, time_text=incident_time, logger=logger)
+            return build_incident_review_response(settings=self.settings, data_dir=self.data_dir, state_path=self.state_path, spot_id=spot_id, time_text=incident_time, detector=self.incident_detector, logger=logger)
         if action == "lab_run":
             if lab_kind is None:
                 raise MatrixCommandParseError("usage: !parking lab run <replay|tuning>")
@@ -665,7 +676,7 @@ class MatrixCommandService:
 
     def _apply_command(self, command: MatrixCommand, *, event: MatrixTextEvent) -> str | MatrixCommandResponse:
         metadata = {"matrix_event_id": event.event_id, "matrix_sender": event.sender, "matrix_room_id": event.room_id}
-        if command.action in {"status", "config", "latest", "recent"}:
+        if command.action in {"status", "config", "latest", "recent", "confidence"}:
             return self._format_cockpit_reply(command.action)
         if command.action == "lab_run":
             assert command.lab_kind is not None
@@ -685,6 +696,22 @@ class MatrixCommandService:
             result = self.feedback_labeler.record_correction(
                 spot_id=command.spot_id,
                 actual_state=command.actual_state,
+                matrix_event_id=event.event_id,
+                matrix_sender=event.sender,
+                matrix_room_id=event.room_id,
+            )
+            return result.reply_text
+        if command.action == "learn_label":
+            if self.feedback_labeler is None:
+                raise RuntimeError("operator feedback labeler is not configured")
+            assert command.spot_id is not None and command.actual_state is not None and command.subject_id is not None
+            result = self.feedback_labeler.record_learn_label(
+                spot_id=command.spot_id,
+                target_state=command.actual_state,
+                requested_time=command.subject_id,
+                settings=None if self.cockpit_context is None else self.cockpit_context.settings,
+                state_path=None if self.cockpit_context is None else self.cockpit_context.state_path,
+                detector=None if self.cockpit_context is None else self.cockpit_context.incident_detector,
                 matrix_event_id=event.event_id,
                 matrix_sender=event.sender,
                 matrix_room_id=event.room_id,
@@ -902,16 +929,48 @@ def format_operator_recent_reply(
     return _format_operator_recent_reply(data_dir=data_dir, logger=logger)
 
 
+def format_operator_confidence_reply(
+    *,
+    settings: Any,
+    data_dir: str | Path,
+    health_path: str | Path,
+    state_path: str | Path,
+    now: datetime | None = None,
+    logger: StructuredLogger | None = None,
+) -> str:
+    from parking_spot_monitor.operator_cockpit import format_operator_confidence_reply as _format_operator_confidence_reply
+
+    return _format_operator_confidence_reply(
+        settings=settings,
+        data_dir=data_dir,
+        health_path=health_path,
+        state_path=state_path,
+        now=now,
+        logger=logger,
+    )
+
+
 def build_incident_review_response(
     *,
     data_dir: str | Path,
     spot_id: str,
     time_text: str,
+    settings: Any | None = None,
+    state_path: str | Path | None = None,
+    detector: Any | None = None,
     logger: StructuredLogger | None = None,
 ) -> MatrixCommandResponse:
     from parking_spot_monitor.operator_cockpit import build_incident_review_response as _build_incident_review_response
 
-    return _build_incident_review_response(data_dir=data_dir, spot_id=spot_id, time_text=time_text, logger=logger)
+    return _build_incident_review_response(
+        settings=settings,
+        data_dir=data_dir,
+        state_path=state_path,
+        spot_id=spot_id,
+        time_text=time_text,
+        detector=detector,
+        logger=logger,
+    )
 
 
 def format_detection_lab_run_reply(
@@ -975,10 +1034,26 @@ def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> Matr
             spot_id=_validate_spot_id(parts[2]),
             actual_state=_validate_actual_state(parts[3]),
         )
+    if parts[1] == "learn":
+        if len(parts) != 6 or parts[4] != "at":
+            raise MatrixCommandParseError("usage: !parking learn <spot_id> <open|occupied> at <time>")
+        learn_time = redact_diagnostic_text(parts[5])[:80]
+        if not learn_time:
+            raise MatrixCommandParseError("usage: !parking learn <spot_id> <open|occupied> at <time>")
+        return MatrixCommand(
+            action="learn_label",
+            spot_id=_validate_spot_id(parts[2]),
+            actual_state=_validate_actual_state(parts[3]),
+            subject_id=learn_time,
+        )
     if parts[1] == "recent":
         if len(parts) != 2:
             raise MatrixCommandParseError("usage: !parking recent")
         return MatrixCommand(action="recent")
+    if parts[1] == "confidence":
+        if len(parts) != 2:
+            raise MatrixCommandParseError("usage: !parking confidence")
+        return MatrixCommand(action="confidence")
     if parts[1] == "at":
         if len(parts) != 4:
             raise MatrixCommandParseError("usage: !parking at <time> <spot_id>")
@@ -1117,7 +1192,9 @@ def _format_command_help_reply(command_prefix: str) -> str:
         f"{command_prefix} latest — show latest runtime summary and raw full-frame image evidence\n"
         f"{command_prefix} why <spot_id> — explain recent parking decisions for one spot from bounded local memory\n"
         f"{command_prefix} correct <spot_id> <open|occupied> — record the actual spot state for a wrong alert\n"
+        f"{command_prefix} learn <spot_id> <open|occupied> at <time> — record a retained-timeline calibration label for review\n"
         f"{command_prefix} recent — show recent decision, alert, suppression, command, and lab records from bounded local memory\n"
+        f"{command_prefix} confidence — show artifact-derived spot stability, weak evidence, timeline health, and Matrix delivery status\n"
         f"{command_prefix} at <time> <spot_id> — review the nearest retained timeline frame and local decision memory for an incident\n"
         f"{command_prefix} lab run replay — start a bounded local replay lab job using fixed inputs\n"
         f"{command_prefix} lab run tuning — start a bounded local tuning lab job using fixed inputs\n"

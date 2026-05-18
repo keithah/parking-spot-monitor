@@ -423,6 +423,21 @@ def _default_detector_factory(settings: RuntimeSettings) -> UltralyticsVehicleDe
     return UltralyticsVehicleDetector(settings.detection.model)
 
 
+
+
+class _LazyIncidentReplayDetector:
+    """Lazy Matrix incident-review detector to avoid model loads at command-service startup."""
+
+    def __init__(self, settings: RuntimeSettings) -> None:
+        self._settings = settings
+        self._detector: Any | None = None
+
+    def detect(self, frame_path: str | Path, **kwargs: Any) -> Any:
+        if self._detector is None:
+            self._detector = _default_detector_factory(self._settings)
+        return self._detector.detect(frame_path, **kwargs)
+
+
 def _default_matrix_delivery_factory(settings: RuntimeSettings, data_dir: Path, logger: StructuredLogger) -> MatrixDelivery:
     client = MatrixClient(
         homeserver=settings.matrix.homeserver,
@@ -491,6 +506,7 @@ def _default_matrix_command_service_factory(
             latest_path=paths.latest_frame,
             snapshots_dir=paths.snapshots_dir,
             detection_lab_manager=_default_detection_lab_manager(settings, paths, logger),
+            incident_detector=_LazyIncidentReplayDetector(settings),
         ),
         feedback_labeler=feedback_labeler,
         who_snapshot_provider=who_snapshot_provider,

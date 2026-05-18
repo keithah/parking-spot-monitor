@@ -58,7 +58,10 @@ def test_readme_documents_clean_machine_setup_sequence_and_operator_commands() -
             "!parking config",
             "!parking latest",
             "!parking why <spot_id>",
+            "!parking learn <spot_id> <open|occupied> at <time>",
             "!parking recent",
+            "!parking confidence",
+            "!parking at <time> <spot_id>",
             "!parking lab run replay",
             "!parking lab run tuning",
             "!parking lab status",
@@ -92,7 +95,7 @@ def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_se
     assert_contains_all(
         readme,
         [
-            "The read-only cockpit commands are `!parking status`, `!parking config`, `!parking latest`, `!parking why <spot_id>`, and `!parking recent`",
+            "The read-only cockpit commands are `!parking status`, `!parking config`, `!parking latest`, `!parking why <spot_id>`, `!parking recent`, `!parking confidence`, and `!parking at <time> <spot_id>`",
             "Empty `matrix.command_authorized_senders` default-denies all Matrix commands",
             "Missing, corrupt, or unreadable health/state files are reported as `unavailable`",
             "`!parking why <spot_id>` explains the bounded recent decision memory",
@@ -140,6 +143,102 @@ def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_se
 
 
 
+def test_m006_incident_intelligence_commands_and_closeout_smoke_are_documented() -> None:
+    readme = read_tracked("README.md")
+    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
+    feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
+    smoke_source = read_tracked("scripts/verify_m006_incident_intelligence_closeout.py")
+
+    assert_contains_all(
+        readme,
+        [
+            "`!parking confidence` shows artifact-derived spot stability, weak evidence, timeline health, and Matrix delivery status",
+            "`!parking at <time> <spot_id>`",
+            "time first, spot second",
+            "`!parking at 7:00pm left_spot`",
+            "`!parking at 2026-05-18T19:00:00Z left_spot`",
+            "local `data/timeline/frames/` buffer",
+            "local detector replay only for this incident-review path",
+            "copied occupancy-state simulation",
+            "bounded recent decision-memory context",
+            "Nearest retained frame: unavailable",
+            "No retained timeline frames were found",
+            "Missing or malformed health/state/memory/timeline artifacts",
+            "does not run detector/model inference, camera capture, media upload, alert emission, threshold mutation, cloud work, or live state mutation",
+            "never captures a new camera frame",
+            "mutates live occupancy state",
+            "vehicle-history records",
+            "alert history",
+            "detector thresholds",
+            "Matrix open-spot alert delivery",
+            "python scripts/verify_m006_incident_intelligence_closeout.py",
+            "placeholder `RTSP_URL` and `MATRIX_ACCESS_TOKEN` values",
+            "package/Docker validate-config checks",
+            "does not exercise live RTSP capture, live Matrix sync/delivery, media upload, live detector inference, detection-lab jobs, cloud services, or Matrix open-spot alert delivery",
+            "M006_CLOSEOUT_START",
+            "M006_CLOSEOUT_PASS",
+            "M006_CLOSEOUT_FAIL",
+            "M006_CLOSEOUT_DATA",
+            "M006_CLOSEOUT_RESULT",
+            "M006_CLOSEOUT_DATA timeline_frames status=safe-empty",
+            "RTSP URL values",
+            "Matrix token values",
+            "Authorization headers",
+            "raw Matrix response bodies",
+            "tracebacks",
+            "raw image bytes",
+        ],
+    )
+    assert_contains_all(
+        matrix_source,
+        [
+            "usage: !parking at <time> <spot_id>",
+            "usage: !parking confidence",
+            "{command_prefix} at <time> <spot_id> — review the nearest retained timeline frame and local decision memory for an incident",
+            "{command_prefix} confidence — show artifact-derived spot stability, weak evidence, timeline health, and Matrix delivery status",
+        ],
+    )
+    assert_contains_all(
+        cockpit_source,
+        [
+            "Build a local incident review from retained timeline frames and decision memory.",
+            "No retained timeline frames were found.",
+            "No detector, camera, Matrix send, or state mutation was run.",
+            "Read-only: no detector, camera, media upload, alert emission, or state mutation was run.",
+            "filename scan only; image bytes were not opened",
+        ],
+    )
+    assert_contains_all(
+        feedback_source,
+        [
+            "Record a learn-command label from retained timeline evidence and copied-state replay only.",
+            "timeline_missing",
+            "corrupt_frame",
+        ],
+    )
+    assert_contains_all(
+        smoke_source,
+        [
+            "M006_CLOSEOUT_START",
+            "M006_CLOSEOUT_PASS",
+            "M006_CLOSEOUT_FAIL",
+            "M006_CLOSEOUT_DATA",
+            "M006_CLOSEOUT_RESULT",
+            "status=safe-empty",
+        ],
+    )
+
+    forbidden_claims = [
+        "at command captures a new camera frame",
+        "confidence uploads media",
+        "closeout smoke requires live Matrix secrets",
+        "closeout smoke runs live RTSP capture",
+    ]
+    for marker in forbidden_claims:
+        assert marker not in readme
+
+
 def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -> None:
     readme = read_tracked("README.md")
     matrix_source = read_tracked("parking_spot_monitor/matrix.py")
@@ -150,6 +249,7 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
         readme,
         [
             "Use `!parking correct <spot_id> <open|occupied>`",
+            "Use `!parking learn <spot_id> <open|occupied> at <time>`",
             "records a bounded local label in `data/operator-feedback-labels.json`",
             "does not store image bytes, camera URLs, Matrix tokens, raw Matrix bodies, or tracebacks",
             "Feedback labels are training and replay evidence only",
@@ -164,7 +264,9 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
         matrix_source,
         [
             "usage: !parking correct <spot_id> <open|occupied>",
+            "usage: !parking learn <spot_id> <open|occupied> at <time>",
             "{command_prefix} correct <spot_id> <open|occupied> — record the actual spot state for a wrong alert",
+            "{command_prefix} learn <spot_id> <open|occupied> at <time> — record a retained-timeline calibration label for review",
             "usage: !parking who",
             "{command_prefix} who — list active parking sessions by spot and attach a fresh current snapshot when configured",
         ],
@@ -185,6 +287,8 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
             "reported_state",
             "actual_state",
             "operator correction recorded",
+            "record_learn_label",
+            "operator learn label recorded",
         ],
     )
 
