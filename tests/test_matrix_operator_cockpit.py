@@ -564,6 +564,66 @@ def test_operator_cockpit_decision_memory_wrappers_handle_corrupt_memory_safely(
 
 
 
+
+def test_operator_cockpit_incident_review_attaches_nearest_timeline_frame_and_memory(tmp_path: Path) -> None:
+    from parking_spot_monitor.operator_cockpit import build_incident_review_response
+    from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, make_decision_memory_record
+
+    frames_dir = tmp_path / "timeline" / "frames"
+    frames_dir.mkdir(parents=True)
+    far = frames_dir / "20260518T021000Z.jpg"
+    near = frames_dir / "20260518T023900Z.jpg"
+    _write_test_jpeg(far, size=(16, 9))
+    noisy = Image.effect_noise((1280, 720), 80).convert("RGB")
+    noisy.save(near, format="JPEG", quality=95)
+    assert near.stat().st_size > 300_000
+    assert append_decision_memory_record(
+        decision_memory_path(tmp_path),
+        make_decision_memory_record(
+            "miss",
+            observed_at="2026-05-18T02:39:15Z",
+            spot_id="left_spot",
+            summary="runtime state stayed occupied despite operator report",
+        ),
+    )
+
+    response = build_incident_review_response(
+        data_dir=tmp_path,
+        spot_id="left_spot",
+        time_text="7:39pm",
+        now=datetime(2026, 5, 18, 4, 0, tzinfo=timezone.utc),
+    )
+
+    assert response.image_path is not None
+    assert response.image_path.name == "incident_left_spot.jpg"
+    assert response.image_path.stat().st_size <= 300_000
+    assert response.image_info is not None
+    assert response.image_info["size"] == response.image_path.stat().st_size
+    assert response.image_info["w"] < 1280
+    assert response.image_info["h"] < 720
+    assert "Incident review: left_spot around 2026-05-17 7:39 PM PDT" in response.text
+    assert "Nearest retained frame: 2026-05-17 7:39 PM PDT" in response.text
+    assert "runtime state stayed occupied" in response.text
+    assert "No detector, camera, Matrix send, or state mutation was run." in response.text
+    _assert_no_sensitive_text(response.text)
+
+
+def test_operator_cockpit_incident_review_handles_missing_timeline_safely(tmp_path: Path) -> None:
+    from parking_spot_monitor.operator_cockpit import build_incident_review_response
+
+    response = build_incident_review_response(
+        data_dir=tmp_path,
+        spot_id="left_spot",
+        time_text="7:39pm",
+        now=datetime(2026, 5, 18, 4, 0, tzinfo=timezone.utc),
+    )
+
+    assert response.image_path is None
+    assert response.image_info is None
+    assert "Incident review: left_spot" in response.text
+    assert "Nearest retained frame: unavailable" in response.text
+    assert "No retained timeline frames were found." in response.text
+
 def test_operator_cockpit_detection_lab_wrappers_are_bounded_redacted_and_local_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from parking_spot_monitor.detection_lab import DetectionLabManager, REPLAY_CONFIG_FILENAME, REPLAY_LABELS_FILENAME
     from parking_spot_monitor.operator_cockpit import format_detection_lab_run_reply, format_detection_lab_status_reply

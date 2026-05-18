@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Any, Literal
 
 from PIL import Image, UnidentifiedImageError
@@ -20,6 +21,8 @@ MAX_FILE_BYTES = 256_000
 MAX_LATEST_IMAGE_BYTES = 300_000
 MAX_WHO_MATRIX_IMAGE_BYTES = MAX_LATEST_IMAGE_BYTES
 WHO_MATRIX_SNAPSHOT_FILENAME = "who_latest.jpg"
+INCIDENT_MATRIX_SNAPSHOT_TEMPLATE = "incident_{spot_id}.jpg"
+DISPLAY_TIMEZONE = ZoneInfo("America/Los_Angeles")
 WHO_MATRIX_INITIAL_MAX_DIMENSION = 960
 WHO_MATRIX_MIN_DIMENSION = 320
 WHO_MATRIX_JPEG_QUALITIES = (85, 75, 65, 55, 45, 35)
@@ -175,6 +178,129 @@ def build_who_snapshot_response(
         image_path=snapshot.path,
         image_info=dict(snapshot.info),
     )
+
+
+def build_incident_review_response(
+    *,
+    data_dir: str | Path,
+    spot_id: str,
+    time_text: str,
+    now: datetime | None = None,
+    logger: StructuredLogger | None = None,
+) -> MatrixCommandResponse:
+    """Build a local incident review from retained timeline frames and decision memory."""
+
+    root = Path(data_dir)
+    safe_spot = _safe_incident_spot_id(spot_id)
+    observed_now = _utc_now(now)
+    target_time = _parse_incident_time(time_text, now=observed_now)
+    heading_time = _display_local_time(target_time)
+    lines = [f"Incident review: {safe_spot} around {heading_time}"]
+    nearest = _nearest_timeline_frame(root, target_time)
+    if nearest is None:
+        lines.extend([
+            "Nearest retained frame: unavailable",
+            "No retained timeline frames were found.",
+            "No detector, camera, Matrix send, or state mutation was run.",
+        ])
+        return MatrixCommandResponse(text=_bounded_reply(lines))
+
+    frame_path, frame_time = nearest
+    delta_seconds = abs(int((frame_time - target_time).total_seconds()))
+    lines.append(f"Nearest retained frame: {_display_local_time(frame_time)} ({delta_seconds}s from requested time)")
+    lines.append("No detector, camera, Matrix send, or state mutation was run.")
+    lines.append("Recent local decision memory:")
+    why_lines = format_operator_why_reply(data_dir=root, spot_id=safe_spot, logger=logger).splitlines()
+    memory_lines = why_lines[1:7] if len(why_lines) > 1 else why_lines[:1]
+    lines.extend(memory_lines or ["No recent decision memory for this spot."])
+
+    snapshot = _prepare_incident_snapshot_for_matrix(frame_path, data_dir=root, spot_id=safe_spot, now=observed_now, logger=logger)
+    if snapshot.state != "available" or snapshot.path is None or snapshot.info is None:
+        lines.append(f"Frame attachment unavailable: {snapshot.error_type or 'unavailable'}")
+        return MatrixCommandResponse(text=_bounded_reply(lines))
+    return MatrixCommandResponse(text=_bounded_reply(lines), image_path=snapshot.path, image_info=dict(snapshot.info))
+
+
+def _safe_incident_spot_id(value: str) -> str:
+    text = redact_diagnostic_text(value).strip()
+    if text not in {"left_spot", "right_spot"}:
+        raise ValueError("invalid spot id")
+    return text
+
+
+def _parse_incident_time(value: str, *, now: datetime) -> datetime:
+    text = redact_diagnostic_text(value).strip().lower()
+    try:
+        parsed = datetime.fromisoformat(text.replace("z", "+00:00"))
+    except ValueError:
+        parsed = _parse_local_clock_time(text, now=now)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=DISPLAY_TIMEZONE)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_local_clock_time(text: str, *, now: datetime) -> datetime:
+    compact = text.replace(" ", "")
+    suffix = None
+    if compact.endswith("am") or compact.endswith("pm"):
+        suffix = compact[-2:]
+        compact = compact[:-2]
+    if ":" not in compact:
+        raise ValueError("incident time must be ISO or h:mmam/pm")
+    hour_text, minute_text = compact.split(":", 1)
+    hour = int(hour_text)
+    minute = int(minute_text)
+    if suffix == "pm" and hour != 12:
+        hour += 12
+    if suffix == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("incident time is out of range")
+    local_now = now.astimezone(DISPLAY_TIMEZONE)
+    candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate - local_now > timedelta(hours=1):
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _nearest_timeline_frame(data_dir: Path, target_time: datetime) -> tuple[Path, datetime] | None:
+    frames_dir = data_dir / "timeline" / "frames"
+    try:
+        candidates = list(frames_dir.glob("*.jpg"))
+    except OSError:
+        return None
+    nearest: tuple[Path, datetime] | None = None
+    for path in candidates:
+        frame_time = _timeline_frame_time(path)
+        if frame_time is None:
+            continue
+        if nearest is None or abs(frame_time - target_time) < abs(nearest[1] - target_time):
+            nearest = (path, frame_time)
+    return nearest
+
+
+def _timeline_frame_time(path: Path) -> datetime | None:
+    try:
+        return datetime.strptime(path.stem, "%Y%m%dT%H%M00Z").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _prepare_incident_snapshot_for_matrix(path: Path, *, data_dir: Path, spot_id: str, now: datetime, logger: StructuredLogger | None) -> LatestSnapshotValidation:
+    destination = data_dir / INCIDENT_MATRIX_SNAPSHOT_TEMPLATE.format(spot_id=spot_id)
+    try:
+        return _resize_who_snapshot_for_matrix(path, destination=destination, now=now, logger=logger)
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        error_type = redact_diagnostic_text(exc.__class__.__name__)
+        _log_snapshot_failure(logger, reason="incident_resize_failed", error_type=error_type)
+        return LatestSnapshotValidation(state="error", error_type="resize failed")
+
+
+def _display_local_time(value: datetime) -> str:
+    local = value.astimezone(DISPLAY_TIMEZONE)
+    hour = local.hour % 12 or 12
+    suffix = "AM" if local.hour < 12 else "PM"
+    return f"{local.year:04d}-{local.month:02d}-{local.day:02d} {hour}:{local.minute:02d} {suffix} PDT"
 
 def format_operator_status_reply(
     *,

@@ -1838,6 +1838,10 @@ def test_parse_matrix_why_and_recent_commands_are_exact_and_bounded() -> None:
         "!parking why " + "x" * 161,
         "!parking recent now",
         "!parking recent verbose",
+        "!parking at",
+        "!parking at 7:39pm",
+        "!parking at 7:39pm ../state.json",
+        "!parking at 7:39pm left_spot extra",
     ]
     for body in rejected:
         with pytest.raises(MatrixCommandParseError):
@@ -1896,6 +1900,58 @@ def test_command_service_why_recent_use_provider_text_only_repeatably_without_ar
     assert [call["body"] for call in calls] == ["decision why right_spot", "decision why right_spot", "decision recent"]
     assert [call["txn_id"] for call in calls] == ["command:$why", "command:$why", "command:$recent"]
 
+
+
+def test_command_service_incident_review_uses_cockpit_context_with_image_response(tmp_path: Path) -> None:
+    from parking_spot_monitor.matrix import MatrixCommandResponse, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    image_path = tmp_path / "incident_left_spot.jpg"
+    write_jpeg(image_path, size=(11, 7))
+    calls: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(next_batch="s3", events=(MatrixTextEvent(event_id="$at", sender="@op:example", room_id=ROOM_ID, body="!parking at 7:39pm left_spot"),))
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            calls.append({"kind": "upload", **dict(kwargs)})
+            return "mxc://example.org/incident"
+
+        def send_image(self, **kwargs: Any) -> str:
+            calls.append({"kind": "image", **dict(kwargs)})
+            return "$image"
+
+    class Context:
+        def format_reply(self, action: str, **kwargs: Any) -> MatrixCommandResponse:
+            assert action == "incident_review"
+            assert kwargs["spot_id"] == "left_spot"
+            assert kwargs["incident_time"] == "7:39pm"
+            return MatrixCommandResponse(
+                text="Incident review: left_spot around 7:39pm",
+                image_path=image_path,
+                image_info={"mimetype": "image/jpeg", "size": image_path.stat().st_size, "w": 11, "h": 7},
+            )
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_context=Context(),  # type: ignore[arg-type]
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 1
+    assert [call["kind"] for call in calls] == ["text", "upload", "image"]
+    assert calls[0]["txn_id"] == "command:$at:text"
+    assert calls[1]["filename"] == "incident_left_spot.jpg"
+    assert calls[2]["txn_id"] == "command:$at:image"
 
 def test_command_service_rejects_unauthorized_why_before_memory_or_provider_paths() -> None:
     from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
