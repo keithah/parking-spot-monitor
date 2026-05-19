@@ -83,6 +83,7 @@ class MatrixOperatorCockpitContext:
     data_dir: Path
     health_path: Path
     state_path: Path
+    matrix_outbox_path: Path | None = None
     latest_path: Path | None = None
     snapshots_dir: Path | None = None
     detection_lab_manager: Any | None = None
@@ -104,6 +105,7 @@ class MatrixOperatorCockpitContext:
                     settings=self.settings,
                     health_path=self.health_path,
                     state_path=self.state_path,
+                    matrix_outbox_path=self.matrix_outbox_path,
                     logger=logger,
                 )
             )
@@ -139,6 +141,7 @@ class MatrixOperatorCockpitContext:
                     data_dir=self.data_dir,
                     health_path=self.health_path,
                     state_path=self.state_path,
+                    matrix_outbox_path=self.matrix_outbox_path,
                     logger=logger,
                 )
             )
@@ -881,6 +884,7 @@ def format_operator_status_reply(
     settings: Any,
     health_path: str | Path,
     state_path: str | Path,
+    matrix_outbox_path: str | Path | None = None,
     now: datetime | None = None,
     logger: StructuredLogger | None = None,
 ) -> str:
@@ -890,6 +894,7 @@ def format_operator_status_reply(
         settings=settings,
         health_path=health_path,
         state_path=state_path,
+        matrix_outbox_path=matrix_outbox_path,
         now=now,
         logger=logger,
     )
@@ -935,6 +940,7 @@ def format_operator_confidence_reply(
     data_dir: str | Path,
     health_path: str | Path,
     state_path: str | Path,
+    matrix_outbox_path: str | Path | None = None,
     now: datetime | None = None,
     logger: StructuredLogger | None = None,
 ) -> str:
@@ -945,6 +951,7 @@ def format_operator_confidence_reply(
         data_dir=data_dir,
         health_path=health_path,
         state_path=state_path,
+        matrix_outbox_path=matrix_outbox_path,
         now=now,
         logger=logger,
     )
@@ -1390,6 +1397,7 @@ def prepare_event_snapshot(
     snapshot_retention_count: int | None = None,
     logger: StructuredLogger | None = None,
     retention_trigger: str = "matrix-event",
+    protected_snapshots: Sequence[str | Path] | None = None,
 ) -> MatrixSnapshot:
     """Copy a raw full-frame snapshot into a stable event-specific Matrix evidence file.
 
@@ -1422,7 +1430,8 @@ def prepare_event_snapshot(
 
     try:
         snapshot_root.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, destination)
+        if not _same_path(source, destination):
+            shutil.copyfile(source, destination)
     except OSError as exc:
         raise MatrixError(
             "Matrix snapshot copy failed",
@@ -1472,6 +1481,7 @@ def prepare_event_snapshot(
             logger=logger,
             current_snapshot=destination,
             trigger=retention_trigger,
+            protected_snapshots=protected_snapshots,
         )
     return MatrixSnapshot(
         path=destination,
@@ -1490,6 +1500,7 @@ def prune_event_snapshots(
     *,
     current_snapshot: str | Path | None = None,
     trigger: str = "manual",
+    protected_snapshots: Sequence[str | Path] | None = None,
 ) -> SnapshotRetentionResult:
     """Prune oldest Matrix event snapshot files while preserving unrelated runtime files.
 
@@ -1523,20 +1534,15 @@ def prune_event_snapshots(
         return SnapshotRetentionResult(retained_count=len(candidates))
 
     current = Path(current_snapshot).resolve() if current_snapshot is not None else None
+    protected = _resolved_paths(protected_snapshots or ())
+    if current is not None:
+        protected.add(current)
     to_delete = candidates[: len(candidates) - retention_count]
     pruned_count = 0
     pruned_bytes = 0
     failed_count = 0
     for path in to_delete:
-        if current is not None and _same_path(path, current):
-            failed_count += 1
-            _log_retention_failure(
-                logger,
-                root=root,
-                trigger=trigger,
-                error_type="RetentionInvariantError",
-                message="retention attempted to delete current snapshot",
-            )
+        if _path_in_resolved_set(path, protected):
             continue
         try:
             byte_size = path.stat().st_size
@@ -1601,7 +1607,24 @@ def _safe_mtime_ns(path: Path) -> int:
 
 def _same_path(path: Path, current: Path) -> bool:
     try:
-        return path.resolve() == current
+        return path.resolve() == current.resolve()
+    except OSError:
+        return False
+
+
+def _resolved_paths(paths: Sequence[str | Path]) -> set[Path]:
+    resolved: set[Path] = set()
+    for path in paths:
+        try:
+            resolved.add(Path(path).resolve())
+        except OSError:
+            continue
+    return resolved
+
+
+def _path_in_resolved_set(path: Path, resolved: set[Path]) -> bool:
+    try:
+        return path.resolve() in resolved
     except OSError:
         return False
 

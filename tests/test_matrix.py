@@ -2792,3 +2792,24 @@ def test_command_service_latest_media_delivery_failure_is_sanitized_text_failure
     assert ACCESS_TOKEN not in rendered
     assert "raw body" not in rendered
     assert raw_bytes.hex() not in rendered
+
+
+def test_default_matrix_command_service_factory_wires_resolved_outbox_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from parking_spot_monitor.__main__ import _default_matrix_command_service_factory
+    from parking_spot_monitor.config import load_settings
+    from parking_spot_monitor.paths import resolve_runtime_paths
+
+    config_path = tmp_path / "config.yaml"
+    config_text = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "command_authorized_senders: []",
+        "command_authorized_senders: ['@op:example']",
+    )
+    config_path.write_text(config_text, encoding="utf-8")
+    settings = load_settings(config_path, environ={"RTSP_URL": "rtsp://operator:secret@camera/live", "MATRIX_ACCESS_TOKEN": ACCESS_TOKEN})
+    paths = resolve_runtime_paths(settings, tmp_path)
+
+    service = _default_matrix_command_service_factory(settings, tmp_path, logger=None, archive=FakeCommandArchive())  # type: ignore[arg-type]
+
+    assert service is not None
+    assert service.cockpit_context is not None
+    assert service.cockpit_context.matrix_outbox_path == paths.matrix_outbox_file

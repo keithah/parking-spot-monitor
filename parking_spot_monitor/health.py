@@ -30,6 +30,7 @@ class HealthStatus:
     vehicle_history_failure_count: int = 0
     last_vehicle_history_error: Mapping[str, Any] | None = None
     vehicle_history: Mapping[str, Any] | None = None
+    matrix_outbox: Mapping[str, Any] | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return redact_diagnostic_value(
@@ -54,6 +55,7 @@ class HealthStatus:
                     dict(self.last_vehicle_history_error) if self.last_vehicle_history_error is not None else None
                 ),
                 "vehicle_history": dict(self.vehicle_history) if self.vehicle_history is not None else None,
+                "matrix_outbox": dict(self.matrix_outbox) if self.matrix_outbox is not None else None,
             }
         )
 

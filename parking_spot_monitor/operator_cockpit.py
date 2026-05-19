@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from PIL import Image, UnidentifiedImageError
 
+from parking_monitor.outbox import LocalOutbox
 from parking_spot_monitor.capture import CaptureError, capture_latest
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.incident_review import build_incident_replay
@@ -322,6 +323,7 @@ def format_operator_status_reply(
     settings: RuntimeSettings,
     health_path: str | Path,
     state_path: str | Path,
+    matrix_outbox_path: str | Path | None = None,
     now: datetime | None = None,
     logger: StructuredLogger | None = None,
 ) -> str:
@@ -330,6 +332,7 @@ def format_operator_status_reply(
     observed_now = _utc_now(now)
     health = summarize_health(settings=settings, health_path=health_path, now=observed_now, logger=logger)
     state = summarize_state(settings=settings, state_path=state_path, logger=logger)
+    outbox_lines = _matrix_outbox_status_lines(matrix_outbox_path, logger=logger)
 
     lines = ["Parking monitor status", _format_health_line(health)]
     if health.state == "available":
@@ -359,6 +362,9 @@ def format_operator_status_reply(
         lines.append(f"State: unavailable{suffix}")
         for spot in state.spots[:MAX_LINES_PER_SECTION]:
             lines.append(f"- {spot.spot_id}: {spot.status}")
+
+    lines.append("Matrix outbox:")
+    lines.extend(outbox_lines)
 
     return _bounded_reply(lines)
 
@@ -428,6 +434,7 @@ def format_operator_confidence_reply(
     data_dir: str | Path,
     health_path: str | Path,
     state_path: str | Path,
+    matrix_outbox_path: str | Path | None = None,
     now: datetime | None = None,
     logger: StructuredLogger | None = None,
 ) -> str:
@@ -464,9 +471,128 @@ def format_operator_confidence_reply(
     lines.extend(timeline)
     lines.append("Matrix delivery:")
     lines.extend(_matrix_delivery_lines(health_load, memory))
+    lines.extend(_matrix_outbox_status_lines(matrix_outbox_path, logger=logger))
     lines.append("Read-only: no detector, camera, media upload, alert emission, or state mutation was run.")
     return _bounded_reply(lines)
 
+
+
+def _matrix_outbox_status_lines(matrix_outbox_path: str | Path | None, *, logger: StructuredLogger | None) -> list[str]:
+    """Return concise, redacted Matrix outbox lines from LocalOutbox summary fields only."""
+
+    if matrix_outbox_path is None:
+        return ["- outbox status unavailable (path not configured)."]
+    path = Path(matrix_outbox_path)
+    try:
+        summary = LocalOutbox(path).status_summary()
+    except FileNotFoundError:
+        _log_load_problem(logger, label="matrix_outbox", reason="missing", error_type="missing")
+        return ["- outbox empty (file missing)."]
+    except Exception as exc:
+        error_type = redact_diagnostic_text(exc.__class__.__name__)
+        _log_load_problem(logger, label="matrix_outbox", reason="summary_error", error_type=error_type)
+        return [f"- outbox status unavailable ({error_type})."]
+    return _format_matrix_outbox_summary_lines(summary)
+
+
+def _format_matrix_outbox_summary_lines(summary: Mapping[str, Any]) -> list[str]:
+    total = _int(summary.get("total"))
+    counts = _mapping(summary.get("counts_by_state"))
+    state_order = ("pending", "retrying", "delivered", "failed", "dead_lettered")
+    if total == 0:
+        lines = ["- outbox empty."]
+    else:
+        count_text = ", ".join(f"{state.replace('_', '-')} {_int(counts.get(state))}" for state in state_order)
+        lines = [f"- outbox total {total}: {count_text}."]
+        phase_counts = _outbox_phase_counts(summary)
+        if phase_counts:
+            lines.append("- phase states: " + "; ".join(_format_phase_count(phase, states) for phase, states in phase_counts[:6]) + ".")
+        retry_reasons = _reason_count_line("retry reasons", summary.get("retry_reason_counts"))
+        if retry_reasons is not None:
+            lines.append(retry_reasons)
+        dead_reasons = _reason_count_line("dead-letter reasons", summary.get("dead_letter_reason_counts"))
+        if dead_reasons is not None:
+            lines.append(dead_reasons)
+        lines.extend(_outbox_item_lines(summary))
+
+    recovery = _mapping(summary.get("recovery"))
+    quarantined = _int(recovery.get("quarantined_count"))
+    recovered = _int(recovery.get("recovered_count"))
+    if quarantined or recovered:
+        reasons = _mapping(recovery.get("reason_counts"))
+        reason_text = _format_reason_counts(reasons) if reasons else "none"
+        lines.append(f"- recovery: recovered {recovered}; quarantined {quarantined}; reasons {reason_text}.")
+    return lines[:MAX_LINES_PER_SECTION]
+
+
+def _outbox_phase_counts(summary: Mapping[str, Any]) -> list[tuple[str, dict[str, int]]]:
+    counts: dict[str, dict[str, int]] = {}
+    items = summary.get("items")
+    if not isinstance(items, list):
+        return []
+    for item in items[:MAX_LINES_PER_SECTION]:
+        if not isinstance(item, Mapping):
+            continue
+        phases = item.get("phases")
+        if not isinstance(phases, list):
+            continue
+        for phase_item in phases[:6]:
+            phase_map = _mapping(phase_item)
+            phase = _text(phase_map.get("phase"), default="unknown")
+            state = _text(phase_map.get("state"), default="unknown")
+            if phase == "unknown" or state == "unknown":
+                continue
+            state_counts = counts.setdefault(phase, {})
+            state_counts[state] = state_counts.get(state, 0) + 1
+    return sorted(counts.items())
+
+
+def _format_phase_count(phase: str, states: Mapping[str, int]) -> str:
+    state_order = ("pending", "delivered", "failed")
+    rendered = ", ".join(f"{state} {_int(states.get(state))}" for state in state_order if _int(states.get(state)))
+    return f"{_text(phase)} {rendered or 'none'}"
+
+
+def _reason_count_line(label: str, value: Any) -> str | None:
+    counts = _mapping(value)
+    if not counts:
+        return None
+    return f"- {label}: {_format_reason_counts(counts)}."
+
+
+def _format_reason_counts(counts: Mapping[str, Any]) -> str:
+    return ", ".join(f"{_text(key)} {_int(value)}" for key, value in list(counts.items())[:8]) or "none"
+
+
+def _outbox_item_lines(summary: Mapping[str, Any]) -> list[str]:
+    items = summary.get("items")
+    if not isinstance(items, list):
+        return []
+    lines: list[str] = []
+    for item in items[: min(5, MAX_LINES_PER_SECTION)]:
+        if not isinstance(item, Mapping):
+            continue
+        state = _text(item.get("state"))
+        phase = _text(item.get("phase"))
+        parts = [f"state {state}", f"phase {phase}"]
+        retry_reason = _text(item.get("retry_reason"), default="")
+        dead_reason = _text(item.get("dead_letter_reason"), default="")
+        if retry_reason:
+            parts.append(f"retry {retry_reason}")
+        if dead_reason:
+            parts.append(f"dead-letter {dead_reason}")
+        phase_states = []
+        phases = item.get("phases")
+        if isinstance(phases, list):
+            for phase_item in phases[:3]:
+                phase_map = _mapping(phase_item)
+                phase_states.append(f"{_text(phase_map.get('phase'))}={_text(phase_map.get('state'))}")
+        if phase_states:
+            parts.append("phases " + ", ".join(phase_states))
+        lines.append("- record: " + "; ".join(parts) + ".")
+    if len(items) > len(lines):
+        lines.append(f"- records truncated: showing {len(lines)} of {len(items)}.")
+    return lines
 
 def _threshold_value(value: Any, *, default: int) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else max(1, default)

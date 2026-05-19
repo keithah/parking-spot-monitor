@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery
+from parking_monitor.outbox import LocalOutbox
 from parking_spot_monitor.capture import CaptureError, capture_latest
 from parking_spot_monitor.config import RuntimeSettings, SpotConfig, load_settings
 from parking_spot_monitor.detection_lab import DetectionLabManager
@@ -268,6 +270,7 @@ def _capture_loop(
     detector: Any | None = None
     spot_ids = list(_configured_spot_polygons(settings).keys())
     state_path = data_dir / "state.json"
+    runtime_paths = resolve_runtime_paths(settings, data_dir)
     runtime_state = load_runtime_state(state_path, spot_ids, logger=logger)
     effective_history_archive = history_archive if history_archive is not None else VehicleHistoryArchive(data_dir / "vehicle-history", logger=logger)
     now_fn = now if now is not None else lambda: datetime.now(timezone.utc)
@@ -281,10 +284,14 @@ def _capture_loop(
     last_vehicle_history_error: dict[str, Any] | None = None
     vehicle_history_failure_count = 0
     retention_failure_count = startup_retention_failure_count
+    startup_outbox_error = _drain_matrix_outbox_if_available(matrix_delivery, logger=logger, iteration=iteration, trigger="startup")
+    if startup_outbox_error is not None:
+        last_matrix_error = startup_outbox_error
+        last_error = startup_outbox_error
     _write_loop_health(
         settings,
         logger=logger,
-        status="degraded" if retention_failure_count else "starting",
+        status="degraded" if retention_failure_count or startup_outbox_error is not None else "starting",
         iteration=iteration,
         last_frame_at=last_frame_at,
         selected_decode_mode=selected_decode_mode,
@@ -297,11 +304,16 @@ def _capture_loop(
         vehicle_history_failure_count=vehicle_history_failure_count,
         last_vehicle_history_error=last_vehicle_history_error,
         vehicle_history=effective_history_archive.health_snapshot(),
+        matrix_outbox_file=runtime_paths.matrix_outbox_file,
     )
     while max_iterations is None or iteration < max_iterations:
         iteration += 1
         logger.info("capture-loop-iteration", iteration=iteration, data_dir=str(data_dir))
         try:
+            outbox_error = _drain_matrix_outbox_if_available(matrix_delivery, logger=logger, iteration=iteration, trigger="iteration")
+            if outbox_error is not None:
+                last_matrix_error = outbox_error
+                last_error = outbox_error
             result = capture(settings, data_dir)
             consecutive_capture_failures = 0
             last_frame_at = _format_health_timestamp(result.timestamp)
@@ -390,6 +402,7 @@ def _capture_loop(
                 vehicle_history_failure_count=vehicle_history_failure_count,
                 last_vehicle_history_error=last_vehicle_history_error,
                 vehicle_history=effective_history_archive.health_snapshot(),
+                matrix_outbox_file=runtime_paths.matrix_outbox_file,
             )
             logger.info("capture-loop-paced", iteration=iteration, sleep_seconds=settings.runtime.frame_interval_seconds)
             sleep(settings.runtime.frame_interval_seconds)
@@ -414,6 +427,7 @@ def _capture_loop(
                 vehicle_history_failure_count=vehicle_history_failure_count,
                 last_vehicle_history_error=last_vehicle_history_error,
                 vehicle_history=effective_history_archive.health_snapshot(),
+                matrix_outbox_file=runtime_paths.matrix_outbox_file,
             )
             sleep(backoff_seconds)
     return 0
@@ -438,7 +452,8 @@ class _LazyIncidentReplayDetector:
         return self._detector.detect(frame_path, **kwargs)
 
 
-def _default_matrix_delivery_factory(settings: RuntimeSettings, data_dir: Path, logger: StructuredLogger) -> MatrixDelivery:
+def _default_matrix_delivery_factory(settings: RuntimeSettings, data_dir: Path, logger: StructuredLogger) -> MatrixOutboxDelivery:
+    paths = resolve_runtime_paths(settings, data_dir)
     client = MatrixClient(
         homeserver=settings.matrix.homeserver,
         access_token=settings.matrix.access_token.value,
@@ -447,14 +462,62 @@ def _default_matrix_delivery_factory(settings: RuntimeSettings, data_dir: Path, 
         retry_backoff_seconds=settings.matrix.retry_backoff_seconds,
         logger=logger,
     )
-    return MatrixDelivery(
+    outbox = LocalOutbox(paths.matrix_outbox_file)
+    return MatrixOutboxDelivery(
         client=client,
         room_id=settings.matrix.room_id,
-        data_dir=data_dir,
-        snapshots_dir=settings.storage.snapshots_dir,
+        data_dir=paths.data_dir,
+        snapshots_dir=paths.snapshots_dir,
+        outbox=outbox,
         logger=logger,
         snapshot_retention_count=settings.storage.snapshot_retention_count,
     )
+
+
+def _drain_matrix_outbox_if_available(
+    matrix_delivery: Any | None,
+    *,
+    logger: StructuredLogger,
+    iteration: int,
+    trigger: str,
+) -> dict[str, Any] | None:
+    drain = getattr(matrix_delivery, "drain_outbox", None)
+    if drain is None:
+        return None
+    if not callable(drain):
+        return None
+    logger.info("matrix-outbox-runtime-drain-attempt", trigger=trigger, iteration=iteration)
+    try:
+        result = drain()
+    except Exception as exc:
+        context = _safe_error_context(
+            "matrix-outbox",
+            exc,
+            extra={"trigger": trigger, "iteration": iteration},
+        )
+        logger.warning("matrix-outbox-runtime-drain-failed", **context)
+        return context
+    attempted_count = getattr(result, "attempted_count", None)
+    delivered_count = getattr(result, "delivered_count", None)
+    retrying_count = getattr(result, "retrying_count", None)
+    logger.info(
+        "matrix-outbox-runtime-drain-succeeded",
+        trigger=trigger,
+        iteration=iteration,
+        attempted_count=attempted_count,
+        delivered_count=delivered_count,
+        retrying_count=retrying_count,
+    )
+    if isinstance(retrying_count, int) and retrying_count > 0:
+        return {
+            "phase": "matrix-outbox",
+            "error_type": "retrying_records",
+            "message": "matrix outbox has retrying records",
+            "trigger": trigger,
+            "iteration": iteration,
+            "retrying_count": retrying_count,
+        }
+    return None
 
 
 def _default_matrix_command_service_factory(
@@ -503,6 +566,7 @@ def _default_matrix_command_service_factory(
             data_dir=paths.data_dir,
             health_path=paths.health_file,
             state_path=paths.state_file,
+            matrix_outbox_path=paths.matrix_outbox_file,
             latest_path=paths.latest_frame,
             snapshots_dir=paths.snapshots_dir,
             detection_lab_manager=_default_detection_lab_manager(settings, paths, logger),
@@ -1732,6 +1796,20 @@ def _dispatch_matrix_event(
             context = _log_matrix_delivery_failed(logger, event_name=event_name, event=event, txn_id=txn_id, error=exc)
             _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="failed", error_type=context.get("error_type"), logger=logger)
             return context
+        retrying_count = getattr(retained_snapshot, "retrying_count", None)
+        if isinstance(retrying_count, int) and retrying_count > 0:
+            context = {
+                "phase": "matrix",
+                "event_type": event_name,
+                "spot_id": event.get("spot_id"),
+                "txn_id": txn_id,
+                "error_type": "retrying_records",
+                "message": "matrix outbox delivery is retrying",
+                "retrying_count": retrying_count,
+            }
+            logger.warning("matrix-delivery-failed", **context)
+            _append_matrix_event_memory(decision_memory_path, event_name=event_name, event=event, outcome="failed", error_type=context.get("error_type"), logger=logger)
+            return context
         logger.info(
             "matrix-delivery-succeeded",
             event_type=event_name,
@@ -1798,6 +1876,29 @@ def _log_matrix_delivery_failed(
     return context
 
 
+def _matrix_outbox_health_payload(matrix_outbox_file: Path | None) -> dict[str, Any] | None:
+    """Return a bounded, redacted Matrix outbox health summary without failing health writes."""
+
+    if matrix_outbox_file is None:
+        return None
+    try:
+        summary = LocalOutbox(matrix_outbox_file).status_summary()
+    except Exception as exc:
+        return {
+            "available": False,
+            "phase": "matrix-outbox",
+            "error": {
+                "phase": "matrix-outbox",
+                "action": "status-summary",
+                "error_type": type(exc).__name__,
+                "error_message": "matrix outbox status unavailable",
+            },
+        }
+    payload = dict(summary)
+    payload["available"] = True
+    return payload
+
+
 def _write_loop_health(
     settings: RuntimeSettings,
     *,
@@ -1815,6 +1916,7 @@ def _write_loop_health(
     vehicle_history_failure_count: int = 0,
     last_vehicle_history_error: Mapping[str, Any] | None = None,
     vehicle_history: Mapping[str, Any] | None = None,
+    matrix_outbox_file: Path | None = None,
 ) -> None:
     try:
         write_health_status(
@@ -1834,6 +1936,7 @@ def _write_loop_health(
                 vehicle_history_failure_count=vehicle_history_failure_count,
                 last_vehicle_history_error=last_vehicle_history_error,
                 vehicle_history=vehicle_history,
+                matrix_outbox=_matrix_outbox_health_payload(matrix_outbox_file),
             ),
             logger=logger,
         )

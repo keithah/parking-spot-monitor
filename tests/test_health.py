@@ -4,6 +4,7 @@ import json
 import stat
 from pathlib import Path
 
+from parking_monitor.outbox import AlertIntent, LocalOutbox
 from parking_spot_monitor.health import HealthStatus, write_health_status
 
 
@@ -91,3 +92,53 @@ def test_health_status_redacts_vehicle_history_failure_context(tmp_path: Path) -
     assert "nested-maintenance-secret" not in json.dumps(payload)
     assert "should-hide" not in json.dumps(payload)
     assert "rtsp://camera.local" not in json.dumps(payload)
+
+
+def test_health_status_includes_redacted_matrix_outbox_summary(tmp_path: Path) -> None:
+    path = tmp_path / "health.json"
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    pending = outbox.enqueue(AlertIntent(event_id="evt-pending", phase="text", body="ok"))
+    retrying = outbox.enqueue(AlertIntent(event_id="evt-retrying", phase="upload", body="ok"))
+    delivered = outbox.enqueue(AlertIntent(event_id="evt-delivered", phase="image", body="ok"))
+    failed = outbox.enqueue(AlertIntent(event_id="evt-failed", phase="text", body="ok"))
+    dead = outbox.enqueue(AlertIntent(event_id="evt-dead", phase="text", body="ok"))
+    outbox.mark_retrying(retrying.id, reason="Authorization: Bearer matrix-secret")
+    outbox.mark_delivered(delivered.id)
+    outbox.mark_failed(failed.id, reason="matrix_forbidden")
+    outbox.mark_dead_lettered(dead.id, reason="rtsp://camera.local/stream")
+
+    write_health_status(
+        path,
+        HealthStatus(
+            status="degraded",
+            updated_at="2026-05-18T19:00:00Z",
+            iteration=4,
+            matrix_outbox=outbox.status_summary()
+            | {"diagnostic": {"access_token": "health-secret", "message": "Bearer should-hide"}},
+        ),
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    matrix_outbox = payload["matrix_outbox"]
+    assert matrix_outbox["counts_by_state"] == {
+        "pending": 1,
+        "retrying": 1,
+        "delivered": 1,
+        "failed": 1,
+        "dead_lettered": 1,
+    }
+    assert matrix_outbox["retry_reason_counts"] == {"redacted": 1}
+    assert matrix_outbox["dead_letter_reason_counts"] == {"matrix_forbidden": 1, "redacted": 1}
+    assert {item["state"] for item in matrix_outbox["items"]} == {
+        "pending",
+        "retrying",
+        "delivered",
+        "failed",
+        "dead_lettered",
+    }
+    rendered = json.dumps(payload).lower()
+    assert "authorization" not in rendered
+    assert "matrix-secret" not in rendered
+    assert "health-secret" not in rendered
+    assert "should-hide" not in rendered
+    assert "rtsp://camera.local" not in rendered

@@ -2,6 +2,7 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
     LIBVA_DRIVER_NAME=iHD \
     TZ=America/Los_Angeles
 
@@ -17,6 +18,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY parking_spot_monitor ./parking_spot_monitor
+COPY src ./src
 COPY main.py config.yaml.example ./
 
 CMD ["python", "-m", "parking_spot_monitor", "--config", "/config/config.yaml"]

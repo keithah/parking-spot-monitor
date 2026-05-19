@@ -8,12 +8,14 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery
+from parking_monitor.outbox import AlertIntent, LocalOutbox
 from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import load_decision_memory
 from parking_spot_monitor.matrix import MatrixDelivery, MatrixSnapshot
-from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _dispatch_matrix_event, _main, _presence_by_spot, main
+from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _dispatch_matrix_event, _main, _matrix_outbox_health_payload, _presence_by_spot, main
 from parking_spot_monitor.detection import DetectionError, DetectionFilterResult, RejectedDetection, RejectionReason, SpotDetectionResult, VehicleDetection
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
@@ -3404,3 +3406,238 @@ def test_startup_summary_includes_sanitized_detection_lab_dir(capsys: pytest.Cap
     assert '"detection_lab_dir":"/tmp/parking-data/detection-lab"' in output
     assert_no_secret_leak(output)
 
+
+
+
+def test_validate_config_does_not_construct_matrix_outbox_or_touch_network(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    def forbidden_matrix_factory(_settings: object, _data_dir: Path, _logger: StructuredLogger) -> object:
+        raise AssertionError("validate-config must not construct Matrix delivery")
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path), "--validate-config"],
+        environ=fake_environ(),
+        matrix_delivery_factory=forbidden_matrix_factory,
+    )
+
+    output = combined_output(capsys)
+    assert exit_code == 0
+    assert not (tmp_path / "matrix-outbox.json").exists()
+    assert "matrix-outbox" not in output
+    assert_no_secret_leak(output)
+
+
+def test_matrix_outbox_health_payload_quarantines_corrupt_json_without_raw_secret(tmp_path: Path) -> None:
+    outbox_path = tmp_path / "matrix-outbox.json"
+    outbox_path.write_text('{"items": [Authorization: Bearer matrix-secret', encoding="utf-8")
+
+    payload = _matrix_outbox_health_payload(outbox_path)
+
+    assert payload is not None
+    assert payload["available"] is True
+    assert payload["counts_by_state"] == {}
+    assert payload["recovery"]["quarantined_count"] == 1
+    assert payload["recovery"]["reason_counts"] == {"invalid_json": 1}
+    rendered = json.dumps(payload).lower()
+    assert "authorization" not in rendered
+    assert "bearer" not in rendered
+    assert "matrix-secret" not in rendered
+
+
+def test_matrix_outbox_health_payload_degrades_on_read_error_without_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ExplodingOutbox:
+        def __init__(self, _path: Path) -> None:
+            raise OSError("permission denied access_token=matrix-secret")
+
+    monkeypatch.setattr("parking_spot_monitor.__main__.LocalOutbox", ExplodingOutbox)
+
+    payload = _matrix_outbox_health_payload(tmp_path / "matrix-outbox.json")
+
+    assert payload is not None
+    assert payload["available"] is False
+    assert payload["phase"] == "matrix-outbox"
+    assert payload["error"]["phase"] == "matrix-outbox"
+    assert payload["error"]["action"] == "status-summary"
+    rendered = json.dumps(payload).lower()
+    assert "access_token" not in rendered
+    assert "matrix-secret" not in rendered
+
+
+def test_runtime_health_json_includes_resolved_matrix_outbox_summary(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    pending = outbox.enqueue(AlertIntent(event_id="evt-pending", phase="text", body="ok"))
+    retrying = outbox.enqueue(AlertIntent(event_id="evt-retrying", phase="upload", body="ok"))
+    delivered = outbox.enqueue(AlertIntent(event_id="evt-delivered", phase="image", body="ok"))
+    failed = outbox.enqueue(AlertIntent(event_id="evt-failed", phase="text", body="ok"))
+    dead = outbox.enqueue(AlertIntent(event_id="evt-dead", phase="text", body="ok"))
+    outbox.mark_retrying(retrying.id, reason="timeout")
+    outbox.mark_delivered(delivered.id)
+    outbox.mark_failed(failed.id, reason="matrix_forbidden")
+    outbox.mark_dead_lettered(dead.id, reason="Authorization: Bearer matrix-secret")
+    assert pending.state == "pending"
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir: captured_frame(tmp_path),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: FakeMatrixDelivery(),
+        sleep=lambda _seconds: None,
+        max_iterations=0,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    health = health_payload(tmp_path / "health.json")
+    matrix_outbox = health["matrix_outbox"]
+    assert exit_code == 0
+    assert matrix_outbox["available"] is True
+    assert matrix_outbox["path"] == str(tmp_path / "matrix-outbox.json")
+    assert matrix_outbox["counts_by_state"] == {
+        "pending": 1,
+        "retrying": 1,
+        "delivered": 1,
+        "failed": 1,
+        "dead_lettered": 1,
+    }
+    assert matrix_outbox["retry_reason_counts"] == {"timeout": 1}
+    assert matrix_outbox["dead_letter_reason_counts"] == {"matrix_forbidden": 1, "redacted": 1}
+    assert {item["state"] for item in matrix_outbox["items"]} == {
+        "pending",
+        "retrying",
+        "delivered",
+        "failed",
+        "dead_lettered",
+    }
+    rendered = json.dumps(health).lower()
+    assert "authorization" not in rendered
+    assert "bearer" not in rendered
+    assert "matrix-secret" not in rendered
+    assert_no_secret_leak(output)
+
+
+class UploadFailsOnceMatrixClient(FakeMatrixClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_upload = True
+
+    def upload_image(self, *, filename: str, data: bytes, content_type: str) -> str:
+        if self.fail_upload:
+            self.fail_upload = False
+            raise RuntimeError(f"matrix upload failed {SECRET_MARKER}")
+        return super().upload_image(filename=filename, data=data, content_type=content_type)
+
+
+def outbox_delivery(client: object, data_dir: Path, logger: StructuredLogger) -> MatrixOutboxDelivery:
+    return MatrixOutboxDelivery(
+        client=client,
+        room_id="!room:example.org",
+        data_dir=data_dir,
+        snapshots_dir=data_dir / "snapshots",
+        outbox=LocalOutbox(data_dir / "matrix-outbox.json"),
+        logger=logger,
+    )
+
+
+def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], []]
+    matrix_client = UploadFailsOnceMatrixClient()
+
+    class SequencedDetector:
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            return detections.pop(0)
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: SequencedDetector(),
+        matrix_delivery_factory=lambda _settings, data_dir, logger: outbox_delivery(matrix_client, data_dir, logger),
+        sleep=lambda _seconds: None,
+        max_iterations=6,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    summary = outbox.status_summary()
+    item = summary["items"][0]
+    phases = {phase["phase"]: phase for phase in item["phases"]}
+
+    assert exit_code == 0
+    assert summary["counts_by_state"] == {"retrying": 1}
+    assert phases["text"]["state"] == "delivered"
+    assert phases["upload"]["state"] == "pending"
+    assert phases["image"]["state"] == "pending"
+    assert len(matrix_client.texts) == 1
+    assert matrix_client.uploads == []
+    assert matrix_client.images == []
+    assert '"event":"matrix-delivery-failed"' in output
+    assert '"error_type":"retrying_records"' in output
+    assert '"event":"matrix-outbox-phase-retryable-failure"' in output
+    assert_no_secret_leak(output)
+
+
+def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_event(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # First invocation leaves a retryable record after text delivery and before upload.
+    detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], []]
+    failing_client = UploadFailsOnceMatrixClient()
+
+    class SequencedDetector:
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            return detections.pop(0)
+
+    first_exit = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: SequencedDetector(),
+        matrix_delivery_factory=lambda _settings, data_dir, logger: outbox_delivery(failing_client, data_dir, logger),
+        sleep=lambda _seconds: None,
+        max_iterations=6,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+    assert first_exit == 0
+    capsys.readouterr()
+
+    successful_client = FakeMatrixClient()
+
+    def forbidden_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+        raise AssertionError("startup drain with max_iterations=0 must not capture a new frame")
+
+    second_exit = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=forbidden_capture,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, data_dir, logger: outbox_delivery(successful_client, data_dir, logger),
+        sleep=lambda _seconds: None,
+        max_iterations=0,
+        now=lambda: datetime(2026, 5, 18, 19, 5, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    summary = LocalOutbox(tmp_path / "matrix-outbox.json").status_summary()
+    item = summary["items"][0]
+    phases = {phase["phase"]: phase for phase in item["phases"]}
+
+    assert second_exit == 0
+    assert summary["counts_by_state"] == {"delivered": 1}
+    assert phases["text"]["state"] == "delivered"
+    assert phases["upload"]["state"] == "delivered"
+    assert phases["image"]["state"] == "delivered"
+    assert successful_client.texts == []
+    assert len(successful_client.uploads) == 1
+    assert len(successful_client.images) == 1
+    assert '"event":"matrix-outbox-phase-skip"' in output
+    assert '"reason":"already_delivered"' in output
+    assert '"event":"matrix-outbox-runtime-drain-succeeded"' in output
+    assert '"attempted_count":1' in output
+    assert_no_secret_leak(output)

@@ -18,6 +18,7 @@ class RuntimePaths:
     vehicle_history_dir: Path
     decision_memory_file: Path
     detection_lab_dir: Path
+    matrix_outbox_file: Path
 
 
 def resolve_runtime_paths(settings: RuntimeSettings, data_dir: str | Path) -> RuntimePaths:
@@ -40,6 +41,7 @@ def resolve_runtime_paths(settings: RuntimeSettings, data_dir: str | Path) -> Ru
         vehicle_history_dir=effective_data_dir / "vehicle-history",
         decision_memory_file=effective_data_dir / "operator-decision-memory.json",
         detection_lab_dir=effective_data_dir / "detection-lab",
+        matrix_outbox_file=effective_data_dir / "matrix-outbox.json",
     )
 
 
