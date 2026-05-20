@@ -47,6 +47,70 @@ _SUPPORTED_KINDS = {
     "feedback",
 }
 
+_SAFE_DETAIL_KEYS = (
+    "status",
+    "previous_status",
+    "new_status",
+    "candidate_id",
+    "class_name",
+    "confidence",
+    "threshold",
+    "rejection_reason",
+    "bbox_area_px",
+    "overlap_ratio",
+    "snapshot_ref",
+    "snapshot_path",
+    "retained_snapshot_path",
+    "suppression_until",
+    "alert_channel",
+    "event_type",
+    "event_id",
+    "feedback_label",
+    "label_id",
+    "label_type",
+    "reported_state",
+    "actual_state",
+    "target_state",
+    "evidence_available",
+    "evidence_error_type",
+    "evidence_path",
+    "replay_line_count",
+    "degradation_reasons",
+    "feedback_category",
+    "feedback_category_details",
+    "hit_streak",
+    "miss_streak",
+    "reason",
+    "alert",
+    "outcome",
+    "error_type",
+    "suppressed_reason",
+    "quiet_window_active",
+)
+
+_SAFE_LAB_DETAIL_KEYS = (
+    "job_id",
+    "kind",
+    "status",
+    "phase",
+    "created_at",
+    "updated_at",
+    "report_path",
+    "status_counts",
+    "coverage",
+    "decision",
+    "metric_delta_totals",
+    "shared_threshold_sufficiency",
+    "redaction",
+    "missing_inputs",
+    "error_code",
+    "error_message",
+)
+
+_MAX_FORMAT_DEPTH = 3
+_MAX_FORMAT_ITEMS = 6
+_MAX_FORMAT_TEXT_CHARS = 160
+
 
 class DecisionMemorySchemaError(ValueError):
     """Raised when persisted operator decision memory is not supported."""
@@ -321,36 +385,41 @@ def _format_record_lines(record: DecisionMemoryRecord, *, include_spot: bool) ->
     subject = f" {record.spot_id}" if include_spot and record.spot_id else ""
     lines = [f"- {record.observed_at} {record.kind}{subject}: {_clip_text(record.summary, 220)}"]
     details = record.details or {}
-    keys = (
-        "status",
-        "previous_status",
-        "new_status",
-        "hit_streak",
-        "miss_streak",
-        "reason",
-        "alert",
-        "outcome",
-        "error_type",
-        "suppressed_reason",
-    )
-    if record.kind == "lab_outcome":
-        keys = (
-            "job_id",
-            "kind",
-            "status",
-            "phase",
-            "report_path",
-            "status_counts",
-            "coverage",
-            "decision",
-            "metric_delta_totals",
-            "error_code",
-            "error_message",
-        )
-    for key in keys:
+    for key in _safe_detail_keys_for_record(record):
         if key in details:
-            lines.append(f"  {key}: {_clip_text(details[key], 160)}")
+            lines.append(f"  {key}: {_format_detail_value(details[key])}")
     return lines
+
+
+def _safe_detail_keys_for_record(record: DecisionMemoryRecord) -> tuple[str, ...]:
+    if record.kind == "lab_outcome":
+        return _SAFE_LAB_DETAIL_KEYS
+    return _SAFE_DETAIL_KEYS
+
+
+def _format_detail_value(value: Any, *, depth: int = 0) -> str:
+    """Return one redacted, bounded line fragment for a whitelisted detail value."""
+
+    if depth >= _MAX_FORMAT_DEPTH:
+        return "<truncated>"
+    if isinstance(value, Mapping):
+        parts: list[str] = []
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _MAX_FORMAT_ITEMS:
+                parts.append("...")
+                break
+            safe_key = _clip_text(key, 48)
+            parts.append(f"{safe_key}={_format_detail_value(item, depth=depth + 1)}")
+        return _clip_text("; ".join(parts), _MAX_FORMAT_TEXT_CHARS)
+    if isinstance(value, list | tuple | set | frozenset):
+        items = list(value)
+        rendered = [_format_detail_value(item, depth=depth + 1) for item in items[:_MAX_FORMAT_ITEMS]]
+        if len(items) > len(rendered):
+            rendered.append("...")
+        return _clip_text(", ".join(rendered), _MAX_FORMAT_TEXT_CHARS)
+    if isinstance(value, bytes | bytearray):
+        return "<binary redacted>"
+    return _clip_text(value, _MAX_FORMAT_TEXT_CHARS)
 
 
 def _bounded_reply(lines: Sequence[str], max_reply_bytes: int) -> str:

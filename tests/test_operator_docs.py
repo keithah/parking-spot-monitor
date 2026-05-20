@@ -58,6 +58,7 @@ def test_readme_documents_clean_machine_setup_sequence_and_operator_commands() -
             "!parking config",
             "!parking latest",
             "!parking why <spot_id>",
+            "!parking explain <spot_id>",
             "!parking learn <spot_id> <open|occupied> at <time>",
             "!parking recent",
             "!parking confidence",
@@ -95,10 +96,10 @@ def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_se
     assert_contains_all(
         readme,
         [
-            "The read-only cockpit commands are `!parking status`, `!parking config`, `!parking latest`, `!parking why <spot_id>`, `!parking recent`, `!parking confidence`, and `!parking at <time> <spot_id>`",
+            "The read-only cockpit commands are `!parking status`, `!parking config`, `!parking latest`, `!parking why <spot_id>`, `!parking explain <spot_id>`, `!parking recent`, `!parking confidence`, and `!parking at <time> <spot_id>`",
             "Empty `matrix.command_authorized_senders` default-denies all Matrix commands",
             "Missing, corrupt, or unreadable health/state files are reported as `unavailable`",
-            "`!parking why <spot_id>` explains the bounded recent decision memory",
+            "`!parking why <spot_id>` and `!parking explain <spot_id>` explain the bounded recent decision memory",
             "`!parking recent` returns a compact bounded timeline",
             "operator-decision-memory.json",
             "Decision memory unavailable",
@@ -127,6 +128,7 @@ def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_se
             "{command_prefix} config — show safe monitor configuration",
             "{command_prefix} latest — show latest runtime summary and raw full-frame image evidence",
             "{command_prefix} why <spot_id> — explain recent parking decisions for one spot from bounded local memory",
+            "{command_prefix} explain <spot_id> — alias for why with the same bounded local-memory explanation",
             "{command_prefix} recent — show recent decision, alert, suppression, command, and lab records from bounded local memory",
         ],
     )
@@ -439,6 +441,73 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
     )
 
 
+def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_uat_limits() -> None:
+    readme = read_tracked("README.md")
+    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
+    feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
+
+    assert_contains_all(
+        readme,
+        [
+            "!parking explain <spot_id>",
+            "`!parking analytics` is a read-only historical occupancy summary over local vehicle-history artifacts",
+            "Use `!parking analytics` or `!parking analytics 7d`",
+            "`!parking analytics today`",
+            "`!parking analytics 30d`",
+            "`!parking analytics all`",
+            "Analytics does not start capture, run detector/model inference, upload media, emit alerts, mutate feedback labels, mutate vehicle-history records, change thresholds, prove a live camera, or prove live Matrix room delivery",
+            "Use `!parking correct <spot_id> <open|occupied>` or its explicit false-alert alias `!parking false-alert <spot_id> <open|occupied>`",
+            "Use `!parking learn <spot_id> <open|occupied> at <time>` or its explicit missed-alert alias `!parking missed-alert <spot_id> <open|occupied> at <time>`",
+            "records a bounded local label in `data/operator-feedback-labels.json`",
+            "They append local feedback labels only after validating the bounded alert or timeline evidence they can access",
+            "does not mutate live occupancy state",
+            "does not provide live-camera proof from repository tests, README examples, or local docs alone",
+            "does not provide a live Matrix delivery guarantee from send attempts or docs alone",
+            "Room-visible Matrix delivery requires explicit live proof/readback evidence",
+        ],
+    )
+    assert_contains_all(
+        matrix_source,
+        [
+            "usage: !parking explain <spot_id>",
+            "usage: !parking analytics [today|7d|30d|all]",
+            "{command_prefix} false-alert <spot_id> <open|occupied> — explicit alias for correcting a false alert",
+            "{command_prefix} missed-alert <spot_id> <open|occupied> at <time> — explicit alias for recording missed timeline evidence",
+            "{command_prefix} analytics [today|7d|30d|all] — show spot-level historical occupancy metrics from local vehicle-history sessions",
+            "if parts[1] in {\"correct\", \"false-alert\"}",
+            "if parts[1] in {\"learn\", \"missed-alert\"}",
+        ],
+    )
+    assert_contains_all(
+        cockpit_source,
+        [
+            "Format bounded spot-level historical occupancy analytics from local vehicle-history JSON only.",
+            "Parking occupancy analytics",
+            "Parking occupancy analytics unavailable",
+        ],
+    )
+    assert_contains_all(
+        feedback_source,
+        [
+            "FEEDBACK_LABELS_FILENAME = \"operator-feedback-labels.json\"",
+            "feedback_category=\"false_alert\"",
+            "feedback_category=\"missed_alert\"",
+            "operator-feedback-label-appended",
+        ],
+    )
+
+    forbidden_operator_intelligence_claims = [
+        "analytics proves live Matrix delivery",
+        "analytics starts a capture",
+        "false-alert mutates live occupancy state",
+        "missed-alert changes detector thresholds",
+        "local docs prove live Matrix delivery",
+    ]
+    for marker in forbidden_operator_intelligence_claims:
+        assert marker not in readme
+
+
 def test_operator_docs_include_timeline_frame_buffer_contract() -> None:
     readme = read_tracked("README.md")
     timeline_source = read_tracked("parking_spot_monitor/timeline_buffer.py")
@@ -592,7 +661,7 @@ def test_why_recent_command_docs_cover_memory_boundaries_and_safe_failures() -> 
     assert_contains_all(
         readme,
         [
-            "`!parking why <spot_id>` explains the bounded recent decision memory",
+            "`!parking why <spot_id>` and `!parking explain <spot_id>` explain the bounded recent decision memory",
             "`!parking recent` returns a compact bounded timeline",
             "accepted/rejected evidence",
             "hit/miss streak context",
@@ -605,6 +674,7 @@ def test_why_recent_command_docs_cover_memory_boundaries_and_safe_failures() -> 
             "no detector or camera work was run",
             "No recent decision memory for this spot",
             "bounded local `operator-decision-memory.json` under the effective runtime data directory",
+            "why/explain/recent memory boundary",
             "Matrix arguments cannot choose arbitrary files",
             "They are text-only commands",
             "do not upload media",
@@ -621,6 +691,7 @@ def test_why_recent_command_docs_cover_memory_boundaries_and_safe_failures() -> 
         matrix_source,
         [
             "usage: !parking why <spot_id>",
+            "usage: !parking explain <spot_id>",
             "usage: !parking recent",
             "invalid spot id",
             "{command_prefix} why <spot_id> — explain recent parking decisions for one spot from bounded local memory",

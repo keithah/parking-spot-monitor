@@ -97,6 +97,7 @@ class MatrixOperatorCockpitContext:
         lab_kind: str | None = None,
         lab_job_id: str | None = None,
         incident_time: str | None = None,
+        analytics_window: str | None = None,
         logger: StructuredLogger | None = None,
     ) -> MatrixCommandResponse:
         if action == "status":
@@ -128,8 +129,10 @@ class MatrixOperatorCockpitContext:
                 logger=logger,
             )
             return MatrixCommandResponse(text=latest.text, image_path=latest.image_path, image_info=latest.image_info)
-        if action == "why":
+        if action in {"why", "explain"}:
             if spot_id is None:
+                if action == "explain":
+                    raise MatrixCommandParseError("usage: !parking explain <spot_id>")
                 raise MatrixCommandParseError("usage: !parking why <spot_id>")
             return MatrixCommandResponse(text=format_operator_why_reply(data_dir=self.data_dir, spot_id=spot_id, logger=logger))
         if action == "recent":
@@ -145,6 +148,8 @@ class MatrixOperatorCockpitContext:
                     logger=logger,
                 )
             )
+        if action == "analytics":
+            return MatrixCommandResponse(text=format_operator_analytics_reply(data_dir=self.data_dir, window=analytics_window or "7d", logger=logger))
         if action == "incident_review":
             if spot_id is None or incident_time is None:
                 raise MatrixCommandParseError("usage: !parking at <time> <spot_id>")
@@ -681,12 +686,14 @@ class MatrixCommandService:
         metadata = {"matrix_event_id": event.event_id, "matrix_sender": event.sender, "matrix_room_id": event.room_id}
         if command.action in {"status", "config", "latest", "recent", "confidence"}:
             return self._format_cockpit_reply(command.action)
+        if command.action == "analytics":
+            return self._format_cockpit_reply(command.action, analytics_window=command.subject_id or "7d")
         if command.action == "lab_run":
             assert command.lab_kind is not None
             return self._format_cockpit_reply(command.action, lab_kind=command.lab_kind)
         if command.action == "lab_status":
             return self._format_cockpit_reply(command.action, lab_job_id=command.lab_job_id or "latest")
-        if command.action == "why":
+        if command.action in {"why", "explain"}:
             assert command.spot_id is not None
             return self._format_cockpit_reply(command.action, spot_id=command.spot_id)
         if command.action == "incident_review":
@@ -765,6 +772,7 @@ class MatrixCommandService:
         lab_kind: str | None = None,
         lab_job_id: str | None = None,
         incident_time: str | None = None,
+        analytics_window: str | None = None,
     ) -> str | MatrixCommandResponse:
         if self.cockpit_provider is not None:
             kwargs: dict[str, str] = {}
@@ -776,9 +784,19 @@ class MatrixCommandService:
                 kwargs["lab_job_id"] = lab_job_id
             if incident_time is not None:
                 kwargs["incident_time"] = incident_time
+            if analytics_window is not None:
+                kwargs["analytics_window"] = analytics_window
             return self.cockpit_provider(action, **kwargs)  # type: ignore[call-arg]
         if self.cockpit_context is not None:
-            return self.cockpit_context.format_reply(action, spot_id=spot_id, lab_kind=lab_kind, lab_job_id=lab_job_id, incident_time=incident_time, logger=self.logger)
+            return self.cockpit_context.format_reply(
+                action,
+                spot_id=spot_id,
+                lab_kind=lab_kind,
+                lab_job_id=lab_job_id,
+                incident_time=incident_time,
+                analytics_window=analytics_window,
+                logger=self.logger,
+            )
         raise RuntimeError("operator cockpit provider is not configured")
 
     def _profile_summary(self, profile_id: str, *, event: MatrixTextEvent) -> Mapping[str, Any]:
@@ -913,6 +931,19 @@ def format_operator_config_reply(
 
 
 
+def format_operator_analytics_reply(
+    *,
+    data_dir: str | Path,
+    window: str = "7d",
+    now: datetime | None = None,
+    logger: StructuredLogger | None = None,
+    **kwargs: Any,
+) -> str:
+    from parking_spot_monitor.operator_cockpit import format_operator_analytics_reply as _format_operator_analytics_reply
+
+    return _format_operator_analytics_reply(data_dir=data_dir, window=window, now=now, logger=logger, **kwargs)
+
+
 def format_operator_why_reply(
     *,
     data_dir: str | Path,
@@ -1033,20 +1064,26 @@ def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> Matr
         if len(parts) != 3:
             raise MatrixCommandParseError("usage: !parking why <spot_id>")
         return MatrixCommand(action="why", spot_id=_validate_spot_id(parts[2]))
-    if parts[1] == "correct":
+    if parts[1] == "explain":
+        if len(parts) != 3:
+            raise MatrixCommandParseError("usage: !parking explain <spot_id>")
+        return MatrixCommand(action="explain", spot_id=_validate_spot_id(parts[2]))
+    if parts[1] in {"correct", "false-alert"}:
+        usage = "usage: !parking correct <spot_id> <open|occupied>" if parts[1] == "correct" else f"usage: {prefix} false-alert <spot_id> <open|occupied>"
         if len(parts) != 4:
-            raise MatrixCommandParseError("usage: !parking correct <spot_id> <open|occupied>")
+            raise MatrixCommandParseError(usage)
         return MatrixCommand(
             action="correct_spot_state",
             spot_id=_validate_spot_id(parts[2]),
             actual_state=_validate_actual_state(parts[3]),
         )
-    if parts[1] == "learn":
+    if parts[1] in {"learn", "missed-alert"}:
+        usage = "usage: !parking learn <spot_id> <open|occupied> at <time>" if parts[1] == "learn" else f"usage: {prefix} missed-alert <spot_id> <open|occupied> at <time>"
         if len(parts) != 6 or parts[4] != "at":
-            raise MatrixCommandParseError("usage: !parking learn <spot_id> <open|occupied> at <time>")
+            raise MatrixCommandParseError(usage)
         learn_time = redact_diagnostic_text(parts[5])[:80]
         if not learn_time:
-            raise MatrixCommandParseError("usage: !parking learn <spot_id> <open|occupied> at <time>")
+            raise MatrixCommandParseError(usage)
         return MatrixCommand(
             action="learn_label",
             spot_id=_validate_spot_id(parts[2]),
@@ -1061,6 +1098,12 @@ def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> Matr
         if len(parts) != 2:
             raise MatrixCommandParseError("usage: !parking confidence")
         return MatrixCommand(action="confidence")
+    if parts[1] == "analytics":
+        if len(parts) == 2:
+            return MatrixCommand(action="analytics", subject_id="7d")
+        if len(parts) == 3 and parts[2] in {"today", "7d", "30d", "all"}:
+            return MatrixCommand(action="analytics", subject_id=parts[2])
+        raise MatrixCommandParseError("usage: !parking analytics [today|7d|30d|all]")
     if parts[1] == "at":
         if len(parts) != 4:
             raise MatrixCommandParseError("usage: !parking at <time> <spot_id>")
@@ -1198,10 +1241,14 @@ def _format_command_help_reply(command_prefix: str) -> str:
         f"{command_prefix} config — show safe monitor configuration\n"
         f"{command_prefix} latest — show latest runtime summary and raw full-frame image evidence\n"
         f"{command_prefix} why <spot_id> — explain recent parking decisions for one spot from bounded local memory\n"
+        f"{command_prefix} explain <spot_id> — alias for why with the same bounded local-memory explanation\n"
         f"{command_prefix} correct <spot_id> <open|occupied> — record the actual spot state for a wrong alert\n"
+        f"{command_prefix} false-alert <spot_id> <open|occupied> — explicit alias for correcting a false alert\n"
         f"{command_prefix} learn <spot_id> <open|occupied> at <time> — record a retained-timeline calibration label for review\n"
+        f"{command_prefix} missed-alert <spot_id> <open|occupied> at <time> — explicit alias for recording missed timeline evidence\n"
         f"{command_prefix} recent — show recent decision, alert, suppression, command, and lab records from bounded local memory\n"
         f"{command_prefix} confidence — show artifact-derived spot stability, weak evidence, timeline health, and Matrix delivery status\n"
+        f"{command_prefix} analytics [today|7d|30d|all] — show spot-level historical occupancy metrics from local vehicle-history sessions\n"
         f"{command_prefix} at <time> <spot_id> — review the nearest retained timeline frame and local decision memory for an incident\n"
         f"{command_prefix} lab run replay — start a bounded local replay lab job using fixed inputs\n"
         f"{command_prefix} lab run tuning — start a bounded local tuning lab job using fixed inputs\n"

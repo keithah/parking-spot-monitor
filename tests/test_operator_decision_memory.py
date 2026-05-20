@@ -207,6 +207,86 @@ def test_append_failure_returns_false_and_logs_diagnostic(tmp_path: Path) -> Non
     assert "operator-decision-memory-append-failed" in log_stream.getvalue()
     _assert_no_sensitive_text(log_stream.getvalue())
 
+
+def test_why_reply_includes_rich_safe_decision_evidence_details(tmp_path: Path) -> None:
+    path = _memory_path(tmp_path)
+    long_snapshot_ref = "snapshot-" + ("frame-" * 120) + FAKE_MATRIX_TOKEN
+    records = [
+        _record(
+            "accepted_evidence",
+            "right_spot",
+            "accepted vehicle candidate",
+            status="occupied",
+            candidate_id="candidate-42",
+            confidence=0.93,
+            threshold=0.7,
+            snapshot_ref=long_snapshot_ref,
+            rtsp_url=FAKE_RTSP_URL,
+        ),
+        _record(
+            "rejected_evidence",
+            "right_spot",
+            "rejected low-confidence vehicle candidate",
+            status="open",
+            candidate_id="candidate-99",
+            rejection_reason="below occupancy threshold",
+            confidence=0.41,
+            threshold=0.7,
+            snapshot_ref="snapshot-rejected-001",
+        ),
+        _record(
+            "suppression",
+            "right_spot",
+            "suppressed alert while operator override is active",
+            suppressed_reason="operator_override",
+            suppression_until="2026-05-18T20:00:00Z",
+            snapshot_ref="snapshot-suppressed-001",
+        ),
+        _record(
+            "alert",
+            "right_spot",
+            "alert emitted for occupied status",
+            alert="sent",
+            alert_channel="matrix",
+            snapshot_ref="snapshot-alert-001",
+            token=FAKE_MATRIX_TOKEN,
+        ),
+        _record(
+            "feedback",
+            "right_spot",
+            "operator marked the decision as wrong",
+            feedback_label="false_positive",
+            previous_status="occupied",
+            new_status="open",
+            rejection_reason="operator correction",
+            snapshot_ref="snapshot-feedback-001",
+        ),
+    ]
+    for record in records:
+        assert append_decision_memory_record(path, record)
+
+    reply = format_why_reply(path, "right_spot", max_records=10, max_reply_bytes=2400)
+
+    assert "accepted_evidence" in reply
+    assert "rejected_evidence" in reply
+    assert "suppression" in reply
+    assert "alert" in reply
+    assert "feedback" in reply
+    assert "candidate_id: candidate-42" in reply
+    assert "candidate_id: candidate-99" in reply
+    assert "threshold: 0.7" in reply
+    assert "confidence: 0.93" in reply
+    assert "confidence: 0.41" in reply
+    assert "rejection_reason: below occupancy threshold" in reply
+    assert "suppression_until: 2026-05-18T20:00:00Z" in reply
+    assert "alert_channel: matrix" in reply
+    assert "feedback_label: false_positive" in reply
+    assert "snapshot_ref: snapshot-" in reply
+    assert "snapshot_ref: snapshot-rejected-001" in reply
+    assert len(reply.encode("utf-8")) <= 2400
+    _assert_no_sensitive_text(reply + path.read_text(encoding="utf-8"))
+
+
 def test_recent_formats_lab_outcome_safe_details(tmp_path: Path) -> None:
     path = _memory_path(tmp_path)
     assert append_decision_memory_record(
@@ -234,7 +314,42 @@ def test_recent_formats_lab_outcome_safe_details(tmp_path: Path) -> None:
     assert "job_id: lab-20260518T190000Z-abcdef12" in reply
     assert "phase: complete" in reply
     assert "report_path: detection-lab/jobs/lab-20260518T190000Z-abcdef12/replay-report.json" in reply
-    assert "status_counts:" in reply
-    assert "coverage:" in reply
+    assert "status_counts: occupied=3; open=2" in reply
+    assert "coverage: assessed_frames=5; blocked_frames=0; not_assessed_frames=1" in reply
+    _assert_no_sensitive_text(reply + path.read_text(encoding="utf-8"))
+
+
+def test_why_reply_recursively_formats_only_whitelisted_safe_details(tmp_path: Path) -> None:
+    path = _memory_path(tmp_path)
+    assert append_decision_memory_record(
+        path,
+        make_decision_memory_record(
+            "feedback",
+            observed_at=datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+            spot_id="right_spot",
+            summary="operator learn label recorded",
+            details={
+                "label_id": "label-123",
+                "label_type": "learn",
+                "target_state": "occupied",
+                "evidence_available": True,
+                "degradation_reasons": ["missing_state", "replay_clipped", "extra-detail"],
+                "unlisted_safe_but_private_context": "do not render this arbitrary detail",
+                "Authorization": "Bearer should-never-render",
+                "debug_dump": {"trace": TRACEBACK_TEXT, "rtsp": FAKE_RTSP_URL},
+            },
+        ),
+    )
+
+    reply = format_why_reply(path, "right_spot", max_records=1, max_reply_bytes=1200)
+
+    assert "label_id: label-123" in reply
+    assert "label_type: learn" in reply
+    assert "target_state: occupied" in reply
+    assert "evidence_available: True" in reply
+    assert "degradation_reasons: missing_state, replay_clipped, extra-detail" in reply
+    assert "unlisted_safe_but_private_context" not in reply
+    assert "debug_dump" not in reply
+    assert "Authorization" not in reply
     _assert_no_sensitive_text(reply + path.read_text(encoding="utf-8"))
 

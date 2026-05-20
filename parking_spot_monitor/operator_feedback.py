@@ -100,6 +100,8 @@ class FeedbackLabel:
     replay_context: tuple[str, ...] = ()
     degradation_reasons: tuple[str, ...] = ()
     source_metadata: Mapping[str, Any] | None = None
+    feedback_category: str | None = None
+    feedback_category_details: Mapping[str, Any] | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         label_type = _feedback_label_type(self.label_type)
@@ -122,6 +124,10 @@ class FeedbackLabel:
             payload["matrix_event_id"] = _safe_optional_text(self.matrix_event_id, limit=180)
         if self.matrix_room_id_hash is not None:
             payload["matrix_room_id_hash"] = _safe_optional_text(self.matrix_room_id_hash, limit=120)
+        if self.feedback_category is not None:
+            payload["feedback_category"] = _safe_feedback_category(self.feedback_category)
+        if self.feedback_category_details is not None:
+            payload["feedback_category_details"] = _safe_metadata(self.feedback_category_details)
         if label_type == "learn":
             payload["target_state"] = _feedback_state(self.target_state, "target_state")
             payload["learned_at"] = _safe_required_text(self.learned_at or self.corrected_at, "learned_at", limit=80)
@@ -293,6 +299,8 @@ class OperatorFeedbackLabeler:
             evidence=evidence,
             matrix_event_id=matrix_event_id,
             matrix_room_id_hash=hash_operator_identifier(matrix_room_id),
+            feedback_category="false_alert",
+            feedback_category_details={"reported_state": candidate.reported_state, "actual_state": state},
         )
         append_result = append_feedback_label(self.labels_path, label, logger=self.logger)
         if not append_result:
@@ -332,6 +340,8 @@ class OperatorFeedbackLabeler:
                     "alert_event_id": candidate.alert_event_id,
                     "evidence_available": evidence.available,
                     "evidence_error_type": evidence.error_type,
+                    "feedback_category": "false_alert",
+                    "feedback_category_details": {"reported_state": candidate.reported_state, "actual_state": state},
                 },
             ),
             logger=self.logger,
@@ -537,6 +547,8 @@ class OperatorFeedbackLabeler:
                     "evidence_path": evidence.path,
                     "replay_line_count": len(replay.lines),
                     "degradation_reasons": list(reasons),
+                    "feedback_category": "missed_alert",
+                    "feedback_category_details": {"target_state": state, "requested_at": target_time.isoformat().replace("+00:00", "Z")},
                 },
             ),
             logger=self.logger,
@@ -769,6 +781,8 @@ def make_learn_feedback_label(
         replay_context=tuple(replay_context),
         degradation_reasons=tuple(degradation_reasons),
         source_metadata=source_metadata,
+        feedback_category="missed_alert",
+        feedback_category_details={"target_state": state},
     )
 
 
@@ -1083,7 +1097,16 @@ def _label_from_any(value: FeedbackLabel | Mapping[str, Any]) -> FeedbackLabel:
         replay_context=tuple(_safe_text_list(value.get("replay_context", ()), max_items=MAX_REPLAY_CONTEXT_LINES, item_limit=MAX_REPLAY_LINE_CHARS)) if label_type == "learn" else (),
         degradation_reasons=tuple(_safe_text_list(value.get("degradation_reasons", ()), max_items=MAX_DEGRADATION_REASONS, item_limit=120)) if label_type == "learn" else (),
         source_metadata=_safe_metadata(value.get("source_metadata")) if label_type == "learn" else None,
+        feedback_category=_safe_feedback_category(value.get("feedback_category")) if value.get("feedback_category") is not None else None,
+        feedback_category_details=_safe_metadata(value.get("feedback_category_details")) if value.get("feedback_category_details") is not None else None,
     )
+
+
+def _safe_feedback_category(value: object) -> str:
+    category = _safe_required_text(value, "feedback_category", limit=80)
+    if category not in {"false_alert", "missed_alert"}:
+        raise FeedbackLabelSchemaError("feedback label feedback_category must be false_alert or missed_alert")
+    return category
 
 
 def _feedback_label_type(value: object) -> FeedbackLabelType:

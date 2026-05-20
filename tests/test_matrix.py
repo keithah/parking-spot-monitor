@@ -1023,8 +1023,12 @@ def test_parse_matrix_commands_are_strict_and_normalize_labels() -> None:
     assert (correct.action, correct.spot_id, correct.actual_state) == ("correct_spot_state", "left_spot", "open")
     occupied_correct = parse_matrix_command("!parking correct right_spot occupied")
     assert (occupied_correct.action, occupied_correct.spot_id, occupied_correct.actual_state) == ("correct_spot_state", "right_spot", "occupied")
+    false_alert = parse_matrix_command("  !parking   false-alert   right_spot   occupied  ")
+    assert (false_alert.action, false_alert.spot_id, false_alert.actual_state) == ("correct_spot_state", "right_spot", "occupied")
     learn = parse_matrix_command("  !parking   learn   left_spot   occupied   at   2026-05-18T19:00:00Z  ")
     assert (learn.action, learn.spot_id, learn.actual_state, learn.subject_id) == ("learn_label", "left_spot", "occupied", "2026-05-18T19:00:00Z")
+    missed_alert = parse_matrix_command("  !parking   missed-alert   left_spot   open   at   2026-05-18T19:00:00Z  ")
+    assert (missed_alert.action, missed_alert.spot_id, missed_alert.actual_state, missed_alert.subject_id) == ("learn_label", "left_spot", "open", "2026-05-18T19:00:00Z")
 
     with pytest.raises(MatrixCommandParseError):
         parse_matrix_command("!parking profile merge prof_a prof_b extra")
@@ -1047,6 +1051,13 @@ def test_parse_matrix_commands_are_strict_and_normalize_labels() -> None:
         "!parking correct ../left_spot open",
         "!parking correct left/spot occupied",
         "!parking correct . open",
+        "!parking false-alert",
+        "!parking false-alert left_spot",
+        "!parking false-alert left_spot open extra",
+        "!parking false-alert left_spot closed",
+        "!parking false-alert ../left_spot open",
+        "!parking false-alert left/spot occupied",
+        "!parking false-alert . open",
     ]
     for body in rejected_correct_commands:
         with pytest.raises(MatrixCommandParseError):
@@ -1061,6 +1072,14 @@ def test_parse_matrix_commands_are_strict_and_normalize_labels() -> None:
         "!parking learn ../left_spot open at 2026-05-18T19:00:00Z",
         "!parking learn left_spot open at",
         "!parking learn left_spot open at 2026-05-18T19:00:00Z extra",
+        "!parking missed-alert",
+        "!parking missed-alert left_spot",
+        "!parking missed-alert left_spot open",
+        "!parking missed-alert left_spot open 2026-05-18T19:00:00Z",
+        "!parking missed-alert left_spot closed at 2026-05-18T19:00:00Z",
+        "!parking missed-alert ../left_spot open at 2026-05-18T19:00:00Z",
+        "!parking missed-alert left_spot open at",
+        "!parking missed-alert left_spot open at 2026-05-18T19:00:00Z extra",
     ]
     for body in rejected_learn_commands:
         with pytest.raises(MatrixCommandParseError):
@@ -1334,6 +1353,7 @@ def test_command_service_authorizes_applies_and_replies_safely() -> None:
     assert "right_spot: occupied — Keith's black Tesla — confidence 1.00 — samples 7" in rendered_replies
     assert "!parking help" in rendered_replies
     assert "!parking confidence" in rendered_replies
+    assert "!parking analytics [today|7d|30d|all]" in rendered_replies
     assert "!parking owner <spot_id>" in rendered_replies
     assert "Profile prof_b: Blue hatchback" in rendered_replies
     assert ACCESS_TOKEN not in rendered_replies
@@ -1440,6 +1460,156 @@ def test_command_service_authorized_learn_routes_to_labeler_with_runtime_context
         }
     ]
     assert replies == [{"room_id": ROOM_ID, "txn_id": "command:$learn", "body": "Parking learn label recorded\nSpot: left_spot\nTarget: occupied"}]
+
+
+def test_command_service_explicit_feedback_aliases_are_authorized_idempotent_and_text_only() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixOperatorCockpitContext, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[dict[str, Any]] = []
+    correction_event_ids: set[str] = set()
+    learn_event_ids: set[str] = set()
+    calls: list[tuple[str, dict[str, Any]]] = []
+    settings = type("Settings", (), {"spots": type("Spots", (), {"left_spot": object(), "right_spot": object()})()})()
+    state_path = Path("/tmp/state.json")
+    detector = object()
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$false", sender="@op:example", room_id=ROOM_ID, body="!parking false-alert left_spot open"),
+                    MatrixTextEvent(event_id="$false", sender="@op:example", room_id=ROOM_ID, body="!parking false-alert left_spot open"),
+                    MatrixTextEvent(event_id="$missed", sender="@op:example", room_id=ROOM_ID, body="!parking missed-alert right_spot occupied at 2026-05-18T19:00:00Z"),
+                    MatrixTextEvent(event_id="$missed", sender="@op:example", room_id=ROOM_ID, body="!parking missed-alert right_spot occupied at 2026-05-18T19:00:00Z"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(dict(kwargs))
+            return "$reply"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("feedback command replies must be text only")
+
+        def send_image(self, **kwargs: Any) -> str:
+            raise AssertionError("feedback command replies must be text only")
+
+    class FeedbackLabeler:
+        def record_correction(self, **kwargs: Any) -> Any:
+            calls.append(("correction", dict(kwargs)))
+            duplicate = kwargs["matrix_event_id"] in correction_event_ids
+            correction_event_ids.add(kwargs["matrix_event_id"])
+            text = "Command already applied; acknowledgement repeated." if duplicate else "Parking correction recorded\n- spot: left_spot\n- actual: open"
+            return type("FeedbackResult", (), {"reply_text": text})()
+
+        def record_learn_label(self, **kwargs: Any) -> Any:
+            calls.append(("learn", dict(kwargs)))
+            duplicate = kwargs["matrix_event_id"] in learn_event_ids
+            learn_event_ids.add(kwargs["matrix_event_id"])
+            text = "Command already applied; learn acknowledgement repeated." if duplicate else "Parking learn label recorded\n- spot: right_spot\n- target: occupied"
+            return type("LearnResult", (), {"reply_text": text})()
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        feedback_labeler=FeedbackLabeler(),
+        cockpit_context=MatrixOperatorCockpitContext(settings=settings, data_dir=Path("/tmp"), health_path=Path("/tmp/health.json"), state_path=state_path, incident_detector=detector),
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 4
+    assert result.error_count == 0
+    assert [kind for kind, _ in calls] == ["correction", "correction", "learn", "learn"]
+    assert calls[0][1] == {
+        "spot_id": "left_spot",
+        "actual_state": "open",
+        "matrix_event_id": "$false",
+        "matrix_sender": "@op:example",
+        "matrix_room_id": ROOM_ID,
+    }
+    assert calls[2][1] == {
+        "spot_id": "right_spot",
+        "target_state": "occupied",
+        "requested_time": "2026-05-18T19:00:00Z",
+        "settings": settings,
+        "state_path": state_path,
+        "detector": detector,
+        "matrix_event_id": "$missed",
+        "matrix_sender": "@op:example",
+        "matrix_room_id": ROOM_ID,
+    }
+    assert [reply["txn_id"] for reply in replies] == ["command:$false", "command:$false", "command:$missed", "command:$missed"]
+    assert [reply["body"] for reply in replies] == [
+        "Parking correction recorded\n- spot: left_spot\n- actual: open",
+        "Command already applied; acknowledgement repeated.",
+        "Parking learn label recorded\n- spot: right_spot\n- target: occupied",
+        "Command already applied; learn acknowledgement repeated.",
+    ]
+    assert all(isinstance(reply["body"], str) and len(reply["body"].encode("utf-8")) <= 4096 for reply in replies)
+
+
+def test_command_service_explicit_feedback_aliases_reject_unauthorized_and_malformed_before_labeler() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[dict[str, Any]] = []
+    labeler_calls: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$denied-false", sender="@intruder:example", room_id=ROOM_ID, body="!parking false-alert left_spot open"),
+                    MatrixTextEvent(event_id="$denied-missed", sender="@intruder:example", room_id=ROOM_ID, body="!parking missed-alert left_spot open at 2026-05-18T19:00:00Z"),
+                    MatrixTextEvent(event_id="$bad-false", sender="@op:example", room_id=ROOM_ID, body="!parking false-alert left_spot closed"),
+                    MatrixTextEvent(event_id="$bad-missed", sender="@op:example", room_id=ROOM_ID, body="!parking missed-alert left_spot open 2026-05-18T19:00:00Z"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(dict(kwargs))
+            return "$reply"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("rejection replies must be text only")
+
+        def send_image(self, **kwargs: Any) -> str:
+            raise AssertionError("rejection replies must be text only")
+
+    class FeedbackLabeler:
+        def record_correction(self, **kwargs: Any) -> Any:
+            labeler_calls.append(dict(kwargs))
+            raise AssertionError("rejected false-alert command must not reach labeler")
+
+        def record_learn_label(self, **kwargs: Any) -> Any:
+            labeler_calls.append(dict(kwargs))
+            raise AssertionError("rejected missed-alert command must not reach labeler")
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        feedback_labeler=FeedbackLabeler(),
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 0
+    assert result.error_count == 4
+    assert labeler_calls == []
+    assert [reply["body"] for reply in replies] == [
+        "Command rejected: sender is not authorized.",
+        "Command rejected: sender is not authorized.",
+        "Command rejected: invalid actual state",
+        "Command rejected: usage: !parking missed-alert <spot_id> <open|occupied> at <time>",
+    ]
+    assert all(reply["room_id"] == ROOM_ID and reply["txn_id"].startswith("command:") for reply in replies)
+    assert all(len(reply["body"].encode("utf-8")) <= 4096 for reply in replies)
 
 
 def test_command_service_learn_rejects_unauthorized_malformed_and_missing_labeler() -> None:
@@ -1791,6 +1961,29 @@ def test_parse_matrix_latest_command_is_exact_and_rejects_arguments() -> None:
             parse_matrix_command(body)
 
 
+
+def test_parse_matrix_analytics_command_accepts_bounded_windows_and_rejects_extra_args() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandParseError, parse_matrix_command
+
+    default = parse_matrix_command("  !parking   analytics  ")
+    assert (default.action, default.subject_id) == ("analytics", "7d")
+
+    for window in ["today", "7d", "30d", "all"]:
+        command = parse_matrix_command(f"!parking analytics {window}")
+        assert (command.action, command.subject_id) == ("analytics", window)
+
+    rejected = [
+        "!parking analytics today extra",
+        "!parking analytics yesterday",
+        "!parking analytics 90d",
+        "!parking analytics ../sessions",
+        "!parking analytics " + "x" * 513,
+    ]
+    for body in rejected:
+        with pytest.raises(MatrixCommandParseError):
+            parse_matrix_command(body)
+
+
 def test_parse_matrix_confidence_command_is_exact_and_rejects_arguments() -> None:
     from parking_spot_monitor.matrix import MatrixCommandParseError, parse_matrix_command
 
@@ -1974,13 +2167,15 @@ def test_command_service_latest_failure_and_unauthorized_latest_are_text_only(tm
     assert all(call["kind"] == "text" for call in calls)
 
 
-def test_parse_matrix_why_and_recent_commands_are_exact_and_bounded() -> None:
+def test_parse_matrix_why_explain_and_recent_commands_are_exact_and_bounded() -> None:
     from parking_spot_monitor.matrix import MatrixCommandParseError, parse_matrix_command
 
     why = parse_matrix_command("  !parking   why   right_spot  ")
+    explain = parse_matrix_command("  !parking   explain   right_spot  ")
     recent = parse_matrix_command("\n!parking recent\t")
 
     assert (why.action, why.spot_id) == ("why", "right_spot")
+    assert (explain.action, explain.spot_id) == ("explain", "right_spot")
     assert recent.action == "recent"
 
     rejected = [
@@ -1989,6 +2184,11 @@ def test_parse_matrix_why_and_recent_commands_are_exact_and_bounded() -> None:
         "!parking why ../state.json",
         "!parking why /tmp/right_spot",
         "!parking why " + "x" * 161,
+        "!parking explain",
+        "!parking explain right_spot extra",
+        "!parking explain ../state.json",
+        "!parking explain /tmp/right_spot",
+        "!parking explain " + "x" * 161,
         "!parking recent now",
         "!parking recent verbose",
         "!parking at",
@@ -2001,7 +2201,7 @@ def test_parse_matrix_why_and_recent_commands_are_exact_and_bounded() -> None:
             parse_matrix_command(body)
 
 
-def test_command_service_why_recent_use_provider_text_only_repeatably_without_archive_correction() -> None:
+def test_command_service_why_explain_recent_use_provider_text_only_repeatably_without_archive_correction() -> None:
     from parking_spot_monitor.matrix import MatrixCommandResponse, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
 
     calls: list[dict[str, Any]] = []
@@ -2014,6 +2214,7 @@ def test_command_service_why_recent_use_provider_text_only_repeatably_without_ar
                 events=(
                     MatrixTextEvent(event_id="$why", sender="@op:example", room_id=ROOM_ID, body="!parking why right_spot"),
                     MatrixTextEvent(event_id="$why", sender="@op:example", room_id=ROOM_ID, body="!parking why right_spot"),
+                    MatrixTextEvent(event_id="$explain", sender="@op:example", room_id=ROOM_ID, body="!parking explain right_spot"),
                     MatrixTextEvent(event_id="$recent", sender="@op:example", room_id=ROOM_ID, body="!parking recent"),
                 ),
             )
@@ -2045,13 +2246,13 @@ def test_command_service_why_recent_use_provider_text_only_repeatably_without_ar
 
     result = service.poll_once()
 
-    assert result.processed_count == 3
+    assert result.processed_count == 4
     assert result.error_count == 0
-    assert provider_calls == [("why", "right_spot"), ("why", "right_spot"), ("recent", None)]
+    assert provider_calls == [("why", "right_spot"), ("why", "right_spot"), ("explain", "right_spot"), ("recent", None)]
     assert archive.calls == []
-    assert [call["kind"] for call in calls] == ["text", "text", "text"]
-    assert [call["body"] for call in calls] == ["decision why right_spot", "decision why right_spot", "decision recent"]
-    assert [call["txn_id"] for call in calls] == ["command:$why", "command:$why", "command:$recent"]
+    assert [call["kind"] for call in calls] == ["text", "text", "text", "text"]
+    assert [call["body"] for call in calls] == ["decision why right_spot", "decision why right_spot", "decision explain right_spot", "decision recent"]
+    assert [call["txn_id"] for call in calls] == ["command:$why", "command:$why", "command:$explain", "command:$recent"]
 
 
 
@@ -2205,7 +2406,7 @@ def test_command_service_incident_review_real_context_replays_detector_sends_saf
     assert str(tmp_path) not in calls[1]["filename"]
     assert str(tmp_path) not in calls[2]["body"]
 
-def test_command_service_rejects_unauthorized_why_before_memory_or_provider_paths() -> None:
+def test_command_service_rejects_unauthorized_why_and_explain_before_memory_or_provider_paths() -> None:
     from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
 
     replies: list[str] = []
@@ -2214,7 +2415,10 @@ def test_command_service_rejects_unauthorized_why_before_memory_or_provider_path
         def sync(self, **kwargs: Any) -> MatrixSyncResult:
             return MatrixSyncResult(
                 next_batch="s3",
-                events=(MatrixTextEvent(event_id="$why", sender="@intruder:example", room_id=ROOM_ID, body="!parking why right_spot"),),
+                events=(
+                    MatrixTextEvent(event_id="$why", sender="@intruder:example", room_id=ROOM_ID, body="!parking why right_spot"),
+                    MatrixTextEvent(event_id="$explain", sender="@intruder:example", room_id=ROOM_ID, body="!parking explain right_spot"),
+                ),
             )
 
         def send_text(self, **kwargs: Any) -> str:
@@ -2222,7 +2426,7 @@ def test_command_service_rejects_unauthorized_why_before_memory_or_provider_path
             return "$reply"
 
     def cockpit_provider(action: str, *, spot_id: str | None = None) -> str:
-        raise AssertionError("unauthorized why must not touch provider or memory paths")
+        raise AssertionError("unauthorized why/explain must not touch provider or memory paths")
 
     service = MatrixCommandService(
         client=Client(),  # type: ignore[arg-type]
@@ -2235,8 +2439,8 @@ def test_command_service_rejects_unauthorized_why_before_memory_or_provider_path
     result = service.poll_once()
 
     assert result.processed_count == 0
-    assert result.error_count == 1
-    assert replies == ["Command rejected: sender is not authorized."]
+    assert result.error_count == 2
+    assert replies == ["Command rejected: sender is not authorized.", "Command rejected: sender is not authorized."]
 
 
 def test_command_service_confidence_context_reads_local_artifacts_text_only(tmp_path: Path) -> None:
@@ -2325,6 +2529,191 @@ def test_command_service_confidence_context_reads_local_artifacts_text_only(tmp_
     assert str(tmp_path) not in body
 
 
+
+def test_command_service_analytics_windows_route_to_cockpit_provider_text_only_without_archive_corrections() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    calls: list[dict[str, Any]] = []
+    provider_calls: list[tuple[str, str | None]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$analytics-default", sender="@op:example", room_id=ROOM_ID, body="!parking analytics"),
+                    MatrixTextEvent(event_id="$analytics-today", sender="@op:example", room_id=ROOM_ID, body="!parking analytics today"),
+                    MatrixTextEvent(event_id="$analytics-7d", sender="@op:example", room_id=ROOM_ID, body="!parking analytics 7d"),
+                    MatrixTextEvent(event_id="$analytics-30d", sender="@op:example", room_id=ROOM_ID, body="!parking analytics 30d"),
+                    MatrixTextEvent(event_id="$analytics-all", sender="@op:example", room_id=ROOM_ID, body="!parking analytics all"),
+                    MatrixTextEvent(event_id="$analytics-bad", sender="@op:example", room_id=ROOM_ID, body="!parking analytics today extra"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("analytics replies must not upload media")
+
+        def send_image(self, **kwargs: Any) -> str:
+            raise AssertionError("analytics replies must not send media")
+
+    def cockpit_provider(action: str, *, analytics_window: str | None = None) -> str:
+        provider_calls.append((action, analytics_window))
+        return f"analytics reply for {analytics_window}"
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    archive.corrections.append(FakeCorrection("existing", matrix_event_id="$analytics-default"))
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_provider=cockpit_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 5
+    assert result.error_count == 1
+    assert provider_calls == [("analytics", "7d"), ("analytics", "today"), ("analytics", "7d"), ("analytics", "30d"), ("analytics", "all")]
+    assert archive.calls == []
+    assert [call["kind"] for call in calls] == ["text", "text", "text", "text", "text", "text"]
+    assert [call["txn_id"] for call in calls] == [
+        "command:$analytics-default",
+        "command:$analytics-today",
+        "command:$analytics-7d",
+        "command:$analytics-30d",
+        "command:$analytics-all",
+        "command:$analytics-bad",
+    ]
+    assert [call["body"] for call in calls[:5]] == [
+        "analytics reply for 7d",
+        "analytics reply for today",
+        "analytics reply for 7d",
+        "analytics reply for 30d",
+        "analytics reply for all",
+    ]
+    assert calls[5]["body"] == "Command rejected: usage: !parking analytics [today|7d|30d|all]"
+
+
+def test_command_service_rejects_unauthorized_analytics_before_provider_or_artifacts() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[str] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(next_batch="s3", events=(MatrixTextEvent(event_id="$analytics", sender="@intruder:example", room_id=ROOM_ID, body="!parking analytics all"),))
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(kwargs["body"])
+            return "$reply"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("unauthorized analytics replies must not upload media")
+
+    def cockpit_provider(action: str, **kwargs: Any) -> str:
+        raise AssertionError("unauthorized analytics must not touch cockpit provider or artifact paths")
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@operator:example"],
+        cockpit_provider=cockpit_provider,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 0
+    assert result.error_count == 1
+    assert replies == ["Command rejected: sender is not authorized."]
+
+
+def test_command_service_analytics_context_reads_vehicle_history_text_only_and_does_not_mutate_archive(tmp_path: Path) -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixOperatorCockpitContext, MatrixSyncResult, MatrixTextEvent
+
+    closed_dir = tmp_path / "vehicle-history" / "sessions" / "closed"
+    active_dir = tmp_path / "vehicle-history" / "sessions" / "active"
+    closed_dir.mkdir(parents=True)
+    active_dir.mkdir(parents=True)
+    closed_session = closed_dir / "sess_closed.json"
+    active_session = active_dir / "sess_active.json"
+    malformed = closed_dir / "malformed.json"
+    closed_session.write_text(
+        json.dumps(
+            {
+                "session_id": "sess_closed",
+                "spot_id": "left_spot",
+                "started_at": "2026-05-18T08:00:00Z",
+                "ended_at": "2026-05-18T09:30:00Z",
+                "duration_seconds": 5400,
+            }
+        ),
+        encoding="utf-8",
+    )
+    active_session.write_text(
+        json.dumps({"session_id": "sess_active", "spot_id": "right_spot", "started_at": "2026-05-19T10:00:00Z", "ended_at": None}),
+        encoding="utf-8",
+    )
+    malformed.write_text("{not json", encoding="utf-8")
+    before = {path: (path.read_text(encoding="utf-8"), path.stat().st_mtime_ns) for path in [closed_session, active_session, malformed]}
+    calls: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(next_batch="s3", events=(MatrixTextEvent(event_id="$analytics", sender="@op:example", room_id=ROOM_ID, body="!parking analytics all"),))
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            raise AssertionError("analytics context replies must not upload media")
+
+        def send_image(self, **kwargs: Any) -> str:
+            raise AssertionError("analytics context replies must not send media")
+
+    context = MatrixOperatorCockpitContext(
+        settings=object(),
+        data_dir=tmp_path,
+        health_path=tmp_path / "health.json",
+        state_path=tmp_path / "state.json",
+    )
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_context=context,
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 1
+    assert result.error_count == 0
+    assert archive.calls == []
+    assert [call["kind"] for call in calls] == ["text"]
+    assert calls[0]["txn_id"] == "command:$analytics"
+    body = calls[0]["body"]
+    assert "Parking occupancy analytics" in body
+    assert "Window: all" in body
+    assert "left_spot: sessions 1" in body
+    assert "right_spot: sessions 1" in body
+    assert "malformed vehicle-history session ignored" in body
+    assert "No detector, camera, Matrix media upload, alert emission, or state mutation was run." in body
+    assert len(body.encode("utf-8")) <= 4096
+    assert ACCESS_TOKEN not in body
+    assert str(tmp_path) not in body
+    for path, (content, mtime_ns) in before.items():
+        assert path.read_text(encoding="utf-8") == content
+        assert path.stat().st_mtime_ns == mtime_ns
+
+
 def test_command_service_rejects_unauthorized_confidence_before_provider_or_artifacts() -> None:
     from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
 
@@ -2359,7 +2748,7 @@ def test_command_service_rejects_unauthorized_confidence_before_provider_or_arti
     assert replies == ["Command rejected: sender is not authorized."]
 
 
-def test_command_service_why_recent_context_reads_decision_memory_safely_text_only(tmp_path: Path) -> None:
+def test_command_service_why_explain_recent_context_reads_decision_memory_safely_text_only(tmp_path: Path) -> None:
     from parking_spot_monitor.matrix import MatrixCommandService, MatrixOperatorCockpitContext, MatrixSyncResult, MatrixTextEvent
     from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, make_decision_memory_record
 
@@ -2378,6 +2767,10 @@ def test_command_service_why_recent_context_reads_decision_memory_safely_text_on
         memory_path,
         make_decision_memory_record("command_outcome", observed_at="2026-05-18T19:01:00Z", summary="command processed", details={"outcome": "ok"}),
     )
+    state_path = tmp_path / "state.json"
+    state_path.write_text('{"schema_version":"test","state_by_spot":{}}', encoding="utf-8")
+    state_before = state_path.read_text(encoding="utf-8")
+    state_mtime_before_ns = state_path.stat().st_mtime_ns
     calls: list[dict[str, Any]] = []
 
     class Client:
@@ -2386,7 +2779,8 @@ def test_command_service_why_recent_context_reads_decision_memory_safely_text_on
                 next_batch="s3",
                 events=(
                     MatrixTextEvent(event_id="$why", sender="@op:example", room_id=ROOM_ID, body="!parking why right_spot"),
-                    MatrixTextEvent(event_id="$unknown", sender="@op:example", room_id=ROOM_ID, body="!parking why unknown_spot"),
+                    MatrixTextEvent(event_id="$explain", sender="@op:example", room_id=ROOM_ID, body="!parking explain right_spot"),
+                    MatrixTextEvent(event_id="$unknown", sender="@op:example", room_id=ROOM_ID, body="!parking explain unknown_spot"),
                     MatrixTextEvent(event_id="$recent", sender="@op:example", room_id=ROOM_ID, body="!parking recent"),
                 ),
             )
@@ -2405,7 +2799,7 @@ def test_command_service_why_recent_context_reads_decision_memory_safely_text_on
         settings=object(),
         data_dir=tmp_path,
         health_path=tmp_path / "health.json",
-        state_path=tmp_path / "state.json",
+        state_path=state_path,
     )
     service = MatrixCommandService(
         client=Client(),  # type: ignore[arg-type]
@@ -2418,8 +2812,11 @@ def test_command_service_why_recent_context_reads_decision_memory_safely_text_on
     result = service.poll_once()
     rendered = "\n".join(call["body"] for call in calls)
 
-    assert result.processed_count == 3
+    assert result.processed_count == 4
     assert result.error_count == 0
+    assert service.archive.calls == []
+    assert state_path.read_text(encoding="utf-8") == state_before
+    assert state_path.stat().st_mtime_ns == state_mtime_before_ns
     assert "Parking decision memory for right_spot" in rendered
     assert "accepted parked vehicle evidence" in rendered
     assert "hit_streak: 4" in rendered
@@ -2686,6 +3083,8 @@ def test_command_service_lab_context_routes_to_manager_safely_text_only(tmp_path
         "!parking config verbose",
         "!parking latest ../debug_latest.jpg",
         "!parking why ../state.json",
+        "!parking explain ../state.json",
+        "!parking explain right_spot extra",
         "!parking recent now",
         "!parking confidence now",
         "!parking lab run replay; rm -rf /",

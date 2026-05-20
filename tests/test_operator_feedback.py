@@ -82,6 +82,31 @@ def test_feedback_label_serialization_rejects_invalid_reported_or_actual_state()
         _sample_feedback_label(actual_state="available").to_json_dict()
 
 
+def test_feedback_label_category_metadata_is_optional_backward_compatible_and_validated() -> None:
+    from parking_spot_monitor.operator_feedback import FeedbackLabelSchemaError
+
+    legacy_payload = _sample_feedback_label().to_json_dict()
+    assert "feedback_category" not in legacy_payload
+    assert "feedback_category_details" not in legacy_payload
+
+    categorized = _sample_feedback_label(
+        feedback_category="false_alert",
+        feedback_category_details={
+            "reported_state": "occupied",
+            "actual_state": "open",
+            "operator": "@operator:example",
+        },
+    ).to_json_dict()
+
+    assert categorized["feedback_category"] == "false_alert"
+    assert categorized["feedback_category_details"]["reported_state"] == "occupied"
+    assert categorized["feedback_category_details"]["actual_state"] == "open"
+    assert categorized["feedback_category_details"]["operator"].startswith("sha256:")
+
+    with pytest.raises(FeedbackLabelSchemaError):
+        _sample_feedback_label(feedback_category="generic_feedback").to_json_dict()
+
+
 def test_feedback_label_load_quarantines_invalid_state(tmp_path: Path) -> None:
     from parking_spot_monitor.operator_feedback import load_feedback_labels
 
@@ -281,6 +306,8 @@ def test_labeler_records_correction_from_latest_alert_with_retained_snapshot(tmp
     assert len(loaded.labels) == 1
     assert loaded.labels[0].reported_state == "occupied"
     assert loaded.labels[0].actual_state == "open"
+    assert loaded.labels[0].feedback_category == "false_alert"
+    assert loaded.labels[0].feedback_category_details == {"reported_state": "occupied", "actual_state": "open"}
     assert loaded.labels[0].operator_sender_hash.startswith("sha256:")
     assert "@operator:example" not in (tmp_path / "operator-feedback-labels.json").read_text(encoding="utf-8")
 
@@ -352,6 +379,9 @@ def test_labeler_repeats_duplicate_correction_ack_without_duplicate_label_or_mem
     loaded_memory = load_decision_memory(memory_path)
     feedback_records = [record for record in loaded_memory.records if record.kind == "feedback"]
     assert len(feedback_records) == 1
+    assert feedback_records[0].details is not None
+    assert feedback_records[0].details["feedback_category"] == "false_alert"
+    assert feedback_records[0].details["feedback_category_details"] == {"reported_state": "occupied", "actual_state": "open"}
 
 
 def test_labeler_binds_correction_to_latest_sent_alert_not_newer_failed_alert(tmp_path: Path) -> None:
@@ -523,6 +553,8 @@ def test_learn_feedback_label_serializes_safe_replay_context_and_hashes_matrix_i
     assert stored["evidence"]["path"] == "timeline/left_spot/2026-05-16T18-00-00Z.jpg"
     assert len(stored["replay_context"]) == 3
     assert stored["source_metadata"]["command"] == "learn"
+    assert stored["feedback_category"] == "missed_alert"
+    assert stored["feedback_category_details"] == {"target_state": "open"}
 
     loaded = load_feedback_labels(path)
     assert loaded.state == "available"
@@ -767,6 +799,8 @@ def test_labeler_records_learn_label_from_retained_timeline_replay_without_state
     assert label.evidence.path == "timeline/frames/20260518T023900Z.jpg"
     assert label.source_metadata is not None
     assert label.source_metadata["frame_delta_seconds"] == "0"
+    assert label.feedback_category == "missed_alert"
+    assert label.feedback_category_details == {"target_state": "occupied"}
     rendered = feedback_labels_path(tmp_path).read_text(encoding="utf-8")
     assert str(tmp_path) not in rendered
     _assert_no_sensitive_text(rendered)
@@ -781,6 +815,8 @@ def test_labeler_records_learn_label_from_retained_timeline_replay_without_state
     assert len(feedback_records) == 1
     assert feedback_records[0].details is not None
     assert feedback_records[0].details["label_id"] == label.label_id
+    assert feedback_records[0].details["feedback_category"] == "missed_alert"
+    assert feedback_records[0].details["feedback_category_details"] == {"target_state": "occupied", "requested_at": "2026-05-18T02:39:00Z"}
 
 
 def test_labeler_repeats_duplicate_learn_ack_without_duplicate_label_or_memory(tmp_path: Path) -> None:
@@ -824,7 +860,10 @@ def test_labeler_repeats_duplicate_learn_ack_without_duplicate_label_or_memory(t
     assert "already applied" in second.reply_text.lower()
     assert second.spot_id == "left_spot"
     assert second.target_state == "open"
-    assert len(load_feedback_labels(feedback_labels_path(tmp_path)).labels) == 1
+    loaded_duplicate_labels = load_feedback_labels(feedback_labels_path(tmp_path)).labels
+    assert len(loaded_duplicate_labels) == 1
+    assert loaded_duplicate_labels[0].feedback_category == "missed_alert"
+    assert loaded_duplicate_labels[0].feedback_category_details == {"target_state": "open"}
     feedback_records = [record for record in load_decision_memory(tmp_path / "operator-decision-memory.json").records if record.kind == "feedback"]
     assert len(feedback_records) == 1
 

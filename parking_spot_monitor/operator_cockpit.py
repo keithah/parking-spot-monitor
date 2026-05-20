@@ -16,6 +16,7 @@ from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.incident_review import build_incident_replay
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
 from parking_spot_monitor.matrix import MatrixCommandResponse
+from parking_spot_monitor.occupancy_analytics import analyze_occupancy
 from parking_spot_monitor.paths import resolve_runtime_paths
 
 MAX_REPLY_BYTES = 4096
@@ -475,6 +476,130 @@ def format_operator_confidence_reply(
     lines.append("Read-only: no detector, camera, media upload, alert emission, or state mutation was run.")
     return _bounded_reply(lines)
 
+
+
+def format_operator_analytics_reply(
+    *,
+    data_dir: str | Path,
+    window: str = "7d",
+    now: datetime | None = None,
+    detector: Any | None = None,
+    health_path: str | Path | None = None,
+    state_path: str | Path | None = None,
+    logger: StructuredLogger | None = None,
+) -> str:
+    """Format bounded spot-level historical occupancy analytics from local vehicle-history JSON only."""
+
+    del detector, health_path, state_path
+    observed_now = _utc_now(now)
+    root = Path(data_dir)
+    closed_sessions, closed_invalid = _load_vehicle_history_session_dicts(root / "vehicle-history" / "sessions" / "closed", logger=logger)
+    active_sessions, active_invalid = _load_vehicle_history_session_dicts(root / "vehicle-history" / "sessions" / "active", logger=logger)
+    invalid_placeholders = [{} for _ in range(closed_invalid + active_invalid)]
+    try:
+        result = analyze_occupancy(
+            [*closed_sessions, *invalid_placeholders],
+            active_sessions=active_sessions,
+            window=window,
+            now=observed_now,
+        )
+    except ValueError:
+        safe_window = _text(window, default="unknown")
+        return _bounded_reply([
+            "Parking occupancy analytics unavailable",
+            f"Window: {safe_window}",
+            "Unsupported window; use today, 7d, 30d, or all.",
+            "No detector, camera, Matrix media upload, alert emission, or state mutation was run.",
+        ])
+
+    lines = [
+        "Parking occupancy analytics",
+        f"Window: {result.window.label} ({result.window.started_at or 'beginning'} to {result.window.ended_at})",
+        "Source: local vehicle-history sessions; sparse local history can make these metrics noisy.",
+        (
+            f"Totals: sessions {result.session_count}; closed {result.closed_session_count}; "
+            f"active {result.active_session_count}; occupied spots {result.current_occupied_spot_count}."
+        ),
+    ]
+
+    if result.spots:
+        lines.append("Spots:")
+        for metric in list(result.spots.values())[:MAX_LINES_PER_SECTION]:
+            state = "currently occupied" if metric.currently_occupied else "currently open"
+            dwell = _duration_label(metric.average_dwell_seconds) if metric.average_dwell_seconds is not None else "n/a"
+            longest = _duration_label(metric.longest_session_seconds) if metric.longest_session_seconds is not None else "n/a"
+            lines.append(
+                f"- {metric.spot_id}: sessions {metric.session_count}; active {metric.active_session_count}; {state}; "
+                f"occupied {_duration_label(metric.occupied_duration_seconds)}; average dwell {dwell}; longest {longest}"
+            )
+    else:
+        lines.append("No vehicle-history sessions overlap the selected window.")
+
+    diagnostics = [*result.diagnostics]
+    for metric in result.spots.values():
+        diagnostics.extend(metric.diagnostics)
+    if diagnostics:
+        lines.append("Caveats:")
+        seen: set[str] = set()
+        for diagnostic in diagnostics[:MAX_LINES_PER_SECTION]:
+            message = _text(_mapping(diagnostic).get("message"), default="analytics caveat unavailable")
+            if message in seen:
+                continue
+            seen.add(message)
+            lines.append(f"- {message}")
+    if closed_invalid + active_invalid:
+        count = closed_invalid + active_invalid
+        noun = "session" if count == 1 else "sessions"
+        lines.append(f"- {count} malformed vehicle-history {noun} ignored during local archive scan.")
+
+    lines.append("Read-only: local vehicle-history JSON was scanned; no detector, camera, Matrix media upload, alert emission, or state mutation was run.")
+    lines.append("No detector, camera, Matrix media upload, alert emission, or state mutation was run.")
+    return _bounded_reply(lines)
+
+
+def _load_vehicle_history_session_dicts(directory: Path, *, logger: StructuredLogger | None) -> tuple[list[Mapping[str, Any]], int]:
+    try:
+        paths = sorted(path for path in directory.glob("*.json") if path.is_file())
+    except OSError as exc:
+        _log_load_problem(logger, label="vehicle_history", reason="scan_error", error_type=exc.__class__.__name__)
+        return [], 1
+    records: list[Mapping[str, Any]] = []
+    invalid_count = 0
+    for path in paths[: MAX_LINES_PER_SECTION * 20]:
+        try:
+            if path.stat().st_size > MAX_FILE_BYTES:
+                invalid_count += 1
+                continue
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            invalid_count += 1
+            continue
+        if isinstance(payload, Mapping):
+            records.append(dict(payload))
+        else:
+            invalid_count += 1
+    if len(paths) > MAX_LINES_PER_SECTION * 20:
+        invalid_count += len(paths) - (MAX_LINES_PER_SECTION * 20)
+    return records, invalid_count
+
+
+def _duration_label(seconds: int | None) -> str:
+    if seconds is None:
+        return "n/a"
+    remaining = max(0, int(seconds))
+    if remaining < 60:
+        return f"{remaining}s"
+    minutes = remaining // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 48:
+        extra_minutes = minutes % 60
+        return f"{hours}h {extra_minutes}m" if extra_minutes else f"{hours}h"
+    days = hours // 24
+    extra_hours = hours % 24
+    return f"{days}d {extra_hours}h" if extra_hours else f"{days}d"
 
 
 def _matrix_outbox_status_lines(matrix_outbox_path: str | Path | None, *, logger: StructuredLogger | None) -> list[str]:
