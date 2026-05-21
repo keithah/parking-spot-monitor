@@ -1192,17 +1192,18 @@ def test_operator_cockpit_analytics_reply_formats_archive_metrics_and_window_lab
 
     assert "Parking occupancy analytics" in reply
     assert "Window: today" in reply
-    assert "2026-05-20T00:00:00Z" in reply
-    assert "2026-05-20T12:00:00Z" in reply
-    assert "local vehicle-history sessions" in reply
-    assert "left_spot" in reply
-    assert "sessions 2" in reply
-    assert "active 1" in reply
-    assert "currently occupied" in reply
-    assert "occupied 3h" in reply
-    assert "average dwell 2h" in reply
+    assert "Range: 2026-05-20T00:00:00Z → 2026-05-20T12:00:00Z" in reply
+    assert "Source: local vehicle-history sessions" in reply
+    assert "Totals\n- Sessions: 2\n- Closed: 1\n- Active: 1\n- Currently occupied spots: 1" in reply
+    assert "Spots\nleft_spot" in reply
+    assert "- Sessions: 2" in reply
+    assert "- Active: 1" in reply
+    assert "- Status: occupied" in reply
+    assert "- Occupied: 3h" in reply
+    assert "- Average dwell: 2h" in reply
     assert "right_spot" not in reply
-    assert "No detector, camera, Matrix media upload, alert emission, or state mutation was run." in reply
+    assert "Read-only\nScanned local vehicle-history JSON only. No detector, camera, Matrix media upload, alert emission, or state mutation was run." in reply
+    assert reply.count("No detector, camera, Matrix media upload, alert emission, or state mutation was run.") == 1
     assert len(reply.encode("utf-8")) <= 4096
     _assert_no_sensitive_text(reply)
 
@@ -1250,6 +1251,32 @@ def test_operator_cockpit_analytics_reply_degrades_for_empty_sparse_and_malforme
     assert "No detector, camera, Matrix media upload, alert emission, or state mutation was run." in malformed
     assert len(malformed.encode("utf-8")) <= 4096
     _assert_no_sensitive_text(malformed)
+
+
+def test_operator_cockpit_analytics_reply_sanitizes_archive_spot_ids(tmp_path: Path) -> None:
+    from parking_spot_monitor.operator_cockpit import format_operator_analytics_reply
+
+    raw_spot_id = "/var/lib/parking/private/latest.jpg"
+    _write_vehicle_history_session(
+        tmp_path,
+        state="closed",
+        session_id="path-like-spot",
+        spot_id=raw_spot_id,
+        started_at="2026-05-20T08:00:00Z",
+        ended_at="2026-05-20T08:30:00Z",
+        duration_seconds=1_800,
+    )
+
+    reply = format_operator_analytics_reply(
+        data_dir=tmp_path,
+        window="today",
+        now=datetime(2026, 5, 20, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert raw_spot_id not in reply
+    assert "/var/lib" not in reply
+    assert "unknown_spot" in reply
+    _assert_no_sensitive_text(reply)
 
 
 def test_operator_cockpit_analytics_reply_is_read_only_local_and_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

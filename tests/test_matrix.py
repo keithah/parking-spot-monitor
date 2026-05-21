@@ -2702,8 +2702,8 @@ def test_command_service_analytics_context_reads_vehicle_history_text_only_and_d
     body = calls[0]["body"]
     assert "Parking occupancy analytics" in body
     assert "Window: all" in body
-    assert "left_spot: sessions 1" in body
-    assert "right_spot: sessions 1" in body
+    assert "left_spot\n- Sessions: 1" in body
+    assert "\n\nright_spot\n- Sessions: 1" in body
     assert "malformed vehicle-history session ignored" in body
     assert "No detector, camera, Matrix media upload, alert emission, or state mutation was run." in body
     assert len(body.encode("utf-8")) <= 4096

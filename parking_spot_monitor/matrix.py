@@ -234,6 +234,7 @@ class MatrixDelivery:
         snapshots_dir: str | Path | None,
         logger: StructuredLogger,
         snapshot_retention_count: int = 50,
+        protected_snapshots_provider: Callable[[], Sequence[str | Path]] | None = None,
     ) -> None:
         self.client = client
         self.room_id = room_id
@@ -241,6 +242,7 @@ class MatrixDelivery:
         self.snapshots_dir = Path(snapshots_dir) if snapshots_dir is not None else None
         self.logger = logger
         self.snapshot_retention_count = snapshot_retention_count
+        self._protected_snapshots_provider = protected_snapshots_provider
 
     def send_quiet_window_notice(self, event: Mapping[str, Any]) -> None:
         event_id = _require_non_empty("event_id", str(event.get("event_id", "")))
@@ -264,6 +266,7 @@ class MatrixDelivery:
             snapshot_retention_count=self.snapshot_retention_count,
             logger=self.logger,
             retention_trigger="matrix-event",
+            protected_snapshots=self._protected_snapshots(),
         )
         self.logger.info("matrix-snapshot-copied", **snapshot.log_context, txn_id=snapshot.txn_id)
         upload = _matrix_snapshot_upload(snapshot, logger=self.logger)
@@ -320,6 +323,7 @@ class MatrixDelivery:
                 snapshot_retention_count=self.snapshot_retention_count,
                 logger=self.logger,
                 retention_trigger="matrix-event",
+                protected_snapshots=self._protected_snapshots(),
             )
             if self.logger is not None:
                 self.logger.info("matrix-snapshot-copied", **snapshot.log_context, txn_id=snapshot.txn_id)
@@ -363,6 +367,11 @@ class MatrixDelivery:
             txn_id=owner_vehicle_quiet_window_event_id(event),
             body=format_owner_vehicle_quiet_window_alert(event),
         )
+
+    def _protected_snapshots(self) -> Sequence[str | Path]:
+        if self._protected_snapshots_provider is None:
+            return ()
+        return tuple(self._protected_snapshots_provider())
 
     def send_live_proof(self, *, latest_path: str | Path, observed_at: object, selected_mode: object) -> None:
         self.send_live_proof_text(observed_at=observed_at, selected_mode=selected_mode)

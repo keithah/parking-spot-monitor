@@ -19,6 +19,7 @@ from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_tex
 from parking_spot_monitor.matrix import (
     JPEG_MIMETYPE,
     OPEN_SPOT_EVENT_TYPE,
+    MatrixDelivery,
     MatrixError,
     MatrixSnapshot,
     _matrix_snapshot_upload,
@@ -60,6 +61,35 @@ class MatrixOutboxDelivery:
         self.outbox = outbox
         self.logger = logger
         self.snapshot_retention_count = snapshot_retention_count
+        self._immediate_delivery = MatrixDelivery(
+            client=client,
+            room_id=room_id,
+            data_dir=self.data_dir,
+            snapshots_dir=self.snapshots_dir,
+            logger=logger,
+            snapshot_retention_count=snapshot_retention_count,
+            protected_snapshots_provider=self._retryable_retained_snapshots,
+        )
+
+    def send_occupied_spot_alert(self, event: Mapping[str, Any]) -> MatrixSnapshot:
+        """Send occupied alerts through the immediate Matrix path.
+
+        Open-spot alerts stay durable/outbox-backed; occupied alerts are
+        evidence notifications for vehicle-history session starts and use the
+        existing immediate delivery behavior.
+        """
+
+        return self._immediate_delivery.send_occupied_spot_alert(event)
+
+    def send_quiet_window_notice(self, event: Mapping[str, Any]) -> str:
+        """Send quiet-window notices through the immediate Matrix path."""
+
+        return self._immediate_delivery.send_quiet_window_notice(event)
+
+    def send_owner_vehicle_quiet_window_alert(self, event: Mapping[str, Any]) -> str:
+        """Send owner-vehicle quiet-window alerts through the immediate Matrix path."""
+
+        return self._immediate_delivery.send_owner_vehicle_quiet_window_alert(event)
 
     def send_open_spot_alert(self, event: Mapping[str, Any]) -> MatrixOutboxDrainResult:
         """Persist an open alert before Matrix I/O, then drain retryable work."""

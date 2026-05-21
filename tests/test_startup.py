@@ -3524,7 +3524,7 @@ class UploadFailsOnceMatrixClient(FakeMatrixClient):
         self.fail_upload = True
 
     def upload_image(self, *, filename: str, data: bytes, content_type: str) -> str:
-        if self.fail_upload:
+        if self.fail_upload and filename.startswith("occupancy-open-event-"):
             self.fail_upload = False
             raise RuntimeError(f"matrix upload failed {SECRET_MARKER}")
         return super().upload_image(filename=filename, data=data, content_type=content_type)
@@ -3572,9 +3572,12 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
     assert phases["text"]["state"] == "delivered"
     assert phases["upload"]["state"] == "pending"
     assert phases["image"]["state"] == "pending"
-    assert len(matrix_client.texts) == 1
-    assert matrix_client.uploads == []
-    assert matrix_client.images == []
+    occupancy_text_kinds = [text["txn_id"].split(":", 1)[0] for text in matrix_client.texts if text["txn_id"].startswith("occupancy-")]
+    assert occupancy_text_kinds == ["occupancy-occupied-event", "occupancy-open-event"]
+    assert len(matrix_client.uploads) == 1
+    assert matrix_client.uploads[0]["filename"].startswith("occupancy-occupied-event-")
+    assert len(matrix_client.images) == 1
+    assert matrix_client.images[0]["txn_id"].startswith("occupancy-occupied-event:")
     assert '"event":"matrix-delivery-failed"' in output
     assert '"error_type":"retrying_records"' in output
     assert '"event":"matrix-outbox-phase-retryable-failure"' in output

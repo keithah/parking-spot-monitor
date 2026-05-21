@@ -35,6 +35,22 @@ def open_event(snapshot_path: Path) -> dict[str, Any]:
     }
 
 
+def occupied_event(snapshot_path: Path) -> dict[str, Any]:
+    return {
+        "event_type": "occupancy-occupied-event",
+        "spot_id": "left_spot",
+        "previous_status": "empty",
+        "new_status": "occupied",
+        "observed_at": datetime(2026, 5, 20, 21, 22, 54, tzinfo=timezone.utc),
+        "source_timestamp": "2026-05-20T21:22:54Z",
+        "event_id": "occupancy-state-changed:left_spot:2026-05-20T21:22:54Z",
+        "session_id": "sess_left-spot_2026-05-20t21-22-54-187227-00-00",
+        "occupied_snapshot_path": str(snapshot_path),
+        "likely_vehicle": {"label": "unknown vehicle"},
+        "vehicle_history_estimate": {"status": "insufficient_history", "sample_count": 0},
+    }
+
+
 class FakeMatrixClient:
     def __init__(self, *, fail: dict[str, Exception] | None = None, on_send_text: Any | None = None) -> None:
         self.fail = fail or {}
@@ -87,6 +103,27 @@ def make_delivery(
         logger=StructuredLogger(stream=stream) if stream is not None else None,
         snapshot_retention_count=snapshot_retention_count,
     )
+
+
+def test_occupied_alert_sends_immediately_without_open_outbox_record(tmp_path: Path) -> None:
+    source = tmp_path / "occupied.jpg"
+    source_bytes = write_jpeg(source, color=(110, 25, 80))
+    client = FakeMatrixClient()
+    delivery = make_delivery(tmp_path, client)
+
+    snapshot = delivery.send_occupied_spot_alert(occupied_event(source))
+
+    assert [call["kind"] for call in client.calls] == ["text", "upload", "image"]
+    assert client.calls[0]["txn_id"].startswith("occupancy-occupied-event:left_spot:")
+    assert client.calls[0]["txn_id"].endswith(":text")
+    assert client.calls[1]["filename"].startswith("occupancy-occupied-event-left-spot-")
+    assert client.calls[1]["data"] == source_bytes
+    assert client.calls[1]["content_type"] == "image/jpeg"
+    assert client.calls[2]["txn_id"].startswith("occupancy-occupied-event:left_spot:")
+    assert client.calls[2]["txn_id"].endswith(":image")
+    assert snapshot.path.exists()
+    assert snapshot.path.name.startswith("occupancy-occupied-event-left-spot-")
+    assert LocalOutbox(tmp_path / "matrix-outbox.json").list_records() == []
 
 
 def test_text_failure_persists_three_phase_record_before_network_and_leaves_text_pending(tmp_path: Path) -> None:
@@ -148,6 +185,26 @@ def test_text_retry_uploads_retained_event_snapshot_not_changed_latest(tmp_path:
     assert len(uploads) == 1
     assert uploads[0]["data"] == original_bytes
     assert uploads[0]["data"] != changed_bytes
+
+
+def test_occupied_alert_retention_preserves_retryable_open_outbox_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    first_bytes = write_jpeg(source, color=(25, 50, 75))
+    store_path = tmp_path / "matrix-outbox.json"
+
+    first_client = FakeMatrixClient(fail={"text": MatrixError("timeout", error_type="timeout")})
+    make_delivery(tmp_path, first_client, snapshot_retention_count=1).send_open_spot_alert(open_event(source))
+    [retrying] = LocalOutbox(store_path).list_records()
+    protected_path = Path(str(retrying.intent.metadata["retained_snapshot_path"]))
+    assert protected_path.exists()
+    assert protected_path.read_bytes() == first_bytes
+
+    occupied_source = tmp_path / "occupied.jpg"
+    write_jpeg(occupied_source, color=(90, 20, 120))
+    make_delivery(tmp_path, FakeMatrixClient(), snapshot_retention_count=1).send_occupied_spot_alert(occupied_event(occupied_source))
+
+    assert protected_path.exists()
+    assert protected_path.read_bytes() == first_bytes
 
 
 def test_snapshot_retention_preserves_retryable_outbox_evidence_while_pruning_unprotected(tmp_path: Path) -> None:

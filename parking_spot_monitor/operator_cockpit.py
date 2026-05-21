@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -514,26 +515,37 @@ def format_operator_analytics_reply(
 
     lines = [
         "Parking occupancy analytics",
-        f"Window: {result.window.label} ({result.window.started_at or 'beginning'} to {result.window.ended_at})",
+        f"Window: {result.window.label}",
+        f"Range: {result.window.started_at or 'beginning'} → {result.window.ended_at}",
         "Source: local vehicle-history sessions; sparse local history can make these metrics noisy.",
-        (
-            f"Totals: sessions {result.session_count}; closed {result.closed_session_count}; "
-            f"active {result.active_session_count}; occupied spots {result.current_occupied_spot_count}."
-        ),
+        "",
+        "Totals",
+        f"- Sessions: {result.session_count}",
+        f"- Closed: {result.closed_session_count}",
+        f"- Active: {result.active_session_count}",
+        f"- Currently occupied spots: {result.current_occupied_spot_count}",
     ]
 
+    spot_labels = {metric.spot_id: _analytics_spot_label(metric.spot_id) for metric in result.spots.values()}
     if result.spots:
-        lines.append("Spots:")
-        for metric in list(result.spots.values())[:MAX_LINES_PER_SECTION]:
-            state = "currently occupied" if metric.currently_occupied else "currently open"
+        lines.extend(["", "Spots"])
+        for index, metric in enumerate(list(result.spots.values())[:MAX_LINES_PER_SECTION]):
+            if index:
+                lines.append("")
+            state = "occupied" if metric.currently_occupied else "open"
             dwell = _duration_label(metric.average_dwell_seconds) if metric.average_dwell_seconds is not None else "n/a"
             longest = _duration_label(metric.longest_session_seconds) if metric.longest_session_seconds is not None else "n/a"
-            lines.append(
-                f"- {metric.spot_id}: sessions {metric.session_count}; active {metric.active_session_count}; {state}; "
-                f"occupied {_duration_label(metric.occupied_duration_seconds)}; average dwell {dwell}; longest {longest}"
-            )
+            lines.extend([
+                spot_labels.get(metric.spot_id, "unknown_spot"),
+                f"- Sessions: {metric.session_count}",
+                f"- Active: {metric.active_session_count}",
+                f"- Status: {state}",
+                f"- Occupied: {_duration_label(metric.occupied_duration_seconds)}",
+                f"- Average dwell: {dwell}",
+                f"- Longest dwell: {longest}",
+            ])
     else:
-        lines.append("No vehicle-history sessions overlap the selected window.")
+        lines.extend(["", "No vehicle-history sessions overlap the selected window."])
 
     diagnostics = [*result.diagnostics]
     for metric in result.spots.values():
@@ -542,7 +554,7 @@ def format_operator_analytics_reply(
         lines.append("Caveats:")
         seen: set[str] = set()
         for diagnostic in diagnostics[:MAX_LINES_PER_SECTION]:
-            message = _text(_mapping(diagnostic).get("message"), default="analytics caveat unavailable")
+            message = _analytics_diagnostic_message(_mapping(diagnostic).get("message"), spot_labels)
             if message in seen:
                 continue
             seen.add(message)
@@ -552,9 +564,32 @@ def format_operator_analytics_reply(
         noun = "session" if count == 1 else "sessions"
         lines.append(f"- {count} malformed vehicle-history {noun} ignored during local archive scan.")
 
-    lines.append("Read-only: local vehicle-history JSON was scanned; no detector, camera, Matrix media upload, alert emission, or state mutation was run.")
-    lines.append("No detector, camera, Matrix media upload, alert emission, or state mutation was run.")
+    lines.extend([
+        "",
+        "Read-only",
+        "Scanned local vehicle-history JSON only. No detector, camera, Matrix media upload, alert emission, or state mutation was run.",
+    ])
     return _bounded_reply(lines)
+
+
+_SAFE_ANALYTICS_SPOT_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+
+
+def _analytics_spot_label(value: object) -> str:
+    text = _text(value, default="unknown_spot")[:80]
+    if not _SAFE_ANALYTICS_SPOT_RE.fullmatch(text):
+        return "unknown_spot"
+    if ".." in text:
+        return "unknown_spot"
+    return text
+
+
+def _analytics_diagnostic_message(value: object, spot_labels: Mapping[str, str]) -> str:
+    message = _text(value, default="analytics caveat unavailable")
+    for raw, safe in sorted(spot_labels.items(), key=lambda item: len(item[0]), reverse=True):
+        if raw and raw != safe:
+            message = message.replace(raw, safe)
+    return message
 
 
 def _load_vehicle_history_session_dicts(directory: Path, *, logger: StructuredLogger | None) -> tuple[list[Mapping[str, Any]], int]:
@@ -1294,7 +1329,7 @@ def _age_label(value: datetime | None, now: datetime) -> str:
 
 
 def _bounded_reply(lines: Sequence[str]) -> str:
-    rendered = redact_diagnostic_text("\n".join(_bounded_lines(lines)))
+    rendered = "\n".join(_bounded_lines(lines))
     encoded = rendered.encode("utf-8")
     if len(encoded) <= MAX_REPLY_BYTES:
         return rendered
