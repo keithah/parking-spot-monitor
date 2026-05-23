@@ -53,6 +53,25 @@ data/m002-validation/m002-validation-package.md
 # Private S07 real-traffic evidence: labels, proposed configs, replay/tuning outputs, and coverage summaries
 data/s07-replay-evidence/
 
+# Local camera media and screenshots
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tif
+*.tiff
+*.heic
+*.heif
+*.avif
+*.mp4
+*.mov
+*.m4v
+*.avi
+*.mkv
+*.webm
+
 # ── GSD baseline (auto-generated) ──
 .gsd
 .gsd-id
