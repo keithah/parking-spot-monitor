@@ -91,6 +91,11 @@ class MatrixOutboxDelivery:
 
         return self._immediate_delivery.send_owner_vehicle_quiet_window_alert(event)
 
+    def send_lifecycle_notice(self, event: Mapping[str, Any]) -> str:
+        """Send monitor lifecycle notices through the immediate Matrix path."""
+
+        return self._immediate_delivery.send_lifecycle_notice(event)
+
     def send_open_spot_alert(self, event: Mapping[str, Any]) -> MatrixOutboxDrainResult:
         """Persist an open alert before Matrix I/O, then drain retryable work."""
 

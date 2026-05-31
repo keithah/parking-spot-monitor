@@ -25,6 +25,9 @@ JPEG_MIMETYPE = "image/jpeg"
 OPEN_SPOT_EVENT_TYPE = "occupancy-open-event"
 OCCUPIED_SPOT_EVENT_TYPE = "occupancy-occupied-event"
 OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE = "owner-vehicle-quiet-window-alert"
+MONITOR_STARTED_EVENT_TYPE = "parking-monitor-started"
+MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE = "parking-monitor-shutdown-requested"
+LIFECYCLE_EVENT_TYPES = frozenset({MONITOR_STARTED_EVENT_TYPE, MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE})
 DISPLAY_TIMEZONE = ZoneInfo("America/Los_Angeles")
 MAX_MATRIX_UPLOAD_IMAGE_BYTES = 300_000
 MATRIX_UPLOAD_INITIAL_MAX_DIMENSION = 960
@@ -367,6 +370,18 @@ class MatrixDelivery:
             txn_id=owner_vehicle_quiet_window_event_id(event),
             body=format_owner_vehicle_quiet_window_alert(event),
         )
+
+    def send_lifecycle_notice(self, event: Mapping[str, Any]) -> str:
+        event_type = str(event.get("event_type", ""))
+        if event_type not in LIFECYCLE_EVENT_TYPES:
+            raise MatrixError(
+                "Matrix lifecycle event type is unsupported",
+                error_type="unsupported_lifecycle_event",
+                event_type=event_type,
+                event_id=str(event.get("event_id", "")),
+            )
+        event_id = _require_non_empty("event_id", str(event.get("event_id", "")))
+        return self.client.send_text(room_id=self.room_id, txn_id=event_id, body=format_lifecycle_notice(event))
 
     def _protected_snapshots(self) -> Sequence[str | Path]:
         if self._protected_snapshots_provider is None:
@@ -1627,6 +1642,34 @@ def prune_event_snapshots(
     )
 
 
+def monitor_lifecycle_event_id(
+    *,
+    event_type: str,
+    observed_at: str,
+    signal: str | None = None,
+) -> str:
+    if signal:
+        return f"{event_type}:{signal}:{observed_at}"
+    return f"{event_type}:{observed_at}"
+
+
+def monitor_lifecycle_event(
+    event_type: str,
+    observed_at: datetime,
+    *,
+    signal: str | None = None,
+) -> dict[str, Any]:
+    observed_at_text = _format_observed_at(observed_at)
+    event: dict[str, Any] = {
+        "event_type": event_type,
+        "observed_at": observed_at_text,
+        "event_id": monitor_lifecycle_event_id(event_type=event_type, observed_at=observed_at_text, signal=signal),
+    }
+    if signal is not None:
+        event["signal"] = signal
+    return event
+
+
 def open_spot_event_id(event: Mapping[str, Any]) -> str:
     """Return the stable Matrix transaction base for a confirmed open event."""
 
@@ -1958,6 +2001,22 @@ def format_quiet_window_notice(event: Mapping[str, Any]) -> str:
     else:
         verb = event_type
     return f"Street sweeping {verb}: {window_id}"
+
+
+def format_lifecycle_notice(event: Mapping[str, Any]) -> str:
+    event_type = _require_non_empty("event_type", str(event.get("event_type", "")))
+    observed_at = _display_observed_at(event.get("observed_at"))
+    if event_type == MONITOR_STARTED_EVENT_TYPE:
+        return f"Parking monitor started at {observed_at}."
+    if event_type == MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE:
+        signal_name = _safe_text(event.get("signal"), default="shutdown signal")
+        return f"Parking monitor shutdown requested by {signal_name} at {observed_at}."
+    raise MatrixError(
+        "Matrix lifecycle event type is unsupported",
+        error_type="unsupported_lifecycle_event",
+        event_type=event_type,
+        event_id=str(event.get("event_id", "")),
+    )
 
 
 def _format_lead_time(minutes: int) -> str:

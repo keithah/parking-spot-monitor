@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -147,6 +148,7 @@ class FakeMatrixDelivery:
         self.occupied_alerts: list[dict[str, Any]] = []
         self.live_proofs: list[dict[str, Any]] = []
         self.owner_alerts: list[dict[str, Any]] = []
+        self.lifecycle_notices: list[dict[str, Any]] = []
 
     def send_quiet_window_notice(self, event: dict[str, Any]) -> None:
         self.quiet_notices.append(dict(event))
@@ -170,6 +172,11 @@ class FakeMatrixDelivery:
 
     def send_owner_vehicle_quiet_window_alert(self, event: dict[str, Any]) -> None:
         self.owner_alerts.append(dict(event))
+        if self.fail:
+            raise RuntimeError(f"matrix failure {SECRET_MARKER}")
+
+    def send_lifecycle_notice(self, event: dict[str, Any]) -> None:
+        self.lifecycle_notices.append(dict(event))
         if self.fail:
             raise RuntimeError(f"matrix failure {SECRET_MARKER}")
 
@@ -888,7 +895,7 @@ def test_runtime_loop_occupied_alert_sends_text_image_with_seeded_vehicle_estima
     active_payload = json.loads(active_files[0].read_text(encoding="utf-8"))
     snapshot_files = list((tmp_path / "snapshots").glob("occupancy-occupied-event-left-spot-*.jpg"))
     assert exit_code == 0
-    assert len(matrix_client.texts) == 2
+    assert len(matrix_client.texts) == 3
     assert len(matrix_client.uploads) == 1
     assert len(matrix_client.images) == 1
     assert len(snapshot_files) == 1
@@ -896,6 +903,8 @@ def test_runtime_loop_occupied_alert_sends_text_image_with_seeded_vehicle_estima
     assert matrix_client.uploads[0]["data"] == Path(active_payload["occupied_snapshot_path"]).read_bytes()
     reminder_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("quiet-window-upcoming:")]
     occupied_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("occupancy-occupied-event:")]
+    lifecycle_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("parking-monitor-started:")]
+    assert len(lifecycle_texts) == 1
     assert len(reminder_texts) == 1
     assert reminder_texts[0]["body"] == "Street sweeping starts in 1 hour: street_sweeping:2026-05-18:13:00-15:00"
     assert len(occupied_texts) == 1
@@ -2582,6 +2591,123 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
     assert_no_secret_leak(output)
 
 
+def test_runtime_loop_sends_matrix_startup_lifecycle_notice(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    delivery = FakeMatrixDelivery()
+
+    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+        return captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z")
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+        now=lambda: datetime(2026, 5, 18, 18, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    assert exit_code == 0
+    assert len(delivery.lifecycle_notices) == 1
+    notice = delivery.lifecycle_notices[0]
+    assert notice["event_type"] == "parking-monitor-started"
+    assert notice["observed_at"] == "2026-05-18T18:00:00Z"
+    assert notice["event_id"] == "parking-monitor-started:2026-05-18T18:00:00Z"
+    assert '"event":"parking-monitor-started"' in output
+    assert_no_secret_leak(output)
+
+
+def test_shutdown_signal_handler_records_flag_without_matrix_io(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from parking_spot_monitor.runtime_lifecycle import (
+        ShutdownState,
+        install_shutdown_signal_handlers,
+        restore_shutdown_signal_handlers,
+    )
+
+    state = ShutdownState()
+    previous = install_shutdown_signal_handlers(state, logger=StructuredLogger())
+    try:
+        handler = signal.getsignal(signal.SIGTERM)
+        handler(signal.SIGTERM, None)
+        handler(signal.SIGTERM, None)
+    finally:
+        restore_shutdown_signal_handlers(previous)
+
+    assert state.requested is True
+    assert state.signum == signal.SIGTERM
+    assert state.signal_name == "SIGTERM"
+    assert combined_output(capsys) == ""
+
+
+def test_dispatch_shutdown_lifecycle_notice_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from parking_spot_monitor.__main__ import _dispatch_matrix_event
+    from parking_spot_monitor.matrix import MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, monitor_lifecycle_event
+
+    delivery = FakeMatrixDelivery()
+    observed_at = datetime(2026, 5, 18, 18, 1, tzinfo=timezone.utc)
+    _dispatch_matrix_event(
+        delivery,
+        MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
+        monitor_lifecycle_event(MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, observed_at, signal="SIGTERM"),
+        logger=StructuredLogger(),
+        decision_memory_path=tmp_path / "operator-decision-memory.json",
+    )
+
+    output = combined_output(capsys)
+    assert len(delivery.lifecycle_notices) == 1
+    notice = delivery.lifecycle_notices[0]
+    assert notice["event_type"] == "parking-monitor-shutdown-requested"
+    assert notice["signal"] == "SIGTERM"
+    assert notice["event_id"] == "parking-monitor-shutdown-requested:SIGTERM:2026-05-18T18:01:00Z"
+    assert '"event":"parking-monitor-shutdown-requested"' in output
+    assert_no_secret_leak(output)
+
+
+def test_runtime_loop_shutdown_during_sleep_sends_one_shutdown_notice(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    delivery = FakeMatrixDelivery()
+    slept = False
+
+    def sleep_then_sigterm(_seconds: float) -> None:
+        nonlocal slept
+        if slept:
+            return
+        slept = True
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, data_dir: captured_frame(Path(data_dir)),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
+        sleep=sleep_then_sigterm,
+        max_iterations=3,
+        now=lambda: datetime(2026, 5, 18, 18, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    assert exit_code == 0
+    started = [notice for notice in delivery.lifecycle_notices if notice["event_type"] == "parking-monitor-started"]
+    shutdown = [notice for notice in delivery.lifecycle_notices if notice["event_type"] == "parking-monitor-shutdown-requested"]
+    assert len(started) == 1
+    assert len(shutdown) == 1
+    assert shutdown[0]["signal"] == "SIGTERM"
+    assert '"event":"capture-loop-shutdown-requested"' in output
+    assert_no_secret_leak(output)
+
+
 def test_runtime_loop_detection_failure_updates_health_without_advancing_state(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3636,7 +3762,8 @@ def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_eve
     assert phases["text"]["state"] == "delivered"
     assert phases["upload"]["state"] == "delivered"
     assert phases["image"]["state"] == "delivered"
-    assert successful_client.texts == []
+    assert [text for text in successful_client.texts if text["txn_id"].startswith("occupancy-open-event:")] == []
+    assert len([text for text in successful_client.texts if text["txn_id"].startswith("parking-monitor-started:")]) == 1
     assert len(successful_client.uploads) == 1
     assert len(successful_client.images) == 1
     assert '"event":"matrix-outbox-phase-skip"' in output
