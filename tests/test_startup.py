@@ -16,7 +16,8 @@ from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import load_decision_memory
 from parking_spot_monitor.matrix import MatrixDelivery, MatrixSnapshot
-from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _dispatch_matrix_event, _main, _matrix_outbox_health_payload, _presence_by_spot, main
+from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _main, _matrix_outbox_health_payload, _presence_by_spot, main
+from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 from parking_spot_monitor.detection import DetectionError, DetectionFilterResult, RejectedDetection, RejectionReason, SpotDetectionResult, VehicleDetection
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
@@ -213,7 +214,7 @@ def test_dispatch_matrix_open_alert_feedback_uses_retained_snapshot_not_latest(t
         "snapshot_path": str(latest_path),
     }
 
-    error = _dispatch_matrix_event(
+    error = dispatch_matrix_event(
         RetainedSnapshotDelivery(),
         "occupancy-open-event",
         event,
@@ -2649,12 +2650,12 @@ def test_shutdown_signal_handler_records_flag_without_matrix_io(
 def test_dispatch_shutdown_lifecycle_notice_once(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from parking_spot_monitor.__main__ import _dispatch_matrix_event
+    from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
     from parking_spot_monitor.matrix import MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, monitor_lifecycle_event
 
     delivery = FakeMatrixDelivery()
     observed_at = datetime(2026, 5, 18, 18, 1, tzinfo=timezone.utc)
-    _dispatch_matrix_event(
+    dispatch_matrix_event(
         delivery,
         MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
         monitor_lifecycle_event(MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, observed_at, signal="SIGTERM"),

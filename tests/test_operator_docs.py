@@ -930,6 +930,8 @@ def test_s04_docs_contract_stays_grounded_in_tracked_source_events() -> None:
             "docker-compose.yml",
             "config.yaml.example",
             "parking_spot_monitor/__main__.py",
+            "parking_spot_monitor/matrix_dispatch.py",
+            "parking_spot_monitor/runtime_lifecycle.py",
             "parking_spot_monitor/capture.py",
             "parking_spot_monitor/matrix.py",
             "parking_spot_monitor/state.py",
