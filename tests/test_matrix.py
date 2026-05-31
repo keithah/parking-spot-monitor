@@ -10,16 +10,21 @@ import pytest
 from PIL import Image
 
 from parking_spot_monitor.matrix import (
+    MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
+    MONITOR_STARTED_EVENT_TYPE,
     OCCUPIED_SPOT_EVENT_TYPE,
     OPEN_SPOT_EVENT_TYPE,
     MatrixClient,
     MatrixDelivery,
     MatrixError,
+    format_lifecycle_notice,
     format_live_proof_text,
     format_occupied_spot_alert,
     format_open_spot_alert,
     format_quiet_window_notice,
     format_owner_vehicle_quiet_window_alert,
+    monitor_lifecycle_event,
+    monitor_lifecycle_event_id,
     owner_vehicle_quiet_window_event_id,
     occupied_spot_event_id,
     prepare_event_snapshot,
@@ -574,6 +579,54 @@ def test_format_open_spot_alert_displays_12_hour_string_in_los_angeles_time() ->
     assert format_open_spot_alert({"spot_id": "right_spot", "observed_at": "2026-05-12T16:04:08.223073+00:00"}) == (
         "Parking spot open: right_spot at 2026-05-12 9:04:08 AM PDT"
     )
+
+
+def test_monitor_lifecycle_event_uses_canonical_observed_at_format() -> None:
+    observed_at = datetime(2026, 5, 18, 18, 0, tzinfo=timezone.utc)
+    event = monitor_lifecycle_event(MONITOR_STARTED_EVENT_TYPE, observed_at)
+
+    assert event["observed_at"] == "2026-05-18T18:00:00Z"
+    assert event["event_id"] == "parking-monitor-started:2026-05-18T18:00:00Z"
+
+
+def test_monitor_lifecycle_event_id_includes_signal_when_present() -> None:
+    assert (
+        monitor_lifecycle_event_id(
+            event_type=MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
+            observed_at="2026-05-18T18:01:00Z",
+            signal="SIGTERM",
+        )
+        == "parking-monitor-shutdown-requested:SIGTERM:2026-05-18T18:01:00Z"
+    )
+
+
+def test_format_lifecycle_notice_formats_started_and_shutdown_events() -> None:
+    assert (
+        format_lifecycle_notice(
+            {
+                "event_type": MONITOR_STARTED_EVENT_TYPE,
+                "observed_at": "2026-05-18T18:00:00Z",
+            }
+        )
+        == "Parking monitor started at 2026-05-18 11:00:00 AM PDT."
+    )
+    assert (
+        format_lifecycle_notice(
+            {
+                "event_type": MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
+                "observed_at": "2026-05-18T18:01:00Z",
+                "signal": "SIGTERM",
+            }
+        )
+        == "Parking monitor shutdown requested by SIGTERM at 2026-05-18 11:01:00 AM PDT."
+    )
+
+
+def test_format_lifecycle_notice_rejects_unsupported_event_type() -> None:
+    with pytest.raises(MatrixError) as exc_info:
+        format_lifecycle_notice({"event_type": "parking-monitor-unknown", "observed_at": "2026-05-18T18:00:00Z"})
+
+    assert exc_info.value.diagnostics["error_type"] == "unsupported_lifecycle_event"
 
 
 def test_prepare_event_snapshot_uses_data_dir_snapshots_fallback_and_sanitizes_ids(tmp_path: Path) -> None:

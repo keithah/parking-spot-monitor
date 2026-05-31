@@ -12,7 +12,7 @@ services:
       - ./data:/data
       # Optional read-only model mount for operators who pre-stage YOLO weights.
       #   - ./models:/models:ro
-    restart: "no"
+    restart: unless-stopped
     # Hardware decode passthrough for Intel QSV/VAAPI.
     # Hosts without /dev/dri should remove or override this device mapping.
     devices:
