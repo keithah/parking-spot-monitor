@@ -533,8 +533,9 @@ def test_operator_docs_include_timeline_frame_buffer_contract() -> None:
             "timeline-unavailable",
         ],
     )
+    capture_loop_source = read_tracked("parking_spot_monitor/capture_loop.py")
     assert_contains_all(
-        startup_source,
+        startup_source + capture_loop_source,
         [
             "record_timeline_frame",
             "timeline-frame-retained",
@@ -931,9 +932,13 @@ def test_s04_docs_contract_stays_grounded_in_tracked_source_events() -> None:
             "config.yaml.example",
             "parking_spot_monitor/__main__.py",
             "parking_spot_monitor/matrix_dispatch.py",
+            "parking_spot_monitor/capture_loop.py",
+            "parking_spot_monitor/runtime_health.py",
             "parking_spot_monitor/runtime_lifecycle.py",
             "parking_spot_monitor/capture.py",
             "parking_spot_monitor/matrix.py",
+            "parking_spot_monitor/matrix_snapshots.py",
+            "parking_spot_monitor/matrix_alerts.py",
             "parking_spot_monitor/state.py",
             "parking_spot_monitor/health.py",
             "parking_spot_monitor/debug_overlay.py",

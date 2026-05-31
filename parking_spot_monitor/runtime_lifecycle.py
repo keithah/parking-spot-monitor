@@ -6,9 +6,13 @@ import signal
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from parking_spot_monitor.logging import StructuredLogger
+from parking_spot_monitor.matrix import MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, monitor_lifecycle_event
+from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 
 
 @dataclass
@@ -78,3 +82,31 @@ def _signal_name(signum: int) -> str:
         return signal.Signals(signum).name
     except ValueError:
         return f"signal-{signum}"
+
+
+def return_if_shutdown_requested(
+    *,
+    shutdown_state: ShutdownState,
+    matrix_delivery: Any | None,
+    now_fn: Callable[[], datetime],
+    logger: StructuredLogger,
+    decision_memory_path: Path,
+    iteration: int,
+) -> int | None:
+    """Exit the capture loop after dispatching a shutdown lifecycle notice."""
+
+    if not shutdown_state.requested:
+        return None
+    logger.info("capture-loop-shutdown-requested", iteration=iteration, signal=shutdown_state.signal_name)
+    dispatch_matrix_event(
+        matrix_delivery,
+        MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
+        monitor_lifecycle_event(
+            MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
+            now_fn(),
+            signal=shutdown_state.signal_name,
+        ),
+        logger=logger,
+        decision_memory_path=decision_memory_path,
+    )
+    return 0

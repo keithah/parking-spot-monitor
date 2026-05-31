@@ -16,7 +16,8 @@ from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import load_decision_memory
 from parking_spot_monitor.matrix import MatrixDelivery, MatrixSnapshot
-from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _main, _matrix_outbox_health_payload, _presence_by_spot, main
+from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _main, _presence_by_spot, main
+from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as _matrix_outbox_health_payload
 from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 from parking_spot_monitor.detection import DetectionError, DetectionFilterResult, RejectedDetection, RejectionReason, SpotDetectionResult, VehicleDetection
 from parking_spot_monitor.errors import ConfigError
@@ -2879,12 +2880,12 @@ def test_runtime_loop_state_save_failure_continues_from_previous_durable_state(
 def test_runtime_loop_health_write_failure_logs_safely_and_continues(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from parking_spot_monitor import __main__ as cli
+    import parking_spot_monitor.runtime_health as runtime_health
 
     def fail_health_write(*_args: object, **_kwargs: object) -> None:
         raise PermissionError(f"health denied token={SECRET_MARKER} Traceback raw_image_bytes abc")
 
-    monkeypatch.setattr(cli, "write_health_status", fail_health_write, raising=False)
+    monkeypatch.setattr(runtime_health, "write_health_status", fail_health_write)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -3577,7 +3578,7 @@ def test_matrix_outbox_health_payload_degrades_on_read_error_without_secret(
         def __init__(self, _path: Path) -> None:
             raise OSError("permission denied access_token=matrix-secret")
 
-    monkeypatch.setattr("parking_spot_monitor.__main__.LocalOutbox", ExplodingOutbox)
+    monkeypatch.setattr("parking_spot_monitor.runtime_health.LocalOutbox", ExplodingOutbox)
 
     payload = _matrix_outbox_health_payload(tmp_path / "matrix-outbox.json")
 

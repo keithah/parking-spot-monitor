@@ -29,12 +29,10 @@ from parking_spot_monitor.detection import (
     translate_crop_detection,
 )
 from parking_spot_monitor.errors import ConfigError
-from parking_spot_monitor.health import HealthStatus, write_health_status
 from parking_spot_monitor.live_proof import run_live_proof_once
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, setup_logging
 from parking_spot_monitor.matrix import (
     MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
-    MONITOR_STARTED_EVENT_TYPE,
     OCCUPIED_SPOT_EVENT_TYPE,
     MatrixClient,
     MatrixCommandService,
@@ -43,11 +41,17 @@ from parking_spot_monitor.matrix import (
     OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
     owner_vehicle_quiet_window_event_id,
     MatrixError,
-    monitor_lifecycle_event,
     prune_event_snapshots,
 )
 from parking_spot_monitor.matrix_dispatch import append_matrix_event_memory, dispatch_matrix_event
-from parking_spot_monitor.runtime_lifecycle import ShutdownState, monitor_signal_handlers
+from parking_spot_monitor.capture_loop import run_capture_loop
+from parking_spot_monitor.runtime_health import (
+    format_health_timestamp as _format_health_timestamp,
+    matrix_outbox_health_payload as _matrix_outbox_health_payload,
+    observed_at as _observed_at,
+    parse_frame_timestamp as _parse_frame_timestamp,
+    safe_error_context as _safe_error_context,
+)
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus, update_occupancy
 from parking_spot_monitor.operator_cockpit import build_who_snapshot_response
 from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, make_decision_memory_record
@@ -210,7 +214,7 @@ def _main(
         )
 
     history_archive = VehicleHistoryArchive(paths.vehicle_history_dir, logger=logger)
-    return _capture_loop(
+    return run_capture_loop(
         settings,
         paths.data_dir,
         logger=logger,
@@ -253,236 +257,6 @@ def _capture_once(
     return 0
 
 
-def _capture_loop(
-    settings: RuntimeSettings,
-    data_dir: Path,
-    *,
-    logger: StructuredLogger,
-    capture: Callable[[RuntimeSettings, str | Path], Any],
-    overlay: Callable[..., Any],
-    detector_factory: Callable[[RuntimeSettings], Any],
-    matrix_delivery: Any | None,
-    history_archive: VehicleHistoryArchive | None = None,
-    matrix_command_service: Any | None = None,
-    sleep: Callable[[float], None],
-    max_iterations: int | None = None,
-    now: Callable[[], datetime] | None = None,
-    startup_retention_failure_count: int = 0,
-) -> int:
-    iteration = 0
-    detector: Any | None = None
-    spot_ids = list(_configured_spot_polygons(settings).keys())
-    state_path = data_dir / "state.json"
-    runtime_paths = resolve_runtime_paths(settings, data_dir)
-    runtime_state = load_runtime_state(state_path, spot_ids, logger=logger)
-    effective_history_archive = history_archive if history_archive is not None else VehicleHistoryArchive(data_dir / "vehicle-history", logger=logger)
-    now_fn = now if now is not None else lambda: datetime.now(timezone.utc)
-    consecutive_capture_failures = 0
-    consecutive_detection_failures = 0
-    last_frame_at: str | None = None
-    selected_decode_mode: str | None = None
-    last_matrix_error: dict[str, Any] | None = None
-    last_error: dict[str, Any] | None = None
-    state_save_error: dict[str, Any] | None = None
-    last_vehicle_history_error: dict[str, Any] | None = None
-    vehicle_history_failure_count = 0
-    retention_failure_count = startup_retention_failure_count
-    startup_outbox_error = _drain_matrix_outbox_if_available(matrix_delivery, logger=logger, iteration=iteration, trigger="startup")
-    if startup_outbox_error is not None:
-        last_matrix_error = startup_outbox_error
-        last_error = startup_outbox_error
-    decision_memory_path = data_dir / "operator-decision-memory.json"
-    shutdown_state = ShutdownState()
-    with monitor_signal_handlers(shutdown_state, logger=logger):
-        startup_lifecycle_error = dispatch_matrix_event(
-            matrix_delivery,
-            MONITOR_STARTED_EVENT_TYPE,
-            monitor_lifecycle_event(MONITOR_STARTED_EVENT_TYPE, now_fn()),
-            logger=logger,
-            decision_memory_path=decision_memory_path,
-        )
-        if startup_lifecycle_error is not None:
-            logger.warning(
-                "lifecycle-notice-delivery-degraded",
-                event_type=MONITOR_STARTED_EVENT_TYPE,
-                error_type=startup_lifecycle_error.get("error_type"),
-            )
-        _write_loop_health(
-            settings,
-            logger=logger,
-            status="degraded" if retention_failure_count or startup_outbox_error is not None else "starting",
-            iteration=iteration,
-            last_frame_at=last_frame_at,
-            selected_decode_mode=selected_decode_mode,
-            consecutive_capture_failures=consecutive_capture_failures,
-            consecutive_detection_failures=consecutive_detection_failures,
-            last_matrix_error=last_matrix_error,
-            last_error=last_error,
-            retention_failure_count=retention_failure_count,
-            state_save_error=state_save_error,
-            vehicle_history_failure_count=vehicle_history_failure_count,
-            last_vehicle_history_error=last_vehicle_history_error,
-            vehicle_history=effective_history_archive.health_snapshot(),
-            matrix_outbox_file=runtime_paths.matrix_outbox_file,
-        )
-        while max_iterations is None or iteration < max_iterations:
-            shutdown_exit = _return_if_shutdown_requested(
-                shutdown_state=shutdown_state,
-                matrix_delivery=matrix_delivery,
-                now_fn=now_fn,
-                logger=logger,
-                decision_memory_path=decision_memory_path,
-                iteration=iteration,
-            )
-            if shutdown_exit is not None:
-                return shutdown_exit
-            iteration += 1
-            logger.info("capture-loop-iteration", iteration=iteration, data_dir=str(data_dir))
-            try:
-                outbox_error = _drain_matrix_outbox_if_available(matrix_delivery, logger=logger, iteration=iteration, trigger="iteration")
-                if outbox_error is not None:
-                    last_matrix_error = outbox_error
-                    last_error = outbox_error
-                result = capture(settings, data_dir)
-                consecutive_capture_failures = 0
-                last_frame_at = _format_health_timestamp(result.timestamp)
-                selected_decode_mode = str(result.selected_mode.value if hasattr(result.selected_mode, "value") else result.selected_mode)
-                _write_overlay_for_capture(settings, result.latest_path, data_dir, logger=logger, overlay=overlay)
-                timeline_result = record_timeline_frame(result.latest_path, data_dir=data_dir, observed_at=result.timestamp)
-                logger.info("timeline-frame-retained", iteration=iteration, **timeline_result.diagnostics())
-                try:
-                    if detector is None:
-                        detector = detector_factory(settings)
-                    detection_result = _process_detection_for_capture(
-                        settings,
-                        detector,
-                        result.latest_path,
-                        frame_timestamp=result.timestamp,
-                        logger=logger,
-                        mode="runtime-loop",
-                        iteration=iteration,
-                        decision_memory_path=decision_memory_path,
-                    )
-                except DetectionError as exc:
-                    consecutive_detection_failures += 1
-                    last_error = _safe_error_context("detection", exc, extra={"iteration": iteration})
-                    logger.error("detection-frame-failed", mode="runtime-loop", iteration=iteration, **exc.diagnostics())
-                else:
-                    consecutive_detection_failures = 0
-                    last_error = None
-                    observed_at = _observed_at(result.timestamp, now_fn)
-                    frame_update = _update_runtime_state_for_frame(
-                        settings=settings,
-                        runtime_state=runtime_state,
-                        detection_result=detection_result,
-                        observed_at=observed_at,
-                        snapshot_path=str(result.latest_path),
-                        logger=logger,
-                        matrix_delivery=matrix_delivery,
-                        state_path=state_path,
-                        configured_spot_ids=spot_ids,
-                        history_archive=effective_history_archive,
-                        decision_memory_path=decision_memory_path,
-                    )
-                    runtime_state = frame_update.runtime_state
-                    if frame_update.matrix_errors:
-                        last_matrix_error = frame_update.matrix_errors[-1]
-                        last_error = last_matrix_error
-                    if frame_update.history_errors:
-                        vehicle_history_failure_count += len(frame_update.history_errors)
-                        last_vehicle_history_error = frame_update.history_errors[-1]
-                        last_error = last_vehicle_history_error
-                    state_save_error = frame_update.state_save_error
-                    if state_save_error is not None:
-                        last_error = state_save_error
-                    command_error = _poll_matrix_commands_once(
-                        matrix_command_service,
-                        logger=logger,
-                        iteration=iteration,
-                        decision_memory_path=decision_memory_path,
-                    )
-                    if command_error is not None:
-                        vehicle_history_failure_count += 1
-                        last_vehicle_history_error = command_error
-                        last_error = command_error
-                logger.info("capture-loop-frame-written", iteration=iteration, **result.diagnostics())
-                status = _health_status_for_loop(
-                    consecutive_capture_failures=consecutive_capture_failures,
-                    consecutive_detection_failures=consecutive_detection_failures,
-                    last_matrix_error=last_matrix_error,
-                    state_save_error=state_save_error,
-                    retention_failure_count=retention_failure_count,
-                    vehicle_history_failure_count=vehicle_history_failure_count,
-                    last_vehicle_history_error=last_vehicle_history_error,
-                )
-                _write_loop_health(
-                    settings,
-                    logger=logger,
-                    status=status,
-                    iteration=iteration,
-                    last_frame_at=last_frame_at,
-                    selected_decode_mode=selected_decode_mode,
-                    consecutive_capture_failures=consecutive_capture_failures,
-                    consecutive_detection_failures=consecutive_detection_failures,
-                    last_matrix_error=last_matrix_error,
-                    last_error=last_error,
-                    retention_failure_count=retention_failure_count,
-                    state_save_error=state_save_error,
-                    vehicle_history_failure_count=vehicle_history_failure_count,
-                    last_vehicle_history_error=last_vehicle_history_error,
-                    vehicle_history=effective_history_archive.health_snapshot(),
-                    matrix_outbox_file=runtime_paths.matrix_outbox_file,
-                )
-                logger.info("capture-loop-paced", iteration=iteration, sleep_seconds=settings.runtime.frame_interval_seconds)
-                sleep(settings.runtime.frame_interval_seconds)
-                # Re-check after sleep so SIGTERM during frame_interval is not delayed a full iteration.
-                shutdown_exit = _return_if_shutdown_requested(
-                    shutdown_state=shutdown_state,
-                    matrix_delivery=matrix_delivery,
-                    now_fn=now_fn,
-                    logger=logger,
-                    decision_memory_path=decision_memory_path,
-                    iteration=iteration,
-                )
-                if shutdown_exit is not None:
-                    return shutdown_exit
-            except CaptureError as exc:
-                consecutive_capture_failures += 1
-                last_error = _safe_error_context("capture", exc, extra={"iteration": iteration})
-                backoff_seconds = settings.stream.reconnect_seconds
-                logger.error("capture-loop-failure", iteration=iteration, backoff_seconds=backoff_seconds, **exc.diagnostics())
-                _write_loop_health(
-                    settings,
-                    logger=logger,
-                    status="down",
-                    iteration=iteration,
-                    last_frame_at=last_frame_at,
-                    selected_decode_mode=selected_decode_mode,
-                    consecutive_capture_failures=consecutive_capture_failures,
-                    consecutive_detection_failures=consecutive_detection_failures,
-                    last_matrix_error=last_matrix_error,
-                    last_error=last_error,
-                    retention_failure_count=retention_failure_count,
-                    state_save_error=state_save_error,
-                    vehicle_history_failure_count=vehicle_history_failure_count,
-                    last_vehicle_history_error=last_vehicle_history_error,
-                    vehicle_history=effective_history_archive.health_snapshot(),
-                    matrix_outbox_file=runtime_paths.matrix_outbox_file,
-                )
-                sleep(backoff_seconds)
-                shutdown_exit = _return_if_shutdown_requested(
-                    shutdown_state=shutdown_state,
-                    matrix_delivery=matrix_delivery,
-                    now_fn=now_fn,
-                    logger=logger,
-                    decision_memory_path=decision_memory_path,
-                    iteration=iteration,
-                )
-                if shutdown_exit is not None:
-                    return shutdown_exit
-        return 0
-
-
 def _default_detector_factory(settings: RuntimeSettings) -> UltralyticsVehicleDetector:
     return UltralyticsVehicleDetector(settings.detection.model)
 
@@ -520,52 +294,6 @@ def _default_matrix_delivery_factory(settings: RuntimeSettings, data_dir: Path, 
         logger=logger,
         snapshot_retention_count=settings.storage.snapshot_retention_count,
     )
-
-
-def _drain_matrix_outbox_if_available(
-    matrix_delivery: Any | None,
-    *,
-    logger: StructuredLogger,
-    iteration: int,
-    trigger: str,
-) -> dict[str, Any] | None:
-    drain = getattr(matrix_delivery, "drain_outbox", None)
-    if drain is None:
-        return None
-    if not callable(drain):
-        return None
-    logger.info("matrix-outbox-runtime-drain-attempt", trigger=trigger, iteration=iteration)
-    try:
-        result = drain()
-    except Exception as exc:
-        context = _safe_error_context(
-            "matrix-outbox",
-            exc,
-            extra={"trigger": trigger, "iteration": iteration},
-        )
-        logger.warning("matrix-outbox-runtime-drain-failed", **context)
-        return context
-    attempted_count = getattr(result, "attempted_count", None)
-    delivered_count = getattr(result, "delivered_count", None)
-    retrying_count = getattr(result, "retrying_count", None)
-    logger.info(
-        "matrix-outbox-runtime-drain-succeeded",
-        trigger=trigger,
-        iteration=iteration,
-        attempted_count=attempted_count,
-        delivered_count=delivered_count,
-        retrying_count=retrying_count,
-    )
-    if isinstance(retrying_count, int) and retrying_count > 0:
-        return {
-            "phase": "matrix-outbox",
-            "error_type": "retrying_records",
-            "message": "matrix outbox has retrying records",
-            "trigger": trigger,
-            "iteration": iteration,
-            "retrying_count": retrying_count,
-        }
-    return None
 
 
 def _default_matrix_command_service_factory(
@@ -1682,170 +1410,6 @@ def _rejected_summary(rejected: Any) -> dict[str, Any]:
         "bbox_area_px": getattr(rejected, "bbox_area_px", None),
         "overlap_ratio": getattr(rejected, "overlap_ratio", None),
     }
-
-
-def _return_if_shutdown_requested(
-    *,
-    shutdown_state: ShutdownState,
-    matrix_delivery: Any | None,
-    now_fn: Callable[[], datetime],
-    logger: StructuredLogger,
-    decision_memory_path: Path,
-    iteration: int,
-) -> int | None:
-    """Exit the capture loop after dispatching a shutdown lifecycle notice."""
-
-    if not shutdown_state.requested:
-        return None
-    logger.info("capture-loop-shutdown-requested", iteration=iteration, signal=shutdown_state.signal_name)
-    dispatch_matrix_event(
-        matrix_delivery,
-        MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
-        monitor_lifecycle_event(
-            MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
-            now_fn(),
-            signal=shutdown_state.signal_name,
-        ),
-        logger=logger,
-        decision_memory_path=decision_memory_path,
-    )
-    return 0
-
-
-def _matrix_outbox_health_payload(matrix_outbox_file: Path | None) -> dict[str, Any] | None:
-    """Return a bounded, redacted Matrix outbox health summary without failing health writes."""
-
-    if matrix_outbox_file is None:
-        return None
-    try:
-        summary = LocalOutbox(matrix_outbox_file).status_summary()
-    except Exception as exc:
-        return {
-            "available": False,
-            "phase": "matrix-outbox",
-            "error": {
-                "phase": "matrix-outbox",
-                "action": "status-summary",
-                "error_type": type(exc).__name__,
-                "error_message": "matrix outbox status unavailable",
-            },
-        }
-    payload = dict(summary)
-    payload["available"] = True
-    return payload
-
-
-def _write_loop_health(
-    settings: RuntimeSettings,
-    *,
-    logger: StructuredLogger,
-    status: str,
-    iteration: int,
-    last_frame_at: str | None,
-    selected_decode_mode: str | None,
-    consecutive_capture_failures: int,
-    consecutive_detection_failures: int,
-    last_matrix_error: Mapping[str, Any] | None,
-    last_error: Mapping[str, Any] | None,
-    retention_failure_count: int,
-    state_save_error: Mapping[str, Any] | None,
-    vehicle_history_failure_count: int = 0,
-    last_vehicle_history_error: Mapping[str, Any] | None = None,
-    vehicle_history: Mapping[str, Any] | None = None,
-    matrix_outbox_file: Path | None = None,
-) -> None:
-    try:
-        write_health_status(
-            settings.runtime.health_file,
-            HealthStatus(
-                status=status,  # type: ignore[arg-type]
-                updated_at=datetime.now(timezone.utc).isoformat(),
-                iteration=iteration,
-                last_frame_at=last_frame_at,
-                selected_decode_mode=selected_decode_mode,
-                consecutive_capture_failures=consecutive_capture_failures,
-                consecutive_detection_failures=consecutive_detection_failures,
-                last_matrix_error=last_matrix_error,
-                last_error=last_error,
-                retention_failure_count=retention_failure_count,
-                state_save_error=state_save_error,
-                vehicle_history_failure_count=vehicle_history_failure_count,
-                last_vehicle_history_error=last_vehicle_history_error,
-                vehicle_history=vehicle_history,
-                matrix_outbox=_matrix_outbox_health_payload(matrix_outbox_file),
-            ),
-            logger=logger,
-        )
-    except Exception as exc:
-        logger.error(
-            "health-write-failed",
-            path=str(settings.runtime.health_file),
-            error_type=type(exc).__name__,
-            error_message=redact_diagnostic_text(exc),
-        )
-
-
-def _health_status_for_loop(
-    *,
-    consecutive_capture_failures: int,
-    consecutive_detection_failures: int,
-    last_matrix_error: Mapping[str, Any] | None,
-    state_save_error: Mapping[str, Any] | None,
-    retention_failure_count: int,
-    vehicle_history_failure_count: int = 0,
-    last_vehicle_history_error: Mapping[str, Any] | None = None,
-) -> str:
-    if consecutive_capture_failures:
-        return "down"
-    if (
-        consecutive_detection_failures
-        or last_matrix_error is not None
-        or state_save_error is not None
-        or retention_failure_count
-        or vehicle_history_failure_count
-        or last_vehicle_history_error is not None
-    ):
-        return "degraded"
-    return "ok"
-
-
-def _safe_error_context(phase: str, error: BaseException, *, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    context = {
-        "phase": phase,
-        "error_type": type(error).__name__,
-        "error_message": redact_diagnostic_text(error),
-    }
-    if extra:
-        context.update(dict(extra))
-    return context
-
-
-def _format_health_timestamp(value: Any | None) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return str(value)
-
-
-def _observed_at(frame_timestamp: Any | None, now: Callable[[], datetime]) -> datetime:
-    parsed = _parse_frame_timestamp(frame_timestamp)
-    observed = parsed if parsed is not None else now()
-    if observed.tzinfo is None or observed.utcoffset() is None:
-        return observed.replace(tzinfo=timezone.utc)
-    return observed
-
-
-def _parse_frame_timestamp(value: Any | None) -> datetime | None:
-    if isinstance(value, datetime):
-        return value
-    if not isinstance(value, str) or not value:
-        return None
-    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-    try:
-        return datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
 
 
 def _configured_spot_polygons(
