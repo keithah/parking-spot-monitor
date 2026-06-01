@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from parking_spot_monitor.config import RuntimeSettings
+from parking_spot_monitor.detection import DetectionFilterResult
+from parking_spot_monitor.logging import StructuredLogger
+from parking_spot_monitor.matrix import (
+    OCCUPIED_SPOT_EVENT_TYPE,
+    OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
+)
+from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
+from parking_spot_monitor.occupancy import update_occupancy
+from parking_spot_monitor.runtime_decision_memory import _append_runtime_state_memory_records
+from parking_spot_monitor.runtime_health import safe_error_context as _safe_error_context
+from parking_spot_monitor.runtime_presence import _log_missed_occupied_spot_diagnostics, _presence_by_spot
+from parking_spot_monitor.runtime_vehicle_events import _owner_vehicle_quiet_window_alerts, _record_vehicle_history_events
+from parking_spot_monitor.scheduler import evaluate_quiet_windows, quiet_window_notice_events
+from parking_spot_monitor.state import RuntimeState, save_runtime_state
+from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
+
+
+@dataclass(frozen=True)
+class FrameUpdateResult:
+    runtime_state: RuntimeState
+    matrix_errors: list[dict[str, Any]]
+    state_save_error: dict[str, Any] | None = None
+    history_errors: list[dict[str, Any]] | None = None
+
+
+def _update_runtime_state_for_frame(
+    *,
+    settings: RuntimeSettings,
+    runtime_state: RuntimeState,
+    detection_result: DetectionFilterResult,
+    observed_at: datetime,
+    snapshot_path: str,
+    logger: StructuredLogger,
+    matrix_delivery: Any | None,
+    state_path: Path,
+    configured_spot_ids: Sequence[str],
+    history_archive: VehicleHistoryArchive | None = None,
+    decision_memory_path: Path | None = None,
+) -> FrameUpdateResult:
+    matrix_errors: list[dict[str, Any]] = []
+    quiet_status = evaluate_quiet_windows(settings.quiet_windows, observed_at)
+    notice_events = quiet_window_notice_events(
+        previous_active_window_ids=runtime_state.active_quiet_window_ids,
+        current=quiet_status,
+        emitted_notice_ids=runtime_state.quiet_window_notice_ids,
+    )
+    emitted_notice_ids = set(runtime_state.quiet_window_notice_ids)
+    for notice in notice_events:
+        if notice.event_id in emitted_notice_ids:
+            continue
+        payload = notice.to_dict()
+        event_name = str(payload.pop("event_type"))
+        logger.info(event_name, **payload)
+        matrix_error = dispatch_matrix_event(
+            matrix_delivery,
+            event_name,
+            payload | {"event_type": event_name},
+            logger=logger,
+            decision_memory_path=decision_memory_path,
+        )
+        if matrix_error is not None:
+            matrix_errors.append(matrix_error)
+        emitted_notice_ids.add(notice.event_id)
+
+    _log_missed_occupied_spot_diagnostics(
+        logger,
+        runtime_state=runtime_state,
+        detection_result=detection_result,
+        open_suppression_classes=settings.detection.open_suppression_classes,
+        min_polygon_overlap_ratio=settings.detection.min_polygon_overlap_ratio,
+    )
+
+    presence_by_spot = _presence_by_spot(
+        detection_result,
+        open_suppression_classes=settings.detection.open_suppression_classes,
+        min_polygon_overlap_ratio=settings.detection.min_polygon_overlap_ratio,
+    )
+    occupancy_update = update_occupancy(
+        runtime_state.state_by_spot,
+        {spot_id: spot_result.accepted for spot_id, spot_result in detection_result.by_spot.items()},
+        settings.occupancy,
+        observed_at.isoformat(),
+        quiet_status,
+        snapshot_path,
+        configured_spot_ids=configured_spot_ids,
+        presence_by_spot=presence_by_spot,
+    )
+    _append_runtime_state_memory_records(
+        decision_memory_path,
+        previous_state=runtime_state,
+        next_state=occupancy_update.state_by_spot,
+        detection_result=detection_result,
+        quiet_status=quiet_status,
+        observed_at=observed_at,
+        configured_spot_ids=configured_spot_ids,
+        presence_by_spot=presence_by_spot,
+        logger=logger,
+    )
+    history_result = _record_vehicle_history_events(
+        history_archive,
+        occupancy_update.events,
+        detection_result=detection_result,
+        snapshot_path=snapshot_path,
+        logger=logger,
+    )
+    history_errors = history_result.errors
+    owner_alert_ids = set(runtime_state.owner_quiet_window_alert_ids)
+    owner_alerts = _owner_vehicle_quiet_window_alerts(
+        history_archive,
+        quiet_status=quiet_status,
+        observed_at=observed_at,
+        emitted_alert_ids=owner_alert_ids,
+        configured_spot_ids=configured_spot_ids,
+        logger=logger,
+    )
+
+    for owner_alert in owner_alerts:
+        event_name = str(owner_alert.get("event_type", OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE))
+        logger.info(event_name, **{key: value for key, value in owner_alert.items() if key != "event_type"})
+        matrix_error = dispatch_matrix_event(
+            matrix_delivery,
+            event_name,
+            owner_alert,
+            logger=logger,
+            decision_memory_path=decision_memory_path,
+        )
+        if matrix_error is not None:
+            matrix_errors.append(matrix_error)
+        event_id = owner_alert.get("event_id")
+        if isinstance(event_id, str) and event_id:
+            owner_alert_ids.add(event_id)
+
+    for occupied_alert in history_result.occupied_alerts:
+        matrix_error = dispatch_matrix_event(
+            matrix_delivery,
+            str(occupied_alert.get("event_type", OCCUPIED_SPOT_EVENT_TYPE)),
+            occupied_alert,
+            logger=logger,
+            decision_memory_path=decision_memory_path,
+        )
+        if matrix_error is not None:
+            matrix_errors.append(matrix_error)
+
+    for event in occupancy_update.events:
+        payload = event.to_dict()
+        event_name = str(payload.pop("event_type"))
+        logger.info(event_name, **payload)
+        matrix_error = dispatch_matrix_event(
+            matrix_delivery,
+            event_name,
+            payload | {"event_type": event_name},
+            logger=logger,
+            decision_memory_path=decision_memory_path,
+        )
+        if matrix_error is not None:
+            matrix_errors.append(matrix_error)
+
+    updated_state = RuntimeState(
+        state_by_spot=occupancy_update.state_by_spot,
+        active_quiet_window_ids=quiet_status.active_window_ids,
+        quiet_window_notice_ids=frozenset(emitted_notice_ids),
+        owner_quiet_window_alert_ids=frozenset(owner_alert_ids),
+    )
+    try:
+        save_runtime_state(state_path, updated_state, logger=logger)
+    except Exception as exc:
+        return FrameUpdateResult(
+            runtime_state=runtime_state,
+            matrix_errors=matrix_errors,
+            state_save_error=_safe_error_context("state-save", exc),
+            history_errors=history_errors,
+        )
+    return FrameUpdateResult(runtime_state=updated_state, matrix_errors=matrix_errors, history_errors=history_errors)

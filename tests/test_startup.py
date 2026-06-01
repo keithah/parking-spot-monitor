@@ -16,7 +16,8 @@ from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import load_decision_memory
 from parking_spot_monitor.matrix import MatrixDelivery, MatrixSnapshot
-from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _main, _presence_by_spot, main
+from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _main, main
+from parking_spot_monitor.runtime_presence import _presence_by_spot
 from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as _matrix_outbox_health_payload
 from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 from parking_spot_monitor.detection import DetectionError, DetectionFilterResult, RejectedDetection, RejectionReason, SpotDetectionResult, VehicleDetection
@@ -111,6 +112,16 @@ def test_structured_logger_recursively_redacts_secret_bearing_fields(capsys: pyt
     assert "frame-secret" not in output
     assert "list-secret" not in output
     assert "Traceback" not in output
+
+
+def test_runtime_frame_is_only_a_compatibility_shim_for_frame_processing_helpers() -> None:
+    from parking_spot_monitor import runtime_frame
+    from parking_spot_monitor.runtime_detection import _configured_spot_polygons, _process_detection_for_capture
+    from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
+
+    assert runtime_frame._process_detection_for_capture is _process_detection_for_capture
+    assert runtime_frame._update_runtime_state_for_frame is _update_runtime_state_for_frame
+    assert runtime_frame._configured_spot_polygons is _configured_spot_polygons
 
 
 class NoopDetector:
@@ -294,7 +305,7 @@ def test_process_detection_uses_spot_crop_inference_to_recover_full_frame_miss(
                 return [VehicleDetection(class_name="car", confidence=0.88, bbox=(98, 93, 483, 233))]
             return []
 
-    from parking_spot_monitor.__main__ import _process_detection_for_capture
+    from parking_spot_monitor.runtime_detection import _process_detection_for_capture
 
     settings = load_settings(config_path, environ=fake_environ())
     detector = FullMissCropDetector()
@@ -326,7 +337,7 @@ def test_process_detection_scales_configured_polygons_to_actual_frame_size(
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
             return [VehicleDetection(class_name="car", confidence=0.9, bbox=(142.0, 91.0, 265.0, 151.0))]
 
-    from parking_spot_monitor.__main__ import _process_detection_for_capture
+    from parking_spot_monitor.runtime_detection import _process_detection_for_capture
 
     settings = load_settings("config.yaml.example", environ=fake_environ())
     result = _process_detection_for_capture(
@@ -2793,12 +2804,12 @@ def test_runtime_loop_matrix_failure_updates_health_and_loop_continues(
 def test_runtime_loop_state_save_failure_updates_health_and_loop_continues(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from parking_spot_monitor import __main__ as cli
+    import parking_spot_monitor.runtime_state_update as runtime_state_update
 
     def fail_state_save(*_args: object, **_kwargs: object) -> None:
         raise PermissionError(f"state denied token={SECRET_MARKER} Traceback raw_image_bytes abc")
 
-    monkeypatch.setattr(cli, "save_runtime_state", fail_state_save)
+    monkeypatch.setattr(runtime_state_update, "save_runtime_state", fail_state_save)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -2825,7 +2836,7 @@ def test_runtime_loop_state_save_failure_updates_health_and_loop_continues(
 def test_runtime_loop_state_save_failure_continues_from_previous_durable_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from parking_spot_monitor import __main__ as cli
+    import parking_spot_monitor.runtime_state_update as runtime_state_update
 
     state_path = tmp_path / "state.json"
     save_runtime_state(
@@ -2843,7 +2854,7 @@ def test_runtime_loop_state_save_failure_continues_from_previous_durable_state(
             }
         ),
     )
-    real_save_runtime_state = cli.save_runtime_state
+    real_save_runtime_state = runtime_state_update.save_runtime_state
     save_attempts = 0
 
     def fail_once_then_save(*args: object, **kwargs: object) -> None:
@@ -2853,7 +2864,7 @@ def test_runtime_loop_state_save_failure_continues_from_previous_durable_state(
             raise PermissionError(f"state denied token={SECRET_MARKER} Traceback raw_image_bytes abc")
         real_save_runtime_state(*args, **kwargs)
 
-    monkeypatch.setattr(cli, "save_runtime_state", fail_once_then_save)
+    monkeypatch.setattr(runtime_state_update, "save_runtime_state", fail_once_then_save)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],

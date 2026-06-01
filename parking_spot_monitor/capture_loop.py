@@ -21,6 +21,10 @@ from parking_spot_monitor.runtime_health import (
     safe_error_context,
     write_loop_health,
 )
+from parking_spot_monitor.runtime_commands import _poll_matrix_commands_once
+from parking_spot_monitor.runtime_detection import _configured_spot_polygons, _process_detection_for_capture
+from parking_spot_monitor.runtime_overlay import _write_overlay_for_capture
+from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
 from parking_spot_monitor.runtime_lifecycle import (
     ShutdownState,
     monitor_signal_handlers,
@@ -89,11 +93,9 @@ def run_capture_loop(
     now: Callable[[], datetime] | None = None,
     startup_retention_failure_count: int = 0,
 ) -> int:
-    from parking_spot_monitor import __main__ as runtime_main
-
     iteration = 0
     detector: Any | None = None
-    spot_ids = list(runtime_main._configured_spot_polygons(settings).keys())
+    spot_ids = list(_configured_spot_polygons(settings).keys())
     state_path = data_dir / "state.json"
     runtime_paths = resolve_runtime_paths(settings, data_dir)
     runtime_state = load_runtime_state(state_path, spot_ids, logger=logger)
@@ -171,13 +173,13 @@ def run_capture_loop(
                 consecutive_capture_failures = 0
                 last_frame_at = format_health_timestamp(result.timestamp)
                 selected_decode_mode = str(result.selected_mode.value if hasattr(result.selected_mode, "value") else result.selected_mode)
-                runtime_main._write_overlay_for_capture(settings, result.latest_path, data_dir, logger=logger, overlay=overlay)
+                _write_overlay_for_capture(settings, result.latest_path, data_dir, logger=logger, overlay=overlay)
                 timeline_result = record_timeline_frame(result.latest_path, data_dir=data_dir, observed_at=result.timestamp)
                 logger.info("timeline-frame-retained", iteration=iteration, **timeline_result.diagnostics())
                 try:
                     if detector is None:
                         detector = detector_factory(settings)
-                    detection_result = runtime_main._process_detection_for_capture(
+                    detection_result = _process_detection_for_capture(
                         settings,
                         detector,
                         result.latest_path,
@@ -195,7 +197,7 @@ def run_capture_loop(
                     consecutive_detection_failures = 0
                     last_error = None
                     frame_observed_at = observed_at(result.timestamp, now_fn)
-                    frame_update = runtime_main._update_runtime_state_for_frame(
+                    frame_update = _update_runtime_state_for_frame(
                         settings=settings,
                         runtime_state=runtime_state,
                         detection_result=detection_result,
@@ -219,7 +221,7 @@ def run_capture_loop(
                     state_save_error = frame_update.state_save_error
                     if state_save_error is not None:
                         last_error = state_save_error
-                    command_error = runtime_main._poll_matrix_commands_once(
+                    command_error = _poll_matrix_commands_once(
                         matrix_command_service,
                         logger=logger,
                         iteration=iteration,

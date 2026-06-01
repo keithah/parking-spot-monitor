@@ -933,8 +933,12 @@ def test_s04_docs_contract_stays_grounded_in_tracked_source_events() -> None:
             "parking_spot_monitor/__main__.py",
             "parking_spot_monitor/matrix_dispatch.py",
             "parking_spot_monitor/capture_loop.py",
+            "parking_spot_monitor/runtime_detection.py",
+            "parking_spot_monitor/runtime_frame.py",
             "parking_spot_monitor/runtime_health.py",
             "parking_spot_monitor/runtime_lifecycle.py",
+            "parking_spot_monitor/runtime_overlay.py",
+            "parking_spot_monitor/runtime_state_update.py",
             "parking_spot_monitor/capture.py",
             "parking_spot_monitor/matrix.py",
             "parking_spot_monitor/matrix_snapshots.py",
@@ -1100,6 +1104,9 @@ def test_documented_artifact_paths_and_debug_events_stay_wired_to_tracked_code()
             "parking_spot_monitor/capture.py",
             "parking_spot_monitor/debug_overlay.py",
             "parking_spot_monitor/__main__.py",
+            "parking_spot_monitor/runtime_detection.py",
+            "parking_spot_monitor/runtime_frame.py",
+            "parking_spot_monitor/runtime_overlay.py",
             "parking_spot_monitor/matrix.py",
         ]
     )
