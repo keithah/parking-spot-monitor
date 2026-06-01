@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,6 @@ from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_tex
 from parking_spot_monitor.matrix_models import MatrixCommandResponse
 from parking_spot_monitor.paths import resolve_runtime_paths
 from parking_spot_monitor.operator_cockpit_shared import (
-    DISPLAY_TIMEZONE,
     INCIDENT_MATRIX_SNAPSHOT_TEMPLATE,
     MAX_LINES_PER_SECTION,
     MAX_LATEST_IMAGE_BYTES,
@@ -34,6 +33,8 @@ from parking_spot_monitor.operator_cockpit_shared import (
     summarize_health,
     summarize_state,
 )
+from parking_spot_monitor.operator_cockpit_memory import format_operator_why_reply
+from parking_spot_monitor.operator_timeline import DISPLAY_TIMEZONE, nearest_timeline_frame, parse_incident_time
 
 
 def build_latest_snapshot_response(
@@ -137,10 +138,10 @@ def build_incident_review_response(
     root = Path(data_dir)
     safe_spot = _safe_incident_spot_id(spot_id)
     observed_now = _utc_now(now)
-    target_time = _parse_incident_time(time_text, now=observed_now)
+    target_time = parse_incident_time(time_text, now=observed_now)
     heading_time = _display_local_time(target_time)
     lines = [f"Incident review: {safe_spot} around {heading_time}"]
-    nearest = _nearest_timeline_frame(root, target_time)
+    nearest = nearest_timeline_frame(root, target_time)
     if nearest is None:
         lines.extend([
             "Nearest retained frame: unavailable",
@@ -165,8 +166,6 @@ def build_incident_review_response(
         return MatrixCommandResponse(text=_bounded_reply(lines))
     lines.extend(replay.lines)
     lines.append("Recent local decision memory:")
-    from parking_spot_monitor.operator_cockpit import format_operator_why_reply
-
     why_lines = format_operator_why_reply(data_dir=root, spot_id=safe_spot, logger=logger).splitlines()
     memory_lines = why_lines[1:7] if len(why_lines) > 1 else why_lines[:1]
     lines.extend(memory_lines or ["No recent decision memory for this spot."])
@@ -183,64 +182,6 @@ def _safe_incident_spot_id(value: str) -> str:
     if text not in {"left_spot", "right_spot"}:
         raise ValueError("invalid spot id")
     return text
-
-
-def _parse_incident_time(value: str, *, now: datetime) -> datetime:
-    text = redact_diagnostic_text(value).strip().lower()
-    try:
-        parsed = datetime.fromisoformat(text.replace("z", "+00:00"))
-    except ValueError:
-        parsed = _parse_local_clock_time(text, now=now)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=DISPLAY_TIMEZONE)
-    return parsed.astimezone(timezone.utc)
-
-
-def _parse_local_clock_time(text: str, *, now: datetime) -> datetime:
-    compact = text.replace(" ", "")
-    suffix = None
-    if compact.endswith("am") or compact.endswith("pm"):
-        suffix = compact[-2:]
-        compact = compact[:-2]
-    if ":" not in compact:
-        raise ValueError("incident time must be ISO or h:mmam/pm")
-    hour_text, minute_text = compact.split(":", 1)
-    hour = int(hour_text)
-    minute = int(minute_text)
-    if suffix == "pm" and hour != 12:
-        hour += 12
-    if suffix == "am" and hour == 12:
-        hour = 0
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError("incident time is out of range")
-    local_now = now.astimezone(DISPLAY_TIMEZONE)
-    candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if candidate - local_now > timedelta(hours=1):
-        candidate -= timedelta(days=1)
-    return candidate
-
-
-def _nearest_timeline_frame(data_dir: Path, target_time: datetime) -> tuple[Path, datetime] | None:
-    frames_dir = data_dir / "timeline" / "frames"
-    try:
-        candidates = list(frames_dir.glob("*.jpg"))
-    except OSError:
-        return None
-    nearest: tuple[Path, datetime] | None = None
-    for path in candidates:
-        frame_time = _timeline_frame_time(path)
-        if frame_time is None:
-            continue
-        if nearest is None or abs(frame_time - target_time) < abs(nearest[1] - target_time):
-            nearest = (path, frame_time)
-    return nearest
-
-
-def _timeline_frame_time(path: Path) -> datetime | None:
-    try:
-        return datetime.strptime(path.stem, "%Y%m%dT%H%M00Z").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
 
 
 def _prepare_incident_snapshot_for_matrix(path: Path, *, data_dir: Path, spot_id: str, now: datetime, logger: StructuredLogger | None) -> LatestSnapshotValidation:

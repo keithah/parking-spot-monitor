@@ -22,6 +22,9 @@ from parking_spot_monitor.operator_feedback_models import (
     FEEDBACK_LABELS_FILENAME,
     MAX_FEEDBACK_FILE_BYTES,
     MAX_FEEDBACK_LABELS,
+    MAX_DEGRADATION_REASONS,
+    MAX_REPLAY_CONTEXT_LINES,
+    MAX_REPLAY_LINE_CHARS,
     AlertEvidenceCandidate,
     FeedbackAppendResult,
     FeedbackEvidence,
@@ -43,14 +46,9 @@ from parking_spot_monitor.operator_feedback_models import (
     _write_feedback_labels,
     hash_operator_identifier,
 )
+from parking_spot_monitor.operator_timeline import nearest_timeline_frame, parse_incident_time
 
 
-
-MAX_REPLAY_CONTEXT_LINES = 12
-MAX_REPLAY_LINE_CHARS = 240
-MAX_DEGRADATION_REASONS = 8
-
-_RAW_IMAGE_PREFIX_PATTERN = re.compile(r"\xff\xd8[\s\S]*")
 _SAFE_ID_PATTERN = re.compile(r"[^A-Za-z0-9_.:-]+")
 
 
@@ -501,15 +499,11 @@ def _parse_learn_requested_time(value: datetime | str, *, now: datetime | None) 
     if isinstance(value, datetime):
         selected = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
         return selected.astimezone(timezone.utc)
-    from parking_spot_monitor.operator_cockpit import _parse_incident_time
-
-    return _parse_incident_time(str(value), now=_utc_now(now))
+    return parse_incident_time(str(value), now=_utc_now(now))
 
 
 def _nearest_learn_timeline_frame(data_dir: str | Path, target_time: datetime) -> tuple[Path, datetime] | None:
-    from parking_spot_monitor.operator_cockpit import _nearest_timeline_frame
-
-    return _nearest_timeline_frame(Path(data_dir), target_time)
+    return nearest_timeline_frame(Path(data_dir), target_time)
 
 
 def _utc_now(value: datetime | None) -> datetime:

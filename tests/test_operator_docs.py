@@ -273,11 +273,16 @@ def test_m006_incident_intelligence_commands_and_closeout_smoke_are_documented()
         ],
     )
     assert_contains_all(
-        cockpit_source + cockpit_snapshot_source,
+        cockpit_snapshot_source,
         [
             "Build a local incident review from retained timeline frames and decision memory.",
             "No retained timeline frames were found.",
             "No detector, camera, Matrix send, or state mutation was run.",
+        ],
+    )
+    assert_contains_all(
+        cockpit_source,
+        [
             "Read-only: no detector, camera, media upload, alert emission, or state mutation was run.",
             "filename scan only; image bytes were not opened",
         ],
@@ -493,7 +498,7 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
         ],
     )
     assert_contains_all(
-        cockpit_source + cockpit_snapshot_source,
+        cockpit_snapshot_source,
         [
             "Build a Matrix who reply enriched by one fresh raw capture when available.",
             "not run detector/model inference and does not read or mutate occupancy",
@@ -502,11 +507,16 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
         ],
     )
     assert_contains_all(
-        feedback_source + feedback_model_source,
+        feedback_model_source,
         [
             "FEEDBACK_LABELS_FILENAME = \"operator-feedback-labels.json\"",
             "reported_state",
             "actual_state",
+        ],
+    )
+    assert_contains_all(
+        feedback_source,
+        [
             "operator correction recorded",
             "record_learn_label",
             "operator learn label recorded",
@@ -562,9 +572,14 @@ def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_ua
         ],
     )
     assert_contains_all(
-        feedback_source + feedback_model_source,
+        feedback_model_source,
         [
             "FEEDBACK_LABELS_FILENAME = \"operator-feedback-labels.json\"",
+        ],
+    )
+    assert_contains_all(
+        feedback_source,
+        [
             "feedback_category=\"false_alert\"",
             "feedback_category=\"missed_alert\"",
             "operator-feedback-label-appended",

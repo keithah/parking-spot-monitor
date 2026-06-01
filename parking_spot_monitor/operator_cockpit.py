@@ -38,13 +38,12 @@ from parking_spot_monitor.operator_cockpit_snapshots import (
     LatestSnapshotResponse,
     LatestSnapshotValidation,
     _display_time,
-    _nearest_timeline_frame,
-    _parse_incident_time,
-    _timeline_frame_time,
     build_incident_review_response,
     build_latest_snapshot_response,
     build_who_snapshot_response,
 )
+from parking_spot_monitor.operator_cockpit_memory import format_operator_recent_reply, format_operator_why_reply
+from parking_spot_monitor.operator_timeline import timeline_frame_time
 
 
 
@@ -552,7 +551,7 @@ def _summarize_timeline_frames(frames_dir: Path, *, now: datetime, logger: Struc
         _log_load_problem(logger, label="timeline", reason="scan_error", error_type=error_type)
         return [f"- unavailable ({error_type})."]
 
-    parsed = [_timeline_frame_time(path) for path in paths[: MAX_LINES_PER_SECTION * 20]]
+    parsed = [timeline_frame_time(path) for path in paths[: MAX_LINES_PER_SECTION * 20]]
     valid_times = sorted(time for time in parsed if time is not None)
     ignored = len([time for time in parsed if time is None])
     if not valid_times:
@@ -590,31 +589,6 @@ def _matrix_delivery_lines(health_load: BoundedJsonLoad, memory: Any) -> list[st
     else:
         lines.append("- delivery memory unavailable.")
     return lines
-
-def format_operator_why_reply(
-    *,
-    data_dir: str | Path,
-    spot_id: str,
-    logger: StructuredLogger | None = None,
-) -> str:
-    """Format a bounded, redacted decision-memory explanation for one spot."""
-
-    from parking_spot_monitor.operator_decision_memory import decision_memory_path, format_why_reply
-
-    return format_why_reply(decision_memory_path(data_dir), spot_id, logger=logger)
-
-
-def format_operator_recent_reply(
-    *,
-    data_dir: str | Path,
-    logger: StructuredLogger | None = None,
-) -> str:
-    """Format a bounded, redacted recent decision-memory timeline."""
-
-    from parking_spot_monitor.operator_decision_memory import decision_memory_path, format_recent_reply
-
-    return format_recent_reply(decision_memory_path(data_dir), logger=logger)
-
 
 def format_detection_lab_run_reply(
     *,

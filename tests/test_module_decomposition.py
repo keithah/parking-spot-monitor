@@ -77,10 +77,12 @@ def test_runtime_modules_stay_decomposed() -> None:
 def test_operator_modules_stay_decomposed() -> None:
     module_caps = {
         "parking_spot_monitor/operator_cockpit.py": 900,
+        "parking_spot_monitor/operator_cockpit_memory.py": 80,
         "parking_spot_monitor/operator_cockpit_shared.py": 380,
         "parking_spot_monitor/operator_cockpit_snapshots.py": 460,
         "parking_spot_monitor/operator_feedback.py": 940,
         "parking_spot_monitor/operator_feedback_models.py": 450,
+        "parking_spot_monitor/operator_timeline.py": 100,
     }
     for path, max_lines in module_caps.items():
         assert (ROOT / path).exists()
