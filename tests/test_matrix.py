@@ -817,7 +817,14 @@ def test_prepare_event_snapshot_rejects_non_image_bytes_without_claiming_jpeg_me
     assert source.read_bytes() == b"not a jpeg"
     assert exc_info.value.diagnostics["error_type"] == "snapshot_metadata_failed"
     assert exc_info.value.diagnostics["source_path"] == str(source)
+    assert not (tmp_path / "snapshots" / "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg").exists()
     assert "mimetype" not in exc_info.value.diagnostics
+
+
+def test_matrix_support_path_token_sanitizes_without_name_error() -> None:
+    from parking_spot_monitor.matrix_support import _path_token
+
+    assert _path_token("left spot/1") == "left-spot-1"
 
 
 def test_quiet_notice_text_is_deterministic_and_contextual() -> None:

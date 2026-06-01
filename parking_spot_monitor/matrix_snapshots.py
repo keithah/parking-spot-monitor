@@ -130,7 +130,8 @@ def prepare_event_snapshot(
 
     try:
         snapshot_root.mkdir(parents=True, exist_ok=True)
-        if not _same_path(source, destination):
+        copied_snapshot = not _same_path(source, destination)
+        if copied_snapshot:
             shutil.copyfile(source, destination)
     except OSError as exc:
         raise MatrixError(
@@ -148,6 +149,11 @@ def prepare_event_snapshot(
     try:
         width, height = _jpeg_dimensions(destination)
     except (OSError, UnidentifiedImageError) as exc:
+        if copied_snapshot:
+            try:
+                destination.unlink()
+            except FileNotFoundError:
+                pass
         raise MatrixError(
             "Matrix snapshot metadata could not be read as JPEG",
             error_type="snapshot_metadata_failed",
@@ -377,4 +383,3 @@ def _path_token(value: object) -> str:
 def _snapshot_body(*, spot_id: str | None, observed_at: str) -> str:
     subject = redact_diagnostic_text(spot_id) if spot_id else "parking spot"
     return f"Raw full-frame snapshot for {subject} at {observed_at.replace('Z', '+00:00')}"
-

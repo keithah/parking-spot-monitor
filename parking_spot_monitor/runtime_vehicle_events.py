@@ -42,16 +42,16 @@ def _owner_vehicle_quiet_window_alerts(
     window_id = getattr(quiet_status, "active_window_id", None)
     if not isinstance(window_id, str) or not window_id:
         return []
-    registry = load_owner_vehicle_registry(history_archive.root / "owner-vehicles.json")
     configured = set(configured_spot_ids)
     alerts: list[dict[str, Any]] = []
     try:
+        registry = load_owner_vehicle_registry(history_archive.root / "owner-vehicles.json")
         sessions = history_archive.load_active_sessions()
     except Exception as exc:
         logger.warning(
             "owner-vehicle-alert-scan-failed",
             phase="owner-vehicle",
-            action="scan-active-sessions",
+            action="load-owner-registry",
             error_type=type(exc).__name__,
             error_message=redact_diagnostic_text(exc),
         )

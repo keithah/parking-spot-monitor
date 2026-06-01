@@ -80,6 +80,8 @@ def health_status_for_loop(
     last_matrix_error: Mapping[str, Any] | None,
     state_save_error: Mapping[str, Any] | None,
     retention_failure_count: int,
+    matrix_command_failure_count: int = 0,
+    last_matrix_command_error: Mapping[str, Any] | None = None,
     vehicle_history_failure_count: int = 0,
     last_vehicle_history_error: Mapping[str, Any] | None = None,
 ) -> str:
@@ -90,6 +92,8 @@ def health_status_for_loop(
         or last_matrix_error is not None
         or state_save_error is not None
         or retention_failure_count
+        or matrix_command_failure_count
+        or last_matrix_command_error is not None
         or vehicle_history_failure_count
         or last_vehicle_history_error is not None
     ):
@@ -111,6 +115,8 @@ def write_loop_health(
     last_error: Mapping[str, Any] | None,
     retention_failure_count: int,
     state_save_error: Mapping[str, Any] | None,
+    matrix_command_failure_count: int = 0,
+    last_matrix_command_error: Mapping[str, Any] | None = None,
     vehicle_history_failure_count: int = 0,
     last_vehicle_history_error: Mapping[str, Any] | None = None,
     vehicle_history: Mapping[str, Any] | None = None,
@@ -131,6 +137,8 @@ def write_loop_health(
                 last_error=last_error,
                 retention_failure_count=retention_failure_count,
                 state_save_error=state_save_error,
+                matrix_command_failure_count=matrix_command_failure_count,
+                last_matrix_command_error=last_matrix_command_error,
                 vehicle_history_failure_count=vehicle_history_failure_count,
                 last_vehicle_history_error=last_vehicle_history_error,
                 vehicle_history=vehicle_history,

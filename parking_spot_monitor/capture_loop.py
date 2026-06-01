@@ -110,6 +110,8 @@ def run_capture_loop(
     last_matrix_error: dict[str, Any] | None = None
     last_error: dict[str, Any] | None = None
     state_save_error: dict[str, Any] | None = None
+    last_matrix_command_error: dict[str, Any] | None = None
+    matrix_command_failure_count = 0
     last_vehicle_history_error: dict[str, Any] | None = None
     vehicle_history_failure_count = 0
     retention_failure_count = startup_retention_failure_count
@@ -146,6 +148,8 @@ def run_capture_loop(
             last_error=last_error,
             retention_failure_count=retention_failure_count,
             state_save_error=state_save_error,
+            matrix_command_failure_count=matrix_command_failure_count,
+            last_matrix_command_error=last_matrix_command_error,
             vehicle_history_failure_count=vehicle_history_failure_count,
             last_vehicle_history_error=last_vehicle_history_error,
             vehicle_history=effective_history_archive.health_snapshot(),
@@ -165,10 +169,15 @@ def run_capture_loop(
             iteration += 1
             logger.info("capture-loop-iteration", iteration=iteration, data_dir=str(data_dir))
             try:
+                previous_matrix_error = last_matrix_error
                 outbox_error = drain_matrix_outbox_if_available(matrix_delivery, logger=logger, iteration=iteration, trigger="iteration")
                 if outbox_error is not None:
                     last_matrix_error = outbox_error
                     last_error = outbox_error
+                else:
+                    if last_error is previous_matrix_error or last_error == previous_matrix_error:
+                        last_error = None
+                    last_matrix_error = None
                 result = capture(settings, data_dir)
                 consecutive_capture_failures = 0
                 last_frame_at = format_health_timestamp(result.timestamp)
@@ -214,13 +223,23 @@ def run_capture_loop(
                     if frame_update.matrix_errors:
                         last_matrix_error = frame_update.matrix_errors[-1]
                         last_error = last_matrix_error
+                    else:
+                        last_matrix_error = None
                     if frame_update.history_errors:
                         vehicle_history_failure_count += len(frame_update.history_errors)
                         last_vehicle_history_error = frame_update.history_errors[-1]
                         last_error = last_vehicle_history_error
+                    else:
+                        if last_error is last_vehicle_history_error or last_error == last_vehicle_history_error:
+                            last_error = None
+                        vehicle_history_failure_count = 0
+                        last_vehicle_history_error = None
+                    previous_state_save_error = state_save_error
                     state_save_error = frame_update.state_save_error
                     if state_save_error is not None:
                         last_error = state_save_error
+                    elif last_error is previous_state_save_error or last_error == previous_state_save_error:
+                        last_error = None
                     command_error = _poll_matrix_commands_once(
                         matrix_command_service,
                         logger=logger,
@@ -228,9 +247,14 @@ def run_capture_loop(
                         decision_memory_path=decision_memory_path,
                     )
                     if command_error is not None:
-                        vehicle_history_failure_count += 1
-                        last_vehicle_history_error = command_error
+                        matrix_command_failure_count += 1
+                        last_matrix_command_error = command_error
                         last_error = command_error
+                    else:
+                        if last_error is last_matrix_command_error or last_error == last_matrix_command_error:
+                            last_error = None
+                        matrix_command_failure_count = 0
+                        last_matrix_command_error = None
                 logger.info("capture-loop-frame-written", iteration=iteration, **result.diagnostics())
                 status = health_status_for_loop(
                     consecutive_capture_failures=consecutive_capture_failures,
@@ -238,6 +262,8 @@ def run_capture_loop(
                     last_matrix_error=last_matrix_error,
                     state_save_error=state_save_error,
                     retention_failure_count=retention_failure_count,
+                    matrix_command_failure_count=matrix_command_failure_count,
+                    last_matrix_command_error=last_matrix_command_error,
                     vehicle_history_failure_count=vehicle_history_failure_count,
                     last_vehicle_history_error=last_vehicle_history_error,
                 )
@@ -254,6 +280,8 @@ def run_capture_loop(
                     last_error=last_error,
                     retention_failure_count=retention_failure_count,
                     state_save_error=state_save_error,
+                    matrix_command_failure_count=matrix_command_failure_count,
+                    last_matrix_command_error=last_matrix_command_error,
                     vehicle_history_failure_count=vehicle_history_failure_count,
                     last_vehicle_history_error=last_vehicle_history_error,
                     vehicle_history=effective_history_archive.health_snapshot(),
@@ -289,6 +317,8 @@ def run_capture_loop(
                     last_error=last_error,
                     retention_failure_count=retention_failure_count,
                     state_save_error=state_save_error,
+                    matrix_command_failure_count=matrix_command_failure_count,
+                    last_matrix_command_error=last_matrix_command_error,
                     vehicle_history_failure_count=vehicle_history_failure_count,
                     last_vehicle_history_error=last_vehicle_history_error,
                     vehicle_history=effective_history_archive.health_snapshot(),

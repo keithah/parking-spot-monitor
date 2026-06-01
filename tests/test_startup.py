@@ -194,6 +194,12 @@ class FakeMatrixDelivery:
             raise RuntimeError(f"matrix failure {SECRET_MARKER}")
 
 
+class FakeOutboxDrainResult:
+    attempted_count = 0
+    delivered_count = 0
+    retrying_count = 0
+
+
 def test_dispatch_matrix_open_alert_feedback_uses_retained_snapshot_not_latest(tmp_path: Path) -> None:
     from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler, feedback_labels_path, load_feedback_labels
 
@@ -558,6 +564,37 @@ def test_runtime_loop_owner_vehicle_in_quiet_window_sends_deduped_alert(
     assert delivery.owner_alerts[0]["spot_id"] == "right_spot"
     assert state_payload["owner_quiet_window_alert_ids"] == [expected_event_id]
     assert output.count("owner-vehicle-quiet-window-alert") >= 1
+    assert_no_secret_leak(output)
+
+
+def test_owner_vehicle_quiet_window_alerts_skip_unreadable_owner_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import parking_spot_monitor.runtime_vehicle_events as runtime_vehicle_events
+    from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
+
+    class ActiveQuietStatus:
+        active = True
+        active_window_id = "street_sweeping:2026-05-18:13:00-15:00"
+
+    def fail_registry(_path: Path) -> object:
+        raise PermissionError(f"registry denied token={SECRET_MARKER} raw_image_bytes")
+
+    monkeypatch.setattr(runtime_vehicle_events, "load_owner_vehicle_registry", fail_registry)
+
+    alerts = runtime_vehicle_events._owner_vehicle_quiet_window_alerts(
+        VehicleHistoryArchive(tmp_path, logger=StructuredLogger()),
+        quiet_status=ActiveQuietStatus(),
+        observed_at=datetime(2026, 5, 18, 20, 5, 6, tzinfo=timezone.utc),
+        emitted_alert_ids=set(),
+        configured_spot_ids=("left_spot",),
+        logger=StructuredLogger(),
+    )
+
+    output = combined_output(capsys)
+    assert alerts == []
+    assert '"event":"owner-vehicle-alert-scan-failed"' in output
+    assert '"action":"load-owner-registry"' in output
     assert_no_secret_leak(output)
 
 
@@ -1309,8 +1346,11 @@ def test_runtime_loop_matrix_command_failure_is_non_blocking_and_redacted(
     assert exit_code == 0
     assert len(delivery.occupied_alerts) == 1
     assert health["status"] == "degraded"
-    assert health["last_vehicle_history_error"]["phase"] == "matrix-command"
-    assert health["last_vehicle_history_error"]["action"] == "matrix-command"
+    assert health["vehicle_history_failure_count"] == 0
+    assert health["last_vehicle_history_error"] is None
+    assert health["matrix_command_failure_count"] == 4
+    assert health["last_matrix_command_error"]["phase"] == "matrix-command"
+    assert health["last_matrix_command_error"]["action"] == "matrix-command"
     assert '"event":"matrix-command-poll-failed"' in output
     assert_no_secret_leak(output)
 
@@ -1438,11 +1478,12 @@ def test_runtime_loop_vehicle_history_image_capture_failure_degrades_health_with
     assert runtime_state_payload(tmp_path / "state.json")["spots"]["left_spot"]["status"] == "empty"
     assert closed_payload["occupied_snapshot_path"] is None
     assert closed_payload["occupied_crop_path"] is None
-    assert health["status"] == "degraded"
-    assert health["vehicle_history_failure_count"] == 1
-    assert health["last_vehicle_history_error"]["action"] == "attach-images"
-    assert health["last_vehicle_history_error"]["image_phase"] == "image-capture"
-    assert health["last_vehicle_history_error"]["spot_id"] == "left_spot"
+    assert health["status"] == "ok"
+    assert health["vehicle_history_failure_count"] == 0
+    assert health["last_vehicle_history_error"] is None
+    assert health["vehicle_history"]["vehicle_history_failure_count"] == 1
+    assert health["vehicle_history"]["last_vehicle_history_error"]["phase"] == "image-capture"
+    assert health["vehicle_history"]["last_vehicle_history_error"]["session_id"] == closed_payload["session_id"]
     assert health["vehicle_history"]["missing_occupied_image_reference_count"] == 1
     assert '"event":"vehicle-session-images-failed"' in output
     assert '"event":"vehicle-history-record-failed"' in output
@@ -2604,6 +2645,43 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
     assert_no_secret_leak(output)
 
 
+def test_runtime_loop_clears_transient_matrix_outbox_error_after_clean_iteration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class FlakyOutboxDelivery(FakeMatrixDelivery):
+        def __init__(self) -> None:
+            super().__init__()
+            self.drain_calls = 0
+
+        def drain_outbox(self) -> FakeOutboxDrainResult:
+            self.drain_calls += 1
+            if self.drain_calls == 2:
+                raise RuntimeError(f"outbox transient token={SECRET_MARKER}")
+            return FakeOutboxDrainResult()
+
+    delivery = FlakyOutboxDelivery()
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z"),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
+        sleep=lambda _seconds: None,
+        max_iterations=2,
+        now=lambda: datetime(2026, 5, 18, 18, 0, tzinfo=timezone.utc),
+    )
+
+    health = health_payload(tmp_path / "health.json")
+    assert exit_code == 0
+    assert delivery.drain_calls == 3
+    assert health["status"] == "ok"
+    assert health["last_matrix_error"] is None
+    assert health["last_error"] is None
+    assert_no_secret_leak(combined_output(capsys))
+
+
 def test_runtime_loop_sends_matrix_startup_lifecycle_notice(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2830,6 +2908,53 @@ def test_runtime_loop_state_save_failure_updates_health_and_loop_continues(
     assert health["state_save_error"]["error_type"] == "PermissionError"
     assert SECRET_MARKER not in json.dumps(health)
     assert '"event":"capture-loop-frame-written"' in output
+    assert_no_secret_leak(output)
+
+
+def test_runtime_loop_state_save_failure_does_not_emit_matrix_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import parking_spot_monitor.runtime_state_update as runtime_state_update
+
+    state_path = tmp_path / "state.json"
+    save_runtime_state(
+        state_path,
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(
+                    status=OccupancyStatus.OCCUPIED,
+                    hit_streak=3,
+                    miss_streak=2,
+                    last_bbox=(350.0, 200.0, 550.0, 330.0),
+                    open_event_emitted=False,
+                ),
+                "right_spot": SpotOccupancyState(),
+            }
+        ),
+    )
+
+    def fail_state_save(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(f"state denied token={SECRET_MARKER} Traceback raw_image_bytes abc")
+
+    monkeypatch.setattr(runtime_state_update, "save_runtime_state", fail_state_save)
+    delivery = FakeMatrixDelivery()
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    assert exit_code == 0
+    assert delivery.open_alerts == []
+    assert "occupancy-open-event" not in event_names(output)
     assert_no_secret_leak(output)
 
 

@@ -54,21 +54,11 @@ def _update_runtime_state_for_frame(
         emitted_notice_ids=runtime_state.quiet_window_notice_ids,
     )
     emitted_notice_ids = set(runtime_state.quiet_window_notice_ids)
+    pending_notice_payloads: list[dict[str, Any]] = []
     for notice in notice_events:
         if notice.event_id in emitted_notice_ids:
             continue
-        payload = notice.to_dict()
-        event_name = str(payload.pop("event_type"))
-        logger.info(event_name, **payload)
-        matrix_error = dispatch_matrix_event(
-            matrix_delivery,
-            event_name,
-            payload | {"event_type": event_name},
-            logger=logger,
-            decision_memory_path=decision_memory_path,
-        )
-        if matrix_error is not None:
-            matrix_errors.append(matrix_error)
+        pending_notice_payloads.append(notice.to_dict())
         emitted_notice_ids.add(notice.event_id)
 
     _log_missed_occupied_spot_diagnostics(
@@ -94,6 +84,48 @@ def _update_runtime_state_for_frame(
         configured_spot_ids=configured_spot_ids,
         presence_by_spot=presence_by_spot,
     )
+    owner_alert_ids = set(runtime_state.owner_quiet_window_alert_ids)
+    owner_alerts = _owner_vehicle_quiet_window_alerts(
+        history_archive,
+        quiet_status=quiet_status,
+        observed_at=observed_at,
+        emitted_alert_ids=owner_alert_ids,
+        configured_spot_ids=configured_spot_ids,
+        logger=logger,
+    )
+    for owner_alert in owner_alerts:
+        event_id = owner_alert.get("event_id")
+        if isinstance(event_id, str) and event_id:
+            owner_alert_ids.add(event_id)
+
+    updated_state = RuntimeState(
+        state_by_spot=occupancy_update.state_by_spot,
+        active_quiet_window_ids=quiet_status.active_window_ids,
+        quiet_window_notice_ids=frozenset(emitted_notice_ids),
+        owner_quiet_window_alert_ids=frozenset(owner_alert_ids),
+    )
+    try:
+        save_runtime_state(state_path, updated_state, logger=logger)
+    except Exception as exc:
+        return FrameUpdateResult(
+            runtime_state=runtime_state,
+            matrix_errors=matrix_errors,
+            state_save_error=_safe_error_context("state-save", exc),
+        )
+
+    for payload in pending_notice_payloads:
+        event_name = str(payload.pop("event_type"))
+        logger.info(event_name, **payload)
+        matrix_error = dispatch_matrix_event(
+            matrix_delivery,
+            event_name,
+            payload | {"event_type": event_name},
+            logger=logger,
+            decision_memory_path=decision_memory_path,
+        )
+        if matrix_error is not None:
+            matrix_errors.append(matrix_error)
+
     _append_runtime_state_memory_records(
         decision_memory_path,
         previous_state=runtime_state,
@@ -113,15 +145,6 @@ def _update_runtime_state_for_frame(
         logger=logger,
     )
     history_errors = history_result.errors
-    owner_alert_ids = set(runtime_state.owner_quiet_window_alert_ids)
-    owner_alerts = _owner_vehicle_quiet_window_alerts(
-        history_archive,
-        quiet_status=quiet_status,
-        observed_at=observed_at,
-        emitted_alert_ids=owner_alert_ids,
-        configured_spot_ids=configured_spot_ids,
-        logger=logger,
-    )
 
     for owner_alert in owner_alerts:
         event_name = str(owner_alert.get("event_type", OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE))
@@ -135,9 +158,6 @@ def _update_runtime_state_for_frame(
         )
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
-        event_id = owner_alert.get("event_id")
-        if isinstance(event_id, str) and event_id:
-            owner_alert_ids.add(event_id)
 
     for occupied_alert in history_result.occupied_alerts:
         matrix_error = dispatch_matrix_event(
@@ -163,20 +183,4 @@ def _update_runtime_state_for_frame(
         )
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
-
-    updated_state = RuntimeState(
-        state_by_spot=occupancy_update.state_by_spot,
-        active_quiet_window_ids=quiet_status.active_window_ids,
-        quiet_window_notice_ids=frozenset(emitted_notice_ids),
-        owner_quiet_window_alert_ids=frozenset(owner_alert_ids),
-    )
-    try:
-        save_runtime_state(state_path, updated_state, logger=logger)
-    except Exception as exc:
-        return FrameUpdateResult(
-            runtime_state=runtime_state,
-            matrix_errors=matrix_errors,
-            state_save_error=_safe_error_context("state-save", exc),
-            history_errors=history_errors,
-        )
     return FrameUpdateResult(runtime_state=updated_state, matrix_errors=matrix_errors, history_errors=history_errors)
