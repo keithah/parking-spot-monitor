@@ -312,28 +312,29 @@ class VehicleHistoryCorrectionMixin:
         profile_ids = self._known_profile_ids(state=state)
         session_ids = {record.session_id for record in [*self.load_active_sessions(), *self.list_closed_sessions()]}
         if event.action == CORRECTION_ACTION_RENAME_PROFILE:
-            assert event.profile_id is not None
-            if self.resolve_profile_id(event.profile_id, merges=state.merges) not in profile_ids:
+            profile_id = _required_correction_field(event.profile_id, "profile_id")
+            if self.resolve_profile_id(profile_id, merges=state.merges) not in profile_ids:
                 raise ArchiveSchemaError("unknown profile_id")
         elif event.action == CORRECTION_ACTION_MERGE_PROFILES:
-            assert event.source_profile_id is not None and event.target_profile_id is not None
-            source = self.resolve_profile_id(event.source_profile_id, merges=state.merges)
-            target = self.resolve_profile_id(event.target_profile_id, merges=state.merges)
+            source_profile_id = _required_correction_field(event.source_profile_id, "source_profile_id")
+            target_profile_id = _required_correction_field(event.target_profile_id, "target_profile_id")
+            source = self.resolve_profile_id(source_profile_id, merges=state.merges)
+            target = self.resolve_profile_id(target_profile_id, merges=state.merges)
             if source not in profile_ids or target not in profile_ids:
                 raise ArchiveSchemaError("unknown profile_id")
             if source == target:
                 raise ArchiveSchemaError("profile merge cycle detected")
         elif event.action == CORRECTION_ACTION_WRONG_MATCH:
-            assert event.session_id is not None
-            if event.session_id not in session_ids:
+            session_id = _required_correction_field(event.session_id, "session_id")
+            if session_id not in session_ids:
                 raise ArchiveSchemaError("unknown session_id")
             if event.profile_id is not None:
-                session = next(record for record in [*self.load_active_sessions(), *self.list_closed_sessions()] if record.session_id == event.session_id)
+                session = next(record for record in [*self.load_active_sessions(), *self.list_closed_sessions()] if record.session_id == session_id)
                 if self.resolve_profile_id(session.profile_id, merges=state.merges) != self.resolve_profile_id(event.profile_id, merges=state.merges):
                     raise ArchiveSchemaError("wrong_match profile_id does not match session profile")
         elif event.action == CORRECTION_ACTION_PROFILE_SUMMARY_REQUESTED:
-            assert event.profile_id is not None
-            if self.resolve_profile_id(event.profile_id, merges=state.merges) not in profile_ids:
+            profile_id = _required_correction_field(event.profile_id, "profile_id")
+            if self.resolve_profile_id(profile_id, merges=state.merges) not in profile_ids:
                 raise ArchiveSchemaError("unknown profile_id")
 
     def _known_profile_ids(self, *, state: CorrectionReplayState | None = None) -> set[str]:
@@ -365,3 +366,9 @@ class VehicleHistoryCorrectionMixin:
         except OSError as exc:
             self._record_failure(phase="correction-quarantine-count", path_name=self.corrections_quarantine_path.name, error=exc)
             return 0
+
+
+def _required_correction_field(value: str | None, field_name: str) -> str:
+    if value is None:
+        raise ArchiveSchemaError(f"correction missing {field_name}")
+    return value

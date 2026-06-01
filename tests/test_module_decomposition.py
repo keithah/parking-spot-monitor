@@ -52,3 +52,29 @@ def test_vehicle_history_module_is_a_small_compatibility_shim() -> None:
     for path, max_lines in module_caps.items():
         assert (ROOT / path).exists()
         assert _line_count(path) <= max_lines
+
+
+def test_runtime_modules_stay_decomposed() -> None:
+    assert _line_count("parking_spot_monitor/__main__.py") <= 430
+    module_caps = {
+        "parking_spot_monitor/capture_loop.py": 280,
+        "parking_spot_monitor/runtime_commands.py": 120,
+        "parking_spot_monitor/runtime_decision_memory.py": 240,
+        "parking_spot_monitor/runtime_detection.py": 250,
+        "parking_spot_monitor/runtime_frame_plan.py": 160,
+        "parking_spot_monitor/runtime_health.py": 290,
+        "parking_spot_monitor/runtime_lifecycle.py": 150,
+        "parking_spot_monitor/runtime_overlay.py": 90,
+        "parking_spot_monitor/runtime_presence.py": 150,
+        "parking_spot_monitor/runtime_state_update.py": 180,
+        "parking_spot_monitor/runtime_vehicle_events.py": 460,
+    }
+    for path, max_lines in module_caps.items():
+        assert (ROOT / path).exists()
+        assert _line_count(path) <= max_lines
+
+
+def test_vehicle_history_corrections_do_not_use_asserts_for_event_field_narrowing() -> None:
+    correction_source = (ROOT / "parking_spot_monitor/vehicle_history_corrections.py").read_text(encoding="utf-8")
+
+    assert "assert event." not in correction_source
