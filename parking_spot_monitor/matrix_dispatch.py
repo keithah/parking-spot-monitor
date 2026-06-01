@@ -7,15 +7,15 @@ from pathlib import Path
 from typing import Any
 
 from parking_spot_monitor.logging import StructuredLogger
-from parking_spot_monitor.matrix import (
+from parking_spot_monitor.matrix_alerts import (
     LIFECYCLE_EVENT_TYPES,
-    MatrixError,
     OCCUPIED_SPOT_EVENT_TYPE,
     OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
     occupied_spot_event_id,
     open_spot_event_id,
     owner_vehicle_quiet_window_event_id,
 )
+from parking_spot_monitor.matrix_support import MatrixError
 from parking_spot_monitor.occupancy import OccupancyEventType
 from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, make_decision_memory_record
 from parking_spot_monitor.scheduler import QuietWindowEventType

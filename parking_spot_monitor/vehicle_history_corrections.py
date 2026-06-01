@@ -3,8 +3,32 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
 
-from parking_spot_monitor.vehicle_history_models import *
+from parking_spot_monitor.logging import redact_diagnostic_text
+from parking_spot_monitor.vehicle_history_models import (
+    CORRECTION_ACTION_MERGE_PROFILES,
+    CORRECTION_ACTION_PROFILE_SUMMARY_REQUESTED,
+    CORRECTION_ACTION_RENAME_PROFILE,
+    CORRECTION_ACTION_WRONG_MATCH,
+    MAX_CORRECTION_LINE_BYTES,
+    MAX_CORRECTION_TEXT_LENGTH,
+    SCHEMA_VERSION,
+    ArchiveSchemaError,
+    ArchiveWriteError,
+    CorrectionReplayState,
+    ProfileCorrectionEvent,
+    SessionRecord,
+    _bounded_string,
+    _correction_id,
+    _optional_bounded_string,
+    _optional_profile_id,
+    _safe_error_message,
+    _utc_now,
+)
+from parking_spot_monitor.vehicle_history_profile_utils import _session_with_profile
 
 
 class VehicleHistoryCorrectionMixin:

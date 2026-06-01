@@ -16,7 +16,7 @@ from parking_spot_monitor.capture import CaptureError, capture_latest
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.incident_review import build_incident_replay
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
-from parking_spot_monitor.matrix import MatrixCommandResponse
+from parking_spot_monitor.matrix_models import MatrixCommandResponse
 from parking_spot_monitor.occupancy_analytics import analyze_occupancy
 from parking_spot_monitor.paths import resolve_runtime_paths
 

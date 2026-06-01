@@ -26,9 +26,14 @@ def test_vehicle_history_module_is_a_small_compatibility_shim() -> None:
     assert _line_count("parking_spot_monitor/vehicle_history.py") <= 220
     for path in [
         "parking_spot_monitor/vehicle_history_archive.py",
-        "parking_spot_monitor/vehicle_history_facade.py",
+        "parking_spot_monitor/vehicle_history_corrections.py",
         "parking_spot_monitor/vehicle_history_maintenance.py",
+        "parking_spot_monitor/vehicle_history_maintenance_utils.py",
         "parking_spot_monitor/vehicle_history_models.py",
+        "parking_spot_monitor/vehicle_history_profile_utils.py",
+        "parking_spot_monitor/vehicle_history_profiles.py",
+        "parking_spot_monitor/vehicle_history_sessions.py",
+        "parking_spot_monitor/vehicle_history_storage.py",
         "parking_spot_monitor/vehicle_history_validation.py",
     ]:
         assert (ROOT / path).exists()

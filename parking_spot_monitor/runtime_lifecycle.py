@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from parking_spot_monitor.logging import StructuredLogger
-from parking_spot_monitor.matrix import MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, monitor_lifecycle_event
+from parking_spot_monitor.matrix_alerts import MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, monitor_lifecycle_event
 from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 
 

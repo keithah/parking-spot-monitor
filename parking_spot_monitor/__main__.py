@@ -20,12 +20,10 @@ from parking_spot_monitor.detection_lab import DetectionLabManager
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.live_proof import run_live_proof_once
 from parking_spot_monitor.logging import StructuredLogger, setup_logging
-from parking_spot_monitor.matrix import (
-    MatrixClient,
-    MatrixCommandService,
-    MatrixOperatorCockpitContext,
-    prune_event_snapshots,
-)
+from parking_spot_monitor.matrix_client import MatrixClient
+from parking_spot_monitor.matrix_cockpit import MatrixOperatorCockpitContext
+from parking_spot_monitor.matrix_commands import MatrixCommandService
+from parking_spot_monitor.matrix_snapshots import prune_event_snapshots
 from parking_spot_monitor.capture_loop import run_capture_loop
 from parking_spot_monitor.config import RuntimeSettings, load_settings
 from parking_spot_monitor.operator_cockpit import build_who_snapshot_response

@@ -91,7 +91,7 @@ def test_readme_documents_clean_machine_setup_sequence_and_operator_commands() -
 
 def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_secret_safe() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
 
     assert_contains_all(
         readme,
@@ -147,7 +147,7 @@ def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_se
 
 def test_m006_incident_intelligence_commands_and_closeout_smoke_are_documented() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
     smoke_source = read_tracked("scripts/verify_m006_incident_intelligence_closeout.py")
@@ -389,7 +389,7 @@ def test_m007_matrix_outbox_recovery_docs_and_closeout_smoke_are_documented() ->
 
 def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
 
@@ -443,7 +443,7 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
 
 def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_uat_limits() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
 
@@ -545,7 +545,7 @@ def test_operator_docs_include_timeline_frame_buffer_contract() -> None:
 
 def test_detection_lab_command_docs_cover_bounded_authorized_local_artifact_boundary() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
     lab_source = read_tracked("parking_spot_monitor/detection_lab.py")
     startup_source = read_tracked("parking_spot_monitor/__main__.py")
@@ -656,7 +656,7 @@ def test_detection_lab_command_docs_cover_bounded_authorized_local_artifact_boun
 
 def test_why_recent_command_docs_cover_memory_boundaries_and_safe_failures() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
     memory_source = read_tracked("parking_spot_monitor/operator_decision_memory.py")
 
     assert_contains_all(
@@ -725,7 +725,7 @@ def test_why_recent_command_docs_cover_memory_boundaries_and_safe_failures() -> 
 
 def test_latest_command_docs_cover_raw_image_failure_and_retention_boundaries() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix.py")
+    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
 
     assert_contains_all(
         readme,
@@ -941,6 +941,7 @@ def test_s04_docs_contract_stays_grounded_in_tracked_source_events() -> None:
             "parking_spot_monitor/runtime_state_update.py",
             "parking_spot_monitor/capture.py",
             "parking_spot_monitor/matrix.py",
+            "parking_spot_monitor/matrix_commands.py",
             "parking_spot_monitor/matrix_snapshots.py",
             "parking_spot_monitor/matrix_alerts.py",
             "parking_spot_monitor/state.py",

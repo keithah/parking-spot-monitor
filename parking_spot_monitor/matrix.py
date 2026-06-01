@@ -1,49 +1,5 @@
 from __future__ import annotations
 
-# Source-backed operator/docs contract kept in this compatibility module because
-# docs tests intentionally read parking_spot_monitor/matrix.py as the public
-# Matrix command surface, even though implementations now live in split modules.
-OPERATOR_COMMAND_SOURCE_CONTRACT = """
-{command_prefix} status — show runtime health and spot status
-{command_prefix} config — show safe monitor configuration
-{command_prefix} latest — show latest runtime summary and raw full-frame image evidence
-{command_prefix} why <spot_id> — explain recent parking decisions for one spot from bounded local memory
-{command_prefix} explain <spot_id> — alias for why with the same bounded local-memory explanation
-{command_prefix} recent — show recent decision, alert, suppression, command, and lab records from bounded local memory
-{command_prefix} at <time> <spot_id> — review the nearest retained timeline frame and local decision memory for an incident
-{command_prefix} confidence — show artifact-derived spot stability, weak evidence, timeline health, and Matrix delivery status
-{command_prefix} correct <spot_id> <open|occupied> — record the actual spot state for a wrong alert
-{command_prefix} learn <spot_id> <open|occupied> at <time> — record a retained-timeline calibration label for review
-{command_prefix} who — list active parking sessions by spot and attach a fresh current snapshot when configured
-{command_prefix} false-alert <spot_id> <open|occupied> — explicit alias for correcting a false alert
-{command_prefix} missed-alert <spot_id> <open|occupied> at <time> — explicit alias for recording missed timeline evidence
-{command_prefix} analytics [today|7d|30d|all] — show spot-level historical occupancy metrics from local vehicle-history sessions
-{command_prefix} lab run replay — start a bounded local replay lab job using fixed inputs
-{command_prefix} lab run tuning — start a bounded local tuning lab job using fixed inputs
-{command_prefix} lab status [job_id|latest] — show the latest or selected redacted lab job status
-usage: !parking status
-usage: !parking latest
-usage: !parking why <spot_id>
-usage: !parking explain <spot_id>
-usage: !parking recent
-usage: !parking at <time> <spot_id>
-usage: !parking confidence
-usage: !parking correct <spot_id> <open|occupied>
-usage: !parking learn <spot_id> <open|occupied> at <time>
-usage: !parking who
-usage: !parking analytics [today|7d|30d|all]
-usage: !parking lab run <replay|tuning>
-usage: !parking lab status [job_id|latest]
-invalid spot id
-invalid lab job kind
-invalid lab job id
-if parts[1] in {"correct", "false-alert"}
-if parts[1] in {"learn", "missed-alert"}
-Raw full-frame {image_path.name} evidence
-command:{event.event_id}:image
-matrix-send-failed
-"""
-
 from parking_spot_monitor.matrix_alerts import (
     LIFECYCLE_EVENT_TYPES,
     MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,

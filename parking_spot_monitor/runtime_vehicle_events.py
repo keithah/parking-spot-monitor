@@ -9,7 +9,7 @@ from typing import Any
 
 from parking_spot_monitor.detection import DetectionFilterResult
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
-from parking_spot_monitor.matrix import (
+from parking_spot_monitor.matrix_alerts import (
     OCCUPIED_SPOT_EVENT_TYPE,
     OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
     owner_vehicle_quiet_window_event_id,

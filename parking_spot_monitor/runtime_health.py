@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,97 @@ def matrix_outbox_health_payload(matrix_outbox_file: Path | None) -> dict[str, A
     payload = dict(summary)
     payload["available"] = True
     return payload
+
+
+@dataclass
+class RuntimeLoopHealthState:
+    consecutive_capture_failures: int = 0
+    consecutive_detection_failures: int = 0
+    last_frame_at: str | None = None
+    selected_decode_mode: str | None = None
+    last_matrix_error: dict[str, Any] | None = None
+    last_error: dict[str, Any] | None = None
+    state_save_error: dict[str, Any] | None = None
+    last_matrix_command_error: dict[str, Any] | None = None
+    matrix_command_failure_count: int = 0
+    last_vehicle_history_error: dict[str, Any] | None = None
+    vehicle_history_failure_count: int = 0
+    retention_failure_count: int = 0
+
+    def record_capture_success(self, *, timestamp: Any, selected_mode: Any) -> None:
+        self.consecutive_capture_failures = 0
+        self.last_frame_at = format_health_timestamp(timestamp)
+        self.selected_decode_mode = str(selected_mode.value if hasattr(selected_mode, "value") else selected_mode)
+
+    def record_capture_failure(self, error: BaseException, *, iteration: int) -> None:
+        self.consecutive_capture_failures += 1
+        self.last_error = safe_error_context("capture", error, extra={"iteration": iteration})
+
+    def record_detection_failure(self, error: BaseException, *, iteration: int) -> None:
+        self.consecutive_detection_failures += 1
+        self.last_error = safe_error_context("detection", error, extra={"iteration": iteration})
+
+    def record_detection_success(self) -> None:
+        self.consecutive_detection_failures = 0
+        self.last_error = None
+
+    def record_matrix_result(self, error: dict[str, Any] | None) -> None:
+        if error is not None:
+            self.last_matrix_error = error
+            self.last_error = error
+            return
+        self._clear_if_current(self.last_matrix_error)
+        self.last_matrix_error = None
+
+    def record_frame_update(
+        self,
+        *,
+        matrix_errors: list[dict[str, Any]],
+        history_errors: list[dict[str, Any]] | None,
+        state_save_error: dict[str, Any] | None,
+    ) -> None:
+        self.record_matrix_result(matrix_errors[-1] if matrix_errors else None)
+        if history_errors:
+            self.vehicle_history_failure_count += len(history_errors)
+            self.last_vehicle_history_error = history_errors[-1]
+            self.last_error = self.last_vehicle_history_error
+        else:
+            self._clear_if_current(self.last_vehicle_history_error)
+            self.vehicle_history_failure_count = 0
+            self.last_vehicle_history_error = None
+        previous_state_error = self.state_save_error
+        self.state_save_error = state_save_error
+        if state_save_error is not None:
+            self.last_error = state_save_error
+        else:
+            self._clear_if_current(previous_state_error)
+
+    def record_command_result(self, error: dict[str, Any] | None) -> None:
+        if error is not None:
+            self.matrix_command_failure_count += 1
+            self.last_matrix_command_error = error
+            self.last_error = error
+            return
+        self._clear_if_current(self.last_matrix_command_error)
+        self.matrix_command_failure_count = 0
+        self.last_matrix_command_error = None
+
+    def status(self) -> str:
+        return health_status_for_loop(
+            consecutive_capture_failures=self.consecutive_capture_failures,
+            consecutive_detection_failures=self.consecutive_detection_failures,
+            last_matrix_error=self.last_matrix_error,
+            state_save_error=self.state_save_error,
+            retention_failure_count=self.retention_failure_count,
+            matrix_command_failure_count=self.matrix_command_failure_count,
+            last_matrix_command_error=self.last_matrix_command_error,
+            vehicle_history_failure_count=self.vehicle_history_failure_count,
+            last_vehicle_history_error=self.last_vehicle_history_error,
+        )
+
+    def _clear_if_current(self, previous_error: Mapping[str, Any] | None) -> None:
+        if previous_error is not None and (self.last_error is previous_error or self.last_error == previous_error):
+            self.last_error = None
 
 
 def health_status_for_loop(

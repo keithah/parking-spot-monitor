@@ -1,3 +1,0 @@
-from __future__ import annotations
-
-from parking_spot_monitor.vehicle_history_archive import VehicleHistoryArchive

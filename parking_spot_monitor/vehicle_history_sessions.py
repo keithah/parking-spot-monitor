@@ -1,11 +1,27 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from parking_spot_monitor.occupancy import OccupancyEvent
 from parking_spot_monitor.vehicle_history_images import VehicleHistoryImageError, capture_occupied_images
-from parking_spot_monitor.vehicle_history_models import *
+from parking_spot_monitor.vehicle_history_models import (
+    SCHEMA_VERSION,
+    ArchiveSchemaError,
+    ArchiveWriteError,
+    SessionRecord,
+    _duration_seconds,
+    _event_payload,
+    _event_time,
+    _optional_event_snapshot,
+    _safe_error_message,
+    _session_id,
+    _utc_now,
+    _validate_close_event,
+    _validate_start_event,
+)
 
 
 class VehicleHistorySessionMixin:

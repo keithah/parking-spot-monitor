@@ -9,7 +9,24 @@ from parking_spot_monitor.vehicle_profiles import (
     VehicleProfileDescriptorError,
     extract_vehicle_descriptor,
 )
-from parking_spot_monitor.vehicle_history_models import *
+from parking_spot_monitor.vehicle_history_models import (
+    OWNER_PROFILE_MIN_ASSIGNMENT_CONFIDENCE,
+    PROFILE_STATUS_ACTIVE,
+    SCHEMA_VERSION,
+    ArchiveSchemaError,
+    ArchiveWriteError,
+    ProfileAssignment,
+    StoredVehicleProfile,
+    _bounded_string,
+    _safe_error_message,
+    _slug,
+    _utc_now,
+)
+from parking_spot_monitor.vehicle_history_profile_utils import (
+    _is_owner_profile_low_confidence_match,
+    _profile_with_sample,
+    _session_with_profile,
+)
 
 
 class VehicleHistoryProfileMixin:

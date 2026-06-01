@@ -3,11 +3,20 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
-from parking_spot_monitor.vehicle_history_models import *
+from parking_spot_monitor.vehicle_history_models import (
+    MAX_PROFILE_FILE_BYTES,
+    MAX_SESSION_FILE_BYTES,
+    ArchiveSchemaError,
+    ArchiveWriteError,
+    SessionRecord,
+    StoredVehicleProfile,
+    _safe_error_message,
+)
 
 class VehicleHistoryStorageMixin:
     def __init__(self, root: str | os.PathLike[str], logger: StructuredLogger | None = None) -> None:

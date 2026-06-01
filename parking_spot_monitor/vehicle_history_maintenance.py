@@ -5,12 +5,39 @@ import json
 import os
 import tarfile
 import tempfile
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from parking_spot_monitor.vehicle_estimates import VehicleHistoryEstimate, estimate_vehicle_history
-from parking_spot_monitor.vehicle_history_models import *
+from parking_spot_monitor.vehicle_history_maintenance_utils import (
+    _archive_files_for_export,
+    _archive_member_name,
+    _coerce_cutoff_datetime,
+    _image_directory_stats,
+    _maintenance_log_fields,
+    _maintenance_stamp,
+    _missing_occupied_image_reference_count,
+    _oldest_retained_session_started_at,
+    _profile_quarantine_count,
+    _record_archive_image_paths,
+    _record_closed_before,
+    _referenced_archive_paths,
+    _safe_file_size,
+    _safe_maintenance_metadata,
+)
+from parking_spot_monitor.vehicle_history_models import (
+    MAX_PROFILE_FILE_BYTES,
+    SCHEMA_VERSION,
+    ArchiveSchemaError,
+    ArchiveWriteError,
+    VehicleHistoryExportResult,
+    VehicleHistoryPruneResult,
+    _safe_error_message,
+    _utc_now,
+    _validate_json_safe,
+)
 
 
 class VehicleHistoryMaintenanceMixin:
