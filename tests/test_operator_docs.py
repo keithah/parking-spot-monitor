@@ -219,6 +219,7 @@ def test_m006_incident_intelligence_commands_and_closeout_smoke_are_documented()
     readme = read_tracked("README.md")
     matrix_contract = read_matrix_command_contract()
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
+    cockpit_snapshot_source = read_tracked("parking_spot_monitor/operator_cockpit_snapshots.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
     smoke_source = read_tracked("scripts/verify_m006_incident_intelligence_closeout.py")
 
@@ -272,7 +273,7 @@ def test_m006_incident_intelligence_commands_and_closeout_smoke_are_documented()
         ],
     )
     assert_contains_all(
-        cockpit_source,
+        cockpit_source + cockpit_snapshot_source,
         [
             "Build a local incident review from retained timeline frames and decision memory.",
             "No retained timeline frames were found.",
@@ -461,7 +462,9 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
     readme = read_tracked("README.md")
     matrix_contract = read_matrix_command_contract()
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
+    cockpit_snapshot_source = read_tracked("parking_spot_monitor/operator_cockpit_snapshots.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
+    feedback_model_source = read_tracked("parking_spot_monitor/operator_feedback_models.py")
 
     assert_contains_all(
         readme,
@@ -490,7 +493,7 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
         ],
     )
     assert_contains_all(
-        cockpit_source,
+        cockpit_source + cockpit_snapshot_source,
         [
             "Build a Matrix who reply enriched by one fresh raw capture when available.",
             "not run detector/model inference and does not read or mutate occupancy",
@@ -499,7 +502,7 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
         ],
     )
     assert_contains_all(
-        feedback_source,
+        feedback_source + feedback_model_source,
         [
             "FEEDBACK_LABELS_FILENAME = \"operator-feedback-labels.json\"",
             "reported_state",
@@ -516,6 +519,7 @@ def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_ua
     matrix_contract = read_matrix_command_contract()
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
+    feedback_model_source = read_tracked("parking_spot_monitor/operator_feedback_models.py")
 
     assert_contains_all(
         readme,
@@ -558,7 +562,7 @@ def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_ua
         ],
     )
     assert_contains_all(
-        feedback_source,
+        feedback_source + feedback_model_source,
         [
             "FEEDBACK_LABELS_FILENAME = \"operator-feedback-labels.json\"",
             "feedback_category=\"false_alert\"",

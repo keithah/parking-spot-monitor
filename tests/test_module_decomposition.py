@@ -74,6 +74,19 @@ def test_runtime_modules_stay_decomposed() -> None:
         assert _line_count(path) <= max_lines
 
 
+def test_operator_modules_stay_decomposed() -> None:
+    module_caps = {
+        "parking_spot_monitor/operator_cockpit.py": 900,
+        "parking_spot_monitor/operator_cockpit_shared.py": 380,
+        "parking_spot_monitor/operator_cockpit_snapshots.py": 460,
+        "parking_spot_monitor/operator_feedback.py": 940,
+        "parking_spot_monitor/operator_feedback_models.py": 450,
+    }
+    for path, max_lines in module_caps.items():
+        assert (ROOT / path).exists()
+        assert _line_count(path) <= max_lines
+
+
 def test_vehicle_history_corrections_do_not_use_asserts_for_event_field_narrowing() -> None:
     correction_source = (ROOT / "parking_spot_monitor/vehicle_history_corrections.py").read_text(encoding="utf-8")
 
