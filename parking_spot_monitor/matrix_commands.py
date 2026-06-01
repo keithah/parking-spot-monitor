@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, Protocol, TypeAlias
 
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
 from parking_spot_monitor.matrix_alerts import _int_field, _safe_text
@@ -36,19 +36,16 @@ from parking_spot_monitor.matrix_support import _require_non_empty, _sanitize_di
 
 
 @dataclass(frozen=True)
-class _CockpitCommand:
+class _CockpitReplyCommand:
     action: str
-    spot_id: str | None = None
-    lab_kind: str | None = None
-    lab_job_id: str | None = None
-    incident_time: str | None = None
-    analytics_window: str | None = None
+    arguments: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class _CorrectSpotStateCommand:
     spot_id: str
     actual_state: str
+    action: str = field(default="correct_spot_state", init=False)
 
 
 @dataclass(frozen=True)
@@ -56,47 +53,53 @@ class _LearnLabelCommand:
     spot_id: str
     actual_state: str
     requested_time: str
+    action: str = field(default="learn_label", init=False)
 
 
 @dataclass(frozen=True)
 class _RenameProfileCommand:
     profile_id: str
     label: str
+    action: str = field(default="rename_profile", init=False)
 
 
 @dataclass(frozen=True)
 class _MergeProfilesCommand:
     source_profile_id: str
     target_profile_id: str
+    action: str = field(default="merge_profiles", init=False)
 
 
 @dataclass(frozen=True)
 class _WrongMatchCommand:
     subject_id: str
+    action: str = field(default="wrong_match", init=False)
 
 
 @dataclass(frozen=True)
 class _AssignOwnerCommand:
     spot_id: str
+    action: str = field(default="assign_owner", init=False)
 
 
 @dataclass(frozen=True)
 class _ActiveSpotAssignmentsCommand:
-    pass
+    action: str = field(default="active_spot_assignments", init=False)
 
 
 @dataclass(frozen=True)
 class _HelpCommand:
-    pass
+    action: str = field(default="help", init=False)
 
 
 @dataclass(frozen=True)
 class _ProfileSummaryCommand:
     profile_id: str
+    action: str = field(default="profile_summary", init=False)
 
 
 _AppliedMatrixCommand: TypeAlias = (
-    _CockpitCommand
+    _CockpitReplyCommand
     | _CorrectSpotStateCommand
     | _LearnLabelCommand
     | _RenameProfileCommand
@@ -107,6 +110,20 @@ _AppliedMatrixCommand: TypeAlias = (
     | _HelpCommand
     | _ProfileSummaryCommand
 )
+
+
+class _CockpitProvider(Protocol):
+    def __call__(self, action: str, **kwargs: str) -> str | MatrixCommandResponse: ...
+
+
+_CommandParser: TypeAlias = Callable[[list[str], str], _AppliedMatrixCommand]
+
+
+@dataclass(frozen=True)
+class _CommandSpec:
+    triggers: tuple[tuple[str, ...], ...]
+    help_text: str
+    parse: _CommandParser
 
 
 class MatrixCommandService:
@@ -124,7 +141,7 @@ class MatrixCommandService:
         logger: StructuredLogger | None = None,
         sync_timeout_ms: int = 0,
         sync_limit: int = 20,
-        cockpit_provider: Callable[[str], str | MatrixCommandResponse] | None = None,
+        cockpit_provider: _CockpitProvider | None = None,
         who_snapshot_provider: Callable[[str], str | MatrixCommandResponse] | None = None,
         cockpit_context: MatrixOperatorCockpitContext | None = None,
         feedback_labeler: Any | None = None,
@@ -182,7 +199,7 @@ class MatrixCommandService:
             self._send_reply(event, "Command rejected: sender is not authorized.")
             return "error"
         try:
-            command = parse_matrix_command(event.body, command_prefix=self.command_prefix)
+            command = _parse_applied_matrix_command(event.body, command_prefix=self.command_prefix)
         except MatrixCommandParseError as exc:
             self._log("warning", "matrix-command-parse-failed", reason=str(exc), **context)
             self._send_reply(event, f"Command rejected: {exc}")
@@ -200,18 +217,11 @@ class MatrixCommandService:
         self._log("info", "matrix-command-applied", action=command.action, **context)
         return "processed"
 
-    def _apply_command(self, command: MatrixCommand, *, event: MatrixTextEvent) -> str | MatrixCommandResponse:
-        typed_command = _typed_command(command)
+    def _apply_command(self, command: MatrixCommand | _AppliedMatrixCommand, *, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+        typed_command = _applied_command_from_compat(command) if isinstance(command, MatrixCommand) else command
         metadata = {"matrix_event_id": event.event_id, "matrix_sender": event.sender, "matrix_room_id": event.room_id}
-        if isinstance(typed_command, _CockpitCommand):
-            return self._format_cockpit_reply(
-                typed_command.action,
-                spot_id=typed_command.spot_id,
-                lab_kind=typed_command.lab_kind,
-                lab_job_id=typed_command.lab_job_id,
-                incident_time=typed_command.incident_time,
-                analytics_window=typed_command.analytics_window,
-            )
+        if isinstance(typed_command, _CockpitReplyCommand):
+            return self._format_cockpit_reply(typed_command)
         if isinstance(typed_command, _CorrectSpotStateCommand):
             if self.feedback_labeler is None:
                 raise RuntimeError("operator feedback labeler is not configured")
@@ -272,35 +282,18 @@ class MatrixCommandService:
 
     def _format_cockpit_reply(
         self,
-        action: str,
-        *,
-        spot_id: str | None = None,
-        lab_kind: str | None = None,
-        lab_job_id: str | None = None,
-        incident_time: str | None = None,
-        analytics_window: str | None = None,
+        command: _CockpitReplyCommand,
     ) -> str | MatrixCommandResponse:
         if self.cockpit_provider is not None:
-            kwargs: dict[str, str] = {}
-            if spot_id is not None:
-                kwargs["spot_id"] = spot_id
-            if lab_kind is not None:
-                kwargs["lab_kind"] = lab_kind
-            if lab_job_id is not None:
-                kwargs["lab_job_id"] = lab_job_id
-            if incident_time is not None:
-                kwargs["incident_time"] = incident_time
-            if analytics_window is not None:
-                kwargs["analytics_window"] = analytics_window
-            return self.cockpit_provider(action, **kwargs)  # type: ignore[call-arg]
+            return self.cockpit_provider(command.action, **dict(command.arguments))
         if self.cockpit_context is not None:
             return self.cockpit_context.format_reply(
-                action,
-                spot_id=spot_id,
-                lab_kind=lab_kind,
-                lab_job_id=lab_job_id,
-                incident_time=incident_time,
-                analytics_window=analytics_window,
+                command.action,
+                spot_id=command.arguments.get("spot_id"),
+                lab_kind=command.arguments.get("lab_kind"),
+                lab_job_id=command.arguments.get("lab_job_id"),
+                incident_time=command.arguments.get("incident_time"),
+                analytics_window=command.arguments.get("analytics_window"),
                 logger=self.logger,
             )
         raise RuntimeError("operator cockpit provider is not configured")
@@ -380,22 +373,233 @@ def _validate_command_image_info(info: Mapping[str, Any] | None) -> dict[str, in
     return {"mimetype": JPEG_MIMETYPE, "size": int(size), "w": int(width), "h": int(height)}
 
 
-def _typed_command(command: MatrixCommand) -> _AppliedMatrixCommand:
+def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> MatrixCommand:
+    return _matrix_command_from_applied(_parse_applied_matrix_command(body, command_prefix=command_prefix))
+
+
+def _parse_applied_matrix_command(body: str, *, command_prefix: str = "!parking") -> _AppliedMatrixCommand:
+    if not isinstance(body, str):
+        raise MatrixCommandParseError("body must be text")
+    if len(body.encode("utf-8")) > 512:
+        raise MatrixCommandParseError("body is too large")
+    text = " ".join(body.strip().split())
+    if not text:
+        raise MatrixCommandParseError("body is blank")
+    prefix = _require_non_empty("command_prefix", command_prefix)
+    if text != prefix and not text.startswith(prefix + " "):
+        raise MatrixCommandParseError("command prefix is required")
+    parts = text.split(" ")
+    if len(parts) < 2:
+        raise MatrixCommandParseError("command action is required")
+    spec = _command_spec_for(parts)
+    if spec is not None:
+        return spec.parse(parts, prefix)
+    if parts[1] == "lab":
+        raise MatrixCommandParseError("unknown lab command")
+    raise MatrixCommandParseError("unknown command")
+
+
+def _command_spec_for(parts: Sequence[str]) -> _CommandSpec | None:
+    for spec in MATRIX_COMMAND_SPECS:
+        for trigger in spec.triggers:
+            if tuple(parts[1 : 1 + len(trigger)]) == trigger:
+                return spec
+    return None
+
+
+def _exact_cockpit(action: str, usage: str) -> _CommandParser:
+    def parse(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+        if len(parts) != 2:
+            raise MatrixCommandParseError(usage)
+        return _CockpitReplyCommand(action)
+
+    return parse
+
+
+def _parse_spot_cockpit(action: str, usage: str) -> _CommandParser:
+    def parse(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+        if len(parts) != 3:
+            raise MatrixCommandParseError(usage)
+        return _CockpitReplyCommand(action, {"spot_id": _validate_spot_id(parts[2])})
+
+    return parse
+
+
+def _parse_correction(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    usage = "usage: !parking correct <spot_id> <open|occupied>" if parts[1] == "correct" else f"usage: {prefix} false-alert <spot_id> <open|occupied>"
+    if len(parts) != 4:
+        raise MatrixCommandParseError(usage)
+    return _CorrectSpotStateCommand(spot_id=_validate_spot_id(parts[2]), actual_state=_validate_actual_state(parts[3]))
+
+
+def _parse_learn_label(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    usage = "usage: !parking learn <spot_id> <open|occupied> at <time>" if parts[1] == "learn" else f"usage: {prefix} missed-alert <spot_id> <open|occupied> at <time>"
+    if len(parts) != 6 or parts[4] != "at":
+        raise MatrixCommandParseError(usage)
+    learn_time = redact_diagnostic_text(parts[5])[:80]
+    if not learn_time:
+        raise MatrixCommandParseError(usage)
+    return _LearnLabelCommand(
+        spot_id=_validate_spot_id(parts[2]),
+        actual_state=_validate_actual_state(parts[3]),
+        requested_time=learn_time,
+    )
+
+
+def _parse_analytics(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    if len(parts) == 2:
+        return _CockpitReplyCommand("analytics", {"analytics_window": "7d"})
+    if len(parts) == 3 and parts[2] in {"today", "7d", "30d", "all"}:
+        return _CockpitReplyCommand("analytics", {"analytics_window": parts[2]})
+    raise MatrixCommandParseError("usage: !parking analytics [today|7d|30d|all]")
+
+
+def _parse_incident_review(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    if len(parts) != 4:
+        raise MatrixCommandParseError("usage: !parking at <time> <spot_id>")
+    incident_time = redact_diagnostic_text(parts[2])[:80]
+    if not incident_time:
+        raise MatrixCommandParseError("usage: !parking at <time> <spot_id>")
+    return _CockpitReplyCommand(
+        "incident_review",
+        {"incident_time": incident_time, "spot_id": _validate_spot_id(parts[3])},
+    )
+
+
+def _parse_lab_run(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    if len(parts) != 4:
+        raise MatrixCommandParseError("usage: !parking lab run <replay|tuning>")
+    return _CockpitReplyCommand("lab_run", {"lab_kind": _validate_lab_kind(parts[3])})
+
+
+def _parse_lab_status(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    if len(parts) == 3:
+        return _CockpitReplyCommand("lab_status", {"lab_job_id": "latest"})
+    if len(parts) == 4:
+        return _CockpitReplyCommand("lab_status", {"lab_job_id": _validate_lab_job_id(parts[3])})
+    raise MatrixCommandParseError("usage: !parking lab status [job_id|latest]")
+
+
+def _parse_profile_rename(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    if len(parts) < 5:
+        raise MatrixCommandParseError("usage: !parking profile rename <profile_id> <label>")
+    return _RenameProfileCommand(
+        profile_id=_validate_profile_id(parts[3], "profile_id"),
+        label=_validate_label(" ".join(parts[4:])),
+    )
+
+
+def _parse_profile_merge(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    if len(parts) != 5:
+        raise MatrixCommandParseError("usage: !parking profile merge <source_profile_id> <target_profile_id>")
+    source = _validate_profile_id(parts[3], "source_profile_id")
+    target = _validate_profile_id(parts[4], "target_profile_id")
+    if source == target:
+        raise MatrixCommandParseError("source and target profiles must differ")
+    return _MergeProfilesCommand(source_profile_id=source, target_profile_id=target)
+
+
+def _parse_profile_summary(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    if len(parts) != 4:
+        raise MatrixCommandParseError("usage: !parking profile summary <profile_id>")
+    return _ProfileSummaryCommand(profile_id=_validate_profile_id(parts[3], "profile_id"))
+
+
+def _parse_wrong_match(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    if len(parts) != 3:
+        raise MatrixCommandParseError("usage: !parking wrong <spot_id|session_id>")
+    return _WrongMatchCommand(subject_id=_validate_subject_id(parts[2]))
+
+
+def _parse_assign_owner(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    if len(parts) != 3:
+        raise MatrixCommandParseError("usage: !parking owner <spot_id>")
+    return _AssignOwnerCommand(spot_id=_validate_subject_id(parts[2]))
+
+
+def _parse_who(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    if len(parts) != 2:
+        raise MatrixCommandParseError("usage: !parking who")
+    return _ActiveSpotAssignmentsCommand()
+
+
+def _parse_help(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
+    if len(parts) != 2:
+        raise MatrixCommandParseError("usage: !parking help")
+    return _HelpCommand()
+
+
+MATRIX_COMMAND_SPECS: tuple[_CommandSpec, ...] = (
+    _CommandSpec((("help",),), "help — show this help text", _parse_help),
+    _CommandSpec((("status",),), "status — show runtime health and spot status", _exact_cockpit("status", "usage: !parking status")),
+    _CommandSpec((("config",),), "config — show safe monitor configuration", _exact_cockpit("config", "usage: !parking config")),
+    _CommandSpec((("latest",),), "latest — show latest runtime summary and raw full-frame image evidence", _exact_cockpit("latest", "usage: !parking latest")),
+    _CommandSpec((("why",),), "why <spot_id> — explain recent parking decisions for one spot from bounded local memory", _parse_spot_cockpit("why", "usage: !parking why <spot_id>")),
+    _CommandSpec((("explain",),), "explain <spot_id> — alias for why with the same bounded local-memory explanation", _parse_spot_cockpit("explain", "usage: !parking explain <spot_id>")),
+    _CommandSpec((("correct",),), "correct <spot_id> <open|occupied> — record the actual spot state for a wrong alert", _parse_correction),
+    _CommandSpec((("false-alert",),), "false-alert <spot_id> <open|occupied> — explicit alias for correcting a false alert", _parse_correction),
+    _CommandSpec((("learn",),), "learn <spot_id> <open|occupied> at <time> — record a retained-timeline calibration label for review", _parse_learn_label),
+    _CommandSpec((("missed-alert",),), "missed-alert <spot_id> <open|occupied> at <time> — explicit alias for recording missed timeline evidence", _parse_learn_label),
+    _CommandSpec((("recent",),), "recent — show recent decision, alert, suppression, command, and lab records from bounded local memory", _exact_cockpit("recent", "usage: !parking recent")),
+    _CommandSpec((("confidence",),), "confidence — show artifact-derived spot stability, weak evidence, timeline health, and Matrix delivery status", _exact_cockpit("confidence", "usage: !parking confidence")),
+    _CommandSpec((("analytics",),), "analytics [today|7d|30d|all] — show spot-level historical occupancy metrics from local vehicle-history sessions", _parse_analytics),
+    _CommandSpec((("at",),), "at <time> <spot_id> — review the nearest retained timeline frame and local decision memory for an incident", _parse_incident_review),
+    _CommandSpec((("lab", "run"),), "lab run replay — start a bounded local replay lab job using fixed inputs", _parse_lab_run),
+    _CommandSpec((("lab", "run"),), "lab run tuning — start a bounded local tuning lab job using fixed inputs", _parse_lab_run),
+    _CommandSpec((("lab", "status"),), "lab status [job_id|latest] — show the latest or selected redacted lab job status", _parse_lab_status),
+    _CommandSpec((("who",),), "who — list active parking sessions by spot and attach a fresh current snapshot when configured", _parse_who),
+    _CommandSpec((("owner",),), "owner <spot_id> — mark the active vehicle in a spot as the configured owner vehicle", _parse_assign_owner),
+    _CommandSpec((("wrong",),), "wrong <spot_id|session_id> — mark a vehicle profile match as wrong", _parse_wrong_match),
+    _CommandSpec((("profile", "summary"),), "profile summary <profile_id> — show a safe vehicle profile summary", _parse_profile_summary),
+    _CommandSpec((("profile", "rename"),), "profile rename <profile_id> <label> — set a human label for a profile", _parse_profile_rename),
+    _CommandSpec((("profile", "merge"),), "profile merge <source_profile_id> <target_profile_id> — merge one profile into another", _parse_profile_merge),
+)
+
+
+def _matrix_command_from_applied(command: _AppliedMatrixCommand) -> MatrixCommand:
+    if isinstance(command, _CockpitReplyCommand):
+        return MatrixCommand(
+            action=command.action,
+            spot_id=command.arguments.get("spot_id"),
+            subject_id=command.arguments.get("incident_time") or command.arguments.get("analytics_window"),
+            lab_kind=command.arguments.get("lab_kind"),
+            lab_job_id=command.arguments.get("lab_job_id"),
+        )
+    if isinstance(command, _CorrectSpotStateCommand):
+        return MatrixCommand(action=command.action, spot_id=command.spot_id, actual_state=command.actual_state)
+    if isinstance(command, _LearnLabelCommand):
+        return MatrixCommand(action=command.action, spot_id=command.spot_id, actual_state=command.actual_state, subject_id=command.requested_time)
+    if isinstance(command, _RenameProfileCommand):
+        return MatrixCommand(action=command.action, profile_id=command.profile_id, label=command.label)
+    if isinstance(command, _MergeProfilesCommand):
+        return MatrixCommand(action=command.action, source_profile_id=command.source_profile_id, target_profile_id=command.target_profile_id)
+    if isinstance(command, _WrongMatchCommand):
+        return MatrixCommand(action=command.action, subject_id=command.subject_id)
+    if isinstance(command, _AssignOwnerCommand):
+        return MatrixCommand(action=command.action, subject_id=command.spot_id)
+    if isinstance(command, _ProfileSummaryCommand):
+        return MatrixCommand(action=command.action, profile_id=command.profile_id)
+    return MatrixCommand(action=command.action)
+
+
+def _applied_command_from_compat(command: MatrixCommand) -> _AppliedMatrixCommand:
     if command.action in {"status", "config", "latest", "recent", "confidence"}:
-        return _CockpitCommand(command.action)
+        return _CockpitReplyCommand(command.action)
     if command.action == "analytics":
-        return _CockpitCommand(command.action, analytics_window=command.subject_id or "7d")
+        return _CockpitReplyCommand(command.action, {"analytics_window": command.subject_id or "7d"})
     if command.action == "lab_run":
-        return _CockpitCommand(command.action, lab_kind=_require_command_field(command.lab_kind, "lab_kind"))
+        return _CockpitReplyCommand(command.action, {"lab_kind": _require_command_field(command.lab_kind, "lab_kind")})
     if command.action == "lab_status":
-        return _CockpitCommand(command.action, lab_job_id=command.lab_job_id or "latest")
+        return _CockpitReplyCommand(command.action, {"lab_job_id": command.lab_job_id or "latest"})
     if command.action in {"why", "explain"}:
-        return _CockpitCommand(command.action, spot_id=_require_command_field(command.spot_id, "spot_id"))
+        return _CockpitReplyCommand(command.action, {"spot_id": _require_command_field(command.spot_id, "spot_id")})
     if command.action == "incident_review":
-        return _CockpitCommand(
+        return _CockpitReplyCommand(
             command.action,
-            spot_id=_require_command_field(command.spot_id, "spot_id"),
-            incident_time=_require_command_field(command.subject_id, "incident_time"),
+            {
+                "spot_id": _require_command_field(command.spot_id, "spot_id"),
+                "incident_time": _require_command_field(command.subject_id, "incident_time"),
+            },
         )
     if command.action == "correct_spot_state":
         return _CorrectSpotStateCommand(
@@ -435,132 +639,6 @@ def _require_command_field(value: str | None, name: str) -> str:
     if value is None:
         raise MatrixCommandParseError(f"missing {name}")
     return value
-
-
-def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> MatrixCommand:
-    if not isinstance(body, str):
-        raise MatrixCommandParseError("body must be text")
-    if len(body.encode("utf-8")) > 512:
-        raise MatrixCommandParseError("body is too large")
-    text = " ".join(body.strip().split())
-    if not text:
-        raise MatrixCommandParseError("body is blank")
-    prefix = _require_non_empty("command_prefix", command_prefix)
-    if text != prefix and not text.startswith(prefix + " "):
-        raise MatrixCommandParseError("command prefix is required")
-    parts = text.split(" ")
-    if len(parts) < 2:
-        raise MatrixCommandParseError("command action is required")
-    if parts[1] == "status":
-        if len(parts) != 2:
-            raise MatrixCommandParseError("usage: !parking status")
-        return MatrixCommand(action="status")
-    if parts[1] == "config":
-        if len(parts) != 2:
-            raise MatrixCommandParseError("usage: !parking config")
-        return MatrixCommand(action="config")
-    if parts[1] == "latest":
-        if len(parts) != 2:
-            raise MatrixCommandParseError("usage: !parking latest")
-        return MatrixCommand(action="latest")
-    if parts[1] == "why":
-        if len(parts) != 3:
-            raise MatrixCommandParseError("usage: !parking why <spot_id>")
-        return MatrixCommand(action="why", spot_id=_validate_spot_id(parts[2]))
-    if parts[1] == "explain":
-        if len(parts) != 3:
-            raise MatrixCommandParseError("usage: !parking explain <spot_id>")
-        return MatrixCommand(action="explain", spot_id=_validate_spot_id(parts[2]))
-    if parts[1] in {"correct", "false-alert"}:
-        usage = "usage: !parking correct <spot_id> <open|occupied>" if parts[1] == "correct" else f"usage: {prefix} false-alert <spot_id> <open|occupied>"
-        if len(parts) != 4:
-            raise MatrixCommandParseError(usage)
-        return MatrixCommand(
-            action="correct_spot_state",
-            spot_id=_validate_spot_id(parts[2]),
-            actual_state=_validate_actual_state(parts[3]),
-        )
-    if parts[1] in {"learn", "missed-alert"}:
-        usage = "usage: !parking learn <spot_id> <open|occupied> at <time>" if parts[1] == "learn" else f"usage: {prefix} missed-alert <spot_id> <open|occupied> at <time>"
-        if len(parts) != 6 or parts[4] != "at":
-            raise MatrixCommandParseError(usage)
-        learn_time = redact_diagnostic_text(parts[5])[:80]
-        if not learn_time:
-            raise MatrixCommandParseError(usage)
-        return MatrixCommand(
-            action="learn_label",
-            spot_id=_validate_spot_id(parts[2]),
-            actual_state=_validate_actual_state(parts[3]),
-            subject_id=learn_time,
-        )
-    if parts[1] == "recent":
-        if len(parts) != 2:
-            raise MatrixCommandParseError("usage: !parking recent")
-        return MatrixCommand(action="recent")
-    if parts[1] == "confidence":
-        if len(parts) != 2:
-            raise MatrixCommandParseError("usage: !parking confidence")
-        return MatrixCommand(action="confidence")
-    if parts[1] == "analytics":
-        if len(parts) == 2:
-            return MatrixCommand(action="analytics", subject_id="7d")
-        if len(parts) == 3 and parts[2] in {"today", "7d", "30d", "all"}:
-            return MatrixCommand(action="analytics", subject_id=parts[2])
-        raise MatrixCommandParseError("usage: !parking analytics [today|7d|30d|all]")
-    if parts[1] == "at":
-        if len(parts) != 4:
-            raise MatrixCommandParseError("usage: !parking at <time> <spot_id>")
-        incident_time = redact_diagnostic_text(parts[2])[:80]
-        if not incident_time:
-            raise MatrixCommandParseError("usage: !parking at <time> <spot_id>")
-        return MatrixCommand(action="incident_review", subject_id=incident_time, spot_id=_validate_spot_id(parts[3]))
-    if parts[1] == "lab":
-        if parts[1:3] == ["lab", "run"]:
-            if len(parts) != 4:
-                raise MatrixCommandParseError("usage: !parking lab run <replay|tuning>")
-            return MatrixCommand(action="lab_run", lab_kind=_validate_lab_kind(parts[3]))
-        if parts[1:3] == ["lab", "status"]:
-            if len(parts) == 3:
-                return MatrixCommand(action="lab_status", lab_job_id="latest")
-            if len(parts) == 4:
-                return MatrixCommand(action="lab_status", lab_job_id=_validate_lab_job_id(parts[3]))
-            raise MatrixCommandParseError("usage: !parking lab status [job_id|latest]")
-        raise MatrixCommandParseError("unknown lab command")
-    if parts[1:3] == ["profile", "rename"]:
-        if len(parts) < 5:
-            raise MatrixCommandParseError("usage: !parking profile rename <profile_id> <label>")
-        profile_id = _validate_profile_id(parts[3], "profile_id")
-        label = _validate_label(" ".join(parts[4:]))
-        return MatrixCommand(action="rename_profile", profile_id=profile_id, label=label)
-    if parts[1:3] == ["profile", "merge"]:
-        if len(parts) != 5:
-            raise MatrixCommandParseError("usage: !parking profile merge <source_profile_id> <target_profile_id>")
-        source = _validate_profile_id(parts[3], "source_profile_id")
-        target = _validate_profile_id(parts[4], "target_profile_id")
-        if source == target:
-            raise MatrixCommandParseError("source and target profiles must differ")
-        return MatrixCommand(action="merge_profiles", source_profile_id=source, target_profile_id=target)
-    if parts[1:3] == ["profile", "summary"]:
-        if len(parts) != 4:
-            raise MatrixCommandParseError("usage: !parking profile summary <profile_id>")
-        return MatrixCommand(action="profile_summary", profile_id=_validate_profile_id(parts[3], "profile_id"))
-    if parts[1] == "wrong":
-        if len(parts) != 3:
-            raise MatrixCommandParseError("usage: !parking wrong <spot_id|session_id>")
-        return MatrixCommand(action="wrong_match", subject_id=_validate_subject_id(parts[2]))
-    if parts[1] == "owner":
-        if len(parts) != 3:
-            raise MatrixCommandParseError("usage: !parking owner <spot_id>")
-        return MatrixCommand(action="assign_owner", subject_id=_validate_subject_id(parts[2]))
-    if parts[1] == "who":
-        if len(parts) != 2:
-            raise MatrixCommandParseError("usage: !parking who")
-        return MatrixCommand(action="active_spot_assignments")
-    if parts[1] == "help":
-        if len(parts) != 2:
-            raise MatrixCommandParseError("usage: !parking help")
-        return MatrixCommand(action="help")
-    raise MatrixCommandParseError("unknown command")
 
 def _validate_profile_id(value: str, name: str) -> str:
     if not re.fullmatch(r"prof_[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}", value):
@@ -605,32 +683,9 @@ def _validate_label(value: str) -> str:
     return label
 
 def _format_command_help_reply(command_prefix: str) -> str:
-    return (
-        "Parking monitor commands:\n"
-        f"{command_prefix} help — show this help text\n"
-        f"{command_prefix} status — show runtime health and spot status\n"
-        f"{command_prefix} config — show safe monitor configuration\n"
-        f"{command_prefix} latest — show latest runtime summary and raw full-frame image evidence\n"
-        f"{command_prefix} why <spot_id> — explain recent parking decisions for one spot from bounded local memory\n"
-        f"{command_prefix} explain <spot_id> — alias for why with the same bounded local-memory explanation\n"
-        f"{command_prefix} correct <spot_id> <open|occupied> — record the actual spot state for a wrong alert\n"
-        f"{command_prefix} false-alert <spot_id> <open|occupied> — explicit alias for correcting a false alert\n"
-        f"{command_prefix} learn <spot_id> <open|occupied> at <time> — record a retained-timeline calibration label for review\n"
-        f"{command_prefix} missed-alert <spot_id> <open|occupied> at <time> — explicit alias for recording missed timeline evidence\n"
-        f"{command_prefix} recent — show recent decision, alert, suppression, command, and lab records from bounded local memory\n"
-        f"{command_prefix} confidence — show artifact-derived spot stability, weak evidence, timeline health, and Matrix delivery status\n"
-        f"{command_prefix} analytics [today|7d|30d|all] — show spot-level historical occupancy metrics from local vehicle-history sessions\n"
-        f"{command_prefix} at <time> <spot_id> — review the nearest retained timeline frame and local decision memory for an incident\n"
-        f"{command_prefix} lab run replay — start a bounded local replay lab job using fixed inputs\n"
-        f"{command_prefix} lab run tuning — start a bounded local tuning lab job using fixed inputs\n"
-        f"{command_prefix} lab status [job_id|latest] — show the latest or selected redacted lab job status\n"
-        f"{command_prefix} who — list active parking sessions by spot and attach a fresh current snapshot when configured\n"
-        f"{command_prefix} owner <spot_id> — mark the active vehicle in a spot as the configured owner vehicle\n"
-        f"{command_prefix} wrong <spot_id|session_id> — mark a vehicle profile match as wrong\n"
-        f"{command_prefix} profile summary <profile_id> — show a safe vehicle profile summary\n"
-        f"{command_prefix} profile rename <profile_id> <label> — set a human label for a profile\n"
-        f"{command_prefix} profile merge <source_profile_id> <target_profile_id> — merge one profile into another"
-    )
+    lines = ["Parking monitor commands:"]
+    lines.extend(f"{command_prefix} {spec.help_text}" for spec in MATRIX_COMMAND_SPECS)
+    return "\n".join(lines)
 
 def _confidence_text(value: object) -> str:
     if isinstance(value, (int, float)) and math.isfinite(float(value)):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import tempfile
 
 import yaml
 
@@ -38,7 +39,7 @@ def assert_section_case(section: str, case_name: str, required: list[str]) -> No
 
 
 def read_matrix_command_contract() -> str:
-    from parking_spot_monitor.matrix_commands import MatrixCommandParseError, _format_command_help_reply, parse_matrix_command
+    from parking_spot_monitor.matrix_commands import MatrixCommandParseError, MatrixCommandResponse, MatrixCommandService, MatrixTextEvent, _format_command_help_reply, parse_matrix_command
 
     def parse_error(body: str) -> str:
         try:
@@ -47,13 +48,52 @@ def read_matrix_command_contract() -> str:
             return str(exc)
         raise AssertionError(f"expected Matrix command parse failure for {body!r}")
 
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def send_text(self, **kwargs: object) -> str:
+            self.calls.append({"kind": "text", **kwargs})
+            return "$text"
+
+        def upload_image(self, **kwargs: object) -> str:
+            self.calls.append({"kind": "upload", **kwargs})
+            return "matrix-content-uri"
+
+        def send_image(self, **kwargs: object) -> str:
+            self.calls.append({"kind": "image", **kwargs})
+            return "$image"
+
+    client = Client()
+    service = MatrixCommandService(client=client, archive=object(), room_id="!room:example", authorized_senders=["@op:example"])
+    with tempfile.TemporaryDirectory() as tmp:
+        image_path = Path(tmp) / "latest.jpg"
+        image_path.write_bytes(b"jpeg")
+        service._send_command_response(
+            MatrixTextEvent(event_id="$event", sender="@op:example", room_id="!room:example", body="!parking latest"),
+            MatrixCommandResponse(text="Latest", image_path=image_path, image_info={"mimetype": "image/jpeg", "size": 4, "w": 1, "h": 1}),
+        )
+    image_call = next(call for call in client.calls if call["kind"] == "image")
+
     false_alert = parse_matrix_command("!parking false-alert left_spot open")
     missed_alert = parse_matrix_command("!parking missed-alert left_spot occupied at 2026-05-18T19:00:00Z")
     return "\n".join(
         [
             _format_command_help_reply("{command_prefix}"),
+            parse_error("!parking correct"),
+            parse_error("!parking learn left_spot open"),
+            parse_error("!parking who extra"),
+            parse_error("!parking why"),
             parse_error("!parking explain"),
             parse_error("!parking analytics bogus"),
+            parse_error("!parking at"),
+            parse_error("!parking confidence extra"),
+            parse_error("!parking lab run"),
+            parse_error("!parking lab run bogus"),
+            parse_error("!parking lab status latest extra"),
+            parse_error("!parking lab status bogus"),
+            parse_error("!parking why bad/spot"),
+            parse_error("!parking recent extra"),
             f"false-alert action={false_alert.action}",
             f"false-alert spot_id={false_alert.spot_id}",
             f"false-alert actual_state={false_alert.actual_state}",
@@ -61,6 +101,8 @@ def read_matrix_command_contract() -> str:
             f"missed-alert spot_id={missed_alert.spot_id}",
             f"missed-alert actual_state={missed_alert.actual_state}",
             f"missed-alert subject_id={missed_alert.subject_id}",
+            str(image_call["body"]),
+            str(image_call["txn_id"]),
         ]
     )
 
@@ -119,7 +161,7 @@ def test_readme_documents_clean_machine_setup_sequence_and_operator_commands() -
 
 def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_secret_safe() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
+    matrix_contract = read_matrix_command_contract()
 
     assert_contains_all(
         readme,
@@ -150,7 +192,7 @@ def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_se
         ],
     )
     assert_contains_all(
-        matrix_source,
+        matrix_contract,
         [
             "{command_prefix} status — show runtime health and spot status",
             "{command_prefix} config — show safe monitor configuration",
@@ -175,7 +217,7 @@ def test_operator_cockpit_commands_are_documented_as_authorized_read_only_and_se
 
 def test_m006_incident_intelligence_commands_and_closeout_smoke_are_documented() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
+    matrix_contract = read_matrix_command_contract()
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
     smoke_source = read_tracked("scripts/verify_m006_incident_intelligence_closeout.py")
@@ -221,7 +263,7 @@ def test_m006_incident_intelligence_commands_and_closeout_smoke_are_documented()
         ],
     )
     assert_contains_all(
-        matrix_source,
+        matrix_contract,
         [
             "usage: !parking at <time> <spot_id>",
             "usage: !parking confidence",
@@ -417,7 +459,7 @@ def test_m007_matrix_outbox_recovery_docs_and_closeout_smoke_are_documented() ->
 
 def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
+    matrix_contract = read_matrix_command_contract()
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
 
@@ -437,7 +479,7 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
         ],
     )
     assert_contains_all(
-        matrix_source,
+        matrix_contract,
         [
             "usage: !parking correct <spot_id> <open|occupied>",
             "usage: !parking learn <spot_id> <open|occupied> at <time>",
@@ -573,7 +615,7 @@ def test_operator_docs_include_timeline_frame_buffer_contract() -> None:
 
 def test_detection_lab_command_docs_cover_bounded_authorized_local_artifact_boundary() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
+    matrix_contract = read_matrix_command_contract()
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
     lab_source = read_tracked("parking_spot_monitor/detection_lab.py")
     startup_source = read_tracked("parking_spot_monitor/__main__.py")
@@ -625,7 +667,7 @@ def test_detection_lab_command_docs_cover_bounded_authorized_local_artifact_boun
         ],
     )
     assert_contains_all(
-        matrix_source,
+        matrix_contract,
         [
             "{command_prefix} lab run replay — start a bounded local replay lab job using fixed inputs",
             "{command_prefix} lab run tuning — start a bounded local tuning lab job using fixed inputs",
@@ -684,7 +726,7 @@ def test_detection_lab_command_docs_cover_bounded_authorized_local_artifact_boun
 
 def test_why_recent_command_docs_cover_memory_boundaries_and_safe_failures() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
+    matrix_contract = read_matrix_command_contract()
     memory_source = read_tracked("parking_spot_monitor/operator_decision_memory.py")
 
     assert_contains_all(
@@ -717,7 +759,7 @@ def test_why_recent_command_docs_cover_memory_boundaries_and_safe_failures() -> 
         ],
     )
     assert_contains_all(
-        matrix_source,
+        matrix_contract,
         [
             "usage: !parking why <spot_id>",
             "usage: !parking explain <spot_id>",
@@ -753,7 +795,7 @@ def test_why_recent_command_docs_cover_memory_boundaries_and_safe_failures() -> 
 
 def test_latest_command_docs_cover_raw_image_failure_and_retention_boundaries() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
+    matrix_contract = read_matrix_command_contract()
 
     assert_contains_all(
         readme,
@@ -782,13 +824,13 @@ def test_latest_command_docs_cover_raw_image_failure_and_retention_boundaries() 
         ],
     )
     assert_contains_all(
-        matrix_source,
-        [
-            "{command_prefix} latest — show latest runtime summary and raw full-frame image evidence",
-            "Raw full-frame {image_path.name} evidence",
-            "command:{event.event_id}:image",
-        ],
-    )
+        matrix_contract,
+            [
+                "{command_prefix} latest — show latest runtime summary and raw full-frame image evidence",
+                "Raw full-frame latest.jpg evidence",
+                "command:$event:image",
+            ],
+        )
 
     forbidden_latest_claims = [
         "latest uses debug_latest.jpg",
