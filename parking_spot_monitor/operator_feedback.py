@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
@@ -20,8 +19,6 @@ from parking_spot_monitor.operator_decision_memory import (
 )
 from parking_spot_monitor.operator_feedback_models import (
     FEEDBACK_LABELS_FILENAME,
-    MAX_FEEDBACK_FILE_BYTES,
-    MAX_FEEDBACK_LABELS,
     MAX_DEGRADATION_REASONS,
     MAX_REPLAY_CONTEXT_LINES,
     MAX_REPLAY_LINE_CHARS,
@@ -29,23 +26,18 @@ from parking_spot_monitor.operator_feedback_models import (
     FeedbackAppendResult,
     FeedbackEvidence,
     FeedbackLabel,
-    FeedbackLabelLoad,
     FeedbackLabelSchemaError,
     FeedbackRecordResult,
     LearnLabelRecordResult,
     clip_feedback_text,
     feedback_state,
-    feedback_label_from_any,
-    feedback_labels_from_payload,
-    positive_feedback_limit,
-    quarantine_feedback_file,
     optional_feedback_path_text,
     optional_feedback_text,
     required_feedback_text,
     safe_feedback_text_list,
-    write_feedback_labels,
     hash_operator_identifier,
 )
+from parking_spot_monitor.operator_feedback_store import append_feedback_label, find_feedback_label_by_matrix_event_id, load_feedback_labels
 from parking_spot_monitor.operator_timeline import nearest_timeline_frame, parse_incident_time
 
 
@@ -613,89 +605,6 @@ def make_learn_feedback_label(
         feedback_category="missed_alert",
         feedback_category_details={"target_state": state},
     )
-
-
-def append_feedback_label(
-    path: str | Path,
-    label: FeedbackLabel | Mapping[str, Any],
-    *,
-    max_labels: int = MAX_FEEDBACK_LABELS,
-    max_file_bytes: int = MAX_FEEDBACK_FILE_BYTES,
-    logger: StructuredLogger | None = None,
-) -> FeedbackAppendResult:
-    """Append one sanitized feedback label with atomic write and bounded retention."""
-
-    labels_path = Path(path)
-    try:
-        new_label = feedback_label_from_any(label)
-        loaded = load_feedback_labels(labels_path, max_labels=max_labels, max_file_bytes=max_file_bytes, logger=logger)
-        retained = list(loaded.labels)
-        if new_label.matrix_event_id and any(existing.matrix_event_id == new_label.matrix_event_id for existing in retained):
-            _log(logger, "debug", "operator-feedback-label-duplicate-skipped", path=labels_path, matrix_event_id=new_label.matrix_event_id)
-            return FeedbackAppendResult(status="duplicate", label_id=new_label.label_id)
-        retained.append(new_label)
-        retained = retained[-positive_feedback_limit(max_labels, MAX_FEEDBACK_LABELS) :]
-        write_feedback_labels(labels_path, retained)
-    except Exception as exc:
-        _log(logger, "warning", "operator-feedback-label-append-failed", path=labels_path, error_type=type(exc).__name__, error=str(exc))
-        return FeedbackAppendResult(status="failed")
-
-    _log(logger, "debug", "operator-feedback-label-appended", path=labels_path, label_count=len(retained), label_id=new_label.label_id)
-    return FeedbackAppendResult(status="appended", label_id=new_label.label_id)
-
-
-def load_feedback_labels(
-    path: str | Path,
-    *,
-    max_labels: int = MAX_FEEDBACK_LABELS,
-    max_file_bytes: int = MAX_FEEDBACK_FILE_BYTES,
-    logger: StructuredLogger | None = None,
-) -> FeedbackLabelLoad:
-    """Load a bounded tail of feedback labels, quarantining corrupt or oversized files."""
-
-    labels_path = Path(path)
-    if not labels_path.exists():
-        _log(logger, "debug", "operator-feedback-labels-load-missing", path=labels_path)
-        return FeedbackLabelLoad(state="missing")
-
-    try:
-        size = labels_path.stat().st_size
-    except OSError as exc:
-        _log(logger, "warning", "operator-feedback-labels-load-failed", path=labels_path, phase="stat", error_type=type(exc).__name__, error=str(exc))
-        return FeedbackLabelLoad(state="unavailable", error_type=type(exc).__name__)
-
-    if size > max_file_bytes:
-        quarantined = quarantine_feedback_file(labels_path)
-        _log(logger, "warning", "operator-feedback-labels-quarantined", path=labels_path, quarantine_path=quarantined, phase="size", error_type="oversized")
-        return FeedbackLabelLoad(state="unavailable", error_type="oversized", quarantined_path=quarantined)
-
-    try:
-        with labels_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        labels = feedback_labels_from_payload(payload)
-    except (OSError, json.JSONDecodeError, FeedbackLabelSchemaError) as exc:
-        quarantined = quarantine_feedback_file(labels_path)
-        _log(logger, "warning", "operator-feedback-labels-quarantined", path=labels_path, quarantine_path=quarantined, phase="load", error_type=type(exc).__name__, error=str(exc))
-        return FeedbackLabelLoad(state="unavailable", error_type=type(exc).__name__, quarantined_path=quarantined)
-
-    bounded = tuple(labels[-positive_feedback_limit(max_labels, MAX_FEEDBACK_LABELS) :])
-    _log(logger, "debug", "operator-feedback-labels-loaded", path=labels_path, label_count=len(bounded), state="available")
-    return FeedbackLabelLoad(state="available", labels=bounded)
-
-
-def find_feedback_label_by_matrix_event_id(path: str | Path, matrix_event_id: str | None, *, logger: StructuredLogger | None = None) -> FeedbackLabel | None:
-    """Return the stored feedback label for an already-processed Matrix event id."""
-
-    safe_event_id = optional_feedback_text(matrix_event_id, limit=180)
-    if not safe_event_id:
-        return None
-    loaded = load_feedback_labels(path, logger=logger)
-    if loaded.state != "available":
-        return None
-    for label in reversed(loaded.labels):
-        if label.matrix_event_id == safe_event_id:
-            return label
-    return None
 
 
 def resolve_latest_alert_candidate(path: str | Path, spot_id: str, *, logger: StructuredLogger | None = None) -> AlertEvidenceCandidate | None:

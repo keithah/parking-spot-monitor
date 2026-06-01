@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import os
 import re
-import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -208,44 +205,6 @@ class LearnLabelRecordResult:
     duplicate: bool = False
 
 
-def write_feedback_labels(path: Path, labels: Sequence[FeedbackLabel]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"schema_version": SCHEMA_VERSION, "labels": [label.to_json_dict() for label in labels]}
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=path.parent, prefix=f".{path.name}.", suffix=".tmp") as handle:
-            temp_path = Path(handle.name)
-            json.dump(payload, handle, sort_keys=True, separators=(",", ":"), allow_nan=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temp_path, 0o644)
-        os.replace(temp_path, path)
-    except Exception:
-        if temp_path is not None:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise
-
-
-def feedback_labels_from_payload(payload: Any) -> list[FeedbackLabel]:
-    if not isinstance(payload, Mapping):
-        raise FeedbackLabelSchemaError("feedback label payload must be an object")
-    if payload.get("schema_version") != SCHEMA_VERSION:
-        raise FeedbackLabelSchemaError("unsupported feedback label schema_version")
-    raw_labels = payload.get("labels")
-    if not isinstance(raw_labels, list):
-        raise FeedbackLabelSchemaError("feedback label labels must be a list")
-    if len(raw_labels) > MAX_FEEDBACK_LABELS * 10:
-        raise FeedbackLabelSchemaError("feedback label count exceeds validation bound")
-    labels: list[FeedbackLabel] = []
-    for item in raw_labels:
-        labels.append(feedback_label_from_any(item))
-    return labels
-
-
 def feedback_label_from_any(value: FeedbackLabel | Mapping[str, Any]) -> FeedbackLabel:
     if isinstance(value, FeedbackLabel):
         return FeedbackLabel(**value.to_json_dict() | {"evidence": FeedbackEvidence(**value.evidence.to_json_dict())})
@@ -300,9 +259,11 @@ def _safe_feedback_category(value: object) -> str:
 
 def _feedback_label_type(value: object) -> FeedbackLabelType:
     label_type = required_feedback_text(value, "label_type", limit=40)
-    if label_type not in {"correction", "learn"}:
-        raise FeedbackLabelSchemaError("feedback label label_type must be correction or learn")
-    return label_type  # type: ignore[return-value]
+    if label_type == "correction":
+        return "correction"
+    if label_type == "learn":
+        return "learn"
+    raise FeedbackLabelSchemaError("feedback label label_type must be correction or learn")
 
 
 def feedback_state(value: object, field: str) -> str:
@@ -405,12 +366,3 @@ def positive_feedback_limit(value: int, default: int) -> int:
     if isinstance(value, bool) or value <= 0:
         return default
     return value
-
-
-def quarantine_feedback_file(path: Path) -> Path | None:
-    quarantine_path = path.with_name(f"{path.name}.quarantine")
-    try:
-        os.replace(path, quarantine_path)
-        return quarantine_path
-    except OSError:
-        return None

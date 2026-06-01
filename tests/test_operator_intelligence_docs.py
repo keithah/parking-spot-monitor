@@ -69,6 +69,7 @@ def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_ua
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
     feedback_model_source = read_tracked("parking_spot_monitor/operator_feedback_models.py")
+    feedback_store_source = read_tracked("parking_spot_monitor/operator_feedback_store.py")
 
     assert_contains_all(
         readme,
@@ -121,6 +122,11 @@ def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_ua
         [
             "feedback_category=\"false_alert\"",
             "feedback_category=\"missed_alert\"",
+        ],
+    )
+    assert_contains_all(
+        feedback_store_source,
+        [
             "operator-feedback-label-appended",
         ],
     )

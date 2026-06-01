@@ -97,8 +97,8 @@ def summarize_health(
     now: datetime | None = None,
     logger: StructuredLogger | None = None,
 ) -> HealthSummary:
-    observed_now = _utc_now(now)
-    loaded = _load_bounded_json_object(Path(health_path), label="health", logger=logger)
+    observed_now = utc_now(now)
+    loaded = load_bounded_json_object(Path(health_path), label="health", logger=logger)
     frame_interval = getattr(getattr(settings, "runtime", None), "frame_interval_seconds", "unknown")
     if loaded.state != "available" or loaded.payload is None:
         return HealthSummary(state=loaded.state, frame_interval_seconds=frame_interval, error_type=loaded.error_type)
@@ -106,31 +106,31 @@ def summarize_health(
     payload = loaded.payload
     updated_at = _parse_time(payload.get("updated_at"))
     freshness = _freshness(updated_at, observed_now, frame_interval)
-    capture = _mapping(payload.get("capture"))
+    capture = mapping_value(payload.get("capture"))
     last_frame_at = _parse_time(_first_present(payload, "last_frame_at") or _first_present(capture, "last_success_at"))
     iteration = payload.get("iteration")
     return HealthSummary(
         state="available",
-        status=_text(payload.get("status"), default="unavailable"),
+        status=text_value(payload.get("status"), default="unavailable"),
         freshness=freshness,
         updated_at=updated_at,
-        updated_age=_age_label(updated_at, observed_now),
+        updated_age=age_label(updated_at, observed_now),
         iteration=str(iteration) if isinstance(iteration, int) and not isinstance(iteration, bool) else "unknown",
-        last_frame_age=_age_label(last_frame_at, observed_now),
+        last_frame_age=age_label(last_frame_at, observed_now),
         frame_interval_seconds=frame_interval,
-        selected_decode_mode=_text(
+        selected_decode_mode=text_value(
             _first_present(payload, "selected_decode_mode") or _first_present(capture, "selected_decode_mode"),
             default="unknown",
         ),
-        consecutive_capture_failures=_int(payload.get("consecutive_capture_failures")),
-        consecutive_detection_failures=_int(payload.get("consecutive_detection_failures")),
+        consecutive_capture_failures=int_value(payload.get("consecutive_capture_failures")),
+        consecutive_detection_failures=int_value(payload.get("consecutive_detection_failures")),
     )
 
 
 def summarize_state(*, settings: RuntimeSettings, state_path: str | Path, logger: StructuredLogger | None = None) -> StateSummary:
-    configured = _spot_ids(settings)
+    configured = spot_ids(settings)
     fallback_spots = tuple(SpotSummary(spot_id=spot_id, status="open", hit_streak=0, miss_streak=0, open_event_emitted=False) for spot_id in configured)
-    loaded = _load_bounded_json_object(Path(state_path), label="state", logger=logger)
+    loaded = load_bounded_json_object(Path(state_path), label="state", logger=logger)
     if loaded.state != "available" or loaded.payload is None:
         return StateSummary(state=loaded.state, spots=fallback_spots, error_type=loaded.error_type)
 
@@ -142,13 +142,13 @@ def summarize_state(*, settings: RuntimeSettings, state_path: str | Path, logger
     spots: list[SpotSummary] = []
     for spot_id in configured:
         raw = raw_spots.get(spot_id)
-        spot = _mapping(raw)
+        spot = mapping_value(raw)
         spots.append(
             SpotSummary(
                 spot_id=spot_id,
                 status=_spot_status(spot.get("status")),
-                hit_streak=_int(spot.get("hit_streak")),
-                miss_streak=_int(spot.get("miss_streak")),
+                hit_streak=int_value(spot.get("hit_streak")),
+                miss_streak=int_value(spot.get("miss_streak")),
                 open_event_emitted=spot.get("open_event_emitted") is True,
             )
         )
@@ -161,36 +161,36 @@ def summarize_state(*, settings: RuntimeSettings, state_path: str | Path, logger
     )
 
 
-def _load_bounded_json_object(path: Path, *, label: str, logger: StructuredLogger | None) -> BoundedJsonLoad:
+def load_bounded_json_object(path: Path, *, label: str, logger: StructuredLogger | None) -> BoundedJsonLoad:
     try:
         size = path.stat().st_size
     except FileNotFoundError:
-        _log_load_problem(logger, label=label, reason="missing", error_type="FileNotFoundError")
+        log_load_problem(logger, label=label, reason="missing", error_type="FileNotFoundError")
         return BoundedJsonLoad(state="unavailable", error_type="missing")
     except OSError as exc:
         error_type = redact_diagnostic_text(exc.__class__.__name__)
-        _log_load_problem(logger, label=label, reason="stat_error", error_type=error_type)
+        log_load_problem(logger, label=label, reason="stat_error", error_type=error_type)
         return BoundedJsonLoad(state="unavailable", error_type=error_type)
     if size > MAX_FILE_BYTES:
-        _log_load_problem(logger, label=label, reason="too_large", error_type="file_too_large", byte_size=size)
+        log_load_problem(logger, label=label, reason="too_large", error_type="file_too_large", byte_size=size)
         return BoundedJsonLoad(state="error", error_type="file_too_large")
     try:
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except json.JSONDecodeError as exc:
-        _log_load_problem(logger, label=label, reason="json_parse", error_type=exc.__class__.__name__)
+        log_load_problem(logger, label=label, reason="json_parse", error_type=exc.__class__.__name__)
         return BoundedJsonLoad(state="unavailable", error_type="JSONDecodeError")
     except OSError as exc:
         error_type = redact_diagnostic_text(exc.__class__.__name__)
-        _log_load_problem(logger, label=label, reason="read_error", error_type=error_type)
+        log_load_problem(logger, label=label, reason="read_error", error_type=error_type)
         return BoundedJsonLoad(state="unavailable", error_type=error_type)
     if not isinstance(payload, Mapping):
-        _log_load_problem(logger, label=label, reason="schema", error_type="non_object_payload")
+        log_load_problem(logger, label=label, reason="schema", error_type="non_object_payload")
         return BoundedJsonLoad(state="error", error_type="non_object_payload")
     return BoundedJsonLoad(state="available", payload=dict(payload))
 
 
-def _format_health_line(health: HealthSummary) -> str:
+def format_health_line(health: HealthSummary) -> str:
     if health.state == "available":
         stale = " stale" if health.freshness == "stale" else ""
         return f"Health: {health.status}{stale} (updated {health.updated_age})"
@@ -209,26 +209,26 @@ def _freshness(updated_at: datetime | None, now: datetime, frame_interval: objec
     return "stale" if (now - updated_at).total_seconds() > allowed else "fresh"
 
 
-def _log_load_problem(logger: StructuredLogger | None, **fields: Any) -> None:
+def log_load_problem(logger: StructuredLogger | None, **fields: Any) -> None:
     if logger is None:
         return
     logger.warning("matrix-operator-runtime-load", **redact_diagnostic_value(fields))
 
 
-def _spot_items(settings: RuntimeSettings) -> list[tuple[str, Any]]:
+def spot_items(settings: RuntimeSettings) -> list[tuple[str, Any]]:
     spots = getattr(settings, "spots", None)
     if spots is None:
         return []
     return [("left_spot", spots.left_spot), ("right_spot", spots.right_spot)]
 
 
-def _spot_ids(settings: RuntimeSettings) -> list[str]:
-    names = [spot_id for spot_id, _spot in _spot_items(settings)]
+def spot_ids(settings: RuntimeSettings) -> list[str]:
+    names = [spot_id for spot_id, _spot in spot_items(settings)]
     return names or ["left_spot", "right_spot"]
 
 
 def _spot_status(value: Any) -> str:
-    text = _text(value, default="unknown")
+    text = text_value(value, default="unknown")
     if text in {"empty", "open", "unknown"}:
         return "open"
     if text == "occupied":
@@ -248,7 +248,7 @@ def _parse_time(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _age_label(value: datetime | None, now: datetime) -> str:
+def age_label(value: datetime | None, now: datetime) -> str:
     if value is None:
         return "unknown"
     seconds = max(0, int((now - value).total_seconds()))
@@ -263,29 +263,29 @@ def _age_label(value: datetime | None, now: datetime) -> str:
     return f"{hours // 24}d ago"
 
 
-def _bounded_reply(lines: Sequence[str]) -> str:
-    rendered = "\n".join(_bounded_lines(lines))
+def bounded_reply(lines: Sequence[str]) -> str:
+    rendered = "\n".join(bounded_lines(lines))
     encoded = rendered.encode("utf-8")
     if len(encoded) <= MAX_REPLY_BYTES:
         return rendered
     return encoded[: MAX_REPLY_BYTES - 3].decode("utf-8", errors="ignore") + "..."
 
 
-def _bounded_lines(lines: Sequence[str]) -> list[str]:
+def bounded_lines(lines: Sequence[str]) -> list[str]:
     bounded = [redact_diagnostic_text(line) for line in lines[: MAX_LINES_PER_SECTION * 3]]
     if len(lines) > len(bounded):
         bounded.append("... truncated")
     return bounded
 
 
-def _utc_now(value: datetime | None) -> datetime:
+def utc_now(value: datetime | None) -> datetime:
     selected = value if value is not None else datetime.now(timezone.utc)
     if selected.tzinfo is None:
         return selected.replace(tzinfo=timezone.utc)
     return selected.astimezone(timezone.utc)
 
 
-def _mapping(value: Any) -> Mapping[str, Any]:
+def mapping_value(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
@@ -294,7 +294,7 @@ def _first_present(mapping: Mapping[str, Any], key: str) -> Any:
     return value if value not in (None, "") else None
 
 
-def _text(value: Any, *, default: str = "unknown") -> str:
+def text_value(value: Any, *, default: str = "unknown") -> str:
     if value is None:
         return default
     if isinstance(value, bool):
@@ -303,7 +303,7 @@ def _text(value: Any, *, default: str = "unknown") -> str:
     return text[:160] if text else default
 
 
-def _int(value: Any) -> int:
+def int_value(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
@@ -313,18 +313,18 @@ def _bounded_count(value: Any) -> int:
     return min(len(value), MAX_LINES_PER_SECTION)
 
 
-def _crop_label(enabled: Any) -> str:
+def crop_label(enabled: Any) -> str:
     return "crop enabled" if bool(enabled) else "crop disabled"
 
 
-def _list_label(value: Any) -> str:
+def list_label(value: Any) -> str:
     if not isinstance(value, list | tuple):
         return "none"
-    items = [_text(item) for item in value[:8]]
+    items = [text_value(item) for item in value[:8]]
     suffix = ", ..." if len(value) > len(items) else ""
     return ", ".join(items) + suffix if items else "none"
 
 
-def _matrix_token_present(matrix: Mapping[str, Any]) -> bool:
-    token = _mapping(matrix.get("matrix_token"))
+def matrix_token_present(matrix: Mapping[str, Any]) -> bool:
+    token = mapping_value(matrix.get("matrix_token"))
     return token.get("present") is True

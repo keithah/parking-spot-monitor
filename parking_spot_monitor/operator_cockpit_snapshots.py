@@ -25,11 +25,11 @@ from parking_spot_monitor.operator_cockpit_shared import (
     WHO_MATRIX_SNAPSHOT_FILENAME,
     LatestSnapshotResponse,
     LatestSnapshotValidation,
-    _age_label,
-    _bounded_lines,
-    _bounded_reply,
-    _format_health_line,
-    _utc_now,
+    age_label,
+    bounded_lines,
+    bounded_reply,
+    format_health_line,
+    utc_now,
     summarize_health,
     summarize_state,
 )
@@ -48,14 +48,14 @@ def build_latest_snapshot_response(
 ) -> LatestSnapshotResponse:
     """Build a bounded, redacted latest snapshot summary from local runtime files only."""
 
-    observed_now = _utc_now(now)
+    observed_now = utc_now(now)
     snapshot = _validate_latest_snapshot(Path(latest_path), now=observed_now, logger=logger)
     health = summarize_health(settings=settings, health_path=health_path, now=observed_now, logger=logger)
     state = summarize_state(settings=settings, state_path=state_path, logger=logger)
 
     available = snapshot.state == "available" and snapshot.path is not None and snapshot.info is not None
     heading = "Parking monitor latest" if available else "Parking monitor latest unavailable"
-    lines = [heading, _format_latest_snapshot_line(snapshot), _format_health_line(health)]
+    lines = [heading, _format_latest_snapshot_line(snapshot), format_health_line(health)]
     if health.state == "available":
         lines.append(
             "Runtime: iteration "
@@ -74,7 +74,7 @@ def build_latest_snapshot_response(
             lines.append(f"- {spot.spot_id}: {spot.status}")
 
     return LatestSnapshotResponse(
-        text=_bounded_reply(lines),
+        text=bounded_reply(lines),
         image_path=snapshot.path if available else None,
         image_info=dict(snapshot.info) if available and snapshot.info is not None else None,
     )
@@ -96,7 +96,7 @@ def build_who_snapshot_response(
     state.
     """
 
-    observed_now = _utc_now(now)
+    observed_now = utc_now(now)
     try:
         capture = capture_func(settings, Path(data_dir), logger=logger)
         latest_path = Path(capture.latest_path)
@@ -116,7 +116,7 @@ def build_who_snapshot_response(
         return MatrixCommandResponse(text=_prepend_who_snapshot_line(base_text, _who_snapshot_unavailable_line(reason)))
 
     return MatrixCommandResponse(
-        text=_prepend_who_snapshot_line(base_text, f"Snapshot: fresh capture at {_display_time(getattr(capture, 'timestamp', None))}"),
+        text=_prepend_who_snapshot_line(base_text, f"Snapshot: fresh capture at {display_time(getattr(capture, 'timestamp', None))}"),
         image_path=snapshot.path,
         image_info=dict(snapshot.info),
     )
@@ -137,7 +137,7 @@ def build_incident_review_response(
 
     root = Path(data_dir)
     safe_spot = _safe_incident_spot_id(spot_id)
-    observed_now = _utc_now(now)
+    observed_now = utc_now(now)
     target_time = parse_incident_time(time_text, now=observed_now)
     heading_time = _display_local_time(target_time)
     lines = [f"Incident review: {safe_spot} around {heading_time}"]
@@ -148,7 +148,7 @@ def build_incident_review_response(
             "No retained timeline frames were found.",
             "No detector, camera, Matrix send, or state mutation was run.",
         ])
-        return MatrixCommandResponse(text=_bounded_reply(lines))
+        return MatrixCommandResponse(text=bounded_reply(lines))
 
     frame_path, frame_time = nearest
     delta_seconds = abs(int((frame_time - target_time).total_seconds()))
@@ -163,7 +163,7 @@ def build_incident_review_response(
     )
     if replay.unavailable_reason == "corrupt_frame":
         lines.extend(replay.lines)
-        return MatrixCommandResponse(text=_bounded_reply(lines))
+        return MatrixCommandResponse(text=bounded_reply(lines))
     lines.extend(replay.lines)
     lines.append("Recent local decision memory:")
     why_lines = format_operator_why_reply(data_dir=root, spot_id=safe_spot, logger=logger).splitlines()
@@ -173,8 +173,8 @@ def build_incident_review_response(
     snapshot = _prepare_incident_snapshot_for_matrix(frame_path, data_dir=root, spot_id=safe_spot, now=observed_now, logger=logger)
     if snapshot.state != "available" or snapshot.path is None or snapshot.info is None:
         lines.append(f"Frame attachment unavailable: {snapshot.error_type or 'unavailable'}")
-        return MatrixCommandResponse(text=_bounded_reply(lines))
-    return MatrixCommandResponse(text=_bounded_reply(lines), image_path=snapshot.path, image_info=dict(snapshot.info))
+        return MatrixCommandResponse(text=bounded_reply(lines))
+    return MatrixCommandResponse(text=bounded_reply(lines), image_path=snapshot.path, image_info=dict(snapshot.info))
 
 
 def _safe_incident_spot_id(value: str) -> str:
@@ -221,7 +221,7 @@ def _who_snapshot_unavailable_line(reason: str) -> str:
     return f"Snapshot: fresh capture unavailable ({safe_reason}); no live state was changed."
 
 
-def _display_time(value: object) -> str:
+def display_time(value: object) -> str:
     parsed: datetime | None = None
     if isinstance(value, datetime):
         parsed = value
@@ -232,7 +232,7 @@ def _display_time(value: object) -> str:
             return redact_diagnostic_text(value)[:80] or "unknown"
     if parsed is None:
         return "unknown"
-    return _utc_now(parsed).isoformat().replace("+00:00", "Z")
+    return utc_now(parsed).isoformat().replace("+00:00", "Z")
 
 
 def _log_snapshot_failure(logger: StructuredLogger | None, **fields: Any) -> None:
@@ -290,7 +290,7 @@ def _resize_who_snapshot_for_matrix(path: Path, *, destination: Path, now: datet
                     path=destination,
                     info={"mimetype": "image/jpeg", "size": stat.st_size, "w": output_width, "h": output_height},
                     freshness="fresh",
-                    age=_age_label(datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc), now),
+                    age=age_label(datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc), now),
                 )
         max_dimension = int(max_dimension * 0.85)
     raise ValueError("resized image exceeds Matrix upload budget")
@@ -339,7 +339,7 @@ def _validate_latest_snapshot(path: Path, *, now: datetime, logger: StructuredLo
         path=path,
         info={"mimetype": "image/jpeg", "size": stat.st_size, "w": width, "h": height},
         freshness="fresh",
-        age=_age_label(mtime, now),
+        age=age_label(mtime, now),
     )
 
 

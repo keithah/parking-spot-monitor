@@ -83,6 +83,7 @@ def test_operator_modules_stay_decomposed() -> None:
         "parking_spot_monitor/operator_cockpit_snapshots.py": 460,
         "parking_spot_monitor/operator_feedback.py": 940,
         "parking_spot_monitor/operator_feedback_models.py": 450,
+        "parking_spot_monitor/operator_feedback_store.py": 220,
         "parking_spot_monitor/operator_timeline.py": 100,
     }
     for path, max_lines in module_caps.items():
@@ -92,6 +93,7 @@ def test_operator_modules_stay_decomposed() -> None:
 
 def test_operator_feedback_does_not_import_model_privates() -> None:
     feedback_source = (ROOT / "parking_spot_monitor/operator_feedback.py").read_text(encoding="utf-8")
+    model_source = (ROOT / "parking_spot_monitor/operator_feedback_models.py").read_text(encoding="utf-8")
     tree = ast.parse(feedback_source)
 
     model_imports = [
@@ -102,6 +104,40 @@ def test_operator_feedback_does_not_import_model_privates() -> None:
     ]
     assert model_imports
     assert all(not name.startswith("_") for name in model_imports)
+    assert "feedback_label_from_any" not in model_imports
+
+    store_imports = [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "parking_spot_monitor.operator_feedback_store"
+        for alias in node.names
+    ]
+    assert {"append_feedback_label", "find_feedback_label_by_matrix_event_id", "load_feedback_labels"} <= set(store_imports)
+    assert "write_feedback_labels" not in model_source
+    assert "quarantine_feedback_file" not in model_source
+    assert "import json" not in model_source
+    assert "import tempfile" not in model_source
+
+
+def test_operator_cockpit_modules_do_not_import_shared_privates() -> None:
+    for relative_path in (
+        "parking_spot_monitor/operator_cockpit.py",
+        "parking_spot_monitor/operator_cockpit_snapshots.py",
+    ):
+        tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+        shared_imports = [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module in {
+                "parking_spot_monitor.operator_cockpit_shared",
+                "parking_spot_monitor.operator_cockpit_snapshots",
+            }
+            for alias in node.names
+        ]
+        assert shared_imports
+        assert all(not name.startswith("_") for name in shared_imports)
 
 
 def test_operator_docs_tests_stay_decomposed() -> None:
