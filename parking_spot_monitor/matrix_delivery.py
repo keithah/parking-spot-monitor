@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from parking_spot_monitor.logging import StructuredLogger
+from parking_spot_monitor.matrix_client import MatrixClient
 from parking_spot_monitor.matrix_alerts import (
     LIFECYCLE_EVENT_TYPES,
     OCCUPIED_SPOT_EVENT_TYPE,

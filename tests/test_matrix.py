@@ -2698,6 +2698,45 @@ def test_command_service_rejects_unauthorized_analytics_before_provider_or_artif
     assert replies == ["Command rejected: sender is not authorized."]
 
 
+def test_command_service_parse_errors_use_configured_command_prefix() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[str] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(
+                    MatrixTextEvent(event_id="$analytics", sender="@op:example", room_id=ROOM_ID, body=".park analytics tomorrow"),
+                    MatrixTextEvent(event_id="$confidence", sender="@op:example", room_id=ROOM_ID, body=".park confidence now"),
+                    MatrixTextEvent(event_id="$learn", sender="@op:example", room_id=ROOM_ID, body=".park learn left_spot open 2026-05-18T19:00:00Z"),
+                ),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(str(kwargs["body"]))
+            return "$reply"
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        command_prefix=".park",
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 0
+    assert result.error_count == 3
+    assert replies == [
+        "Command rejected: usage: .park analytics [today|7d|30d|all]",
+        "Command rejected: usage: .park confidence",
+        "Command rejected: usage: .park learn <spot_id> <open|occupied> at <time>",
+    ]
+
+
 def test_command_service_analytics_context_reads_vehicle_history_text_only_and_does_not_mutate_archive(tmp_path: Path) -> None:
     from parking_spot_monitor.matrix import MatrixCommandService, MatrixOperatorCockpitContext, MatrixSyncResult, MatrixTextEvent
 

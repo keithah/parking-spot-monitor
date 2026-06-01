@@ -71,9 +71,9 @@ def validate_feedback_evidence(
             image.verify()
         with Image.open(candidate) as image:
             width, height = image.size
-            if image.format != "JPEG":
+            if image.format != "JPEG" or width <= 0 or height <= 0:
                 return FeedbackEvidence("alert_snapshot", safe_relative, False, False, None, None, byte_size, "invalid_jpeg")
-    except (OSError, UnidentifiedImageError) as exc:
+    except (OSError, UnidentifiedImageError, ValueError) as exc:
         _log(logger, "warning", "operator-feedback-evidence-invalid", path=safe_relative, error_type=type(exc).__name__)
         return FeedbackEvidence("alert_snapshot", safe_relative, False, False, None, None, None, "invalid_jpeg")
 

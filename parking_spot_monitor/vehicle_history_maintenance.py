@@ -97,8 +97,6 @@ class VehicleHistoryMaintenanceMixin:
                 info.size = len(manifest_bytes)
                 info.mtime = int(datetime.now(timezone.utc).timestamp())
                 info.mode = 0o644
-                import io
-
                 bundle.addfile(info, io.BytesIO(manifest_bytes))
             os.chmod(temp_path, 0o644)
             os.replace(temp_path, output)

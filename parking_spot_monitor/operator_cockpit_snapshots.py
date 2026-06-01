@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from PIL import Image, UnidentifiedImageError
 
@@ -198,7 +198,8 @@ def _display_local_time(value: datetime) -> str:
     local = value.astimezone(DISPLAY_TIMEZONE)
     hour = local.hour % 12 or 12
     suffix = "AM" if local.hour < 12 else "PM"
-    return f"{local.year:04d}-{local.month:02d}-{local.day:02d} {hour}:{local.minute:02d} {suffix} PDT"
+    zone = local.strftime("%Z") or "local"
+    return f"{local.year:04d}-{local.month:02d}-{local.day:02d} {hour}:{local.minute:02d} {suffix} {zone}"
 
 
 def _prepend_who_snapshot_line(base_text: str, snapshot_line: str) -> str:

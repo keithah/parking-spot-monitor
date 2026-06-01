@@ -127,7 +127,8 @@ def _summarize_timeline_frames(frames_dir: Path, *, now: datetime, logger: Struc
         log_load_problem(logger, label="timeline", reason="scan_error", error_type=error_type)
         return [f"- unavailable ({error_type})."]
 
-    parsed = [timeline_frame_time(path) for path in paths[: MAX_LINES_PER_SECTION * 20]]
+    bounded_paths = sorted(paths)[-MAX_LINES_PER_SECTION * 20 :]
+    parsed = [timeline_frame_time(path) for path in bounded_paths]
     valid_times = sorted(time for time in parsed if time is not None)
     ignored = len([time for time in parsed if time is None])
     if not valid_times:

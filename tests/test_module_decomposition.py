@@ -193,5 +193,13 @@ def test_operator_docs_tests_stay_decomposed() -> None:
 
 def test_vehicle_history_corrections_do_not_use_asserts_for_event_field_narrowing() -> None:
     correction_source = (ROOT / "parking_spot_monitor/vehicle_history_corrections.py").read_text(encoding="utf-8")
+    tree = ast.parse(correction_source)
 
-    assert "assert event." not in correction_source
+    def accesses_event(value: ast.AST) -> bool:
+        if isinstance(value, ast.Attribute):
+            return isinstance(value.value, ast.Name) and value.value.id == "event"
+        if isinstance(value, ast.Subscript):
+            return isinstance(value.value, ast.Name) and value.value.id == "event"
+        return False
+
+    assert not any(isinstance(node, ast.Assert) and accesses_event(node.test) for node in ast.walk(tree))

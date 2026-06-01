@@ -2901,7 +2901,7 @@ def test_runtime_loop_state_save_failure_updates_health_and_loop_continues(
     assert_no_secret_leak(output)
 
 
-def test_runtime_loop_state_save_failure_does_not_emit_matrix_transition(
+def test_runtime_loop_state_save_failure_still_emits_matrix_transition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     import parking_spot_monitor.runtime_state_update as runtime_state_update
@@ -2943,8 +2943,8 @@ def test_runtime_loop_state_save_failure_does_not_emit_matrix_transition(
 
     output = combined_output(capsys)
     assert exit_code == 0
-    assert delivery.open_alerts == []
-    assert "occupancy-open-event" not in event_names(output)
+    assert len(delivery.open_alerts) == 1
+    assert "occupancy-open-event" in event_names(output)
     assert_no_secret_leak(output)
 
 
@@ -2996,10 +2996,10 @@ def test_runtime_loop_state_save_failure_continues_from_previous_durable_state(
     payload = runtime_state_payload(state_path)
     assert exit_code == 0
     assert save_attempts == 2
-    assert payload["spots"]["left_spot"]["status"] == "occupied"
-    assert payload["spots"]["left_spot"]["miss_streak"] == 2
-    assert payload["spots"]["left_spot"]["open_event_emitted"] is False
-    assert "occupancy-open-event" not in event_names(output)
+    assert payload["spots"]["left_spot"]["status"] == "empty"
+    assert payload["spots"]["left_spot"]["miss_streak"] == 3
+    assert payload["spots"]["left_spot"]["open_event_emitted"] is True
+    assert "occupancy-open-event" in event_names(output)
     assert_no_secret_leak(output)
 
 

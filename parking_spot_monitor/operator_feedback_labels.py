@@ -114,7 +114,10 @@ def feedback_timestamp_text(value: datetime | str | None) -> str:
     if isinstance(value, str) and value.strip():
         text = value.strip()
         normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
-        parsed = datetime.fromisoformat(normalized)
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         selected = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
         return selected.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

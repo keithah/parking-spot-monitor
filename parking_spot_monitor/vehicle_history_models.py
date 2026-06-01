@@ -519,8 +519,8 @@ def _optional_profile_id(value: Any, field_name: str) -> str | None:
     text = _optional_bounded_string(value, field_name, max_length=220)
     if text is None:
         return None
-    if not text.startswith("prof"):
-        raise ArchiveSchemaError(f"{field_name} must start with prof")
+    if not text.startswith("prof_"):
+        raise ArchiveSchemaError(f"{field_name} must start with prof_")
     return text
 
 def _optional_string(value: Any, field_name: str) -> str | None:

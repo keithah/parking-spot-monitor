@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from parking_spot_monitor.owner_vehicles import load_owner_vehicle_registry
 from parking_spot_monitor.vehicle_estimates import VehicleHistoryEstimate, estimate_vehicle_history

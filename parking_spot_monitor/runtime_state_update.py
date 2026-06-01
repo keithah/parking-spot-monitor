@@ -55,14 +55,7 @@ def _update_runtime_state_for_frame(
         history_archive=history_archive,
         logger=logger,
     )
-    try:
-        save_runtime_state(state_path, frame_plan.runtime_state, logger=logger)
-    except Exception as exc:
-        return FrameUpdateResult(
-            runtime_state=runtime_state,
-            matrix_errors=matrix_errors,
-            state_save_error=_safe_error_context("state-save", exc),
-        )
+    state_save_error: dict[str, Any] | None = None
 
     for pending_payload in frame_plan.pending_notice_payloads:
         payload = dict(pending_payload)
@@ -135,4 +128,15 @@ def _update_runtime_state_for_frame(
         )
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
-    return FrameUpdateResult(runtime_state=frame_plan.runtime_state, matrix_errors=matrix_errors, history_errors=history_errors)
+
+    try:
+        save_runtime_state(state_path, frame_plan.runtime_state, logger=logger)
+    except Exception as exc:
+        state_save_error = _safe_error_context("state-save", exc)
+
+    return FrameUpdateResult(
+        runtime_state=frame_plan.runtime_state,
+        matrix_errors=matrix_errors,
+        state_save_error=state_save_error,
+        history_errors=history_errors,
+    )

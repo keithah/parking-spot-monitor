@@ -348,7 +348,10 @@ class VehicleHistoryCorrectionMixin:
 
     def _quarantine_correction_line(self, *, line_number: int, reason: str) -> None:
         self.corrections_dir.mkdir(parents=True, exist_ok=True)
-        entry = {"line_number": line_number, "reason": redact_diagnostic_text(reason), "quarantined_at": _utc_now()}
+        safe_reason = redact_diagnostic_text(reason)
+        if self._correction_line_already_quarantined(line_number=line_number, reason=safe_reason):
+            return
+        entry = {"line_number": line_number, "reason": safe_reason, "quarantined_at": _utc_now()}
         try:
             with self.corrections_quarantine_path.open("a", encoding="utf-8") as handle:
                 json.dump(entry, handle, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -356,6 +359,22 @@ class VehicleHistoryCorrectionMixin:
         except OSError as exc:
             self._record_failure(phase="correction-quarantine", path_name=self.corrections_quarantine_path.name, error=exc)
         self._log("warning", "vehicle-profile-correction-quarantined", phase="correction-load", line_number=line_number, reason=reason)
+
+    def _correction_line_already_quarantined(self, *, line_number: int, reason: str) -> bool:
+        if not self.corrections_quarantine_path.exists():
+            return False
+        try:
+            with self.corrections_quarantine_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(entry, Mapping) and entry.get("line_number") == line_number and entry.get("reason") == reason:
+                        return True
+        except OSError as exc:
+            self._record_failure(phase="correction-quarantine-read", path_name=self.corrections_quarantine_path.name, error=exc)
+        return False
 
     def _correction_quarantine_count(self) -> int:
         if not self.corrections_quarantine_path.exists():
