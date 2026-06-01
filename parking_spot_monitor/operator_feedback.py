@@ -33,17 +33,17 @@ from parking_spot_monitor.operator_feedback_models import (
     FeedbackLabelSchemaError,
     FeedbackRecordResult,
     LearnLabelRecordResult,
-    _clip_text,
-    _feedback_state,
-    _label_from_any,
-    _labels_from_payload,
-    _positive_limit,
-    _quarantine_file,
-    _safe_optional_path_text,
-    _safe_optional_text,
-    _safe_required_text,
-    _safe_text_list,
-    _write_feedback_labels,
+    clip_feedback_text,
+    feedback_state,
+    feedback_label_from_any,
+    feedback_labels_from_payload,
+    positive_feedback_limit,
+    quarantine_feedback_file,
+    optional_feedback_path_text,
+    optional_feedback_text,
+    required_feedback_text,
+    safe_feedback_text_list,
+    write_feedback_labels,
     hash_operator_identifier,
 )
 from parking_spot_monitor.operator_timeline import nearest_timeline_frame, parse_incident_time
@@ -91,8 +91,8 @@ class OperatorFeedbackLabeler:
             )
         existing_label = find_feedback_label_by_matrix_event_id(self.labels_path, matrix_event_id, logger=self.logger)
         if existing_label is not None:
-            reported_state = _feedback_state(existing_label.reported_state, "reported_state")
-            stored_actual_state = _feedback_state(existing_label.actual_state, "actual_state")
+            reported_state = feedback_state(existing_label.reported_state, "reported_state")
+            stored_actual_state = feedback_state(existing_label.actual_state, "actual_state")
             return FeedbackRecordResult(
                 recorded=True,
                 reply_text=format_duplicate_correction_reply(existing_label.spot_id, reported_state, stored_actual_state, existing_label.evidence),
@@ -103,7 +103,7 @@ class OperatorFeedbackLabeler:
                 label_id=existing_label.label_id,
             )
 
-        state = _feedback_state(actual_state, "actual_state")
+        state = feedback_state(actual_state, "actual_state")
         corrected_text = _feedback_timestamp_text(corrected_at)
         candidate = resolve_latest_alert_candidate(self.memory_path, safe_spot, logger=self.logger)
         if candidate is None:
@@ -224,7 +224,7 @@ class OperatorFeedbackLabeler:
                 error_type="invalid_spot",
             )
         try:
-            state = _feedback_state(target_state, "target_state")
+            state = feedback_state(target_state, "target_state")
         except FeedbackLabelSchemaError:
             return LearnLabelRecordResult(
                 recorded=False,
@@ -236,7 +236,7 @@ class OperatorFeedbackLabeler:
 
         existing_label = find_feedback_label_by_matrix_event_id(self.labels_path, matrix_event_id, logger=self.logger)
         if existing_label is not None:
-            existing_state = _feedback_state(existing_label.target_state or existing_label.actual_state, "target_state")
+            existing_state = feedback_state(existing_label.target_state or existing_label.actual_state, "target_state")
             return LearnLabelRecordResult(
                 recorded=True,
                 reply_text=format_duplicate_learn_reply(existing_label),
@@ -428,7 +428,7 @@ def validate_timeline_feedback_evidence(
     try:
         resolved = path.resolve()
         relative = resolved.relative_to(root).as_posix()
-        safe_relative = _safe_optional_path_text(relative)
+        safe_relative = optional_feedback_path_text(relative)
     except (OSError, ValueError, FeedbackLabelSchemaError):
         return FeedbackEvidence("timeline_frame", None, False, False, None, None, None, "unsafe_path")
     if safe_relative is None or not safe_relative.startswith("timeline/frames/"):
@@ -468,7 +468,7 @@ def format_learn_reply(
     else:
         evidence_line = f"linked evidence: unavailable; retained timeline frame unavailable ({evidence.error_type or 'unavailable'})"
     replay_line = "replay: available" if replay_context else "replay: unavailable"
-    safe_reasons = _safe_text_list(degradation_reasons, max_items=MAX_DEGRADATION_REASONS, item_limit=120)
+    safe_reasons = safe_feedback_text_list(degradation_reasons, max_items=MAX_DEGRADATION_REASONS, item_limit=120)
     if safe_reasons:
         replay_line += "; degraded " + ", ".join(safe_reasons[:MAX_DEGRADATION_REASONS])
     return _bounded_feedback_reply([
@@ -526,14 +526,14 @@ def _learn_degradation_reasons(*, evidence: FeedbackEvidence, replay: Any | None
         reasons.append(evidence.error_type or "evidence_unavailable")
     if replay is not None:
         for value in (getattr(replay, "unavailable_reason", None), getattr(replay, "detector_error_type", None), getattr(replay, "state_error_type", None)):
-            text = _safe_optional_text(value, limit=120)
+            text = optional_feedback_text(value, limit=120)
             if text and text not in reasons:
                 reasons.append(text)
     return reasons[:MAX_DEGRADATION_REASONS]
 
 
 def _bounded_feedback_reply(lines: Sequence[str]) -> str:
-    rendered = redact_diagnostic_text("\n".join(_clip_text(line, MAX_REPLAY_LINE_CHARS) for line in lines[:MAX_REPLAY_CONTEXT_LINES]))
+    rendered = redact_diagnostic_text("\n".join(clip_feedback_text(line, MAX_REPLAY_LINE_CHARS) for line in lines[:MAX_REPLAY_CONTEXT_LINES]))
     encoded = rendered.encode("utf-8")
     if len(encoded) <= 4096:
         return rendered
@@ -563,8 +563,8 @@ def make_label_id(*, corrected_at: datetime | str | None, spot_id: str, matrix_e
     """Create a deterministic, safe label id from timestamp, spot, and Matrix event id."""
 
     timestamp = reformat_timestamp_for_id(corrected_at)
-    safe_spot = _SAFE_ID_PATTERN.sub("_", _safe_required_text(spot_id, "spot_id", limit=80)).strip("_") or "spot"
-    event_id = _safe_optional_text(matrix_event_id, limit=180) or ""
+    safe_spot = _SAFE_ID_PATTERN.sub("_", required_feedback_text(spot_id, "spot_id", limit=80)).strip("_") or "spot"
+    event_id = optional_feedback_text(matrix_event_id, limit=180) or ""
     suffix_material = "\0".join((timestamp, safe_spot, event_id))
     suffix = hashlib.sha256(suffix_material.encode("utf-8")).hexdigest()[:8]
     return f"feedback-{timestamp}-{safe_spot}-{suffix}"
@@ -588,7 +588,7 @@ def make_learn_feedback_label(
     safe_spot = _safe_spot_id(spot_id)
     if safe_spot is None:
         raise FeedbackLabelSchemaError("feedback label spot_id is required")
-    state = _feedback_state(target_state, "target_state")
+    state = feedback_state(target_state, "target_state")
     learned_text = _feedback_timestamp_text(learned_at)
     return FeedbackLabel(
         label_id=make_label_id(corrected_at=learned_text, spot_id=safe_spot, matrix_event_id=matrix_event_id),
@@ -627,15 +627,15 @@ def append_feedback_label(
 
     labels_path = Path(path)
     try:
-        new_label = _label_from_any(label)
+        new_label = feedback_label_from_any(label)
         loaded = load_feedback_labels(labels_path, max_labels=max_labels, max_file_bytes=max_file_bytes, logger=logger)
         retained = list(loaded.labels)
         if new_label.matrix_event_id and any(existing.matrix_event_id == new_label.matrix_event_id for existing in retained):
             _log(logger, "debug", "operator-feedback-label-duplicate-skipped", path=labels_path, matrix_event_id=new_label.matrix_event_id)
             return FeedbackAppendResult(status="duplicate", label_id=new_label.label_id)
         retained.append(new_label)
-        retained = retained[-_positive_limit(max_labels, MAX_FEEDBACK_LABELS) :]
-        _write_feedback_labels(labels_path, retained)
+        retained = retained[-positive_feedback_limit(max_labels, MAX_FEEDBACK_LABELS) :]
+        write_feedback_labels(labels_path, retained)
     except Exception as exc:
         _log(logger, "warning", "operator-feedback-label-append-failed", path=labels_path, error_type=type(exc).__name__, error=str(exc))
         return FeedbackAppendResult(status="failed")
@@ -665,20 +665,20 @@ def load_feedback_labels(
         return FeedbackLabelLoad(state="unavailable", error_type=type(exc).__name__)
 
     if size > max_file_bytes:
-        quarantined = _quarantine_file(labels_path)
+        quarantined = quarantine_feedback_file(labels_path)
         _log(logger, "warning", "operator-feedback-labels-quarantined", path=labels_path, quarantine_path=quarantined, phase="size", error_type="oversized")
         return FeedbackLabelLoad(state="unavailable", error_type="oversized", quarantined_path=quarantined)
 
     try:
         with labels_path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-        labels = _labels_from_payload(payload)
+        labels = feedback_labels_from_payload(payload)
     except (OSError, json.JSONDecodeError, FeedbackLabelSchemaError) as exc:
-        quarantined = _quarantine_file(labels_path)
+        quarantined = quarantine_feedback_file(labels_path)
         _log(logger, "warning", "operator-feedback-labels-quarantined", path=labels_path, quarantine_path=quarantined, phase="load", error_type=type(exc).__name__, error=str(exc))
         return FeedbackLabelLoad(state="unavailable", error_type=type(exc).__name__, quarantined_path=quarantined)
 
-    bounded = tuple(labels[-_positive_limit(max_labels, MAX_FEEDBACK_LABELS) :])
+    bounded = tuple(labels[-positive_feedback_limit(max_labels, MAX_FEEDBACK_LABELS) :])
     _log(logger, "debug", "operator-feedback-labels-loaded", path=labels_path, label_count=len(bounded), state="available")
     return FeedbackLabelLoad(state="available", labels=bounded)
 
@@ -686,7 +686,7 @@ def load_feedback_labels(
 def find_feedback_label_by_matrix_event_id(path: str | Path, matrix_event_id: str | None, *, logger: StructuredLogger | None = None) -> FeedbackLabel | None:
     """Return the stored feedback label for an already-processed Matrix event id."""
 
-    safe_event_id = _safe_optional_text(matrix_event_id, limit=180)
+    safe_event_id = optional_feedback_text(matrix_event_id, limit=180)
     if not safe_event_id:
         return None
     loaded = load_feedback_labels(path, logger=logger)
@@ -718,9 +718,9 @@ def resolve_latest_alert_candidate(path: str | Path, spot_id: str, *, logger: St
             spot_id=spot_id,
             reported_state=reported_state,
             reported_at=record.observed_at,
-            alert_event_type=_safe_optional_text(event_type, limit=120),
-            alert_event_id=_safe_optional_text(details.get("event_id"), limit=180),
-            snapshot_path=_safe_optional_text(details.get("retained_snapshot_path") or details.get("snapshot_path"), limit=240),
+            alert_event_type=optional_feedback_text(event_type, limit=120),
+            alert_event_id=optional_feedback_text(details.get("event_id"), limit=180),
+            snapshot_path=optional_feedback_text(details.get("retained_snapshot_path") or details.get("snapshot_path"), limit=240),
         )
     return None
 
@@ -737,7 +737,7 @@ def validate_feedback_evidence(
     if not snapshot_path:
         return FeedbackEvidence("alert_snapshot", None, False, False, None, None, None, "missing")
     try:
-        safe_relative = _safe_optional_path_text(snapshot_path)
+        safe_relative = optional_feedback_path_text(snapshot_path)
     except FeedbackLabelSchemaError:
         return FeedbackEvidence("alert_snapshot", None, False, False, None, None, None, "unsafe_path")
     if safe_relative is None:
@@ -828,7 +828,7 @@ def _reported_state_from_event_type(value: object) -> SpotState | None:
 
 def _safe_spot_id(value: str) -> str | None:
     try:
-        text = _safe_required_text(value, "spot_id", limit=80)
+        text = required_feedback_text(value, "spot_id", limit=80)
     except FeedbackLabelSchemaError:
         return None
     if text.startswith("/") or "\\" in text or ".." in Path(text).parts:

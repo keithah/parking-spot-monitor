@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 
@@ -87,6 +88,20 @@ def test_operator_modules_stay_decomposed() -> None:
     for path, max_lines in module_caps.items():
         assert (ROOT / path).exists()
         assert _line_count(path) <= max_lines
+
+
+def test_operator_feedback_does_not_import_model_privates() -> None:
+    feedback_source = (ROOT / "parking_spot_monitor/operator_feedback.py").read_text(encoding="utf-8")
+    tree = ast.parse(feedback_source)
+
+    model_imports = [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "parking_spot_monitor.operator_feedback_models"
+        for alias in node.names
+    ]
+    assert model_imports
+    assert all(not name.startswith("_") for name in model_imports)
 
 
 def test_operator_docs_tests_stay_decomposed() -> None:

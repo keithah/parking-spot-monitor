@@ -52,8 +52,8 @@ class FeedbackEvidence:
 
     def to_json_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "kind": _clip_text(self.kind, 80),
-            "path": _safe_optional_path_text(self.path),
+            "kind": clip_feedback_text(self.kind, 80),
+            "path": optional_feedback_path_text(self.path),
             "available": bool(self.available),
             "validated_jpeg": bool(self.validated_jpeg),
             "width": _optional_non_negative_int(self.width),
@@ -61,7 +61,7 @@ class FeedbackEvidence:
             "byte_size": _optional_non_negative_int(self.byte_size),
         }
         if self.error_type is not None:
-            payload["error_type"] = _clip_text(self.error_type, 80)
+            payload["error_type"] = clip_feedback_text(self.error_type, 80)
         return payload
 
 
@@ -95,33 +95,33 @@ class FeedbackLabel:
     def to_json_dict(self) -> dict[str, Any]:
         label_type = _feedback_label_type(self.label_type)
         payload: dict[str, Any] = {
-            "label_id": _safe_required_text(self.label_id, "label_id", limit=160),
-            "spot_id": _safe_required_text(self.spot_id, "spot_id", limit=80),
-            "reported_state": _feedback_state(self.reported_state, "reported_state"),
-            "actual_state": _feedback_state(self.actual_state, "actual_state"),
-            "source": _safe_required_text(self.source, "source", limit=80),
-            "operator_sender_hash": _safe_required_text(self.operator_sender_hash, "operator_sender_hash", limit=120),
-            "corrected_at": _safe_required_text(self.corrected_at, "corrected_at", limit=80),
-            "reported_at": _safe_optional_text(self.reported_at, limit=80),
-            "alert_event_type": _safe_optional_text(self.alert_event_type, limit=120),
-            "alert_event_id": _safe_optional_text(self.alert_event_id, limit=180),
+            "label_id": required_feedback_text(self.label_id, "label_id", limit=160),
+            "spot_id": required_feedback_text(self.spot_id, "spot_id", limit=80),
+            "reported_state": feedback_state(self.reported_state, "reported_state"),
+            "actual_state": feedback_state(self.actual_state, "actual_state"),
+            "source": required_feedback_text(self.source, "source", limit=80),
+            "operator_sender_hash": required_feedback_text(self.operator_sender_hash, "operator_sender_hash", limit=120),
+            "corrected_at": required_feedback_text(self.corrected_at, "corrected_at", limit=80),
+            "reported_at": optional_feedback_text(self.reported_at, limit=80),
+            "alert_event_type": optional_feedback_text(self.alert_event_type, limit=120),
+            "alert_event_id": optional_feedback_text(self.alert_event_id, limit=180),
             "evidence": self.evidence.to_json_dict(),
-            "notes": _clip_text(self.notes, MAX_TEXT_FIELD_CHARS),
+            "notes": clip_feedback_text(self.notes, MAX_TEXT_FIELD_CHARS),
             "label_type": label_type,
         }
         if self.matrix_event_id is not None:
-            payload["matrix_event_id"] = _safe_optional_text(self.matrix_event_id, limit=180)
+            payload["matrix_event_id"] = optional_feedback_text(self.matrix_event_id, limit=180)
         if self.matrix_room_id_hash is not None:
-            payload["matrix_room_id_hash"] = _safe_optional_text(self.matrix_room_id_hash, limit=120)
+            payload["matrix_room_id_hash"] = optional_feedback_text(self.matrix_room_id_hash, limit=120)
         if self.feedback_category is not None:
             payload["feedback_category"] = _safe_feedback_category(self.feedback_category)
         if self.feedback_category_details is not None:
             payload["feedback_category_details"] = _safe_metadata(self.feedback_category_details)
         if label_type == "learn":
-            payload["target_state"] = _feedback_state(self.target_state, "target_state")
-            payload["learned_at"] = _safe_required_text(self.learned_at or self.corrected_at, "learned_at", limit=80)
-            payload["replay_context"] = _safe_text_list(self.replay_context, max_items=MAX_REPLAY_CONTEXT_LINES, item_limit=MAX_REPLAY_LINE_CHARS)
-            payload["degradation_reasons"] = _safe_text_list(self.degradation_reasons, max_items=MAX_DEGRADATION_REASONS, item_limit=120)
+            payload["target_state"] = feedback_state(self.target_state, "target_state")
+            payload["learned_at"] = required_feedback_text(self.learned_at or self.corrected_at, "learned_at", limit=80)
+            payload["replay_context"] = safe_feedback_text_list(self.replay_context, max_items=MAX_REPLAY_CONTEXT_LINES, item_limit=MAX_REPLAY_LINE_CHARS)
+            payload["degradation_reasons"] = safe_feedback_text_list(self.degradation_reasons, max_items=MAX_DEGRADATION_REASONS, item_limit=120)
             payload["source_metadata"] = _safe_metadata(self.source_metadata)
         return payload
 
@@ -208,7 +208,7 @@ class LearnLabelRecordResult:
     duplicate: bool = False
 
 
-def _write_feedback_labels(path: Path, labels: Sequence[FeedbackLabel]) -> None:
+def write_feedback_labels(path: Path, labels: Sequence[FeedbackLabel]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"schema_version": SCHEMA_VERSION, "labels": [label.to_json_dict() for label in labels]}
     temp_path: Path | None = None
@@ -230,7 +230,7 @@ def _write_feedback_labels(path: Path, labels: Sequence[FeedbackLabel]) -> None:
         raise
 
 
-def _labels_from_payload(payload: Any) -> list[FeedbackLabel]:
+def feedback_labels_from_payload(payload: Any) -> list[FeedbackLabel]:
     if not isinstance(payload, Mapping):
         raise FeedbackLabelSchemaError("feedback label payload must be an object")
     if payload.get("schema_version") != SCHEMA_VERSION:
@@ -242,11 +242,11 @@ def _labels_from_payload(payload: Any) -> list[FeedbackLabel]:
         raise FeedbackLabelSchemaError("feedback label count exceeds validation bound")
     labels: list[FeedbackLabel] = []
     for item in raw_labels:
-        labels.append(_label_from_any(item))
+        labels.append(feedback_label_from_any(item))
     return labels
 
 
-def _label_from_any(value: FeedbackLabel | Mapping[str, Any]) -> FeedbackLabel:
+def feedback_label_from_any(value: FeedbackLabel | Mapping[str, Any]) -> FeedbackLabel:
     if isinstance(value, FeedbackLabel):
         return FeedbackLabel(**value.to_json_dict() | {"evidence": FeedbackEvidence(**value.evidence.to_json_dict())})
     if not isinstance(value, Mapping):
@@ -255,36 +255,36 @@ def _label_from_any(value: FeedbackLabel | Mapping[str, Any]) -> FeedbackLabel:
     if not isinstance(evidence_value, Mapping):
         raise FeedbackLabelSchemaError("feedback label evidence must be an object")
     evidence = FeedbackEvidence(
-        kind=_safe_required_text(evidence_value.get("kind"), "evidence.kind", limit=80),
-        path=_safe_optional_path_text(evidence_value.get("path")),
+        kind=required_feedback_text(evidence_value.get("kind"), "evidence.kind", limit=80),
+        path=optional_feedback_path_text(evidence_value.get("path")),
         available=bool(evidence_value.get("available", False)),
         validated_jpeg=bool(evidence_value.get("validated_jpeg", False)),
         width=_optional_non_negative_int(evidence_value.get("width")),
         height=_optional_non_negative_int(evidence_value.get("height")),
         byte_size=_optional_non_negative_int(evidence_value.get("byte_size")),
-        error_type=_safe_optional_text(evidence_value.get("error_type"), limit=80),
+        error_type=optional_feedback_text(evidence_value.get("error_type"), limit=80),
     )
     label_type = _feedback_label_type(value.get("label_type", "correction"))
     return FeedbackLabel(
-        label_id=_safe_required_text(value.get("label_id"), "label_id", limit=160),
-        spot_id=_safe_required_text(value.get("spot_id"), "spot_id", limit=80),
-        reported_state=_feedback_state(value.get("reported_state"), "reported_state"),
-        actual_state=_feedback_state(value.get("actual_state"), "actual_state"),
-        source=_safe_required_text(value.get("source"), "source", limit=80),
-        operator_sender_hash=_safe_required_text(value.get("operator_sender_hash"), "operator_sender_hash", limit=120),
-        corrected_at=_safe_required_text(value.get("corrected_at"), "corrected_at", limit=80),
-        reported_at=_safe_optional_text(value.get("reported_at"), limit=80),
-        alert_event_type=_safe_optional_text(value.get("alert_event_type"), limit=120),
-        alert_event_id=_safe_optional_text(value.get("alert_event_id"), limit=180),
+        label_id=required_feedback_text(value.get("label_id"), "label_id", limit=160),
+        spot_id=required_feedback_text(value.get("spot_id"), "spot_id", limit=80),
+        reported_state=feedback_state(value.get("reported_state"), "reported_state"),
+        actual_state=feedback_state(value.get("actual_state"), "actual_state"),
+        source=required_feedback_text(value.get("source"), "source", limit=80),
+        operator_sender_hash=required_feedback_text(value.get("operator_sender_hash"), "operator_sender_hash", limit=120),
+        corrected_at=required_feedback_text(value.get("corrected_at"), "corrected_at", limit=80),
+        reported_at=optional_feedback_text(value.get("reported_at"), limit=80),
+        alert_event_type=optional_feedback_text(value.get("alert_event_type"), limit=120),
+        alert_event_id=optional_feedback_text(value.get("alert_event_id"), limit=180),
         evidence=evidence,
-        notes=_safe_optional_text(value.get("notes"), limit=MAX_TEXT_FIELD_CHARS) or "",
-        matrix_event_id=_safe_optional_text(value.get("matrix_event_id"), limit=180),
-        matrix_room_id_hash=_safe_optional_text(value.get("matrix_room_id_hash"), limit=120),
+        notes=optional_feedback_text(value.get("notes"), limit=MAX_TEXT_FIELD_CHARS) or "",
+        matrix_event_id=optional_feedback_text(value.get("matrix_event_id"), limit=180),
+        matrix_room_id_hash=optional_feedback_text(value.get("matrix_room_id_hash"), limit=120),
         label_type=label_type,
-        target_state=_feedback_state(value.get("target_state"), "target_state") if label_type == "learn" else _safe_optional_text(value.get("target_state"), limit=40),
-        learned_at=_safe_required_text(value.get("learned_at") or value.get("corrected_at"), "learned_at", limit=80) if label_type == "learn" else _safe_optional_text(value.get("learned_at"), limit=80),
-        replay_context=tuple(_safe_text_list(value.get("replay_context", ()), max_items=MAX_REPLAY_CONTEXT_LINES, item_limit=MAX_REPLAY_LINE_CHARS)) if label_type == "learn" else (),
-        degradation_reasons=tuple(_safe_text_list(value.get("degradation_reasons", ()), max_items=MAX_DEGRADATION_REASONS, item_limit=120)) if label_type == "learn" else (),
+        target_state=feedback_state(value.get("target_state"), "target_state") if label_type == "learn" else optional_feedback_text(value.get("target_state"), limit=40),
+        learned_at=required_feedback_text(value.get("learned_at") or value.get("corrected_at"), "learned_at", limit=80) if label_type == "learn" else optional_feedback_text(value.get("learned_at"), limit=80),
+        replay_context=tuple(safe_feedback_text_list(value.get("replay_context", ()), max_items=MAX_REPLAY_CONTEXT_LINES, item_limit=MAX_REPLAY_LINE_CHARS)) if label_type == "learn" else (),
+        degradation_reasons=tuple(safe_feedback_text_list(value.get("degradation_reasons", ()), max_items=MAX_DEGRADATION_REASONS, item_limit=120)) if label_type == "learn" else (),
         source_metadata=_safe_metadata(value.get("source_metadata")) if label_type == "learn" else None,
         feedback_category=_safe_feedback_category(value.get("feedback_category")) if value.get("feedback_category") is not None else None,
         feedback_category_details=_safe_metadata(value.get("feedback_category_details")) if value.get("feedback_category_details") is not None else None,
@@ -292,34 +292,34 @@ def _label_from_any(value: FeedbackLabel | Mapping[str, Any]) -> FeedbackLabel:
 
 
 def _safe_feedback_category(value: object) -> str:
-    category = _safe_required_text(value, "feedback_category", limit=80)
+    category = required_feedback_text(value, "feedback_category", limit=80)
     if category not in {"false_alert", "missed_alert"}:
         raise FeedbackLabelSchemaError("feedback label feedback_category must be false_alert or missed_alert")
     return category
 
 
 def _feedback_label_type(value: object) -> FeedbackLabelType:
-    label_type = _safe_required_text(value, "label_type", limit=40)
+    label_type = required_feedback_text(value, "label_type", limit=40)
     if label_type not in {"correction", "learn"}:
         raise FeedbackLabelSchemaError("feedback label label_type must be correction or learn")
     return label_type  # type: ignore[return-value]
 
 
-def _feedback_state(value: object, field: str) -> str:
-    state = _safe_required_text(value, field, limit=40)
+def feedback_state(value: object, field: str) -> str:
+    state = required_feedback_text(value, field, limit=40)
     if state not in VALID_FEEDBACK_STATES:
         raise FeedbackLabelSchemaError(f"feedback label {field} must be open or occupied")
     return state
 
 
-def _safe_text_list(value: object, *, max_items: int, item_limit: int) -> list[str]:
+def safe_feedback_text_list(value: object, *, max_items: int, item_limit: int) -> list[str]:
     if value is None:
         return []
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise FeedbackLabelSchemaError("feedback label replay fields must be lists")
     bounded: list[str] = []
-    for item in list(value)[:_positive_limit(max_items, max_items)]:
-        text = _safe_optional_text(item, limit=item_limit)
+    for item in list(value)[:positive_feedback_limit(max_items, max_items)]:
+        text = optional_feedback_text(item, limit=item_limit)
         if text:
             bounded.append(text)
     return bounded
@@ -332,7 +332,7 @@ def _safe_metadata(value: object) -> dict[str, str]:
         raise FeedbackLabelSchemaError("feedback label source_metadata must be an object")
     sanitized: dict[str, str] = {}
     for raw_key, raw_value in list(value.items())[:MAX_METADATA_ITEMS]:
-        key = _safe_optional_text(raw_key, limit=80)
+        key = optional_feedback_text(raw_key, limit=80)
         if not key:
             continue
         sanitized[key] = _safe_metadata_value(key, raw_value)
@@ -340,7 +340,7 @@ def _safe_metadata(value: object) -> dict[str, str]:
 
 
 def _safe_metadata_value(key: str, value: object) -> str:
-    text = _safe_optional_text(value, limit=160) or ""
+    text = optional_feedback_text(value, limit=160) or ""
     lower_key = key.lower()
     if lower_key in {"sender", "room", "matrix_sender", "matrix_room_id", "operator"} or text.startswith(("@", "!")):
         return hash_operator_identifier(text)
@@ -350,20 +350,20 @@ def _safe_metadata_value(key: str, value: object) -> str:
 def hash_operator_identifier(identifier: object) -> str:
     """Return a stable non-reversible hash for a Matrix sender or operator identifier."""
 
-    text = _safe_optional_text(identifier, limit=4096) or ""
+    text = optional_feedback_text(identifier, limit=4096) or ""
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
 
 
-def _safe_required_text(value: object, field: str, *, limit: int) -> str:
-    text = _safe_optional_text(value, limit=limit)
+def required_feedback_text(value: object, field: str, *, limit: int) -> str:
+    text = optional_feedback_text(value, limit=limit)
     if not text:
         raise FeedbackLabelSchemaError(f"feedback label {field} is required")
     return text
 
 
-def _safe_optional_path_text(value: object) -> str | None:
-    text = _safe_optional_text(value, limit=240)
+def optional_feedback_path_text(value: object) -> str | None:
+    text = optional_feedback_text(value, limit=240)
     if text is None:
         return None
     if text.startswith("/") or ".." in Path(text).parts:
@@ -371,13 +371,13 @@ def _safe_optional_path_text(value: object) -> str | None:
     return text
 
 
-def _safe_optional_text(value: object, *, limit: int) -> str | None:
+def optional_feedback_text(value: object, *, limit: int) -> str | None:
     if value is None:
         return None
-    return _clip_text(value, limit)
+    return clip_feedback_text(value, limit)
 
 
-def _clip_text(value: object, limit: int) -> str:
+def clip_feedback_text(value: object, limit: int) -> str:
     redacted = redact_diagnostic_text(value)
     redacted = _SENSITIVE_TOKEN_PATTERN.sub("<redacted>", redacted)
     redacted = _RAW_IMAGE_PREFIX_PATTERN.sub("<binary redacted>", redacted)
@@ -401,13 +401,13 @@ def _optional_non_negative_int(value: object) -> int | None:
     return integer
 
 
-def _positive_limit(value: int, default: int) -> int:
+def positive_feedback_limit(value: int, default: int) -> int:
     if isinstance(value, bool) or value <= 0:
         return default
     return value
 
 
-def _quarantine_file(path: Path) -> Path | None:
+def quarantine_feedback_file(path: Path) -> Path | None:
     quarantine_path = path.with_name(f"{path.name}.quarantine")
     try:
         os.replace(path, quarantine_path)
