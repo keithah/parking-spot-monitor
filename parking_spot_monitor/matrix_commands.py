@@ -3,8 +3,9 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Callable, Mapping
-from typing import Any
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, TypeAlias
 
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
 from parking_spot_monitor.matrix_alerts import _int_field, _safe_text
@@ -32,6 +33,81 @@ from parking_spot_monitor.matrix_models import (
 )
 from parking_spot_monitor.matrix_snapshots import JPEG_MIMETYPE
 from parking_spot_monitor.matrix_support import _require_non_empty, _sanitize_diagnostics
+
+
+@dataclass(frozen=True)
+class _CockpitCommand:
+    action: str
+    spot_id: str | None = None
+    lab_kind: str | None = None
+    lab_job_id: str | None = None
+    incident_time: str | None = None
+    analytics_window: str | None = None
+
+
+@dataclass(frozen=True)
+class _CorrectSpotStateCommand:
+    spot_id: str
+    actual_state: str
+
+
+@dataclass(frozen=True)
+class _LearnLabelCommand:
+    spot_id: str
+    actual_state: str
+    requested_time: str
+
+
+@dataclass(frozen=True)
+class _RenameProfileCommand:
+    profile_id: str
+    label: str
+
+
+@dataclass(frozen=True)
+class _MergeProfilesCommand:
+    source_profile_id: str
+    target_profile_id: str
+
+
+@dataclass(frozen=True)
+class _WrongMatchCommand:
+    subject_id: str
+
+
+@dataclass(frozen=True)
+class _AssignOwnerCommand:
+    spot_id: str
+
+
+@dataclass(frozen=True)
+class _ActiveSpotAssignmentsCommand:
+    pass
+
+
+@dataclass(frozen=True)
+class _HelpCommand:
+    pass
+
+
+@dataclass(frozen=True)
+class _ProfileSummaryCommand:
+    profile_id: str
+
+
+_AppliedMatrixCommand: TypeAlias = (
+    _CockpitCommand
+    | _CorrectSpotStateCommand
+    | _LearnLabelCommand
+    | _RenameProfileCommand
+    | _MergeProfilesCommand
+    | _WrongMatchCommand
+    | _AssignOwnerCommand
+    | _ActiveSpotAssignmentsCommand
+    | _HelpCommand
+    | _ProfileSummaryCommand
+)
+
 
 class MatrixCommandService:
     """Poll Matrix commands, authorize them, and apply archive corrections."""
@@ -125,42 +201,35 @@ class MatrixCommandService:
         return "processed"
 
     def _apply_command(self, command: MatrixCommand, *, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+        typed_command = _typed_command(command)
         metadata = {"matrix_event_id": event.event_id, "matrix_sender": event.sender, "matrix_room_id": event.room_id}
-        if command.action in {"status", "config", "latest", "recent", "confidence"}:
-            return self._format_cockpit_reply(command.action)
-        if command.action == "analytics":
-            return self._format_cockpit_reply(command.action, analytics_window=command.subject_id or "7d")
-        if command.action == "lab_run":
-            assert command.lab_kind is not None
-            return self._format_cockpit_reply(command.action, lab_kind=command.lab_kind)
-        if command.action == "lab_status":
-            return self._format_cockpit_reply(command.action, lab_job_id=command.lab_job_id or "latest")
-        if command.action in {"why", "explain"}:
-            assert command.spot_id is not None
-            return self._format_cockpit_reply(command.action, spot_id=command.spot_id)
-        if command.action == "incident_review":
-            assert command.spot_id is not None and command.subject_id is not None
-            return self._format_cockpit_reply(command.action, spot_id=command.spot_id, incident_time=command.subject_id)
-        if command.action == "correct_spot_state":
+        if isinstance(typed_command, _CockpitCommand):
+            return self._format_cockpit_reply(
+                typed_command.action,
+                spot_id=typed_command.spot_id,
+                lab_kind=typed_command.lab_kind,
+                lab_job_id=typed_command.lab_job_id,
+                incident_time=typed_command.incident_time,
+                analytics_window=typed_command.analytics_window,
+            )
+        if isinstance(typed_command, _CorrectSpotStateCommand):
             if self.feedback_labeler is None:
                 raise RuntimeError("operator feedback labeler is not configured")
-            assert command.spot_id is not None and command.actual_state is not None
             result = self.feedback_labeler.record_correction(
-                spot_id=command.spot_id,
-                actual_state=command.actual_state,
+                spot_id=typed_command.spot_id,
+                actual_state=typed_command.actual_state,
                 matrix_event_id=event.event_id,
                 matrix_sender=event.sender,
                 matrix_room_id=event.room_id,
             )
             return result.reply_text
-        if command.action == "learn_label":
+        if isinstance(typed_command, _LearnLabelCommand):
             if self.feedback_labeler is None:
                 raise RuntimeError("operator feedback labeler is not configured")
-            assert command.spot_id is not None and command.actual_state is not None and command.subject_id is not None
             result = self.feedback_labeler.record_learn_label(
-                spot_id=command.spot_id,
-                target_state=command.actual_state,
-                requested_time=command.subject_id,
+                spot_id=typed_command.spot_id,
+                target_state=typed_command.actual_state,
+                requested_time=typed_command.requested_time,
                 settings=None if self.cockpit_context is None else self.cockpit_context.settings,
                 state_path=None if self.cockpit_context is None else self.cockpit_context.state_path,
                 detector=None if self.cockpit_context is None else self.cockpit_context.incident_detector,
@@ -169,40 +238,35 @@ class MatrixCommandService:
                 matrix_room_id=event.room_id,
             )
             return result.reply_text
-        if command.action in {"rename_profile", "merge_profiles", "wrong_match"} and self._correction_already_seen(event.event_id):
+        if isinstance(typed_command, (_RenameProfileCommand, _MergeProfilesCommand, _WrongMatchCommand)) and self._correction_already_seen(event.event_id):
             return "Command already applied; acknowledgement repeated."
-        if command.action == "rename_profile":
-            assert command.profile_id is not None and command.label is not None
-            applied = self.archive.rename_profile(command.profile_id, command.label, **metadata)
-            return f"Profile {command.profile_id} renamed to {command.label}. Correction {applied.correction_id} recorded."
-        if command.action == "merge_profiles":
-            assert command.source_profile_id is not None and command.target_profile_id is not None
-            applied = self.archive.merge_profiles(command.source_profile_id, command.target_profile_id, **metadata)
-            return f"Profile {command.source_profile_id} merged into {command.target_profile_id}. Correction {applied.correction_id} recorded."
-        if command.action == "wrong_match":
-            assert command.subject_id is not None
-            session_id = self._resolve_wrong_match_subject(command.subject_id)
+        if isinstance(typed_command, _RenameProfileCommand):
+            applied = self.archive.rename_profile(typed_command.profile_id, typed_command.label, **metadata)
+            return f"Profile {typed_command.profile_id} renamed to {typed_command.label}. Correction {applied.correction_id} recorded."
+        if isinstance(typed_command, _MergeProfilesCommand):
+            applied = self.archive.merge_profiles(typed_command.source_profile_id, typed_command.target_profile_id, **metadata)
+            return f"Profile {typed_command.source_profile_id} merged into {typed_command.target_profile_id}. Correction {applied.correction_id} recorded."
+        if isinstance(typed_command, _WrongMatchCommand):
+            session_id = self._resolve_wrong_match_subject(typed_command.subject_id)
             applied = self.archive.mark_wrong_match(session_id, matrix_event_id=event.event_id, matrix_sender=event.sender, matrix_room_id=event.room_id)
             return f"Wrong match recorded for session {session_id}. Correction {applied.correction_id} recorded."
-        if command.action == "assign_owner":
-            assert command.subject_id is not None
-            assignment = self.archive.assign_owner_profile_to_active_spot(command.subject_id)
+        if isinstance(typed_command, _AssignOwnerCommand):
+            assignment = self.archive.assign_owner_profile_to_active_spot(typed_command.spot_id)
             profile_id = _safe_text(getattr(assignment, "profile_id", None), default="unknown")
             session_id = _safe_text(getattr(assignment, "session_id", None), default="unknown")
             confidence = getattr(assignment, "profile_confidence", None)
             confidence_text = _confidence_text(confidence)
-            return f"Owner vehicle assigned to {command.subject_id}: session {session_id}, profile {profile_id}, confidence {confidence_text}."
-        if command.action == "active_spot_assignments":
+            return f"Owner vehicle assigned to {typed_command.spot_id}: session {session_id}, profile {profile_id}, confidence {confidence_text}."
+        if isinstance(typed_command, _ActiveSpotAssignmentsCommand):
             assignments = _active_spot_assignments_with_runtime_status(self.archive.active_spot_assignments(), cockpit_context=self.cockpit_context, logger=self.logger)
             base_reply = _format_active_spot_assignments_reply(assignments)
             if self.who_snapshot_provider is not None:
                 return self.who_snapshot_provider(base_reply)
             return base_reply
-        if command.action == "help":
+        if isinstance(typed_command, _HelpCommand):
             return _format_command_help_reply(self.command_prefix)
-        if command.action == "profile_summary":
-            assert command.profile_id is not None
-            summary = self._profile_summary(command.profile_id, event=event)
+        if isinstance(typed_command, _ProfileSummaryCommand):
+            summary = self._profile_summary(typed_command.profile_id, event=event)
             return _format_profile_summary_reply(summary)
         raise MatrixCommandParseError("unknown command")
 
@@ -314,6 +378,64 @@ def _validate_command_image_info(info: Mapping[str, Any] | None) -> dict[str, in
     if mimetype != JPEG_MIMETYPE or not all(isinstance(value, int) and value > 0 for value in (size, width, height)):
         raise MatrixCommandParseError("operator cockpit image metadata was malformed")
     return {"mimetype": JPEG_MIMETYPE, "size": int(size), "w": int(width), "h": int(height)}
+
+
+def _typed_command(command: MatrixCommand) -> _AppliedMatrixCommand:
+    if command.action in {"status", "config", "latest", "recent", "confidence"}:
+        return _CockpitCommand(command.action)
+    if command.action == "analytics":
+        return _CockpitCommand(command.action, analytics_window=command.subject_id or "7d")
+    if command.action == "lab_run":
+        return _CockpitCommand(command.action, lab_kind=_require_command_field(command.lab_kind, "lab_kind"))
+    if command.action == "lab_status":
+        return _CockpitCommand(command.action, lab_job_id=command.lab_job_id or "latest")
+    if command.action in {"why", "explain"}:
+        return _CockpitCommand(command.action, spot_id=_require_command_field(command.spot_id, "spot_id"))
+    if command.action == "incident_review":
+        return _CockpitCommand(
+            command.action,
+            spot_id=_require_command_field(command.spot_id, "spot_id"),
+            incident_time=_require_command_field(command.subject_id, "incident_time"),
+        )
+    if command.action == "correct_spot_state":
+        return _CorrectSpotStateCommand(
+            spot_id=_require_command_field(command.spot_id, "spot_id"),
+            actual_state=_require_command_field(command.actual_state, "actual_state"),
+        )
+    if command.action == "learn_label":
+        return _LearnLabelCommand(
+            spot_id=_require_command_field(command.spot_id, "spot_id"),
+            actual_state=_require_command_field(command.actual_state, "actual_state"),
+            requested_time=_require_command_field(command.subject_id, "requested_time"),
+        )
+    if command.action == "rename_profile":
+        return _RenameProfileCommand(
+            profile_id=_require_command_field(command.profile_id, "profile_id"),
+            label=_require_command_field(command.label, "label"),
+        )
+    if command.action == "merge_profiles":
+        return _MergeProfilesCommand(
+            source_profile_id=_require_command_field(command.source_profile_id, "source_profile_id"),
+            target_profile_id=_require_command_field(command.target_profile_id, "target_profile_id"),
+        )
+    if command.action == "wrong_match":
+        return _WrongMatchCommand(subject_id=_require_command_field(command.subject_id, "subject_id"))
+    if command.action == "assign_owner":
+        return _AssignOwnerCommand(spot_id=_require_command_field(command.subject_id, "spot_id"))
+    if command.action == "active_spot_assignments":
+        return _ActiveSpotAssignmentsCommand()
+    if command.action == "help":
+        return _HelpCommand()
+    if command.action == "profile_summary":
+        return _ProfileSummaryCommand(profile_id=_require_command_field(command.profile_id, "profile_id"))
+    raise MatrixCommandParseError("unknown command")
+
+
+def _require_command_field(value: str | None, name: str) -> str:
+    if value is None:
+        raise MatrixCommandParseError(f"missing {name}")
+    return value
+
 
 def parse_matrix_command(body: str, *, command_prefix: str = "!parking") -> MatrixCommand:
     if not isinstance(body, str):

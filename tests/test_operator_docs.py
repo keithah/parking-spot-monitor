@@ -37,6 +37,34 @@ def assert_section_case(section: str, case_name: str, required: list[str]) -> No
     assert not missing, f"README.md troubleshooting case '{case_name}' missing tokens: {missing}"
 
 
+def read_matrix_command_contract() -> str:
+    from parking_spot_monitor.matrix_commands import MatrixCommandParseError, _format_command_help_reply, parse_matrix_command
+
+    def parse_error(body: str) -> str:
+        try:
+            parse_matrix_command(body)
+        except MatrixCommandParseError as exc:
+            return str(exc)
+        raise AssertionError(f"expected Matrix command parse failure for {body!r}")
+
+    false_alert = parse_matrix_command("!parking false-alert left_spot open")
+    missed_alert = parse_matrix_command("!parking missed-alert left_spot occupied at 2026-05-18T19:00:00Z")
+    return "\n".join(
+        [
+            _format_command_help_reply("{command_prefix}"),
+            parse_error("!parking explain"),
+            parse_error("!parking analytics bogus"),
+            f"false-alert action={false_alert.action}",
+            f"false-alert spot_id={false_alert.spot_id}",
+            f"false-alert actual_state={false_alert.actual_state}",
+            f"missed-alert action={missed_alert.action}",
+            f"missed-alert spot_id={missed_alert.spot_id}",
+            f"missed-alert actual_state={missed_alert.actual_state}",
+            f"missed-alert subject_id={missed_alert.subject_id}",
+        ]
+    )
+
+
 def test_readme_documents_clean_machine_setup_sequence_and_operator_commands() -> None:
     readme = read_tracked("README.md")
 
@@ -443,7 +471,7 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
 
 def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_uat_limits() -> None:
     readme = read_tracked("README.md")
-    matrix_source = read_tracked("parking_spot_monitor/matrix_commands.py")
+    matrix_contract = read_matrix_command_contract()
     cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
 
@@ -468,15 +496,15 @@ def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_ua
         ],
     )
     assert_contains_all(
-        matrix_source,
+        matrix_contract,
         [
             "usage: !parking explain <spot_id>",
             "usage: !parking analytics [today|7d|30d|all]",
             "{command_prefix} false-alert <spot_id> <open|occupied> — explicit alias for correcting a false alert",
             "{command_prefix} missed-alert <spot_id> <open|occupied> at <time> — explicit alias for recording missed timeline evidence",
             "{command_prefix} analytics [today|7d|30d|all] — show spot-level historical occupancy metrics from local vehicle-history sessions",
-            "if parts[1] in {\"correct\", \"false-alert\"}",
-            "if parts[1] in {\"learn\", \"missed-alert\"}",
+            "false-alert action=correct_spot_state",
+            "missed-alert action=learn_label",
         ],
     )
     assert_contains_all(

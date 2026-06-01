@@ -1146,6 +1146,22 @@ def test_parse_matrix_commands_are_strict_and_normalize_labels() -> None:
             parse_matrix_command(body)
 
 
+def test_command_service_rejects_incomplete_parsed_commands_before_dispatch() -> None:
+    from parking_spot_monitor.matrix import MatrixCommand, MatrixCommandParseError, MatrixCommandService, MatrixTextEvent
+
+    service = MatrixCommandService(
+        client=object(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_provider=lambda action, **kwargs: f"{action}:{kwargs}",
+    )
+    event = MatrixTextEvent(event_id="$event", sender="@op:example", room_id=ROOM_ID, body="!parking why")
+
+    with pytest.raises(MatrixCommandParseError, match="missing spot_id"):
+        service._apply_command(MatrixCommand(action="why"), event=event)
+
+
 def test_parse_matrix_operator_cockpit_commands_are_exact_and_bounded() -> None:
     from parking_spot_monitor.matrix import MatrixCommandParseError, parse_matrix_command
 
