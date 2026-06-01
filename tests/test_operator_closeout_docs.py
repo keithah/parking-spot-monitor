@@ -6,7 +6,7 @@ from tests.operator_docs_helpers import assert_contains_all, read_matrix_command
 def test_m006_incident_intelligence_commands_and_closeout_smoke_are_documented() -> None:
     readme = read_tracked("README.md")
     matrix_contract = read_matrix_command_contract()
-    cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
+    confidence_source = read_tracked("parking_spot_monitor/operator_cockpit_confidence.py")
     cockpit_snapshot_source = read_tracked("parking_spot_monitor/operator_cockpit_snapshots.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
     smoke_source = read_tracked("scripts/verify_m006_incident_intelligence_closeout.py")
@@ -69,7 +69,7 @@ def test_m006_incident_intelligence_commands_and_closeout_smoke_are_documented()
         ],
     )
     assert_contains_all(
-        cockpit_source,
+        confidence_source,
         [
             "Read-only: no detector, camera, media upload, alert emission, or state mutation was run.",
             "filename scan only; image bytes were not opened",

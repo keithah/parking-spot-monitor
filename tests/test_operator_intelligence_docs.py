@@ -6,7 +6,7 @@ from tests.operator_docs_helpers import assert_contains_all, read_matrix_command
 def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -> None:
     readme = read_tracked("README.md")
     matrix_contract = read_matrix_command_contract()
-    cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
+    analytics_source = read_tracked("parking_spot_monitor/operator_cockpit_analytics.py")
     cockpit_snapshot_source = read_tracked("parking_spot_monitor/operator_cockpit_snapshots.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
     feedback_model_source = read_tracked("parking_spot_monitor/operator_feedback_models.py")
@@ -66,7 +66,7 @@ def test_operator_docs_include_feedback_correction_and_who_snapshot_contract() -
 def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_uat_limits() -> None:
     readme = read_tracked("README.md")
     matrix_contract = read_matrix_command_contract()
-    cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
+    analytics_source = read_tracked("parking_spot_monitor/operator_cockpit_analytics.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
     feedback_model_source = read_tracked("parking_spot_monitor/operator_feedback_models.py")
     feedback_store_source = read_tracked("parking_spot_monitor/operator_feedback_store.py")
@@ -104,7 +104,7 @@ def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_ua
         ],
     )
     assert_contains_all(
-        cockpit_source,
+        analytics_source,
         [
             "Format bounded spot-level historical occupancy analytics from local vehicle-history JSON only.",
             "Parking occupancy analytics",
@@ -178,7 +178,7 @@ def test_operator_docs_include_timeline_frame_buffer_contract() -> None:
 def test_detection_lab_command_docs_cover_bounded_authorized_local_artifact_boundary() -> None:
     readme = read_tracked("README.md")
     matrix_contract = read_matrix_command_contract()
-    cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit.py")
+    lab_cockpit_source = read_tracked("parking_spot_monitor/operator_cockpit_lab.py")
     lab_source = read_tracked("parking_spot_monitor/detection_lab.py")
     startup_source = read_tracked("parking_spot_monitor/__main__.py")
 
@@ -241,7 +241,7 @@ def test_detection_lab_command_docs_cover_bounded_authorized_local_artifact_boun
         ],
     )
     assert_contains_all(
-        cockpit_source,
+        lab_cockpit_source,
         [
             "Detection lab job started",
             "use !parking lab status latest",

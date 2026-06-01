@@ -77,8 +77,12 @@ def test_runtime_modules_stay_decomposed() -> None:
 
 def test_operator_modules_stay_decomposed() -> None:
     module_caps = {
-        "parking_spot_monitor/operator_cockpit.py": 900,
+        "parking_spot_monitor/operator_cockpit.py": 220,
+        "parking_spot_monitor/operator_cockpit_analytics.py": 220,
+        "parking_spot_monitor/operator_cockpit_confidence.py": 220,
+        "parking_spot_monitor/operator_cockpit_lab.py": 180,
         "parking_spot_monitor/operator_cockpit_memory.py": 80,
+        "parking_spot_monitor/operator_cockpit_outbox.py": 180,
         "parking_spot_monitor/operator_cockpit_shared.py": 380,
         "parking_spot_monitor/operator_cockpit_snapshots.py": 460,
         "parking_spot_monitor/operator_feedback.py": 940,
@@ -122,6 +126,10 @@ def test_operator_feedback_does_not_import_model_privates() -> None:
 def test_operator_cockpit_modules_do_not_import_shared_privates() -> None:
     for relative_path in (
         "parking_spot_monitor/operator_cockpit.py",
+        "parking_spot_monitor/operator_cockpit_analytics.py",
+        "parking_spot_monitor/operator_cockpit_confidence.py",
+        "parking_spot_monitor/operator_cockpit_lab.py",
+        "parking_spot_monitor/operator_cockpit_outbox.py",
         "parking_spot_monitor/operator_cockpit_snapshots.py",
     ):
         tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
@@ -130,14 +138,24 @@ def test_operator_cockpit_modules_do_not_import_shared_privates() -> None:
             for node in ast.walk(tree)
             if isinstance(node, ast.ImportFrom)
             and node.module
-            and node.module in {
-                "parking_spot_monitor.operator_cockpit_shared",
-                "parking_spot_monitor.operator_cockpit_snapshots",
-            }
+            and node.module.startswith("parking_spot_monitor.operator_cockpit")
             for alias in node.names
         ]
         assert shared_imports
         assert all(not name.startswith("_") for name in shared_imports)
+
+
+def test_operator_cockpit_compat_surface_stays_thin() -> None:
+    cockpit_source = (ROOT / "parking_spot_monitor/operator_cockpit.py").read_text(encoding="utf-8")
+
+    assert "format_operator_analytics_reply" in cockpit_source
+    assert "format_operator_confidence_reply" in cockpit_source
+    assert "format_detection_lab_run_reply" in cockpit_source
+    assert "matrix_outbox_status_lines" in cockpit_source
+    assert "def _load_vehicle_history_session_dicts" not in cockpit_source
+    assert "def _summarize_timeline_frames" not in cockpit_source
+    assert "def _format_lab_status_lines" not in cockpit_source
+    assert "def _outbox_item_lines" not in cockpit_source
 
 
 def test_operator_docs_tests_stay_decomposed() -> None:
