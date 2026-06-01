@@ -85,8 +85,12 @@ def test_operator_modules_stay_decomposed() -> None:
         "parking_spot_monitor/operator_cockpit_outbox.py": 180,
         "parking_spot_monitor/operator_cockpit_shared.py": 380,
         "parking_spot_monitor/operator_cockpit_snapshots.py": 460,
-        "parking_spot_monitor/operator_feedback.py": 940,
+        "parking_spot_monitor/operator_feedback.py": 520,
+        "parking_spot_monitor/operator_feedback_alerts.py": 80,
+        "parking_spot_monitor/operator_feedback_evidence.py": 160,
+        "parking_spot_monitor/operator_feedback_labels.py": 160,
         "parking_spot_monitor/operator_feedback_models.py": 450,
+        "parking_spot_monitor/operator_feedback_replies.py": 140,
         "parking_spot_monitor/operator_feedback_store.py": 220,
         "parking_spot_monitor/operator_timeline.py": 100,
     }
@@ -121,6 +125,21 @@ def test_operator_feedback_does_not_import_model_privates() -> None:
     assert "quarantine_feedback_file" not in model_source
     assert "import json" not in model_source
     assert "import tempfile" not in model_source
+
+
+def test_operator_feedback_compat_surface_stays_thin() -> None:
+    feedback_source = (ROOT / "parking_spot_monitor/operator_feedback.py").read_text(encoding="utf-8")
+
+    assert "from parking_spot_monitor.operator_feedback_alerts import" in feedback_source
+    assert "from parking_spot_monitor.operator_feedback_evidence import" in feedback_source
+    assert "from parking_spot_monitor.operator_feedback_labels import" in feedback_source
+    assert "from parking_spot_monitor.operator_feedback_replies import" in feedback_source
+    assert "from PIL import" not in feedback_source
+    assert "def validate_feedback_evidence" not in feedback_source
+    assert "def validate_timeline_feedback_evidence" not in feedback_source
+    assert "def format_learn_reply" not in feedback_source
+    assert "def make_learn_feedback_label" not in feedback_source
+    assert "def resolve_latest_alert_candidate" not in feedback_source
 
 
 def test_operator_cockpit_modules_do_not_import_shared_privates() -> None:

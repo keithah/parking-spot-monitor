@@ -68,6 +68,7 @@ def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_ua
     matrix_contract = read_matrix_command_contract()
     analytics_source = read_tracked("parking_spot_monitor/operator_cockpit_analytics.py")
     feedback_source = read_tracked("parking_spot_monitor/operator_feedback.py")
+    feedback_label_source = read_tracked("parking_spot_monitor/operator_feedback_labels.py")
     feedback_model_source = read_tracked("parking_spot_monitor/operator_feedback_models.py")
     feedback_store_source = read_tracked("parking_spot_monitor/operator_feedback_store.py")
 
@@ -121,6 +122,11 @@ def test_operator_intelligence_docs_cover_feedback_aliases_analytics_and_live_ua
         feedback_source,
         [
             "feedback_category=\"false_alert\"",
+        ],
+    )
+    assert_contains_all(
+        feedback_label_source,
+        [
             "feedback_category=\"missed_alert\"",
         ],
     )
