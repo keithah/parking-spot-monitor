@@ -32,19 +32,23 @@ def test_matrix_command_contract_is_not_asserted_from_source_text() -> None:
 
     assert 'read_tracked("parking_spot_monitor/matrix_commands.py")' not in docs_test_source
     assert "# type: ignore" not in command_source
+    assert "_applied_command_from_compat" not in command_source
+    assert "MatrixCommand | _AppliedMatrixCommand" not in command_source
 
 
 def test_vehicle_history_module_is_a_small_compatibility_shim() -> None:
     assert _line_count("parking_spot_monitor/vehicle_history.py") <= 220
-    for path in [
-        "parking_spot_monitor/vehicle_history_archive.py",
-        "parking_spot_monitor/vehicle_history_corrections.py",
-        "parking_spot_monitor/vehicle_history_maintenance.py",
-        "parking_spot_monitor/vehicle_history_maintenance_utils.py",
-        "parking_spot_monitor/vehicle_history_models.py",
-        "parking_spot_monitor/vehicle_history_profile_utils.py",
-        "parking_spot_monitor/vehicle_history_profiles.py",
-        "parking_spot_monitor/vehicle_history_sessions.py",
-        "parking_spot_monitor/vehicle_history_storage.py",
-    ]:
+    module_caps = {
+        "parking_spot_monitor/vehicle_history_archive.py": 220,
+        "parking_spot_monitor/vehicle_history_corrections.py": 410,
+        "parking_spot_monitor/vehicle_history_maintenance.py": 390,
+        "parking_spot_monitor/vehicle_history_maintenance_utils.py": 260,
+        "parking_spot_monitor/vehicle_history_models.py": 640,
+        "parking_spot_monitor/vehicle_history_profile_utils.py": 120,
+        "parking_spot_monitor/vehicle_history_profiles.py": 320,
+        "parking_spot_monitor/vehicle_history_sessions.py": 220,
+        "parking_spot_monitor/vehicle_history_storage.py": 320,
+    }
+    for path, max_lines in module_caps.items():
         assert (ROOT / path).exists()
+        assert _line_count(path) <= max_lines

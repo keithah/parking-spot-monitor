@@ -217,8 +217,7 @@ class MatrixCommandService:
         self._log("info", "matrix-command-applied", action=command.action, **context)
         return "processed"
 
-    def _apply_command(self, command: MatrixCommand | _AppliedMatrixCommand, *, event: MatrixTextEvent) -> str | MatrixCommandResponse:
-        typed_command = _applied_command_from_compat(command) if isinstance(command, MatrixCommand) else command
+    def _apply_command(self, typed_command: _AppliedMatrixCommand, *, event: MatrixTextEvent) -> str | MatrixCommandResponse:
         metadata = {"matrix_event_id": event.event_id, "matrix_sender": event.sender, "matrix_room_id": event.room_id}
         if isinstance(typed_command, _CockpitReplyCommand):
             return self._format_cockpit_reply(typed_command)
@@ -581,64 +580,6 @@ def _matrix_command_from_applied(command: _AppliedMatrixCommand) -> MatrixComman
         return MatrixCommand(action=command.action, profile_id=command.profile_id)
     return MatrixCommand(action=command.action)
 
-
-def _applied_command_from_compat(command: MatrixCommand) -> _AppliedMatrixCommand:
-    if command.action in {"status", "config", "latest", "recent", "confidence"}:
-        return _CockpitReplyCommand(command.action)
-    if command.action == "analytics":
-        return _CockpitReplyCommand(command.action, {"analytics_window": command.subject_id or "7d"})
-    if command.action == "lab_run":
-        return _CockpitReplyCommand(command.action, {"lab_kind": _require_command_field(command.lab_kind, "lab_kind")})
-    if command.action == "lab_status":
-        return _CockpitReplyCommand(command.action, {"lab_job_id": command.lab_job_id or "latest"})
-    if command.action in {"why", "explain"}:
-        return _CockpitReplyCommand(command.action, {"spot_id": _require_command_field(command.spot_id, "spot_id")})
-    if command.action == "incident_review":
-        return _CockpitReplyCommand(
-            command.action,
-            {
-                "spot_id": _require_command_field(command.spot_id, "spot_id"),
-                "incident_time": _require_command_field(command.subject_id, "incident_time"),
-            },
-        )
-    if command.action == "correct_spot_state":
-        return _CorrectSpotStateCommand(
-            spot_id=_require_command_field(command.spot_id, "spot_id"),
-            actual_state=_require_command_field(command.actual_state, "actual_state"),
-        )
-    if command.action == "learn_label":
-        return _LearnLabelCommand(
-            spot_id=_require_command_field(command.spot_id, "spot_id"),
-            actual_state=_require_command_field(command.actual_state, "actual_state"),
-            requested_time=_require_command_field(command.subject_id, "requested_time"),
-        )
-    if command.action == "rename_profile":
-        return _RenameProfileCommand(
-            profile_id=_require_command_field(command.profile_id, "profile_id"),
-            label=_require_command_field(command.label, "label"),
-        )
-    if command.action == "merge_profiles":
-        return _MergeProfilesCommand(
-            source_profile_id=_require_command_field(command.source_profile_id, "source_profile_id"),
-            target_profile_id=_require_command_field(command.target_profile_id, "target_profile_id"),
-        )
-    if command.action == "wrong_match":
-        return _WrongMatchCommand(subject_id=_require_command_field(command.subject_id, "subject_id"))
-    if command.action == "assign_owner":
-        return _AssignOwnerCommand(spot_id=_require_command_field(command.subject_id, "spot_id"))
-    if command.action == "active_spot_assignments":
-        return _ActiveSpotAssignmentsCommand()
-    if command.action == "help":
-        return _HelpCommand()
-    if command.action == "profile_summary":
-        return _ProfileSummaryCommand(profile_id=_require_command_field(command.profile_id, "profile_id"))
-    raise MatrixCommandParseError("unknown command")
-
-
-def _require_command_field(value: str | None, name: str) -> str:
-    if value is None:
-        raise MatrixCommandParseError(f"missing {name}")
-    return value
 
 def _validate_profile_id(value: str, name: str) -> str:
     if not re.fullmatch(r"prof_[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}", value):

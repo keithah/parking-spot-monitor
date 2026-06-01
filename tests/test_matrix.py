@@ -1146,22 +1146,6 @@ def test_parse_matrix_commands_are_strict_and_normalize_labels() -> None:
             parse_matrix_command(body)
 
 
-def test_command_service_rejects_incomplete_parsed_commands_before_dispatch() -> None:
-    from parking_spot_monitor.matrix import MatrixCommand, MatrixCommandParseError, MatrixCommandService, MatrixTextEvent
-
-    service = MatrixCommandService(
-        client=object(),  # type: ignore[arg-type]
-        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
-        room_id=ROOM_ID,
-        authorized_senders=["@op:example"],
-        cockpit_provider=lambda action, **kwargs: f"{action}:{kwargs}",
-    )
-    event = MatrixTextEvent(event_id="$event", sender="@op:example", room_id=ROOM_ID, body="!parking why")
-
-    with pytest.raises(MatrixCommandParseError, match="missing spot_id"):
-        service._apply_command(MatrixCommand(action="why"), event=event)
-
-
 def test_parse_matrix_operator_cockpit_commands_are_exact_and_bounded() -> None:
     from parking_spot_monitor.matrix import MatrixCommandParseError, parse_matrix_command
 
@@ -1880,7 +1864,7 @@ def test_command_service_rejects_unauthorized_status_before_application() -> Non
 
 
 def test_command_service_authorized_status_and_config_reply_via_command_txn_path() -> None:
-    from parking_spot_monitor.matrix import MatrixCommand, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
 
     applied_actions: list[str] = []
     replies: list[dict[str, Any]] = []
@@ -1899,13 +1883,18 @@ def test_command_service_authorized_status_and_config_reply_via_command_txn_path
             replies.append(dict(kwargs))
             return "$reply"
 
-    class Service(MatrixCommandService):
-        def _apply_command(self, command: MatrixCommand, *, event: MatrixTextEvent) -> str:
-            applied_actions.append(command.action)
-            return f"reply for {command.action}"
+    def cockpit_provider(action: str, **kwargs: str) -> str:
+        applied_actions.append(action)
+        return f"reply for {action}"
 
     archive = FakeCommandArchive(cursor={"next_batch": "s2"})
-    service = Service(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@operator:example"])  # type: ignore[arg-type]
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@operator:example"],
+        cockpit_provider=cockpit_provider,
+    )
 
     result = service.poll_once()
 
