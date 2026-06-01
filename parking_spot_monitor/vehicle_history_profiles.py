@@ -8,6 +8,7 @@ from parking_spot_monitor.vehicle_profiles import (
     MatchStatus,
     VehicleProfileDescriptorError,
     extract_vehicle_descriptor,
+    match_vehicle_profile,
 )
 from parking_spot_monitor.vehicle_history_models import (
     OWNER_PROFILE_MIN_ASSIGNMENT_CONFIDENCE,
@@ -271,6 +272,4 @@ class VehicleHistoryProfileMixin:
 
 
 def _match_vehicle_profile(descriptor: object, profiles: object) -> object:
-    from parking_spot_monitor import vehicle_history as legacy_vehicle_history
-
-    return legacy_vehicle_history.match_vehicle_profile(descriptor, profiles)
+    return match_vehicle_profile(descriptor, profiles)

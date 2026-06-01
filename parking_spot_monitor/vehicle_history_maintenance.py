@@ -13,6 +13,7 @@ from typing import Any
 from parking_spot_monitor.vehicle_estimates import VehicleHistoryEstimate, estimate_vehicle_history
 from parking_spot_monitor.vehicle_history_maintenance_utils import (
     _archive_files_for_export,
+    _archive_directory_stats,
     _archive_member_name,
     _coerce_cutoff_datetime,
     _image_directory_stats,
@@ -306,9 +307,7 @@ class VehicleHistoryMaintenanceMixin:
 
     def _archive_directory_stats(self) -> tuple[int, int]:
         try:
-            from parking_spot_monitor import vehicle_history as legacy_vehicle_history
-
-            return legacy_vehicle_history._archive_directory_stats(self.root)
+            return _archive_directory_stats(self.root)
         except OSError as exc:
             self._record_failure(phase="archive-scan", path_name=self.root.name, error=exc)
             return (0, 0)

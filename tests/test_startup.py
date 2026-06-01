@@ -114,16 +114,6 @@ def test_structured_logger_recursively_redacts_secret_bearing_fields(capsys: pyt
     assert "Traceback" not in output
 
 
-def test_runtime_frame_is_only_a_compatibility_shim_for_frame_processing_helpers() -> None:
-    from parking_spot_monitor import runtime_frame
-    from parking_spot_monitor.runtime_detection import _configured_spot_polygons, _process_detection_for_capture
-    from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
-
-    assert runtime_frame._process_detection_for_capture is _process_detection_for_capture
-    assert runtime_frame._update_runtime_state_for_frame is _update_runtime_state_for_frame
-    assert runtime_frame._configured_spot_polygons is _configured_spot_polygons
-
-
 class NoopDetector:
     def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
         return []

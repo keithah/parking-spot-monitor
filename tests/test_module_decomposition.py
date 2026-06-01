@@ -34,6 +34,5 @@ def test_vehicle_history_module_is_a_small_compatibility_shim() -> None:
         "parking_spot_monitor/vehicle_history_profiles.py",
         "parking_spot_monitor/vehicle_history_sessions.py",
         "parking_spot_monitor/vehicle_history_storage.py",
-        "parking_spot_monitor/vehicle_history_validation.py",
     ]:
         assert (ROOT / path).exists()

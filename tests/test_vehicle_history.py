@@ -399,7 +399,7 @@ def test_archive_health_scan_errors_are_non_blocking_and_safely_recorded(tmp_pat
     def fail_archive_stats(directory: Path) -> tuple[int, int]:
         raise OSError("rtsp://camera.local/stream access_token=supersecret raw_image_bytes")
 
-    monkeypatch.setattr("parking_spot_monitor.vehicle_history._archive_directory_stats", fail_archive_stats)
+    monkeypatch.setattr("parking_spot_monitor.vehicle_history_maintenance._archive_directory_stats", fail_archive_stats)
 
     snapshot = archive.health_snapshot()
 
@@ -821,7 +821,7 @@ def test_match_or_create_profile_does_not_update_owner_profile_for_low_confidenc
             reason="forced-low-confidence-owner-match",
         )
 
-    monkeypatch.setattr("parking_spot_monitor.vehicle_history.match_vehicle_profile", low_confidence_owner_match)
+    monkeypatch.setattr("parking_spot_monitor.vehicle_history_profiles.match_vehicle_profile", low_confidence_owner_match)
 
     assignment = archive.match_or_create_profile(session_id=candidate.session_id)
 
