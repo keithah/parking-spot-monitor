@@ -4,6 +4,14 @@ Local Python service for monitoring configured street-parking regions in a UniFi
 
 The working product spec is in [`parking-spot-monitor-spec.md`](parking-spot-monitor-spec.md).
 
+## Runtime architecture and dependency split
+
+The service is intentionally split into focused runtime modules. The package entrypoint loads config, builds shared services, and delegates capture-loop work to runtime helpers for command polling, outbox draining, frame capture, detection, overlay generation, state updates, vehicle-history events, health writes, lifecycle notices, and Matrix dispatch. This keeps startup wiring separate from per-frame work and makes frame-loop behavior easier to test.
+
+Matrix delivery has two paths. Open-spot alerts created by the runtime frame loop are persisted to the local Matrix outbox before Matrix network I/O and are drained at startup and at the beginning of later capture-loop iterations. Occupied-spot alerts, quiet-window notices, owner-vehicle quiet-window alerts, lifecycle notices, and live-proof messages remain direct Matrix delivery paths. The outbox contract is documented in [`docs/outbox.md`](docs/outbox.md).
+
+The Docker build has two targets. `runtime-base` installs the shared runtime dependencies used by config validation, operator helpers, and non-detector tooling. `runtime-detector` extends that image with `requirements-detector.txt`, including `ultralytics>=8`, and is the default final image for the live monitor. Use the base target when you need a smaller image that will not run YOLO inference; use the default detector image for normal camera monitoring.
+
 ## Local configuration
 
 Start from the tracked example and keep real secrets out of YAML and committed files:
@@ -153,6 +161,7 @@ The Compose service is named `parking-spot-monitor`. It builds the local Dockerf
 
 ```sh
 docker build -t parking-spot-monitor:test .
+docker build --target runtime-base -t parking-spot-monitor:base .
 docker compose config --no-interpolate
 ```
 
@@ -178,7 +187,7 @@ docker compose up parking-spot-monitor
 For unattended operation, run the same service detached and inspect it with Compose:
 
 ```sh
-docker compose up -d parking-spot-monitor
+docker compose up -d --build parking-spot-monitor
 docker compose logs -f parking-spot-monitor
 docker compose ps
 docker compose restart parking-spot-monitor
@@ -186,6 +195,8 @@ docker compose down
 ```
 
 `docker compose logs -f parking-spot-monitor` is the primary runtime log surface. Expect structured event names for startup/config/capture/detection/state/Matrix diagnostics, including `startup-ready`, `startup-config-invalid`, `capture-frame-written`, capture attempt/write/failure events, `detection-frame-processed`, `detection-frame-failed`, `state-loaded`, `state-saved`, `state-corrupt-quarantined`, `health-write-failed`, `occupancy-state-changed`, `occupancy-open-event`, `occupancy-open-suppressed`, Matrix delivery success/failure diagnostics, and quiet-window events such as `quiet-window-started` and `quiet-window-ended`.
+
+Use `docker compose up -d --build parking-spot-monitor` after code, dependency, Dockerfile, or requirements changes so the local image is rebuilt before the container is recreated. Use `docker compose restart parking-spot-monitor` only for config or environment changes that do not require a new image.
 
 ### 5. Run a finite Docker capture smoke and inspect first artifacts
 
@@ -799,11 +810,12 @@ docker build --target runtime-base -t parking-spot-monitor:base .
 docker compose config --no-interpolate
 ```
 
-Run the Compose default as the real capture runtime against a mounted operator config and data directory. The service definition intentionally does not bake secret env values into `docker-compose.yml`; provide them from the shell or service manager at runtime.
+Run the Compose default as the real capture runtime against a mounted operator config and data directory. The service definition intentionally does not bake secret env values into `docker-compose.yml`; provide them from the shell or service manager at runtime. Include `--build` when deploying code or dependency changes so the `runtime-detector` image is refreshed.
 
 ```sh
 mkdir -p data
-docker compose up parking-spot-monitor
+docker compose up -d --build parking-spot-monitor
+docker compose logs -f parking-spot-monitor
 ```
 
 Run the same finite capture proof in Docker when you want a bounded smoke check that writes `/data/latest.jpg` inside the container and `./data/latest.jpg` on the host:
