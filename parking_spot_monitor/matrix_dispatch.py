@@ -144,6 +144,8 @@ def dispatch_matrix_event(
                 decision_memory_path=decision_memory_path,
                 attempt_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
                 success_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
+                success_memory_outcome="queued",
+                success_memory_reason="outbox_enqueue",
                 process_send_result=lambda result: (event, None, "error"),
             )
         return _attempt_immediate_matrix_send(
@@ -257,6 +259,8 @@ def _attempt_immediate_matrix_send(
     attempt_log_fields: Mapping[str, Any] | None = None,
     success_log_fields: Mapping[str, Any] | None = None,
     sent_event: Mapping[str, Any] | None = None,
+    success_memory_outcome: str = "sent",
+    success_memory_reason: str | None = None,
     process_send_result: Callable[[Any], tuple[Mapping[str, Any], dict[str, Any] | None, str]] | None = None,
 ) -> dict[str, Any] | None:
     attempt_fields: dict[str, Any] = {
@@ -313,7 +317,8 @@ def _attempt_immediate_matrix_send(
         decision_memory_path,
         event_name=event_name,
         event=resolved_sent_event,
-        outcome="sent",
+        outcome=success_memory_outcome,
+        reason=success_memory_reason,
         logger=logger,
     )
     return None

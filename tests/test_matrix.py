@@ -821,12 +821,6 @@ def test_prepare_event_snapshot_rejects_non_image_bytes_without_claiming_jpeg_me
     assert "mimetype" not in exc_info.value.diagnostics
 
 
-def test_matrix_support_path_token_sanitizes_without_name_error() -> None:
-    from parking_spot_monitor.matrix_support import _path_token
-
-    assert _path_token("left spot/1") == "left-spot-1"
-
-
 def test_quiet_notice_text_is_deterministic_and_contextual() -> None:
     assert format_quiet_window_notice(
         {

@@ -139,7 +139,10 @@ class RuntimeLoopHealthState:
 
     def record_command_result(self, error: dict[str, Any] | None) -> None:
         if error is not None:
-            self.matrix_command_failure_count += 1
+            error_count = error.get("error_count")
+            self.matrix_command_failure_count += (
+                error_count if isinstance(error_count, int) and error_count > 0 else 1
+            )
             self.last_matrix_command_error = error
             self.last_error = error
             return

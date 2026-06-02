@@ -293,6 +293,39 @@ def test_dispatch_matrix_open_alert_enqueues_without_immediate_network_when_outb
     assert delivery.sent == []
 
 
+def test_dispatch_matrix_open_alert_enqueue_records_queued_memory(tmp_path: Path) -> None:
+    class EnqueueOnlyDelivery:
+        def enqueue_open_spot_alert(self, event: dict[str, Any]) -> object:
+            return object()
+
+        def send_open_spot_alert(self, event: dict[str, Any]) -> None:
+            raise AssertionError("frame dispatch should not drain open alerts")
+
+    event = {
+        "event_type": "occupancy-open-event",
+        "event_id": "occupancy-open-event:left_spot:2026-05-18T20:01:02Z",
+        "spot_id": "left_spot",
+        "observed_at": "2026-05-18T20:01:02Z",
+        "snapshot_path": str(tmp_path / "latest.jpg"),
+    }
+    memory_path = tmp_path / "operator-decision-memory.json"
+
+    error = dispatch_matrix_event(
+        EnqueueOnlyDelivery(),
+        "occupancy-open-event",
+        event,
+        logger=StructuredLogger(),
+        decision_memory_path=memory_path,
+    )
+
+    records = json.loads(memory_path.read_text(encoding="utf-8"))["records"]
+    assert error is None
+    assert len(records) == 1
+    assert records[0]["summary"] == "occupancy-open-event queued"
+    assert records[0]["details"]["outcome"] == "queued"
+    assert records[0]["details"]["reason"] == "outbox_enqueue"
+
+
 class FakeCommandPollResult:
     def __init__(self, *, processed_count: int = 0, ignored_count: int = 0, error_count: int = 0, bootstrapped: bool = False) -> None:
         self.next_batch = "fake-next"
@@ -1379,6 +1412,46 @@ def test_runtime_loop_matrix_command_failure_is_non_blocking_and_redacted(
     assert health["last_matrix_command_error"]["phase"] == "matrix-command"
     assert health["last_matrix_command_error"]["action"] == "matrix-command"
     assert '"event":"matrix-command-poll-failed"' in output
+    assert_no_secret_leak(output)
+
+
+def test_runtime_loop_matrix_command_result_errors_degrade_health(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    delivery = FakeMatrixDelivery()
+
+    class CommandServiceWithResultErrors:
+        def poll_once(self) -> FakeCommandPollResult:
+            return FakeCommandPollResult(processed_count=1, error_count=2)
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
+        matrix_command_service_factory=lambda _settings, _data_dir, _logger, _archive: CommandServiceWithResultErrors(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    health = health_payload(tmp_path / "health.json")
+    assert exit_code == 0
+    assert health["status"] == "degraded"
+    assert health["matrix_command_failure_count"] == 2
+    assert health["last_matrix_command_error"] == {
+        "phase": "matrix-command",
+        "action": "matrix-command",
+        "iteration": 1,
+        "error_type": "poll_result_errors",
+        "message": "matrix command poll completed with command errors",
+        "error_count": 2,
+        "processed_count": 1,
+    }
+    assert '"event":"matrix-command-poll-degraded"' in output
     assert_no_secret_leak(output)
 
 

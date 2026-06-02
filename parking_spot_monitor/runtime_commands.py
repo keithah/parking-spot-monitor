@@ -45,15 +45,19 @@ def _poll_matrix_commands_once(
             logger=logger,
         )
         return context
+    processed_count = getattr(result, "processed_count", None)
+    ignored_count = getattr(result, "ignored_count", None)
+    error_count = getattr(result, "error_count", None)
+    bootstrapped = getattr(result, "bootstrapped", None)
     logger.info(
         "matrix-command-poll-succeeded",
         phase="matrix-command",
         action="matrix-command",
         iteration=iteration,
-        processed_count=getattr(result, "processed_count", None),
-        ignored_count=getattr(result, "ignored_count", None),
-        error_count=getattr(result, "error_count", None),
-        bootstrapped=getattr(result, "bootstrapped", None),
+        processed_count=processed_count,
+        ignored_count=ignored_count,
+        error_count=error_count,
+        bootstrapped=bootstrapped,
     )
     if decision_memory_path is not None:
         _append_decision_memory(
@@ -66,11 +70,31 @@ def _poll_matrix_commands_once(
                 "event_type": "matrix-command",
                 "event_id": f"poll:{iteration}",
                 "outcome": "polled",
-                "processed_count": getattr(result, "processed_count", None),
-                "ignored_count": getattr(result, "ignored_count", None),
-                "error_count": getattr(result, "error_count", None),
-                "bootstrapped": getattr(result, "bootstrapped", None),
+                "processed_count": processed_count,
+                "ignored_count": ignored_count,
+                "error_count": error_count,
+                "bootstrapped": bootstrapped,
             },
             logger=logger,
         )
+    if isinstance(error_count, int) and error_count > 0:
+        context = {
+            "phase": "matrix-command",
+            "action": "matrix-command",
+            "iteration": iteration,
+            "error_type": "poll_result_errors",
+            "message": "matrix command poll completed with command errors",
+            "error_count": error_count,
+            "processed_count": processed_count,
+        }
+        logger.warning("matrix-command-poll-degraded", **context)
+        append_matrix_event_memory(
+            decision_memory_path,
+            event_name="matrix-command",
+            event={"event_id": f"poll:{iteration}"},
+            outcome="failed",
+            error_type=context["error_type"],
+            logger=logger,
+        )
+        return context
     return None

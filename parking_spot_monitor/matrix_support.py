@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -20,11 +19,6 @@ class MatrixError(RuntimeError):
 
     def __str__(self) -> str:
         return self.message
-
-def _path_token(value: object) -> str:
-    token = re.sub(r"[^A-Za-z0-9]+", "-", redact_diagnostic_text(value).strip().lower()).strip("-")
-    return token or "unknown"
-
 def _require_non_empty(name: str, value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be non-empty")
