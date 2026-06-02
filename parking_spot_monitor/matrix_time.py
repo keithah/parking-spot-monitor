@@ -40,13 +40,13 @@ def display_observed_at(value: object) -> str:
 
 
 def _format_display_datetime(value: datetime) -> str:
-    time_text = _format_12_hour_time(value.hour, value.minute, value.second)
+    time_text = format_12_hour_time(value.hour, value.minute, value.second)
     timezone_name = value.tzname() if value.tzinfo is not None and value.utcoffset() is not None else ""
     suffix = f" {timezone_name}" if timezone_name else ""
     return f"{value:%Y-%m-%d} {time_text}{suffix}"
 
 
-def _format_12_hour_time(hour: int, minute: int, second: int | None = None) -> str:
+def format_12_hour_time(hour: int, minute: int, second: int | None = None) -> str:
     suffix = "AM" if hour < 12 else "PM"
     display_hour = hour % 12 or 12
     if second is None:

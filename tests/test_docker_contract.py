@@ -44,17 +44,40 @@ def test_readme_documents_mount_relative_runtime_path_contract() -> None:
 def test_dockerfile_installs_runtime_and_defaults_to_package_entrypoint() -> None:
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     requirements = Path("requirements.txt").read_text(encoding="utf-8")
+    detector_requirements = Path("requirements-detector.txt").read_text(encoding="utf-8")
 
     assert "FROM python:3.12-slim" in dockerfile or "FROM python:3.11-slim" in dockerfile
     assert "ffmpeg" in dockerfile
     assert "intel-media-va-driver" in dockerfile
-    assert "vainfo" in dockerfile
+    assert "vainfo" not in dockerfile
     assert "LIBVA_DRIVER_NAME=iHD" in dockerfile
+    assert "FROM python:3.12-slim AS runtime-base" in dockerfile or "FROM python:3.11-slim AS runtime-base" in dockerfile
+    assert "FROM runtime-base AS runtime-detector" in dockerfile
     assert "COPY requirements.txt ./" in dockerfile
     assert "pip install --no-cache-dir -r requirements.txt" in dockerfile
-    assert "ultralytics>=8" in requirements
+    assert "ultralytics>=8" not in requirements
+    assert "ultralytics>=8" in detector_requirements
+    base_stage, detector_stage = dockerfile.split("FROM runtime-base AS runtime-detector", 1)
+    assert "requirements-detector.txt" not in base_stage
+    assert "COPY requirements-detector.txt ./" in detector_stage
+    assert "pip install --no-cache-dir -r requirements-detector.txt" in detector_stage
     assert "COPY parking_spot_monitor ./parking_spot_monitor" in dockerfile
     assert 'CMD ["python", "-m", "parking_spot_monitor", "--config", "/config/config.yaml"]' in dockerfile
+
+
+def test_dockerignore_excludes_runtime_artifacts_and_python_caches() -> None:
+    dockerignore = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
+
+    for required in [
+        ".git/",
+        ".gsd/",
+        "data/",
+        "__pycache__/",
+        "*.py[cod]",
+        ".pytest_cache/",
+        "*.log",
+    ]:
+        assert required in dockerignore
 
 
 def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
@@ -162,6 +185,8 @@ def test_readme_documents_local_yolo_detection_and_deferred_live_tuning() -> Non
 
     assert "## Local YOLO detection" in readme
     assert "ultralytics>=8" in readme
+    assert "runtime-base" in readme
+    assert "runtime-detector" in readme
     assert "YOLO nano" in readme
     assert "detection-frame-processed" in readme
     assert "detection-frame-failed" in readme
@@ -209,6 +234,15 @@ def test_docker_contract_docs_and_compose_do_not_embed_secret_values() -> None:
         assert secret_like not in rendered
     for sentinel in FORBIDDEN_SPAM_SENTINELS:
         assert sentinel not in rendered
+
+
+def test_readme_does_not_claim_production_image_installs_vainfo() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert "image installs `intel-media-va-driver` and `vainfo`" not in readme
+    assert "image installs `intel-media-va-driver`" in readme
+    assert "`vainfo`" in readme
+    assert "diagnostic" in readme
 
 
 def _load_closeout_script_module():

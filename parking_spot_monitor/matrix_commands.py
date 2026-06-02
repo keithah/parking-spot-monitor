@@ -32,7 +32,7 @@ from parking_spot_monitor.matrix_models import (
     MatrixSyncResult,
     MatrixTextEvent,
 )
-from parking_spot_monitor.matrix_snapshots import JPEG_MIMETYPE
+from parking_spot_monitor.matrix_snapshots import JPEG_MIMETYPE, MatrixSnapshot, _matrix_snapshot_upload
 from parking_spot_monitor.matrix_support import _require_non_empty, _sanitize_diagnostics
 
 
@@ -160,6 +160,11 @@ class MatrixCommandService:
         self.who_snapshot_provider = who_snapshot_provider
         self.cockpit_context = cockpit_context
         self.feedback_labeler = feedback_labeler
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
     def poll_once(self) -> MatrixCommandPollResult:
         cursor = self.archive.read_matrix_cursor()
@@ -331,9 +336,20 @@ class MatrixCommandService:
         image_info = _validate_command_image_info(command_response.image_info)
         image_path = Path(command_response.image_path)
         self.client.send_text(room_id=self.room_id, txn_id=f"command:{event.event_id}:text", body=command_response.text)
+        upload = _matrix_snapshot_upload(
+            MatrixSnapshot(
+                path=image_path,
+                filename=image_path.name,
+                txn_id=f"command:{event.event_id}:image",
+                body=f"Raw full-frame {image_path.name} evidence",
+                info=image_info,
+                log_context={"snapshot_path": str(image_path), "event_id": event.event_id},
+            ),
+            logger=self.logger,
+        )
         content_uri = self.client.upload_image(
             filename=image_path.name,
-            data=image_path.read_bytes(),
+            data=upload["data"],
             content_type=JPEG_MIMETYPE,
         )
         self.client.send_image(
@@ -341,7 +357,7 @@ class MatrixCommandService:
             txn_id=f"command:{event.event_id}:image",
             body=f"Raw full-frame {image_path.name} evidence",
             content_uri=content_uri,
-            info=image_info,
+            info=upload["info"],
         )
 
     def _send_reply(self, event: MatrixTextEvent, body: str) -> None:

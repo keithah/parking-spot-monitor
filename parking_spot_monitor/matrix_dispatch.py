@@ -84,7 +84,7 @@ def dispatch_matrix_event(
             event_name=event_name,
             event=event,
             txn_id=txn_id,
-            send=lambda: matrix_delivery.send_lifecycle_notice(dict(event)),
+            send=lambda: matrix_delivery.send_lifecycle_notice(event),
             logger=logger,
             decision_memory_path=decision_memory_path,
         )
@@ -96,7 +96,7 @@ def dispatch_matrix_event(
             event_name=event_name,
             event=event,
             txn_id=txn_id,
-            send=lambda: matrix_delivery.send_owner_vehicle_quiet_window_alert(dict(event)),
+            send=lambda: matrix_delivery.send_owner_vehicle_quiet_window_alert(event),
             logger=logger,
             decision_memory_path=decision_memory_path,
         )
@@ -108,7 +108,7 @@ def dispatch_matrix_event(
             event_name=event_name,
             event=event,
             txn_id=txn_id,
-            send=lambda: matrix_delivery.send_quiet_window_notice(dict(event)),
+            send=lambda: matrix_delivery.send_quiet_window_notice(event),
             logger=logger,
             decision_memory_path=decision_memory_path,
         )
@@ -121,7 +121,7 @@ def dispatch_matrix_event(
             event_name=event_name,
             event=event,
             txn_id=txn_id,
-            send=lambda: matrix_delivery.send_occupied_spot_alert(dict(event)),
+            send=lambda: matrix_delivery.send_occupied_spot_alert(event),
             logger=logger,
             decision_memory_path=decision_memory_path,
             attempt_log_fields=alert_fields,
@@ -132,12 +132,26 @@ def dispatch_matrix_event(
     if event_name == OccupancyEventType.OPEN_EVENT.value:
         txn_id = open_spot_event_id(event)
         alert_fields = _open_alert_log_fields(event, txn_id=txn_id)
+        enqueue_open_alert = getattr(matrix_delivery, "enqueue_open_spot_alert", None)
+        if callable(enqueue_open_alert):
+            return _attempt_immediate_matrix_send(
+                matrix_delivery,
+                event_name=event_name,
+                event=event,
+                txn_id=txn_id,
+                send=lambda: enqueue_open_alert(event),
+                logger=logger,
+                decision_memory_path=decision_memory_path,
+                attempt_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
+                success_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
+                process_send_result=lambda result: (event, None, "error"),
+            )
         return _attempt_immediate_matrix_send(
             matrix_delivery,
             event_name=event_name,
             event=event,
             txn_id=txn_id,
-            send=lambda: matrix_delivery.send_open_spot_alert(dict(event)),
+            send=lambda: matrix_delivery.send_open_spot_alert(event),
             logger=logger,
             decision_memory_path=decision_memory_path,
             attempt_log_fields=alert_fields,

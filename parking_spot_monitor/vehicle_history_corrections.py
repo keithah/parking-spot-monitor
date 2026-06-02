@@ -187,7 +187,7 @@ class VehicleHistoryCorrectionMixin:
         normalized = _optional_profile_id(profile_id, "profile_id")
         if normalized is None:
             return None
-        mapping = dict(merges) if merges is not None else dict(self.correction_replay_state().merges)
+        mapping = merges if merges is not None else self.correction_replay_state().merges
         seen: set[str] = set()
         current = normalized
         while current in mapping:

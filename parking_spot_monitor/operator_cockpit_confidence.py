@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -102,9 +103,14 @@ def _confidence_memory_lines(memory: Any, spot_ids: Sequence[str]) -> list[str]:
 
     weak_kinds = {"confidence_dip", "rejected_evidence", "miss", "suppression"}
     records = list(getattr(memory, "records", ()) or ())
+    records_by_spot: dict[str, list[Any]] = defaultdict(list)
+    for record in records:
+        spot_id = getattr(record, "spot_id", None)
+        if isinstance(spot_id, str) and getattr(record, "kind", "") in weak_kinds:
+            records_by_spot[spot_id].append(record)
     lines: list[str] = []
     for spot_id in spot_ids[:MAX_LINES_PER_SECTION]:
-        matches = [record for record in records if getattr(record, "spot_id", None) == spot_id and getattr(record, "kind", "") in weak_kinds]
+        matches = records_by_spot.get(spot_id, [])
         if not matches:
             lines.append(f"- {spot_id}: no recent weak evidence records.")
             continue

@@ -289,7 +289,7 @@ def filter_spot_detections(
 
         accepted: SpotDetectionCandidate | None = None
         if candidates:
-            selected = sorted(candidates, key=_candidate_sort_key)[0]
+            selected = min(candidates, key=_candidate_sort_key)
             accepted = selected.candidate
 
         by_spot[spot_id] = SpotDetectionResult(spot_id=spot_id, accepted=accepted, rejected=rejected)

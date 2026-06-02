@@ -162,30 +162,40 @@ def _main(
         return _capture_once(settings, paths.data_dir, logger=logger, capture=capture_fn, overlay=overlay_fn, detector_factory=detector_fn)
 
     if args.live_proof_once:
-        return run_live_proof_once(
+        matrix_delivery = matrix_factory(settings, paths.data_dir, logger)
+        try:
+            return run_live_proof_once(
+                settings,
+                paths.data_dir,
+                logger=logger,
+                capture=capture_fn,
+                matrix_delivery=matrix_delivery,
+            )
+        finally:
+            _close_if_available(matrix_delivery)
+
+    history_archive = VehicleHistoryArchive(paths.vehicle_history_dir, logger=logger)
+    matrix_delivery = matrix_factory(settings, paths.data_dir, logger)
+    matrix_command_service = command_factory(settings, paths.data_dir, logger, history_archive)
+    try:
+        return run_capture_loop(
             settings,
             paths.data_dir,
             logger=logger,
             capture=capture_fn,
-            matrix_delivery=matrix_factory(settings, paths.data_dir, logger),
+            overlay=overlay_fn,
+            detector_factory=detector_fn,
+            matrix_delivery=matrix_delivery,
+            history_archive=history_archive,
+            matrix_command_service=matrix_command_service,
+            sleep=sleep,
+            max_iterations=max_iterations,
+            now=now,
+            startup_retention_failure_count=retention_result.failed_count,
         )
-
-    history_archive = VehicleHistoryArchive(paths.vehicle_history_dir, logger=logger)
-    return run_capture_loop(
-        settings,
-        paths.data_dir,
-        logger=logger,
-        capture=capture_fn,
-        overlay=overlay_fn,
-        detector_factory=detector_fn,
-        matrix_delivery=matrix_factory(settings, paths.data_dir, logger),
-        history_archive=history_archive,
-        matrix_command_service=command_factory(settings, paths.data_dir, logger, history_archive),
-        sleep=sleep,
-        max_iterations=max_iterations,
-        now=now,
-        startup_retention_failure_count=retention_result.failed_count,
-    )
+    finally:
+        _close_if_available(matrix_command_service)
+        _close_if_available(matrix_delivery)
 
 
 def _capture_once(
@@ -212,6 +222,12 @@ def _capture_once(
         return 1
     logger.info("capture-once-complete", **result.diagnostics())
     return 0
+
+
+def _close_if_available(resource: Any | None) -> None:
+    close = getattr(resource, "close", None)
+    if callable(close):
+        close()
 
 
 def _default_detector_factory(settings: RuntimeSettings) -> UltralyticsVehicleDetector:

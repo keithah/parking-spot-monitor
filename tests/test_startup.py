@@ -257,6 +257,42 @@ def test_dispatch_matrix_open_alert_feedback_uses_retained_snapshot_not_latest(t
     assert loaded.labels[0].evidence.path == "snapshots/occupancy-open-event-left-spot-retained.jpg"
 
 
+def test_dispatch_matrix_open_alert_enqueues_without_immediate_network_when_outbox_supported(tmp_path: Path) -> None:
+    class EnqueueOnlyDelivery:
+        def __init__(self) -> None:
+            self.enqueued: list[dict[str, Any]] = []
+            self.sent: list[dict[str, Any]] = []
+
+        def enqueue_open_spot_alert(self, event: dict[str, Any]) -> object:
+            self.enqueued.append(dict(event))
+            return object()
+
+        def send_open_spot_alert(self, event: dict[str, Any]) -> None:
+            self.sent.append(dict(event))
+            raise AssertionError("frame dispatch should not perform open-alert network drain")
+
+    event = {
+        "event_type": "occupancy-open-event",
+        "event_id": "occupancy-open-event:left_spot:2026-05-18T20:01:02Z",
+        "spot_id": "left_spot",
+        "observed_at": "2026-05-18T20:01:02Z",
+        "snapshot_path": str(tmp_path / "latest.jpg"),
+    }
+    delivery = EnqueueOnlyDelivery()
+
+    error = dispatch_matrix_event(
+        delivery,
+        "occupancy-open-event",
+        event,
+        logger=StructuredLogger(),
+        decision_memory_path=tmp_path / "operator-decision-memory.json",
+    )
+
+    assert error is None
+    assert delivery.enqueued == [event]
+    assert delivery.sent == []
+
+
 class FakeCommandPollResult:
     def __init__(self, *, processed_count: int = 0, ignored_count: int = 0, error_count: int = 0, bootstrapped: bool = False) -> None:
         self.next_batch = "fake-next"
@@ -345,12 +381,13 @@ def test_process_detection_scales_configured_polygons_to_actual_frame_size(
     )
 
     output = combined_output(capsys)
+    [record] = json_records(output)
     assert result.by_spot["left_spot"].accepted is not None
     assert result.by_spot["right_spot"].accepted is None
-    assert '"frame_size_mismatch":true' in output
-    assert '"configured_frame_size":{"height":806,"width":1458}' in output
-    assert '"actual_frame_size":{"height":360,"width":640}' in output
-    assert '"accepted_by_spot":{"left_spot":true,"right_spot":false}' in output
+    assert record["frame_size_mismatch"] is True
+    assert record["configured_frame_size"] == {"height": 806, "width": 1458}
+    assert record["actual_frame_size"] == {"height": 360, "width": 640}
+    assert record["accepted_by_spot"] == {"left_spot": True, "right_spot": False}
 
 
 def test_runtime_loop_matrix_state_change_skip_log_explains_policy(
@@ -3772,6 +3809,37 @@ def test_runtime_health_json_includes_resolved_matrix_outbox_summary(tmp_path: P
     assert_no_secret_leak(output)
 
 
+def test_runtime_loop_closes_matrix_services_on_exit(tmp_path: Path) -> None:
+    closed: list[str] = []
+
+    class CloseableDelivery(FakeMatrixDelivery):
+        def close(self) -> None:
+            closed.append("delivery")
+
+    class CloseableCommands:
+        def poll_once(self) -> FakeCommandPollResult:
+            return FakeCommandPollResult()
+
+        def close(self) -> None:
+            closed.append("commands")
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir: captured_frame(tmp_path),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: CloseableDelivery(),
+        matrix_command_service_factory=lambda _settings, _data_dir, _logger, _archive: CloseableCommands(),
+        sleep=lambda _seconds: None,
+        max_iterations=0,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    assert exit_code == 0
+    assert closed == ["commands", "delivery"]
+
+
 class UploadFailsOnceMatrixClient(FakeMatrixClient):
     def __init__(self) -> None:
         super().__init__()
@@ -3796,7 +3864,7 @@ def outbox_delivery(client: object, data_dir: Path, logger: StructuredLogger) ->
 
 
 def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], []]
+    detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], [], []]
     matrix_client = UploadFailsOnceMatrixClient()
 
     class SequencedDetector:
@@ -3811,7 +3879,7 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=lambda _settings, data_dir, logger: outbox_delivery(matrix_client, data_dir, logger),
         sleep=lambda _seconds: None,
-        max_iterations=6,
+        max_iterations=7,
         now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
     )
 
@@ -3832,8 +3900,6 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
     assert matrix_client.uploads[0]["filename"].startswith("occupancy-occupied-event-")
     assert len(matrix_client.images) == 1
     assert matrix_client.images[0]["txn_id"].startswith("occupancy-occupied-event:")
-    assert '"event":"matrix-delivery-failed"' in output
-    assert '"error_type":"retrying_records"' in output
     assert '"event":"matrix-outbox-phase-retryable-failure"' in output
     assert_no_secret_leak(output)
 
@@ -3842,7 +3908,7 @@ def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_eve
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # First invocation leaves a retryable record after text delivery and before upload.
-    detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], []]
+    detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], [], []]
     failing_client = UploadFailsOnceMatrixClient()
 
     class SequencedDetector:
@@ -3857,7 +3923,7 @@ def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_eve
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=lambda _settings, data_dir, logger: outbox_delivery(failing_client, data_dir, logger),
         sleep=lambda _seconds: None,
-        max_iterations=6,
+        max_iterations=7,
         now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
     )
     assert first_exit == 0

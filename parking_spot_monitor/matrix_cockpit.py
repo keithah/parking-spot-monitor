@@ -1,28 +1,28 @@
 from __future__ import annotations
 
 import math
-import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from PIL import Image, UnidentifiedImageError
-
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
 from parking_spot_monitor.matrix_alerts import _first_present, _int_field, _occupied_snapshot_body, _safe_text
 from parking_spot_monitor.matrix_models import MatrixCommandParseError, MatrixCommandResponse
-from parking_spot_monitor.matrix_snapshots import (
-    JPEG_MIMETYPE,
-    MAX_MATRIX_UPLOAD_IMAGE_BYTES,
-    MATRIX_UPLOAD_INITIAL_MAX_DIMENSION,
-    MATRIX_UPLOAD_JPEG_QUALITIES,
-    MATRIX_UPLOAD_MIN_DIMENSION,
+from parking_spot_monitor.operator_cockpit import (
+    build_incident_review_response,
+    build_latest_snapshot_response,
+    format_detection_lab_run_reply,
+    format_detection_lab_status_reply,
+    format_operator_analytics_reply,
+    format_operator_confidence_reply,
+    format_operator_config_reply,
+    format_operator_recent_reply,
+    format_operator_status_reply,
+    format_operator_why_reply,
 )
-from parking_spot_monitor.matrix_time import DISPLAY_TIMEZONE, display_observed_at
 
 @dataclass(frozen=True)
 class MatrixOperatorCockpitContext:
@@ -124,154 +124,6 @@ class MatrixOperatorCockpitContext:
                 )
             )
         raise MatrixCommandParseError("unknown cockpit command")
-
-def build_latest_snapshot_response(
-    *,
-    settings: Any,
-    latest_path: str | Path,
-    health_path: str | Path,
-    state_path: str | Path,
-    now: datetime | None = None,
-    logger: StructuredLogger | None = None,
-) -> Any:
-    from parking_spot_monitor.operator_cockpit import build_latest_snapshot_response as _build_latest_snapshot_response
-
-    return _build_latest_snapshot_response(
-        settings=settings,
-        latest_path=latest_path,
-        health_path=health_path,
-        state_path=state_path,
-        now=now,
-        logger=logger,
-    )
-
-def format_operator_status_reply(
-    *,
-    settings: Any,
-    health_path: str | Path,
-    state_path: str | Path,
-    matrix_outbox_path: str | Path | None = None,
-    now: datetime | None = None,
-    logger: StructuredLogger | None = None,
-) -> str:
-    from parking_spot_monitor.operator_cockpit import format_operator_status_reply as _format_operator_status_reply
-
-    return _format_operator_status_reply(
-        settings=settings,
-        health_path=health_path,
-        state_path=state_path,
-        matrix_outbox_path=matrix_outbox_path,
-        now=now,
-        logger=logger,
-    )
-
-def format_operator_config_reply(
-    *,
-    settings: Any,
-    data_dir: str | Path,
-    now: datetime | None = None,
-    logger: StructuredLogger | None = None,
-) -> str:
-    from parking_spot_monitor.operator_cockpit import format_operator_config_reply as _format_operator_config_reply
-
-    return _format_operator_config_reply(settings=settings, data_dir=data_dir, now=now, logger=logger)
-
-def format_operator_analytics_reply(
-    *,
-    data_dir: str | Path,
-    window: str = "7d",
-    now: datetime | None = None,
-    logger: StructuredLogger | None = None,
-    **kwargs: Any,
-) -> str:
-    from parking_spot_monitor.operator_cockpit import format_operator_analytics_reply as _format_operator_analytics_reply
-
-    return _format_operator_analytics_reply(data_dir=data_dir, window=window, now=now, logger=logger, **kwargs)
-
-def format_operator_why_reply(
-    *,
-    data_dir: str | Path,
-    spot_id: str,
-    logger: StructuredLogger | None = None,
-) -> str:
-    from parking_spot_monitor.operator_cockpit import format_operator_why_reply as _format_operator_why_reply
-
-    return _format_operator_why_reply(data_dir=data_dir, spot_id=spot_id, logger=logger)
-
-def format_operator_recent_reply(
-    *,
-    data_dir: str | Path,
-    logger: StructuredLogger | None = None,
-) -> str:
-    from parking_spot_monitor.operator_cockpit import format_operator_recent_reply as _format_operator_recent_reply
-
-    return _format_operator_recent_reply(data_dir=data_dir, logger=logger)
-
-def format_operator_confidence_reply(
-    *,
-    settings: Any,
-    data_dir: str | Path,
-    health_path: str | Path,
-    state_path: str | Path,
-    matrix_outbox_path: str | Path | None = None,
-    now: datetime | None = None,
-    logger: StructuredLogger | None = None,
-) -> str:
-    from parking_spot_monitor.operator_cockpit import format_operator_confidence_reply as _format_operator_confidence_reply
-
-    return _format_operator_confidence_reply(
-        settings=settings,
-        data_dir=data_dir,
-        health_path=health_path,
-        state_path=state_path,
-        matrix_outbox_path=matrix_outbox_path,
-        now=now,
-        logger=logger,
-    )
-
-def build_incident_review_response(
-    *,
-    data_dir: str | Path,
-    spot_id: str,
-    time_text: str,
-    settings: Any | None = None,
-    state_path: str | Path | None = None,
-    detector: Any | None = None,
-    logger: StructuredLogger | None = None,
-) -> MatrixCommandResponse:
-    from parking_spot_monitor.operator_cockpit import build_incident_review_response as _build_incident_review_response
-
-    return _build_incident_review_response(
-        settings=settings,
-        data_dir=data_dir,
-        state_path=state_path,
-        spot_id=spot_id,
-        time_text=time_text,
-        detector=detector,
-        logger=logger,
-    )
-
-def format_detection_lab_run_reply(
-    *,
-    data_dir: str | Path,
-    kind: str,
-    manager: Any | None = None,
-    logger: StructuredLogger | None = None,
-) -> str:
-    from parking_spot_monitor.operator_cockpit import format_detection_lab_run_reply as _format_detection_lab_run_reply
-
-    return _format_detection_lab_run_reply(data_dir=data_dir, kind=kind, manager=manager, logger=logger)
-
-def format_detection_lab_status_reply(
-    *,
-    data_dir: str | Path,
-    job_id: str = "latest",
-    manager: Any | None = None,
-    logger: StructuredLogger | None = None,
-) -> str:
-    from parking_spot_monitor.operator_cockpit import format_detection_lab_status_reply as _format_detection_lab_status_reply
-
-    return _format_detection_lab_status_reply(data_dir=data_dir, job_id=job_id, manager=manager, logger=logger)
 
 def _active_spot_assignments_with_runtime_status(
     assignments: Sequence[Mapping[str, Any]],

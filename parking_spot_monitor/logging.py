@@ -26,8 +26,9 @@ class StructuredLogger:
     RTSP credentials, Matrix tokens, raw tracebacks, or token query values.
     """
 
-    def __init__(self, *, level: str = "INFO", stream: TextIO | None = None) -> None:
+    def __init__(self, *, level: str = "INFO", stream: TextIO | None = None, flush_level: str = "WARNING") -> None:
         self.level = _normalize_level(level)
+        self.flush_level = _normalize_level(flush_level)
         self.stream = sys.stderr if stream is None else stream
 
     def debug(self, event: str, **fields: Any) -> None:
@@ -47,8 +48,9 @@ class StructuredLogger:
         if _LOG_LEVELS[normalized_level] < _LOG_LEVELS[self.level]:
             return
         record = redact_diagnostic_value({"event": event, "level": normalized_level, **fields})
-        self.stream.write(json.dumps(record, sort_keys=True, separators=(",", ":"), default=str) + "\n")
-        self.stream.flush()
+        self.stream.write(json.dumps(record, separators=(",", ":"), default=str) + "\n")
+        if _LOG_LEVELS[normalized_level] >= _LOG_LEVELS[self.flush_level]:
+            self.stream.flush()
 
 
 def redact_diagnostic_text(text: object) -> str:

@@ -8,7 +8,7 @@ from typing import Any
 
 from parking_spot_monitor.logging import redact_diagnostic_text
 from parking_spot_monitor.matrix_support import MatrixError, _require_non_empty
-from parking_spot_monitor.matrix_time import DISPLAY_TIMEZONE, display_observed_at, format_observed_at
+from parking_spot_monitor.matrix_time import DISPLAY_TIMEZONE, display_observed_at, format_12_hour_time, format_observed_at
 
 MONITOR_STARTED_EVENT_TYPE = "parking-monitor-started"
 MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE = "parking-monitor-shutdown-requested"
@@ -197,15 +197,7 @@ def _format_leave_window(leave_window: Mapping[str, Any]) -> str:
 
 def _format_minute_of_day(value: int) -> str:
     minute = value % (24 * 60)
-    return _format_12_hour_time(minute // 60, minute % 60)
-
-
-def _format_12_hour_time(hour: int, minute: int, second: int | None = None) -> str:
-    suffix = "AM" if hour < 12 else "PM"
-    display_hour = hour % 12 or 12
-    if second is None:
-        return f"{display_hour}:{minute:02d} {suffix}"
-    return f"{display_hour}:{minute:02d}:{second:02d} {suffix}"
+    return format_12_hour_time(minute // 60, minute % 60)
 
 
 def _has_meaningful_vehicle_label(label: str, profile_id: str) -> bool:
@@ -301,4 +293,3 @@ def format_live_proof_image_body(*, observed_at: object) -> str:
 
 def live_proof_event_id(observed_at: object) -> str:
     return f"live-proof:{format_observed_at(observed_at)}"
-

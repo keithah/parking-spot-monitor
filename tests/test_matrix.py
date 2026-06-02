@@ -2126,6 +2126,77 @@ def test_command_service_authorized_latest_sends_text_and_one_raw_image_without_
     assert calls[2]["info"] == {"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 11, "h": 7}
 
 
+def test_command_service_resizes_oversized_command_image_before_upload(tmp_path: Path) -> None:
+    from parking_spot_monitor.matrix import MatrixCommandResponse, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+    from parking_spot_monitor.matrix_snapshots import MAX_MATRIX_UPLOAD_IMAGE_BYTES
+
+    latest_path = tmp_path / "latest.jpg"
+    noisy = Image.effect_noise((1458, 806), 90).convert("RGB")
+    noisy.save(latest_path, format="JPEG", quality=95)
+    assert latest_path.stat().st_size > MAX_MATRIX_UPLOAD_IMAGE_BYTES
+    calls: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(next_batch="s3", events=(MatrixTextEvent(event_id="$latest-large", sender="@op:example", room_id=ROOM_ID, body="!parking latest"),))
+
+        def send_text(self, **kwargs: Any) -> str:
+            calls.append({"kind": "text", **dict(kwargs)})
+            return "$text"
+
+        def upload_image(self, **kwargs: Any) -> str:
+            calls.append({"kind": "upload", **dict(kwargs)})
+            return "mxc://example.org/latest"
+
+        def send_image(self, **kwargs: Any) -> str:
+            calls.append({"kind": "image", **dict(kwargs)})
+            return "$image"
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+        cockpit_provider=lambda action: MatrixCommandResponse(
+            text="Parking monitor latest",
+            image_path=latest_path,
+            image_info={"mimetype": "image/jpeg", "size": latest_path.stat().st_size, "w": 1458, "h": 806},
+        ),
+    )
+
+    result = service.poll_once()
+
+    upload = next(call for call in calls if call["kind"] == "upload")
+    image = next(call for call in calls if call["kind"] == "image")
+    assert result.error_count == 0
+    assert len(upload["data"]) <= MAX_MATRIX_UPLOAD_IMAGE_BYTES
+    assert image["info"]["size"] == len(upload["data"])
+    assert image["info"]["w"] <= 960
+
+
+def test_command_service_close_closes_owned_matrix_client() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService
+
+    class Client:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = Client()
+    service = MatrixCommandService(
+        client=client,  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+    )
+
+    service.close()
+
+    assert client.closed is True
+
+
 def test_command_service_who_can_send_active_assignments_with_fresh_snapshot(tmp_path: Path) -> None:
     from parking_spot_monitor.matrix import MatrixCommandResponse, MatrixCommandService, MatrixSyncResult, MatrixTextEvent
 

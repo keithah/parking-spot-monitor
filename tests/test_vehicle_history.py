@@ -1252,6 +1252,65 @@ def test_prune_closed_sessions_dry_run_apply_and_reference_safety(tmp_path: Path
     assert archive.health_snapshot()["last_maintenance_metadata"]["operation"] == "prune"
 
 
+def test_prune_closed_sessions_deduplicates_image_refs_without_list_membership_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import parking_spot_monitor.vehicle_history_maintenance as maintenance
+
+    class HashOnlyPath:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def __fspath__(self) -> str:
+            return os.fspath(self.path)
+
+        def __hash__(self) -> int:
+            return hash(self.path)
+
+        def __eq__(self, other: object) -> bool:
+            raise AssertionError("deduplication should use a hash set, not repeated list membership")
+
+        def stat(self) -> os.stat_result:
+            return self.path.stat()
+
+        def is_file(self) -> bool:
+            return self.path.is_file()
+
+        def unlink(self, *, missing_ok: bool = False) -> None:
+            self.path.unlink(missing_ok=missing_ok)
+
+    archive = VehicleHistoryArchive(tmp_path)
+    old = archive.start_session(occupied_event(spot_id="old", observed_at="2026-01-01T08:00:00Z"))
+    archive.close_session(open_event(spot_id="old", observed_at="2026-01-01T09:00:00Z"))
+    image_path = tmp_path / "vehicle-history" / "images" / "occupied-full" / "old.jpg"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(b"old image")
+    monkeypatch.setattr(maintenance, "_record_archive_image_paths", lambda root, record: [HashOnlyPath(image_path), HashOnlyPath(image_path)])
+
+    result = archive.prune_closed_sessions(older_than="2026-02-01T00:00:00Z", dry_run=True)
+
+    assert result.pruned_file_count == 2
+
+
+def test_resolve_profile_id_uses_provided_merge_mapping_without_copying(tmp_path: Path) -> None:
+    class LookupOnlyMerges:
+        def __contains__(self, key: object) -> bool:
+            return key == "prof_source"
+
+        def __getitem__(self, key: str) -> str:
+            if key == "prof_source":
+                return "prof_target"
+            raise KeyError(key)
+
+        def __iter__(self) -> Any:
+            raise AssertionError("provided merge mapping should not be copied")
+
+        def __len__(self) -> int:
+            return 1
+
+    archive = VehicleHistoryArchive(tmp_path)
+
+    assert archive.resolve_profile_id("prof_source", merges=LookupOnlyMerges()) == "prof_target"
+
+
 def test_prune_counts_missing_image_refs_and_rejects_invalid_cutoff(tmp_path: Path) -> None:
     archive = VehicleHistoryArchive(tmp_path)
     old = archive.start_session(occupied_event(spot_id="missing", observed_at="2026-01-01T08:00:00Z"))

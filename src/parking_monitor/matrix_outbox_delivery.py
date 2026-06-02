@@ -71,6 +71,11 @@ class MatrixOutboxDelivery:
             protected_snapshots_provider=self._retryable_retained_snapshots,
         )
 
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
+
     def send_occupied_spot_alert(self, event: Mapping[str, Any]) -> MatrixSnapshot:
         """Send occupied alerts through the immediate Matrix path.
 

@@ -177,6 +177,50 @@ def test_operator_cockpit_compat_surface_stays_thin() -> None:
     assert "def _outbox_item_lines" not in cockpit_source
 
 
+def test_matrix_cockpit_uses_canonical_operator_functions_without_forwarding_wrappers() -> None:
+    cockpit_source = (ROOT / "parking_spot_monitor/matrix_cockpit.py").read_text(encoding="utf-8")
+
+    assert "from parking_spot_monitor.operator_cockpit import" in cockpit_source
+    for wrapper_name in [
+        "build_latest_snapshot_response",
+        "format_operator_status_reply",
+        "format_operator_config_reply",
+        "format_operator_analytics_reply",
+        "format_operator_why_reply",
+        "format_operator_recent_reply",
+        "format_operator_confidence_reply",
+        "build_incident_review_response",
+        "format_detection_lab_run_reply",
+        "format_detection_lab_status_reply",
+    ]:
+        assert f"def {wrapper_name}" not in cockpit_source
+
+
+def test_matrix_alerts_reuses_shared_time_formatter() -> None:
+    alerts_source = (ROOT / "parking_spot_monitor/matrix_alerts.py").read_text(encoding="utf-8")
+
+    assert "from parking_spot_monitor.matrix_time import" in alerts_source
+    assert "def _format_12_hour_time" not in alerts_source
+
+
+def test_operator_confidence_groups_memory_records_once() -> None:
+    confidence_source = (ROOT / "parking_spot_monitor/operator_cockpit_confidence.py").read_text(encoding="utf-8")
+
+    assert "records_by_spot" in confidence_source
+    assert "matches = [record for record in records if" not in confidence_source
+
+
+def test_matrix_dispatch_send_paths_do_not_copy_event_mappings() -> None:
+    dispatch_source = (ROOT / "parking_spot_monitor/matrix_dispatch.py").read_text(encoding="utf-8")
+
+    assert "send=lambda: matrix_delivery.send_lifecycle_notice(dict(event))" not in dispatch_source
+    assert "send=lambda: matrix_delivery.send_owner_vehicle_quiet_window_alert(dict(event))" not in dispatch_source
+    assert "send=lambda: matrix_delivery.send_quiet_window_notice(dict(event))" not in dispatch_source
+    assert "send=lambda: matrix_delivery.send_occupied_spot_alert(dict(event))" not in dispatch_source
+    assert "send=lambda: enqueue_open_alert(dict(event))" not in dispatch_source
+    assert "send=lambda: matrix_delivery.send_open_spot_alert(dict(event))" not in dispatch_source
+
+
 def test_operator_docs_tests_stay_decomposed() -> None:
     module_caps = {
         "tests/operator_docs_helpers.py": 140,

@@ -156,6 +156,7 @@ class VehicleHistoryMaintenanceMixin:
 
         session_paths = [self.closed_dir / f"{record.session_id}.json" for record in candidates]
         image_paths: list[Path] = []
+        seen_image_paths: set[str] = set()
         missing_file_count = 0
         skipped_retained_image_count = 0
         for record in candidates:
@@ -163,7 +164,9 @@ class VehicleHistoryMaintenanceMixin:
                 if image_path in retained_refs:
                     skipped_retained_image_count += 1
                     continue
-                if image_path not in image_paths:
+                image_path_key = os.fspath(image_path)
+                if image_path_key not in seen_image_paths:
+                    seen_image_paths.add(image_path_key)
                     image_paths.append(image_path)
         prune_paths = [*session_paths, *image_paths]
         existing_paths: list[Path] = []

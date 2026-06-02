@@ -104,7 +104,7 @@ def record_bundle_candidate(manifest_path: Path, *, index_path: Path, capture_ex
     index = _load_index(index_path)
     candidates = [item for item in index["candidates"] if item.get("candidate_id") != candidate_id]
     candidates.append(record)
-    index["candidates"] = sorted(candidates, key=lambda item: str(item.get("candidate_id")))
+    index["candidates"] = candidates
     _write_index(index_path, index)
     return record
 
@@ -127,7 +127,7 @@ def latest_candidate(index_path: Path) -> dict[str, Any] | None:
     index = _load_index(index_path)
     if not index["candidates"]:
         return None
-    return sorted(index["candidates"], key=lambda item: str(item.get("candidate_id")))[-1]
+    return max(index["candidates"], key=lambda item: str(item.get("candidate_id")))
 
 
 def promote_accepted_candidates(*, index_path: Path, labels_path: Path) -> int:

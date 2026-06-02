@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -46,6 +47,41 @@ def test_record_bundle_candidate_writes_publication_safe_pending_record(tmp_path
     assert "latest.jpg" not in json.dumps(saved)
     assert "data/" not in json.dumps(saved)
     assert saved["candidates"][0]["detections"][0]["bbox"] == [300, 180, 650, 340]
+
+
+def test_record_bundle_candidate_avoids_full_sort_for_each_append(tmp_path: Path) -> None:
+    bundle = write_bundle(tmp_path / "calibration-bundles")
+    index_path = tmp_path / "candidates.json"
+
+    with patch("scripts.capture_passing_traffic_candidates.sorted", side_effect=AssertionError("full sort should be deferred"), create=True):
+        record = candidates.record_bundle_candidate(bundle / "manifest.json", index_path=index_path)
+
+    saved = json.loads(index_path.read_text(encoding="utf-8"))
+    assert record["candidate_id"] == "2026-05-11T00-00-00Z"
+    assert saved["candidates"][0]["candidate_id"] == "2026-05-11T00-00-00Z"
+
+
+def test_latest_candidate_selects_max_without_sorting_index(tmp_path: Path) -> None:
+    index_path = tmp_path / "candidates.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "candidates": [
+                    {"candidate_id": "2026-05-11T00-00-01Z"},
+                    {"candidate_id": "2026-05-11T00-00-03Z"},
+                    {"candidate_id": "2026-05-11T00-00-02Z"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("scripts.capture_passing_traffic_candidates.sorted", side_effect=AssertionError("latest should not sort"), create=True):
+        latest = candidates.latest_candidate(index_path)
+
+    assert latest is not None
+    assert latest["candidate_id"] == "2026-05-11T00-00-03Z"
 
 
 def test_promote_accepted_candidate_appends_strict_passing_traffic_label(tmp_path: Path) -> None:

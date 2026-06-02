@@ -56,6 +56,7 @@ class FakeMatrixClient:
         self.fail = fail or {}
         self.on_send_text = on_send_text
         self.calls: list[dict[str, Any]] = []
+        self.closed = False
 
     def send_text(self, *, room_id: str, txn_id: str, body: str) -> str:
         if self.on_send_text is not None:
@@ -85,6 +86,9 @@ class FakeMatrixClient:
         if "image" in self.fail:
             raise self.fail["image"]
         return "$image:example.org"
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def make_delivery(
@@ -124,6 +128,15 @@ def test_occupied_alert_sends_immediately_without_open_outbox_record(tmp_path: P
     assert snapshot.path.exists()
     assert snapshot.path.name.startswith("occupancy-occupied-event-left-spot-")
     assert LocalOutbox(tmp_path / "matrix-outbox.json").list_records() == []
+
+
+def test_matrix_outbox_delivery_close_closes_owned_client(tmp_path: Path) -> None:
+    client = FakeMatrixClient()
+    delivery = make_delivery(tmp_path, client)
+
+    delivery.close()
+
+    assert client.closed is True
 
 
 def test_text_failure_persists_three_phase_record_before_network_and_leaves_text_pending(tmp_path: Path) -> None:

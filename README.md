@@ -778,7 +778,7 @@ Use `--older-than ISO_TIMESTAMP` when you need an explicit cutoff instead of a r
 
 ## Local YOLO detection and Model storage policy
 
-The runtime package includes `ultralytics>=8` so the local detector can load YOLO nano from the configured `detection.model` value, for example `yolov8n.pt`. `detection.model` accepts local model names and local POSIX paths only: use package/Ultralytics names such as `yolov8n.pt`, repo-relative operator paths such as `models/custom-detector.pt`, or mounted Docker paths such as `/models/yolov8n.pt`. Config validation rejects URL-like values (`https://...`, `s3://...`) and path traversal (`../...` or `/models/../...`) before runtime so model configuration failures are clear and do not leak secrets.
+The detector dependency set includes `ultralytics>=8` so the local detector can load YOLO nano from the configured `detection.model` value, for example `yolov8n.pt`. The Dockerfile has a `runtime-base` target with only the shared runtime dependencies and a `runtime-detector` target that adds the detector requirements; the default final image is `runtime-detector` for the live monitor, while tooling that only needs config parsing or operator helpers can build `--target runtime-base`. `detection.model` accepts local model names and local POSIX paths only: use package/Ultralytics names such as `yolov8n.pt`, repo-relative operator paths such as `models/custom-detector.pt`, or mounted Docker paths such as `/models/yolov8n.pt`. Config validation rejects URL-like values (`https://...`, `s3://...`) and path traversal (`../...` or `/models/../...`) before runtime so model configuration failures are clear and do not leak secrets.
 
 First-run Ultralytics downloads are allowed for local names such as `yolov8n.pt`, but they can block startup and require network access. For predictable Docker startup, pre-stage the model file on the host and set `detection.model: /models/yolov8n.pt`, then uncomment the optional read-only Compose mount:
 
@@ -795,6 +795,7 @@ Build and inspect the Docker runtime contract. If your shell has real live secre
 
 ```sh
 docker build -t parking-spot-monitor:test .
+docker build --target runtime-base -t parking-spot-monitor:base .
 docker compose config --no-interpolate
 ```
 
@@ -880,6 +881,6 @@ That failure command should exit non-zero and emit structured `startup-config-in
 
 ## Hardware decode
 
-`docker-compose.yml` mounts `/dev/dri:/dev/dri` so hardware decode can work inside the container. The image installs `intel-media-va-driver` and `vainfo`, and sets `LIBVA_DRIVER_NAME=iHD`; VAAPI should initialize on Intel Iris Xe hosts when `/dev/dri/renderD128` is passed through. The capture path tries VAAPI, DRM, then software by default. QSV may still fail on this host even though FFmpeg is built with `--enable-libvpl`, `libvpl2` is installed, and QSV codecs are listed; the observed failure is `Error creating a MFX session: -9`, while VAAPI succeeds and runtime health/logs should show `selected_mode=vaapi`. Without device passthrough, FFmpeg cannot create hardware devices and the capture path falls back to software decode.
+`docker-compose.yml` mounts `/dev/dri:/dev/dri` so hardware decode can work inside the container. The image installs `intel-media-va-driver` and sets `LIBVA_DRIVER_NAME=iHD`; `vainfo` is treated as a diagnostic host/tooling dependency rather than a production image package. VAAPI should initialize on Intel Iris Xe hosts when `/dev/dri/renderD128` is passed through. The capture path tries VAAPI, DRM, then software by default. QSV may still fail on this host even though FFmpeg is built with `--enable-libvpl`, `libvpl2` is installed, and QSV codecs are listed; the observed failure is `Error creating a MFX session: -9`, while VAAPI succeeds and runtime health/logs should show `selected_mode=vaapi`. Without device passthrough, FFmpeg cannot create hardware devices and the capture path falls back to software decode.
 
 Verify the active container hardware surface with `python scripts/verify_hardware_decode.py --json`. For a concise text check, run `python scripts/verify_hardware_decode.py`; expected output on this host is `hardware_decode_status=vaapi_supported_qsv_unavailable`, which means VAAPI is working and QSV is documented as unavailable. `qsv_required_but_unavailable` is only a failure when `--require-qsv` is intentionally used after changing the host/kernel/libvpl stack. `verifier_timeout` or `vaapi_unavailable` means the container hardware surface needs investigation before claiming hardware acceleration. The same compact summary is embedded in live-proof and alert-soak result/evidence artifacts as `hardware_decode_summary`. Hosts without `/dev/dri` should remove or override the `devices` mapping for software-only operation.
