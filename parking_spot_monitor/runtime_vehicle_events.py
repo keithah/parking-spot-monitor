@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 from parking_spot_monitor.detection import DetectionFilterResult
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
@@ -17,9 +17,17 @@ from parking_spot_monitor.matrix_alerts import (
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
 from parking_spot_monitor.owner_vehicles import load_owner_vehicle_registry
 from parking_spot_monitor.runtime_health import safe_error_context as _safe_error_context
+from parking_spot_monitor.scheduler import QuietWindowStatus
+from parking_spot_monitor.vehicle_history_alert_payloads import (
+    likely_vehicle_payload,
+    vehicle_history_estimate_error_payload,
+    vehicle_history_estimate_payload,
+)
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
+from parking_spot_monitor.vehicle_history_models import ProfileAssignment, SessionRecord
 
 OWNER_VEHICLE_MIN_PROFILE_CONFIDENCE = 0.95
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -28,18 +36,24 @@ class VehicleHistoryEventResult:
     occupied_alerts: list[dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class _VehicleHistoryStepResult(Generic[_T]):
+    value: _T | None
+    errors: list[dict[str, Any]]
+
+
 def _owner_vehicle_quiet_window_alerts(
     history_archive: VehicleHistoryArchive | None,
     *,
-    quiet_status: Any,
+    quiet_status: QuietWindowStatus,
     observed_at: datetime,
     emitted_alert_ids: set[str],
     configured_spot_ids: Sequence[str],
     logger: StructuredLogger,
 ) -> list[dict[str, Any]]:
-    if history_archive is None or not getattr(quiet_status, "active", False):
+    if history_archive is None or not quiet_status.active:
         return []
-    window_id = getattr(quiet_status, "active_window_id", None)
+    window_id = quiet_status.active_window_id
     if not isinstance(window_id, str) or not window_id:
         return []
     configured = set(configured_spot_ids)
@@ -193,26 +207,26 @@ def _record_vehicle_history_start(
         bbox=accepted.bbox,
         event_id=event_id,
         logger=logger,
-        errors=errors,
     )
-    if image_record is None:
+    errors.extend(image_record.errors)
+    if image_record.value is None:
         return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts)
 
     profile_assignment = _match_vehicle_profile_for_session(
         history_archive,
         event,
         session_id=record.session_id,
-        image_record=image_record,
+        image_record=image_record.value,
         event_id=event_id,
         logger=logger,
-        errors=errors,
     )
+    errors.extend(profile_assignment.errors)
     occupied_alert = _occupied_alert_payload(
         history_archive,
         event,
         session_id=record.session_id,
-        image_record=image_record,
-        profile_assignment=profile_assignment,
+        image_record=image_record.value,
+        profile_assignment=profile_assignment.value,
         logger=logger,
     )
     if occupied_alert is not None:
@@ -260,8 +274,7 @@ def _attach_occupied_images(
     bbox: Any,
     event_id: str,
     logger: StructuredLogger,
-    errors: list[dict[str, Any]],
-) -> Any | None:
+) -> _VehicleHistoryStepResult[SessionRecord]:
     try:
         image_record = history_archive.attach_occupied_images(
             session_id=session_id,
@@ -277,9 +290,8 @@ def _attach_occupied_images(
             session_id=session_id,
             image_phase="image-capture",
         )
-        errors.append(context)
         logger.error("vehicle-history-record-failed", **context)
-        return None
+        return _VehicleHistoryStepResult(value=None, errors=[context])
     logger.info(
         "vehicle-session-images-attached",
         action="attach-images",
@@ -288,7 +300,7 @@ def _attach_occupied_images(
         occupied_snapshot_attached=image_record.occupied_snapshot_path is not None,
         occupied_crop_attached=image_record.occupied_crop_path is not None,
     )
-    return image_record
+    return _VehicleHistoryStepResult(value=image_record, errors=[])
 
 
 def _match_vehicle_profile_for_session(
@@ -296,13 +308,12 @@ def _match_vehicle_profile_for_session(
     event: OccupancyEvent,
     *,
     session_id: str,
-    image_record: Any,
+    image_record: SessionRecord,
     event_id: str,
     logger: StructuredLogger,
-    errors: list[dict[str, Any]],
-) -> Any | None:
+) -> _VehicleHistoryStepResult[ProfileAssignment]:
     if image_record.occupied_crop_path is None:
-        return None
+        return _VehicleHistoryStepResult(value=None, errors=[])
     try:
         profile_assignment = history_archive.match_or_create_profile(session_id=session_id)
     except Exception as exc:  # keep the session lifecycle and image archive when profile matching fails
@@ -314,9 +325,8 @@ def _match_vehicle_profile_for_session(
             session_id=session_id,
             profile_phase="profile-match",
         )
-        errors.append(context)
         logger.error("vehicle-history-record-failed", **context)
-        return None
+        return _VehicleHistoryStepResult(value=None, errors=[context])
     logger.info(
         "vehicle-session-profile-matched",
         action="match-profile",
@@ -326,7 +336,7 @@ def _match_vehicle_profile_for_session(
         profile_id=profile_assignment.profile_id,
         profile_confidence=profile_assignment.profile_confidence,
     )
-    return profile_assignment
+    return _VehicleHistoryStepResult(value=profile_assignment, errors=[])
 
 
 def _vehicle_history_error_context(
@@ -359,11 +369,11 @@ def _occupied_alert_payload(
     event: OccupancyEvent,
     *,
     session_id: str,
-    image_record: Any,
-    profile_assignment: Any | None,
+    image_record: SessionRecord,
+    profile_assignment: ProfileAssignment | None,
     logger: StructuredLogger,
 ) -> dict[str, Any] | None:
-    occupied_snapshot_path = getattr(image_record, "occupied_snapshot_path", None)
+    occupied_snapshot_path = image_record.occupied_snapshot_path
     if not isinstance(occupied_snapshot_path, str) or not occupied_snapshot_path.strip():
         logger.info(
             "vehicle-history-occupied-alert-skipped",
@@ -375,10 +385,10 @@ def _occupied_alert_payload(
         )
         return None
 
-    profile_id = getattr(profile_assignment, "profile_id", None)
-    profile_confidence = getattr(profile_assignment, "profile_confidence", None)
-    match_status = getattr(profile_assignment, "status", None)
-    match_reason = getattr(profile_assignment, "reason", None)
+    profile_id = None if profile_assignment is None else profile_assignment.profile_id
+    profile_confidence = None if profile_assignment is None else profile_assignment.profile_confidence
+    match_status = None if profile_assignment is None else profile_assignment.status
+    match_reason = None if profile_assignment is None else profile_assignment.reason
 
     label = _profile_label_for_alert(history_archive, profile_id, logger=logger, spot_id=event.spot_id, session_id=session_id)
     estimate = _estimate_for_alert(history_archive, session_id, logger=logger, spot_id=event.spot_id)
@@ -396,14 +406,7 @@ def _occupied_alert_payload(
         "match_status": match_status,
         "match_reason": match_reason,
         "occupied_snapshot_path": occupied_snapshot_path,
-        "likely_vehicle": {
-            "label": label or profile_id or "unknown vehicle",
-            "profile_id": profile_id,
-            "profile_confidence": profile_confidence,
-            "confidence": profile_confidence,
-            "match_status": match_status,
-            "match_reason": match_reason,
-        },
+        "likely_vehicle": likely_vehicle_payload(profile_assignment, label),
         "vehicle_history_estimate": estimate,
     }
     return payload
@@ -452,34 +455,5 @@ def _estimate_for_alert(
             error_type=type(exc).__name__,
             error_message=redact_diagnostic_text(exc),
         )
-        return {
-            "status": "insufficient_history",
-            "reason": "estimate-error",
-            "profile_id": None,
-            "sample_count": 0,
-            "confidence": "unknown",
-            "dwell_range": None,
-            "leave_time_window": None,
-        }
-    return _vehicle_history_estimate_payload(estimate)
-
-def _vehicle_history_estimate_payload(estimate: Any) -> dict[str, Any]:
-    return {
-        "status": getattr(estimate, "status", "insufficient_history"),
-        "reason": getattr(estimate, "reason", None),
-        "profile_id": getattr(estimate, "profile_id", None),
-        "sample_count": getattr(estimate, "sample_count", 0),
-        "confidence": getattr(estimate, "confidence", "unknown"),
-        "dwell_range": _dataclass_like_payload(getattr(estimate, "dwell_range", None)),
-        "leave_time_window": _dataclass_like_payload(getattr(estimate, "leave_time_window", None)),
-    }
-
-def _dataclass_like_payload(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    fields = getattr(value, "__dataclass_fields__", None)
-    if isinstance(fields, dict):
-        return {name: getattr(value, name) for name in fields}
-    if isinstance(value, Mapping):
-        return dict(value)
-    return None
+        return vehicle_history_estimate_error_payload()
+    return vehicle_history_estimate_payload(estimate)

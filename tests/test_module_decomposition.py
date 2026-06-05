@@ -72,9 +72,91 @@ def _lambda_call_targets(relative_path: str) -> set[str]:
     return targets
 
 
+def _function_arg_names(relative_path: str, function_name: str) -> set[str]:
+    tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == function_name:
+            return {arg.arg for arg in node.args.args + node.args.kwonlyargs}
+    raise AssertionError(f"{function_name} not found in {relative_path}")
+
+
+def _function_body_node_types(relative_path: str, function_name: str) -> set[type[ast.AST]]:
+    tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == function_name:
+            return {type(child) for child in ast.walk(node)}
+    raise AssertionError(f"{function_name} not found in {relative_path}")
+
+
+def _class_field_annotations(relative_path: str, class_name: str) -> dict[str, str]:
+    tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or node.name != class_name:
+            continue
+        fields: dict[str, str] = {}
+        for child in node.body:
+            if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+                fields[child.target.id] = ast.unparse(child.annotation)
+        return fields
+    raise AssertionError(f"{class_name} not found in {relative_path}")
+
+
+def _class_field_annotation_mentions(relative_path: str, class_name: str, field_name: str, expected_name: str) -> bool:
+    tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or node.name != class_name:
+            continue
+        for child in node.body:
+            if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name) and child.target.id == field_name:
+                return any(isinstance(name, ast.Name) and name.id == expected_name for name in ast.walk(child.annotation))
+    raise AssertionError(f"{class_name}.{field_name} not found in {relative_path}")
+
+
+def _function_arg_annotations(relative_path: str, function_name: str) -> dict[str, str]:
+    tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == function_name:
+            args = [*node.args.args, *node.args.kwonlyargs]
+            return {arg.arg: ast.unparse(arg.annotation) for arg in args if arg.annotation is not None}
+    raise AssertionError(f"{function_name} not found in {relative_path}")
+
+
+def _function_arg_annotation_mentions(relative_path: str, function_name: str, arg_name: str, expected_name: str) -> bool:
+    tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != function_name:
+            continue
+        for arg in [*node.args.args, *node.args.kwonlyargs]:
+            if arg.arg == arg_name and arg.annotation is not None:
+                return any(isinstance(name, ast.Name) and name.id == expected_name for name in ast.walk(arg.annotation))
+    raise AssertionError(f"{function_name}.{arg_name} not found in {relative_path}")
+
+
+def _class_names(relative_path: str) -> set[str]:
+    tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+    return {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+
+
+def _function_calls(relative_path: str, function_name: str) -> set[str]:
+    tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == function_name:
+            calls: set[str] = set()
+            for child in ast.walk(node):
+                if isinstance(child, ast.Call):
+                    if isinstance(child.func, ast.Name):
+                        calls.add(child.func.id)
+                    elif isinstance(child.func, ast.Attribute):
+                        calls.add(child.func.attr)
+            return calls
+    raise AssertionError(f"{function_name} not found in {relative_path}")
+
+
 def test_matrix_module_is_a_small_compatibility_shim() -> None:
     assert _line_count("parking_spot_monitor/matrix.py") <= 220
     module_caps = {
+        "parking_spot_monitor/matrix_command_catalog.py": 720,
+        "parking_spot_monitor/matrix_command_runtime.py": 140,
         "parking_spot_monitor/matrix_client.py": 260,
         "parking_spot_monitor/matrix_commands.py": 740,
         "parking_spot_monitor/matrix_cockpit.py": 430,
@@ -121,11 +203,67 @@ def test_matrix_cockpit_context_has_explicit_reply_methods_instead_of_action_dis
     assert "_format_cockpit_context_reply" not in command_functions
 
 
+def test_matrix_commands_keep_parse_data_separate_from_application() -> None:
+    command_strings = _string_constants("parking_spot_monitor/matrix_commands.py")
+    command_functions = _function_names("parking_spot_monitor/matrix_commands.py")
+    command_imports = _imported_module_names("parking_spot_monitor/matrix_commands.py")
+    command_catalog_imports = set(_imported_names("parking_spot_monitor/matrix_commands.py", "parking_spot_monitor.matrix_command_catalog"))
+    command_runtime_imports = set(_imported_names("parking_spot_monitor/matrix_commands.py", "parking_spot_monitor.matrix_command_runtime"))
+    catalog_functions = _function_names("parking_spot_monitor/matrix_command_catalog.py")
+    catalog_strings = _string_constants("parking_spot_monitor/matrix_command_catalog.py")
+    runtime_fields = _class_field_annotations("parking_spot_monitor/matrix_command_runtime.py", "MatrixCommandRuntime")
+
+    assert "_CockpitRenderer" not in command_strings
+    assert "_format_cockpit_reply" not in command_functions
+    assert ast.If not in _function_body_node_types("parking_spot_monitor/matrix_commands.py", "_apply_command")
+    assert "parking_spot_monitor.matrix_command_catalog" in command_imports
+    assert "parking_spot_monitor.matrix_command_runtime" in command_imports
+    assert command_catalog_imports <= {
+        "AppliedMatrixCommand",
+        "format_command_help_reply",
+        "parse_applied_matrix_command",
+        "parse_matrix_command",
+    }
+    assert command_runtime_imports <= {"MatrixCommandArchive", "MatrixCommandRuntime", "MatrixFeedbackLabeler"}
+    assert "_parse_applied_matrix_command" not in command_functions
+    assert "MATRIX_COMMAND_SPECS" not in command_strings
+    assert "render" not in _function_arg_names("parking_spot_monitor/matrix_command_catalog.py", "parse_applied_matrix_command")
+    assert "_CockpitRenderer" not in catalog_strings
+    assert "Any" not in runtime_fields["archive"]
+    assert "Any" not in runtime_fields["feedback_labeler"]
+    assert _class_field_annotation_mentions("parking_spot_monitor/matrix_command_runtime.py", "MatrixCommandRuntime", "archive", "MatrixCommandArchive")
+    assert _class_field_annotation_mentions("parking_spot_monitor/matrix_command_runtime.py", "MatrixCommandRuntime", "feedback_labeler", "MatrixFeedbackLabeler")
+    assert "getattr" not in _function_calls("parking_spot_monitor/matrix_command_runtime.py", "correction_already_seen")
+    assert "getattr" not in _function_calls("parking_spot_monitor/matrix_command_runtime.py", "resolve_wrong_match_subject")
+    assert "MatrixCommandArchive" not in _class_names("parking_spot_monitor/matrix_command_catalog.py")
+    assert "MatrixFeedbackLabeler" not in _class_names("parking_spot_monitor/matrix_command_catalog.py")
+    service_archive_fields = _class_names("parking_spot_monitor/matrix_commands.py")
+    assert "MatrixCommandServiceArchive" in service_archive_fields
+    assert "apply" in catalog_functions
+    assert "to_matrix_command" in catalog_functions
+    assert "parse_applied_matrix_command" in catalog_functions
+    assert "parse_matrix_command" in catalog_functions
+
+
 def test_runtime_vehicle_history_events_use_transition_helpers() -> None:
     runtime_vehicle_functions = _function_names("parking_spot_monitor/runtime_vehicle_events.py")
+    step_result_fields = _class_field_annotations("parking_spot_monitor/runtime_vehicle_events.py", "_VehicleHistoryStepResult")
 
     assert "_record_vehicle_history_start" in runtime_vehicle_functions
     assert "_record_vehicle_history_close" in runtime_vehicle_functions
+    assert "errors" not in _function_arg_names("parking_spot_monitor/runtime_vehicle_events.py", "_attach_occupied_images")
+    assert "errors" not in _function_arg_names("parking_spot_monitor/runtime_vehicle_events.py", "_match_vehicle_profile_for_session")
+    assert "Any" not in step_result_fields["value"]
+    assert _function_arg_annotation_mentions("parking_spot_monitor/runtime_vehicle_events.py", "_match_vehicle_profile_for_session", "image_record", "SessionRecord")
+    assert _function_arg_annotation_mentions("parking_spot_monitor/runtime_vehicle_events.py", "_occupied_alert_payload", "image_record", "SessionRecord")
+    assert "getattr" not in _function_calls("parking_spot_monitor/runtime_vehicle_events.py", "_occupied_alert_payload")
+    runtime_vehicle_imports = _imported_module_names("parking_spot_monitor/runtime_vehicle_events.py")
+    assert "parking_spot_monitor.runtime_vehicle_payloads" not in runtime_vehicle_imports
+    assert "parking_spot_monitor.vehicle_history_alert_payloads" in runtime_vehicle_imports
+    assert "parking_spot_monitor.vehicle_history_models" in runtime_vehicle_imports
+    assert "parking_spot_monitor.vehicle_estimates" not in runtime_vehicle_imports
+    assert not {"VehicleProfileAssignmentPayload", "VehicleHistoryEstimatePayload"} & _class_names("parking_spot_monitor/runtime_vehicle_events.py")
+    assert not {"VehicleHistoryImageAttachResult", "VehicleHistoryProfileMatchResult"} & _class_names("parking_spot_monitor/runtime_vehicle_events.py")
     assert _line_count("parking_spot_monitor/runtime_vehicle_events.py") <= 500
 
 
@@ -133,6 +271,7 @@ def test_vehicle_history_module_is_a_small_compatibility_shim() -> None:
     assert _line_count("parking_spot_monitor/vehicle_history.py") <= 220
     module_caps = {
         "parking_spot_monitor/vehicle_history_archive.py": 220,
+        "parking_spot_monitor/vehicle_history_alert_payloads.py": 120,
         "parking_spot_monitor/vehicle_history_corrections.py": 410,
         "parking_spot_monitor/vehicle_history_maintenance.py": 390,
         "parking_spot_monitor/vehicle_history_maintenance_utils.py": 260,

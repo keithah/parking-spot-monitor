@@ -34,7 +34,8 @@ def assert_section_case(section: str, case_name: str, required: list[str]) -> No
     assert not missing, f"README.md troubleshooting case '{case_name}' missing tokens: {missing}"
 
 def read_matrix_command_contract() -> str:
-    from parking_spot_monitor.matrix_commands import MatrixCommandParseError, MatrixCommandResponse, MatrixCommandService, MatrixTextEvent, _format_command_help_reply, parse_matrix_command
+    from parking_spot_monitor.matrix_command_catalog import format_command_help_reply
+    from parking_spot_monitor.matrix_commands import MatrixCommandParseError, MatrixCommandResponse, MatrixCommandService, MatrixTextEvent, parse_matrix_command
 
     def parse_error(body: str) -> str:
         try:
@@ -74,7 +75,7 @@ def read_matrix_command_contract() -> str:
     missed_alert = parse_matrix_command("!parking missed-alert left_spot occupied at 2026-05-18T19:00:00Z")
     return "\n".join(
         [
-            _format_command_help_reply("{command_prefix}"),
+            format_command_help_reply("{command_prefix}"),
             parse_error("!parking correct"),
             parse_error("!parking learn left_spot open"),
             parse_error("!parking who extra"),

@@ -1460,6 +1460,7 @@ def test_runtime_loop_vehicle_history_close_failure_degrades_health_without_bloc
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from parking_spot_monitor import __main__ as cli
+    from parking_spot_monitor.vehicle_history_models import ProfileAssignment
 
     detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], []]
     delivery = FakeMatrixDelivery()
@@ -1482,11 +1483,7 @@ def test_runtime_loop_vehicle_history_close_failure_degrades_health_without_bloc
             )()
 
         def match_or_create_profile(self, *, session_id: str) -> object:
-            return type(
-                "ProfileAssignment",
-                (),
-                {"session_id": session_id, "status": "matched", "profile_id": "prof-left", "profile_confidence": 0.98},
-            )()
+            return ProfileAssignment(session_id=session_id, status="matched", profile_id="prof-left", profile_confidence=0.98, reason="test-match")
 
         def close_session(self, event: object) -> object:
             raise PermissionError(f"history close denied token={SECRET_MARKER} raw_image_bytes abc")

@@ -1414,6 +1414,37 @@ def test_command_service_authorizes_applies_and_replies_safely() -> None:
     assert ACCESS_TOKEN not in rendered_replies
 
 
+def test_command_service_fails_corrections_when_duplicate_check_is_unavailable() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(MatrixTextEvent(event_id="$rename", sender="@op:example", room_id=ROOM_ID, body="!parking profile rename prof_a Blue"),),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(dict(kwargs))
+            return "$reply"
+
+    class Archive(FakeCommandArchive):
+        def load_corrections(self) -> list[FakeCorrection]:
+            raise PermissionError("corrections unreadable")
+
+    archive = Archive(cursor={"next_batch": "s2"})
+    service = MatrixCommandService(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@op:example"], bot_user_id="@bot:example")  # type: ignore[arg-type]
+
+    result = service.poll_once()
+
+    assert result.processed_count == 0
+    assert result.error_count == 1
+    assert archive.calls == []
+    assert replies == [{"room_id": ROOM_ID, "txn_id": "command:$rename", "body": "Command failed: PermissionError"}]
+
+
 def test_command_service_authorized_correct_records_feedback_label() -> None:
     from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
 
