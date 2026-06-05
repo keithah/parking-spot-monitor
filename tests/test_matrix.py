@@ -1258,7 +1258,7 @@ class FakeCommandArchive:
 
 
 def test_active_spot_assignments_reply_includes_occupied_and_open_durations() -> None:
-    from parking_spot_monitor.matrix import _format_active_spot_assignments_reply
+    from parking_spot_monitor.matrix_cockpit import _format_active_spot_assignments_reply
 
     reply = _format_active_spot_assignments_reply(
         [
@@ -1287,7 +1287,8 @@ def test_active_spot_assignments_reply_includes_occupied_and_open_durations() ->
 
 
 def test_active_spot_assignments_merge_runtime_open_spots_with_duration(tmp_path: Path) -> None:
-    from parking_spot_monitor.matrix import MatrixOperatorCockpitContext, _active_spot_assignments_with_runtime_status
+    from parking_spot_monitor.matrix import MatrixOperatorCockpitContext
+    from parking_spot_monitor.matrix_cockpit import _active_spot_assignments_with_runtime_status
     from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
     from parking_spot_monitor.state import RuntimeState, save_runtime_state
 
@@ -2410,10 +2411,16 @@ def test_command_service_incident_review_uses_cockpit_context_with_image_respons
             return "$image"
 
     class Context:
-        def format_reply(self, action: str, **kwargs: Any) -> MatrixCommandResponse:
-            assert action == "incident_review"
-            assert kwargs["spot_id"] == "left_spot"
-            assert kwargs["incident_time"] == "7:39pm"
+        def incident_review_reply(
+            self,
+            *,
+            spot_id: str,
+            incident_time: str,
+            logger: Any | None = None,
+        ) -> MatrixCommandResponse:
+            del logger
+            assert spot_id == "left_spot"
+            assert incident_time == "7:39pm"
             return MatrixCommandResponse(
                 text="Incident review: left_spot around 7:39pm",
                 image_path=image_path,
@@ -3227,7 +3234,8 @@ def test_command_service_lab_context_routes_to_manager_safely_text_only(tmp_path
 
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        if "Detection lab status\n" in context.format_reply("lab_status").text and "Status: succeeded" in context.format_reply("lab_status").text:
+        status_text = context.lab_status_reply("latest").text
+        if "Detection lab status\n" in status_text and "Status: succeeded" in status_text:
             break
         time.sleep(0.01)
     second = service.poll_once()

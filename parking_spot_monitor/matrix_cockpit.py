@@ -38,92 +38,89 @@ class MatrixOperatorCockpitContext:
     detection_lab_manager: Any | None = None
     incident_detector: Any | None = None
 
-    def format_reply(
-        self,
-        action: str,
-        *,
-        spot_id: str | None = None,
-        lab_kind: str | None = None,
-        lab_job_id: str | None = None,
-        incident_time: str | None = None,
-        analytics_window: str | None = None,
-        logger: StructuredLogger | None = None,
-    ) -> MatrixCommandResponse:
-        if action == "status":
-            return MatrixCommandResponse(
-                text=format_operator_status_reply(
-                    settings=self.settings,
-                    health_path=self.health_path,
-                    state_path=self.state_path,
-                    matrix_outbox_path=self.matrix_outbox_path,
-                    logger=logger,
-                )
-            )
-        if action == "config":
-            return MatrixCommandResponse(
-                text=format_operator_config_reply(
-                    settings=self.settings,
-                    data_dir=self.data_dir,
-                    logger=logger,
-                )
-            )
-        if action == "latest":
-            if self.latest_path is None:
-                return MatrixCommandResponse(text="Parking monitor latest unavailable: latest.jpg path is not configured")
-            latest = build_latest_snapshot_response(
+    def status_reply(self, *, logger: StructuredLogger | None = None) -> MatrixCommandResponse:
+        return MatrixCommandResponse(
+            text=format_operator_status_reply(
                 settings=self.settings,
-                latest_path=self.latest_path,
                 health_path=self.health_path,
                 state_path=self.state_path,
+                matrix_outbox_path=self.matrix_outbox_path,
                 logger=logger,
             )
-            return MatrixCommandResponse(text=latest.text, image_path=latest.image_path, image_info=latest.image_info)
-        if action in {"why", "explain"}:
-            if spot_id is None:
-                if action == "explain":
-                    raise MatrixCommandParseError("usage: !parking explain <spot_id>")
-                raise MatrixCommandParseError("usage: !parking why <spot_id>")
-            return MatrixCommandResponse(text=format_operator_why_reply(data_dir=self.data_dir, spot_id=spot_id, logger=logger))
-        if action == "recent":
-            return MatrixCommandResponse(text=format_operator_recent_reply(data_dir=self.data_dir, logger=logger))
-        if action == "confidence":
-            return MatrixCommandResponse(
-                text=format_operator_confidence_reply(
-                    settings=self.settings,
-                    data_dir=self.data_dir,
-                    health_path=self.health_path,
-                    state_path=self.state_path,
-                    matrix_outbox_path=self.matrix_outbox_path,
-                    logger=logger,
-                )
+        )
+
+    def config_reply(self, *, logger: StructuredLogger | None = None) -> MatrixCommandResponse:
+        return MatrixCommandResponse(text=format_operator_config_reply(settings=self.settings, data_dir=self.data_dir, logger=logger))
+
+    def latest_reply(self, *, logger: StructuredLogger | None = None) -> MatrixCommandResponse:
+        if self.latest_path is None:
+            return MatrixCommandResponse(text="Parking monitor latest unavailable: latest.jpg path is not configured")
+        latest = build_latest_snapshot_response(
+            settings=self.settings,
+            latest_path=self.latest_path,
+            health_path=self.health_path,
+            state_path=self.state_path,
+            logger=logger,
+        )
+        return MatrixCommandResponse(text=latest.text, image_path=latest.image_path, image_info=latest.image_info)
+
+    def why_reply(self, spot_id: str, *, logger: StructuredLogger | None = None) -> MatrixCommandResponse:
+        return MatrixCommandResponse(text=format_operator_why_reply(data_dir=self.data_dir, spot_id=spot_id, logger=logger))
+
+    def recent_reply(self, *, logger: StructuredLogger | None = None) -> MatrixCommandResponse:
+        return MatrixCommandResponse(text=format_operator_recent_reply(data_dir=self.data_dir, logger=logger))
+
+    def confidence_reply(self, *, logger: StructuredLogger | None = None) -> MatrixCommandResponse:
+        return MatrixCommandResponse(
+            text=format_operator_confidence_reply(
+                settings=self.settings,
+                data_dir=self.data_dir,
+                health_path=self.health_path,
+                state_path=self.state_path,
+                matrix_outbox_path=self.matrix_outbox_path,
+                logger=logger,
             )
-        if action == "analytics":
-            return MatrixCommandResponse(text=format_operator_analytics_reply(data_dir=self.data_dir, window=analytics_window or "7d", logger=logger))
-        if action == "incident_review":
-            if spot_id is None or incident_time is None:
-                raise MatrixCommandParseError("usage: !parking at <time> <spot_id>")
-            return build_incident_review_response(settings=self.settings, data_dir=self.data_dir, state_path=self.state_path, spot_id=spot_id, time_text=incident_time, detector=self.incident_detector, logger=logger)
-        if action == "lab_run":
-            if lab_kind is None:
-                raise MatrixCommandParseError("usage: !parking lab run <replay|tuning>")
-            return MatrixCommandResponse(
-                text=format_detection_lab_run_reply(
-                    data_dir=self.data_dir,
-                    kind=lab_kind,
-                    manager=self.detection_lab_manager,
-                    logger=logger,
-                )
+        )
+
+    def analytics_reply(self, window: str, *, logger: StructuredLogger | None = None) -> MatrixCommandResponse:
+        return MatrixCommandResponse(text=format_operator_analytics_reply(data_dir=self.data_dir, window=window, logger=logger))
+
+    def incident_review_reply(
+        self,
+        *,
+        spot_id: str,
+        incident_time: str,
+        logger: StructuredLogger | None = None,
+    ) -> MatrixCommandResponse:
+        return build_incident_review_response(
+            settings=self.settings,
+            data_dir=self.data_dir,
+            state_path=self.state_path,
+            spot_id=spot_id,
+            time_text=incident_time,
+            detector=self.incident_detector,
+            logger=logger,
+        )
+
+    def lab_run_reply(self, kind: str, *, logger: StructuredLogger | None = None) -> MatrixCommandResponse:
+        return MatrixCommandResponse(
+            text=format_detection_lab_run_reply(
+                data_dir=self.data_dir,
+                kind=kind,
+                manager=self.detection_lab_manager,
+                logger=logger,
             )
-        if action == "lab_status":
-            return MatrixCommandResponse(
-                text=format_detection_lab_status_reply(
-                    data_dir=self.data_dir,
-                    job_id=lab_job_id or "latest",
-                    manager=self.detection_lab_manager,
-                    logger=logger,
-                )
+        )
+
+    def lab_status_reply(self, job_id: str, *, logger: StructuredLogger | None = None) -> MatrixCommandResponse:
+        return MatrixCommandResponse(
+            text=format_detection_lab_status_reply(
+                data_dir=self.data_dir,
+                job_id=job_id,
+                manager=self.detection_lab_manager,
+                logger=logger,
             )
-        raise MatrixCommandParseError("unknown cockpit command")
+        )
 
 def _active_spot_assignments_with_runtime_status(
     assignments: Sequence[Mapping[str, Any]],

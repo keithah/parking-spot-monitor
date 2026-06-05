@@ -22,11 +22,11 @@ from parking_spot_monitor.matrix import (
     MatrixDelivery,
     MatrixError,
     MatrixSnapshot,
-    _matrix_snapshot_upload,
     format_open_spot_alert,
     open_spot_event_id,
     prepare_event_snapshot,
 )
+from parking_spot_monitor.matrix_snapshots import _matrix_snapshot_upload
 
 _OPEN_ALERT_PHASES = ("text", "upload", "image")
 

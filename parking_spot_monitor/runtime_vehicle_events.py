@@ -126,156 +126,18 @@ def _record_vehicle_history_events(
         previous_status = event.previous_status
         new_status = event.new_status
         if previous_status is not OccupancyStatus.OCCUPIED and new_status is OccupancyStatus.OCCUPIED:
-            logger.info(
-                "vehicle-session-lifecycle-attempt",
-                action="start",
-                spot_id=event.spot_id,
-                event_id=_occupancy_history_event_id(event),
+            result = _record_vehicle_history_start(
+                history_archive,
+                event,
+                detection_result=detection_result,
+                snapshot_path=snapshot_path,
+                logger=logger,
             )
-            try:
-                record = history_archive.start_session(event)
-            except Exception as exc:  # preserve Matrix/open-alert delivery when archive recording fails
-                context = _safe_error_context(
-                    "vehicle-history",
-                    exc,
-                    extra={
-                        "action": "start",
-                        "event_type": event.event_type.value,
-                        "spot_id": event.spot_id,
-                        "event_id": _occupancy_history_event_id(event),
-                    },
-                )
-                history_errors.append(context)
-                logger.error("vehicle-history-record-failed", **context)
-            else:
-                logger.info(
-                    "vehicle-session-lifecycle-recorded",
-                    action="start",
-                    spot_id=event.spot_id,
-                    session_id=record.session_id,
-                )
-                accepted = None
-                if detection_result is not None:
-                    spot_detection = detection_result.by_spot.get(event.spot_id)
-                    if spot_detection is not None:
-                        accepted = spot_detection.accepted
-                source_frame_path = snapshot_path
-                if accepted is None or source_frame_path is None:
-                    context = _safe_error_context(
-                        "vehicle-history",
-                        RuntimeError("accepted occupied candidate or source frame missing"),
-                        extra={
-                            "action": "attach-images",
-                            "image_phase": "image-capture",
-                            "event_type": event.event_type.value,
-                            "spot_id": event.spot_id,
-                            "event_id": _occupancy_history_event_id(event),
-                            "session_id": record.session_id,
-                        },
-                    )
-                    history_errors.append(context)
-                    logger.error("vehicle-history-record-failed", **context)
-                else:
-                    try:
-                        image_record = history_archive.attach_occupied_images(
-                            session_id=record.session_id,
-                            source_frame_path=source_frame_path,
-                            bbox=accepted.bbox,
-                        )
-                    except Exception as exc:  # keep the session lifecycle recorded when image capture fails
-                        context = _safe_error_context(
-                            "vehicle-history",
-                            exc,
-                            extra={
-                                "action": "attach-images",
-                                "image_phase": "image-capture",
-                                "event_type": event.event_type.value,
-                                "spot_id": event.spot_id,
-                                "event_id": _occupancy_history_event_id(event),
-                                "session_id": record.session_id,
-                            },
-                        )
-                        history_errors.append(context)
-                        logger.error("vehicle-history-record-failed", **context)
-                    else:
-                        logger.info(
-                            "vehicle-session-images-attached",
-                            action="attach-images",
-                            spot_id=event.spot_id,
-                            session_id=image_record.session_id,
-                            occupied_snapshot_attached=image_record.occupied_snapshot_path is not None,
-                            occupied_crop_attached=image_record.occupied_crop_path is not None,
-                        )
-                        profile_assignment = None
-                        if image_record.occupied_crop_path is not None:
-                            try:
-                                profile_assignment = history_archive.match_or_create_profile(session_id=record.session_id)
-                            except Exception as exc:  # keep the session lifecycle and image archive when profile matching fails
-                                context = _safe_error_context(
-                                    "vehicle-history",
-                                    exc,
-                                    extra={
-                                        "action": "match-profile",
-                                        "profile_phase": "profile-match",
-                                        "event_type": event.event_type.value,
-                                        "spot_id": event.spot_id,
-                                        "event_id": _occupancy_history_event_id(event),
-                                        "session_id": record.session_id,
-                                    },
-                                )
-                                history_errors.append(context)
-                                logger.error("vehicle-history-record-failed", **context)
-                            else:
-                                logger.info(
-                                    "vehicle-session-profile-matched",
-                                    action="match-profile",
-                                    spot_id=event.spot_id,
-                                    session_id=profile_assignment.session_id,
-                                    match_status=profile_assignment.status,
-                                    profile_id=profile_assignment.profile_id,
-                                    profile_confidence=profile_assignment.profile_confidence,
-                                )
-                        occupied_alert = _occupied_alert_payload(
-                            history_archive,
-                            event,
-                            session_id=record.session_id,
-                            image_record=image_record,
-                            profile_assignment=profile_assignment,
-                            logger=logger,
-                        )
-                        if occupied_alert is not None:
-                            occupied_alerts.append(occupied_alert)
+            history_errors.extend(result.errors)
+            occupied_alerts.extend(result.occupied_alerts)
             continue
         if previous_status is OccupancyStatus.OCCUPIED and new_status is OccupancyStatus.EMPTY:
-            logger.info(
-                "vehicle-session-lifecycle-attempt",
-                action="close",
-                spot_id=event.spot_id,
-                event_id=_occupancy_history_event_id(event),
-            )
-            try:
-                record = history_archive.close_session(event)
-            except Exception as exc:  # preserve Matrix/open-alert delivery when archive recording fails
-                context = _safe_error_context(
-                    "vehicle-history",
-                    exc,
-                    extra={
-                        "action": "close",
-                        "event_type": event.event_type.value,
-                        "spot_id": event.spot_id,
-                        "event_id": _occupancy_history_event_id(event),
-                    },
-                )
-                history_errors.append(context)
-                logger.error("vehicle-history-record-failed", **context)
-            else:
-                logger.info(
-                    "vehicle-session-lifecycle-recorded",
-                    action="close",
-                    spot_id=event.spot_id,
-                    session_id=None if record is None else record.session_id,
-                    result="noop" if record is None else "closed",
-                )
+            history_errors.extend(_record_vehicle_history_close(history_archive, event, logger=logger))
             continue
         logger.info(
             "vehicle-session-lifecycle-ignored",
@@ -286,6 +148,211 @@ def _record_vehicle_history_events(
             reason="not-lifecycle-transition",
         )
     return VehicleHistoryEventResult(errors=history_errors, occupied_alerts=occupied_alerts)
+
+
+def _record_vehicle_history_start(
+    history_archive: VehicleHistoryArchive,
+    event: OccupancyEvent,
+    *,
+    detection_result: DetectionFilterResult | None,
+    snapshot_path: str | None,
+    logger: StructuredLogger,
+) -> VehicleHistoryEventResult:
+    errors: list[dict[str, Any]] = []
+    occupied_alerts: list[dict[str, Any]] = []
+    event_id = _occupancy_history_event_id(event)
+    logger.info("vehicle-session-lifecycle-attempt", action="start", spot_id=event.spot_id, event_id=event_id)
+    try:
+        record = history_archive.start_session(event)
+    except Exception as exc:  # preserve Matrix/open-alert delivery when archive recording fails
+        context = _vehicle_history_error_context(exc, action="start", event=event, event_id=event_id)
+        errors.append(context)
+        logger.error("vehicle-history-record-failed", **context)
+        return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts)
+
+    logger.info("vehicle-session-lifecycle-recorded", action="start", spot_id=event.spot_id, session_id=record.session_id)
+    accepted = _accepted_detection_for_event(detection_result, event)
+    if accepted is None or snapshot_path is None:
+        context = _vehicle_history_error_context(
+            RuntimeError("accepted occupied candidate or source frame missing"),
+            action="attach-images",
+            event=event,
+            event_id=event_id,
+            session_id=record.session_id,
+            image_phase="image-capture",
+        )
+        errors.append(context)
+        logger.error("vehicle-history-record-failed", **context)
+        return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts)
+
+    image_record = _attach_occupied_images(
+        history_archive,
+        event,
+        session_id=record.session_id,
+        source_frame_path=snapshot_path,
+        bbox=accepted.bbox,
+        event_id=event_id,
+        logger=logger,
+        errors=errors,
+    )
+    if image_record is None:
+        return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts)
+
+    profile_assignment = _match_vehicle_profile_for_session(
+        history_archive,
+        event,
+        session_id=record.session_id,
+        image_record=image_record,
+        event_id=event_id,
+        logger=logger,
+        errors=errors,
+    )
+    occupied_alert = _occupied_alert_payload(
+        history_archive,
+        event,
+        session_id=record.session_id,
+        image_record=image_record,
+        profile_assignment=profile_assignment,
+        logger=logger,
+    )
+    if occupied_alert is not None:
+        occupied_alerts.append(occupied_alert)
+    return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts)
+
+
+def _record_vehicle_history_close(
+    history_archive: VehicleHistoryArchive,
+    event: OccupancyEvent,
+    *,
+    logger: StructuredLogger,
+) -> list[dict[str, Any]]:
+    event_id = _occupancy_history_event_id(event)
+    logger.info("vehicle-session-lifecycle-attempt", action="close", spot_id=event.spot_id, event_id=event_id)
+    try:
+        record = history_archive.close_session(event)
+    except Exception as exc:  # preserve Matrix/open-alert delivery when archive recording fails
+        context = _vehicle_history_error_context(exc, action="close", event=event, event_id=event_id)
+        logger.error("vehicle-history-record-failed", **context)
+        return [context]
+    logger.info(
+        "vehicle-session-lifecycle-recorded",
+        action="close",
+        spot_id=event.spot_id,
+        session_id=None if record is None else record.session_id,
+        result="noop" if record is None else "closed",
+    )
+    return []
+
+
+def _accepted_detection_for_event(detection_result: DetectionFilterResult | None, event: OccupancyEvent) -> Any | None:
+    if detection_result is None:
+        return None
+    spot_detection = detection_result.by_spot.get(event.spot_id)
+    return None if spot_detection is None else spot_detection.accepted
+
+
+def _attach_occupied_images(
+    history_archive: VehicleHistoryArchive,
+    event: OccupancyEvent,
+    *,
+    session_id: str,
+    source_frame_path: str,
+    bbox: Any,
+    event_id: str,
+    logger: StructuredLogger,
+    errors: list[dict[str, Any]],
+) -> Any | None:
+    try:
+        image_record = history_archive.attach_occupied_images(
+            session_id=session_id,
+            source_frame_path=source_frame_path,
+            bbox=bbox,
+        )
+    except Exception as exc:  # keep the session lifecycle recorded when image capture fails
+        context = _vehicle_history_error_context(
+            exc,
+            action="attach-images",
+            event=event,
+            event_id=event_id,
+            session_id=session_id,
+            image_phase="image-capture",
+        )
+        errors.append(context)
+        logger.error("vehicle-history-record-failed", **context)
+        return None
+    logger.info(
+        "vehicle-session-images-attached",
+        action="attach-images",
+        spot_id=event.spot_id,
+        session_id=image_record.session_id,
+        occupied_snapshot_attached=image_record.occupied_snapshot_path is not None,
+        occupied_crop_attached=image_record.occupied_crop_path is not None,
+    )
+    return image_record
+
+
+def _match_vehicle_profile_for_session(
+    history_archive: VehicleHistoryArchive,
+    event: OccupancyEvent,
+    *,
+    session_id: str,
+    image_record: Any,
+    event_id: str,
+    logger: StructuredLogger,
+    errors: list[dict[str, Any]],
+) -> Any | None:
+    if image_record.occupied_crop_path is None:
+        return None
+    try:
+        profile_assignment = history_archive.match_or_create_profile(session_id=session_id)
+    except Exception as exc:  # keep the session lifecycle and image archive when profile matching fails
+        context = _vehicle_history_error_context(
+            exc,
+            action="match-profile",
+            event=event,
+            event_id=event_id,
+            session_id=session_id,
+            profile_phase="profile-match",
+        )
+        errors.append(context)
+        logger.error("vehicle-history-record-failed", **context)
+        return None
+    logger.info(
+        "vehicle-session-profile-matched",
+        action="match-profile",
+        spot_id=event.spot_id,
+        session_id=profile_assignment.session_id,
+        match_status=profile_assignment.status,
+        profile_id=profile_assignment.profile_id,
+        profile_confidence=profile_assignment.profile_confidence,
+    )
+    return profile_assignment
+
+
+def _vehicle_history_error_context(
+    error: BaseException,
+    *,
+    action: str,
+    event: OccupancyEvent,
+    event_id: str,
+    session_id: str | None = None,
+    image_phase: str | None = None,
+    profile_phase: str | None = None,
+) -> dict[str, Any]:
+    extra: dict[str, Any] = {
+        "action": action,
+        "event_type": event.event_type.value,
+        "spot_id": event.spot_id,
+        "event_id": event_id,
+    }
+    if session_id is not None:
+        extra["session_id"] = session_id
+    if image_phase is not None:
+        extra["image_phase"] = image_phase
+    if profile_phase is not None:
+        extra["profile_phase"] = profile_phase
+    return _safe_error_context("vehicle-history", error, extra=extra)
+
 
 def _occupied_alert_payload(
     history_archive: VehicleHistoryArchive,

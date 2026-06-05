@@ -21,11 +21,9 @@ from parking_spot_monitor.matrix_alerts import (
     open_spot_event_id,
     owner_vehicle_quiet_window_event_id,
 )
-from parking_spot_monitor.matrix_client import CLIENT_API_PREFIX, MEDIA_API_PREFIX, MatrixClient, _parse_sync_response, _room_message_path
+from parking_spot_monitor.matrix_client import CLIENT_API_PREFIX, MEDIA_API_PREFIX, MatrixClient
 from parking_spot_monitor.matrix_cockpit import (
     MatrixOperatorCockpitContext,
-    _active_spot_assignments_with_runtime_status,
-    _format_active_spot_assignments_reply,
     build_incident_review_response,
     build_latest_snapshot_response,
     format_detection_lab_run_reply,
@@ -39,18 +37,6 @@ from parking_spot_monitor.matrix_cockpit import (
 )
 from parking_spot_monitor.matrix_commands import (
     MatrixCommandService,
-    _coerce_command_response,
-    _confidence_text,
-    _format_command_help_reply,
-    _format_profile_summary_reply,
-    _validate_actual_state,
-    _validate_command_image_info,
-    _validate_label,
-    _validate_lab_job_id,
-    _validate_lab_kind,
-    _validate_profile_id,
-    _validate_spot_id,
-    _validate_subject_id,
     parse_matrix_command,
 )
 from parking_spot_monitor.matrix_delivery import MatrixDelivery
@@ -72,12 +58,7 @@ from parking_spot_monitor.matrix_snapshots import (
     SnapshotRetentionResult,
     prepare_event_snapshot,
     prune_event_snapshots,
-    _matrix_snapshot_upload,
 )
 from parking_spot_monitor.matrix_support import (
     MatrixError,
-    _http_status_error,
-    _require_non_empty,
-    _require_response_key,
-    _sanitize_diagnostics,
 )

@@ -3664,7 +3664,7 @@ def test_default_matrix_command_service_wires_detection_lab_to_effective_paths_a
     assert context.detection_lab_manager is not None
     assert context.detection_lab_manager.lab_root == tmp_path / "detection-lab"
 
-    response = context.format_reply("lab_run", lab_kind="replay", logger=logger)
+    response = context.lab_run_reply("replay", logger=logger)
     loaded = load_decision_memory(tmp_path / "operator-decision-memory.json")
     output = combined_output(capsys)
 
@@ -3735,8 +3735,7 @@ def test_default_matrix_command_service_defers_incident_detector_construction_un
     assert service.cockpit_context.incident_detector is not None
     assert factory_calls == []
 
-    missing_frame_response = service.cockpit_context.format_reply(
-        "incident_review",
+    missing_frame_response = service.cockpit_context.incident_review_reply(
         spot_id="left_spot",
         incident_time="2026-05-18T02:39:00Z",
         logger=logger,
@@ -3749,8 +3748,7 @@ def test_default_matrix_command_service_defers_incident_detector_construction_un
     frame = frames_dir / "20260518T023900Z.jpg"
     Image.new("RGB", (1458, 806), (20, 30, 40)).save(frame, format="JPEG")
 
-    replay_response = service.cockpit_context.format_reply(
-        "incident_review",
+    replay_response = service.cockpit_context.incident_review_reply(
         spot_id="left_spot",
         incident_time="2026-05-18T02:39:00Z",
         logger=logger,

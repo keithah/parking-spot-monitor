@@ -35,10 +35,13 @@ from parking_spot_monitor.matrix_models import (
 from parking_spot_monitor.matrix_snapshots import JPEG_MIMETYPE, MatrixSnapshot, _matrix_snapshot_upload
 from parking_spot_monitor.matrix_support import _require_non_empty, _sanitize_diagnostics
 
+_CockpitRenderer: TypeAlias = Callable[[MatrixOperatorCockpitContext, StructuredLogger | None], MatrixCommandResponse]
+
 
 @dataclass(frozen=True)
 class _CockpitReplyCommand:
     action: str
+    render: _CockpitRenderer = field(repr=False, compare=False)
     arguments: Mapping[str, str] = field(default_factory=dict)
 
 
@@ -292,15 +295,7 @@ class MatrixCommandService:
         if self.cockpit_provider is not None:
             return self.cockpit_provider(command.action, **dict(command.arguments))
         if self.cockpit_context is not None:
-            return self.cockpit_context.format_reply(
-                command.action,
-                spot_id=command.arguments.get("spot_id"),
-                lab_kind=command.arguments.get("lab_kind"),
-                lab_job_id=command.arguments.get("lab_job_id"),
-                incident_time=command.arguments.get("incident_time"),
-                analytics_window=command.arguments.get("analytics_window"),
-                logger=self.logger,
-            )
+            return command.render(self.cockpit_context, self.logger)
         raise RuntimeError("operator cockpit provider is not configured")
 
     def _profile_summary(self, profile_id: str, *, event: MatrixTextEvent) -> Mapping[str, Any]:
@@ -427,11 +422,68 @@ def _usage(prefix: str, suffix: str) -> str:
     return f"usage: {prefix} {suffix}"
 
 
+_EXACT_COCKPIT_RENDERERS: dict[str, _CockpitRenderer] = {
+    "status": lambda context, logger: context.status_reply(logger=logger),
+    "config": lambda context, logger: context.config_reply(logger=logger),
+    "latest": lambda context, logger: context.latest_reply(logger=logger),
+    "recent": lambda context, logger: context.recent_reply(logger=logger),
+    "confidence": lambda context, logger: context.confidence_reply(logger=logger),
+}
+
+
+def _exact_cockpit_command(action: str) -> _CockpitReplyCommand:
+    return _CockpitReplyCommand(action=action, render=_EXACT_COCKPIT_RENDERERS[action])
+
+
+def _spot_cockpit_command(action: str, spot_id: str) -> _CockpitReplyCommand:
+    return _CockpitReplyCommand(
+        action=action,
+        render=lambda context, logger: context.why_reply(spot_id, logger=logger),
+        arguments={"spot_id": spot_id},
+    )
+
+
+def _analytics_command(window: str) -> _CockpitReplyCommand:
+    return _CockpitReplyCommand(
+        action="analytics",
+        render=lambda context, logger: context.analytics_reply(window, logger=logger),
+        arguments={"analytics_window": window},
+    )
+
+
+def _incident_review_command(*, incident_time: str, spot_id: str) -> _CockpitReplyCommand:
+    return _CockpitReplyCommand(
+        action="incident_review",
+        render=lambda context, logger: context.incident_review_reply(
+            spot_id=spot_id,
+            incident_time=incident_time,
+            logger=logger,
+        ),
+        arguments={"incident_time": incident_time, "spot_id": spot_id},
+    )
+
+
+def _lab_run_command(kind: str) -> _CockpitReplyCommand:
+    return _CockpitReplyCommand(
+        action="lab_run",
+        render=lambda context, logger: context.lab_run_reply(kind, logger=logger),
+        arguments={"lab_kind": kind},
+    )
+
+
+def _lab_status_command(job_id: str) -> _CockpitReplyCommand:
+    return _CockpitReplyCommand(
+        action="lab_status",
+        render=lambda context, logger: context.lab_status_reply(job_id, logger=logger),
+        arguments={"lab_job_id": job_id},
+    )
+
+
 def _exact_cockpit(action: str, usage_suffix: str) -> _CommandParser:
     def parse(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
         if len(parts) != 2:
             raise MatrixCommandParseError(_usage(prefix, usage_suffix))
-        return _CockpitReplyCommand(action)
+        return _exact_cockpit_command(action)
 
     return parse
 
@@ -440,7 +492,7 @@ def _parse_spot_cockpit(action: str, usage_suffix: str) -> _CommandParser:
     def parse(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
         if len(parts) != 3:
             raise MatrixCommandParseError(_usage(prefix, usage_suffix))
-        return _CockpitReplyCommand(action, {"spot_id": _validate_spot_id(parts[2])})
+        return _spot_cockpit_command(action, _validate_spot_id(parts[2]))
 
     return parse
 
@@ -468,9 +520,9 @@ def _parse_learn_label(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
 
 def _parse_analytics(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
     if len(parts) == 2:
-        return _CockpitReplyCommand("analytics", {"analytics_window": "7d"})
+        return _analytics_command("7d")
     if len(parts) == 3 and parts[2] in {"today", "7d", "30d", "all"}:
-        return _CockpitReplyCommand("analytics", {"analytics_window": parts[2]})
+        return _analytics_command(parts[2])
     raise MatrixCommandParseError(_usage(prefix, "analytics [today|7d|30d|all]"))
 
 
@@ -480,23 +532,20 @@ def _parse_incident_review(parts: list[str], prefix: str) -> _AppliedMatrixComma
     incident_time = redact_diagnostic_text(parts[2])[:80]
     if not incident_time:
         raise MatrixCommandParseError(_usage(prefix, "at <time> <spot_id>"))
-    return _CockpitReplyCommand(
-        "incident_review",
-        {"incident_time": incident_time, "spot_id": _validate_spot_id(parts[3])},
-    )
+    return _incident_review_command(incident_time=incident_time, spot_id=_validate_spot_id(parts[3]))
 
 
 def _parse_lab_run(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
     if len(parts) != 4:
         raise MatrixCommandParseError(_usage(prefix, "lab run <replay|tuning>"))
-    return _CockpitReplyCommand("lab_run", {"lab_kind": _validate_lab_kind(parts[3])})
+    return _lab_run_command(_validate_lab_kind(parts[3]))
 
 
 def _parse_lab_status(parts: list[str], prefix: str) -> _AppliedMatrixCommand:
     if len(parts) == 3:
-        return _CockpitReplyCommand("lab_status", {"lab_job_id": "latest"})
+        return _lab_status_command("latest")
     if len(parts) == 4:
-        return _CockpitReplyCommand("lab_status", {"lab_job_id": _validate_lab_job_id(parts[3])})
+        return _lab_status_command(_validate_lab_job_id(parts[3]))
     raise MatrixCommandParseError(_usage(prefix, "lab status [job_id|latest]"))
 
 
