@@ -1,1 +1,1 @@
-ultralytics>=8
+ultralytics==8.4.60

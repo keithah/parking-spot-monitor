@@ -168,6 +168,38 @@ def test_matrix_delivery_live_proof_sends_labelled_text_and_raw_image(tmp_path: 
     assert seen[2]["info"] == {"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 8, "h": 6}
 
 
+def test_matrix_delivery_live_proof_image_uses_shared_upload_helper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source, size=(8, 6))
+    seen: list[dict[str, Any]] = []
+
+    class FakeClient:
+        def upload_image(self, *, filename: str, data: bytes, content_type: str) -> str:
+            seen.append({"kind": "upload", "filename": filename, "data": data, "content_type": content_type})
+            return "mxc://example.org/live-proof"
+
+        def send_image(self, *, room_id: str, txn_id: str, body: str, content_uri: str, info: dict[str, Any]) -> str:
+            seen.append({"kind": "image", "info": dict(info), "content_uri": content_uri})
+            return "$image:example.org"
+
+    def fake_upload(snapshot: Any, *, logger: Any) -> dict[str, Any]:
+        return {"data": b"resized", "info": {"mimetype": "image/jpeg", "size": 7, "w": 4, "h": 3}}
+
+    monkeypatch.setattr("parking_spot_monitor.matrix_delivery._matrix_snapshot_upload", fake_upload)
+    delivery = MatrixDelivery(
+        client=FakeClient(),  # type: ignore[arg-type]
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        logger=None,  # type: ignore[arg-type]
+    )
+
+    delivery.send_live_proof_image(latest_path=source, observed_at="2026-05-18T19:00:00Z", selected_mode="software")
+
+    assert seen[0]["data"] == b"resized"
+    assert seen[1]["info"] == {"mimetype": "image/jpeg", "size": 7, "w": 4, "h": 3}
+
+
 def test_format_live_proof_text_is_visibly_labelled() -> None:
     assert format_live_proof_text(observed_at="2026-05-18T19:00:00Z", selected_mode="software") == (
         "LIVE PROOF / TEST MESSAGE: RTSP capture succeeded at 2026-05-18 12:00:00 PM PDT (decode mode: software)."
@@ -463,7 +495,7 @@ def test_matrix_delivery_open_alert_uploads_resized_image_without_mutating_retai
     assert images[0]["info"]["h"] < 720
     assert images[0]["body"].startswith("Raw full-frame snapshot for left_spot")
 
-def test_matrix_delivery_occupied_alert_sends_text_upload_and_raw_occupied_image(tmp_path: Path) -> None:
+def test_matrix_delivery_occupied_alert_sends_upload_and_image_with_alert_body(tmp_path: Path) -> None:
     source = tmp_path / "occupied.jpg"
     raw_bytes = write_jpeg(source, size=(9, 7))
     seen: list[dict[str, Any]] = []
@@ -501,18 +533,17 @@ def test_matrix_delivery_occupied_alert_sends_text_upload_and_raw_occupied_image
     snapshot = delivery.send_occupied_spot_alert(occupied_event(source))
 
     event_id = "occupancy-occupied-event:left_spot:2026-05-18T20:01:02Z"
-    assert [item["kind"] for item in seen] == ["text", "upload", "image"]
-    assert seen[0]["txn_id"] == f"{event_id}:text"
-    assert "Parking spot occupied: left_spot" in seen[0]["body"]
-    assert seen[1]["content_type"] == "image/jpeg"
-    assert seen[1]["data"] == raw_bytes
-    assert seen[1]["filename"] == "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
+    assert [item["kind"] for item in seen] == ["upload", "image"]
+    assert seen[0]["content_type"] == "image/jpeg"
+    assert seen[0]["data"] == raw_bytes
+    assert seen[0]["filename"] == "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
     assert snapshot.path == tmp_path / "snapshots" / "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
     assert snapshot.filename == "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
-    assert seen[2]["txn_id"] == f"{event_id}:image"
-    assert seen[2]["body"] == "Raw occupied full-frame snapshot for left_spot at 2026-05-18 1:01:02 PM PDT"
-    assert seen[2]["content_uri"] == "mxc://example.org/occupied"
-    assert seen[2]["info"] == {"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 9, "h": 7}
+    assert seen[1]["txn_id"] == f"{event_id}:image"
+    assert seen[1]["body"].startswith("Parking spot occupied: left_spot at 2026-05-18 1:01:02 PM PDT")
+    assert "Likely vehicle: silver hatchback (profile prof_repeat)" in seen[1]["body"]
+    assert seen[1]["content_uri"] == "mxc://example.org/occupied"
+    assert seen[1]["info"] == {"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 9, "h": 7}
 
 
 def test_matrix_delivery_occupied_alert_rejects_invalid_snapshot_source(tmp_path: Path) -> None:

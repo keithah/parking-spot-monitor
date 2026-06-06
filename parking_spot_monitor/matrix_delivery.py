@@ -11,7 +11,6 @@ from parking_spot_monitor.matrix_alerts import (
     OCCUPIED_SPOT_EVENT_TYPE,
     OPEN_SPOT_EVENT_TYPE,
     OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
-    _occupied_snapshot_body,
     format_lifecycle_notice,
     format_live_proof_image_body,
     format_live_proof_text,
@@ -117,11 +116,6 @@ class MatrixDelivery:
                 operation="occupied-alert",
             )
         try:
-            self.client.send_text(
-                room_id=self.room_id,
-                txn_id=f"{event_id}:text",
-                body=format_occupied_spot_alert(event),
-            )
             snapshot = prepare_event_snapshot(
                 source_path=source_path,
                 data_dir=self.data_dir,
@@ -146,7 +140,7 @@ class MatrixDelivery:
             self.client.send_image(
                 room_id=self.room_id,
                 txn_id=f"{event_id}:image",
-                body=_occupied_snapshot_body(spot_id=spot_id, observed_at=observed_at),
+                body=format_occupied_spot_alert(event),
                 content_uri=content_uri,
                 info=upload["info"],
             )
@@ -223,9 +217,10 @@ class MatrixDelivery:
         )
         if self.logger is not None:
             self.logger.info("matrix-live-proof-snapshot-copied", **snapshot.log_context, txn_id=snapshot.txn_id)
+        upload = _matrix_snapshot_upload(snapshot, logger=self.logger)
         content_uri = self.client.upload_image(
             filename=snapshot.filename,
-            data=snapshot.path.read_bytes(),
+            data=upload["data"],
             content_type=JPEG_MIMETYPE,
         )
         return self.client.send_image(
@@ -233,5 +228,5 @@ class MatrixDelivery:
             txn_id=f"{txn_base}:image",
             body=format_live_proof_image_body(observed_at=observed_at),
             content_uri=content_uri,
-            info=snapshot.info,
+            info=upload["info"],
         )

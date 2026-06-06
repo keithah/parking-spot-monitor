@@ -1005,20 +1005,20 @@ def test_runtime_loop_occupied_alert_sends_text_image_with_seeded_vehicle_estima
     active_payload = json.loads(active_files[0].read_text(encoding="utf-8"))
     snapshot_files = list((tmp_path / "snapshots").glob("occupancy-occupied-event-left-spot-*.jpg"))
     assert exit_code == 0
-    assert len(matrix_client.texts) == 3
+    assert len(matrix_client.texts) == 2
     assert len(matrix_client.uploads) == 1
     assert len(matrix_client.images) == 1
     assert len(snapshot_files) == 1
     assert snapshot_files[0].read_bytes() == Path(active_payload["occupied_snapshot_path"]).read_bytes()
     assert matrix_client.uploads[0]["data"] == Path(active_payload["occupied_snapshot_path"]).read_bytes()
     reminder_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("quiet-window-upcoming:")]
-    occupied_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("occupancy-occupied-event:")]
+    occupied_images = [image for image in matrix_client.images if image["txn_id"].startswith("occupancy-occupied-event:")]
     lifecycle_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("parking-monitor-started:")]
     assert len(lifecycle_texts) == 1
     assert len(reminder_texts) == 1
     assert reminder_texts[0]["body"] == "Street sweeping starts in 1 hour: street_sweeping:2026-05-18:13:00-15:00"
-    assert len(occupied_texts) == 1
-    text_body = occupied_texts[0]["body"]
+    assert len(occupied_images) == 1
+    text_body = occupied_images[0]["body"]
     assert "Likely vehicle: Blue Civic (profile prof_civic)" in text_body
     assert "Estimated dwell: 1 hr–1 hr 10 min (typical 1 hr 5 min)" in text_body
     assert "Usual leave window: 8:00 PM–8:15 PM" in text_body
@@ -1179,7 +1179,6 @@ def test_runtime_loop_vehicle_history_final_integrated_regression_includes_reten
     current_closed = [path for path in closed_files if not path.stem.startswith("seed-")]
     health = health_payload(tmp_path / "health.json")
     vehicle_health = health["vehicle_history"]
-    occupied_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("occupancy-occupied-event:")]
     open_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("occupancy-open-event:")]
     occupied_uploads = [upload for upload in matrix_client.uploads if upload["filename"].startswith("occupancy-occupied-event-")]
     open_uploads = [upload for upload in matrix_client.uploads if upload["filename"].startswith("occupancy-open-event-")]
@@ -1200,13 +1199,12 @@ def test_runtime_loop_vehicle_history_final_integrated_regression_includes_reten
     assert current_payload["profile_id"] == source_profile_id
     assert current_payload["profile_confidence"] == pytest.approx(1.0)
 
-    assert len(occupied_texts) == 1
     assert len(open_texts) == 1
     assert len(occupied_uploads) == 1
     assert len(open_uploads) == 1
     assert len(occupied_images) == 1
     assert len(open_images) == 1
-    occupied_body = occupied_texts[0]["body"]
+    occupied_body = occupied_images[0]["body"]
     assert "Likely vehicle: Corrected Fleet (profile prof_source)" in occupied_body
     assert "Estimated dwell: 1 hr–1 hr 10 min (typical 1 hr 5 min)" in occupied_body
     assert "History: 2 samples, estimate confidence low" in occupied_body
@@ -3954,16 +3952,16 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
     output = combined_output(capsys)
     outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
     summary = outbox.status_summary()
-    item = summary["items"][0]
+    item = next(item for item in summary["items"] if item["state"] == "retrying")
     phases = {phase["phase"]: phase for phase in item["phases"]}
 
     assert exit_code == 0
-    assert summary["counts_by_state"] == {"retrying": 1}
+    assert summary["counts_by_state"] == {"delivered": 1, "retrying": 1}
     assert phases["text"]["state"] == "delivered"
     assert phases["upload"]["state"] == "pending"
     assert phases["image"]["state"] == "pending"
     occupancy_text_kinds = [text["txn_id"].split(":", 1)[0] for text in matrix_client.texts if text["txn_id"].startswith("occupancy-")]
-    assert occupancy_text_kinds == ["occupancy-occupied-event", "occupancy-open-event"]
+    assert occupancy_text_kinds == ["occupancy-open-event"]
     assert len(matrix_client.uploads) == 1
     assert matrix_client.uploads[0]["filename"].startswith("occupancy-occupied-event-")
     assert len(matrix_client.images) == 1
@@ -4015,12 +4013,13 @@ def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_eve
     )
 
     output = combined_output(capsys)
-    summary = LocalOutbox(tmp_path / "matrix-outbox.json").status_summary()
-    item = summary["items"][0]
-    phases = {phase["phase"]: phase for phase in item["phases"]}
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    summary = outbox.status_summary()
+    record = next(record for record in outbox.list_records() if record.intent.event_id.startswith("occupancy-open-event:"))
+    phases = {phase: {"state": state} for phase, state in record.phase_states.items()}
 
     assert second_exit == 0
-    assert summary["counts_by_state"] == {"delivered": 1}
+    assert summary["counts_by_state"] == {"delivered": 2}
     assert phases["text"]["state"] == "delivered"
     assert phases["upload"]["state"] == "delivered"
     assert phases["image"]["state"] == "delivered"

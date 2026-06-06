@@ -13,7 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 detector = [
-    "ultralytics>=8",
+    "ultralytics==8.4.60",
 ]
 dev = [
     "pytest>=8",

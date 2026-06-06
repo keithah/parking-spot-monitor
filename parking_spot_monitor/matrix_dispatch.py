@@ -116,6 +116,22 @@ def dispatch_matrix_event(
     if event_name == OCCUPIED_SPOT_EVENT_TYPE:
         txn_id = occupied_spot_event_id(event)
         alert_fields = _occupied_alert_log_fields(event, txn_id=txn_id)
+        enqueue_occupied_alert = getattr(matrix_delivery, "enqueue_occupied_spot_alert", None)
+        if callable(enqueue_occupied_alert):
+            return _attempt_immediate_matrix_send(
+                matrix_delivery,
+                event_name=event_name,
+                event=event,
+                txn_id=txn_id,
+                send=lambda: enqueue_occupied_alert(event),
+                logger=logger,
+                decision_memory_path=decision_memory_path,
+                attempt_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
+                success_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
+                success_memory_outcome="queued",
+                success_memory_reason="outbox_enqueue",
+                process_send_result=lambda result: (event, None, "error"),
+            )
         return _attempt_immediate_matrix_send(
             matrix_delivery,
             event_name=event_name,

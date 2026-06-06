@@ -18,11 +18,14 @@ from parking_monitor.outbox import AlertIntent, LocalOutbox, OutboxRecord
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
 from parking_spot_monitor.matrix import (
     JPEG_MIMETYPE,
+    OCCUPIED_SPOT_EVENT_TYPE,
     OPEN_SPOT_EVENT_TYPE,
     MatrixDelivery,
     MatrixError,
     MatrixSnapshot,
+    format_occupied_spot_alert,
     format_open_spot_alert,
+    occupied_spot_event_id,
     open_spot_event_id,
     prepare_event_snapshot,
 )
@@ -76,15 +79,10 @@ class MatrixOutboxDelivery:
         if callable(close):
             close()
 
-    def send_occupied_spot_alert(self, event: Mapping[str, Any]) -> MatrixSnapshot:
-        """Send occupied alerts through the immediate Matrix path.
+    def send_occupied_spot_alert(self, event: Mapping[str, Any]) -> OutboxRecord:
+        """Persist an occupied alert without performing Matrix network I/O."""
 
-        Open-spot alerts stay durable/outbox-backed; occupied alerts are
-        evidence notifications for vehicle-history session starts and use the
-        existing immediate delivery behavior.
-        """
-
-        return self._immediate_delivery.send_occupied_spot_alert(event)
+        return self.enqueue_occupied_spot_alert(event)
 
     def send_quiet_window_notice(self, event: Mapping[str, Any]) -> str:
         """Send quiet-window notices through the immediate Matrix path."""
@@ -111,31 +109,80 @@ class MatrixOutboxDelivery:
         """Persist a three-phase open-alert record without performing network I/O."""
 
         event_id = open_spot_event_id(event)
-        body = format_open_spot_alert(event)
         metadata = _open_alert_metadata(event)
-        snapshot = self._prepare_retained_snapshot(event=event, event_id=event_id, source_path=str(metadata.get("snapshot_path", "")))
+        return self._enqueue_snapshot_alert(
+            event=event,
+            event_id=event_id,
+            body=format_open_spot_alert(event),
+            metadata=metadata,
+            snapshot_source_path=str(metadata.get("snapshot_path", "")),
+            snapshot_event_type=OPEN_SPOT_EVENT_TYPE,
+            image_body=None,
+            initial_phase="text",
+            followup_phases=("upload", "image"),
+        )
+
+    def enqueue_occupied_spot_alert(self, event: Mapping[str, Any]) -> OutboxRecord:
+        """Persist a three-phase occupied-alert record without performing network I/O."""
+
+        event_id = occupied_spot_event_id(event)
+        metadata = _occupied_alert_metadata(event)
+        return self._enqueue_snapshot_alert(
+            event=event,
+            event_id=event_id,
+            body=format_occupied_spot_alert(event),
+            metadata=metadata,
+            snapshot_source_path=str(metadata.get("occupied_snapshot_path", "")),
+            snapshot_event_type=OCCUPIED_SPOT_EVENT_TYPE,
+            image_body=format_occupied_spot_alert(event),
+            initial_phase="upload",
+            followup_phases=("image",),
+        )
+
+    def _enqueue_snapshot_alert(
+        self,
+        *,
+        event: Mapping[str, Any],
+        event_id: str,
+        body: str,
+        metadata: dict[str, Any],
+        snapshot_source_path: str,
+        snapshot_event_type: str,
+        image_body: str | None,
+        initial_phase: str,
+        followup_phases: tuple[str, ...],
+    ) -> OutboxRecord:
+        snapshot = self._prepare_retained_snapshot(
+            event=event,
+            event_id=event_id,
+            source_path=snapshot_source_path,
+            event_type=snapshot_event_type,
+        )
         metadata.update(
             {
+                "event_type": snapshot_event_type,
                 "retained_snapshot_path": str(snapshot.path),
                 "retained_snapshot_filename": snapshot.filename,
             }
         )
+        if image_body is not None:
+            metadata["image_body"] = image_body
         intent = AlertIntent(
             event_id=event_id,
-            phase="text",
+            phase=initial_phase,
             room_id=self.room_id,
             body=body,
             metadata=metadata,
         )
         record = self.outbox.enqueue(intent)
-        self._log("info", "matrix-outbox-enqueued", item_id=record.id, event_id=event_id, phase="text")
-        # Predeclare all phases before delivery so text success alone cannot make
+        self._log("info", "matrix-outbox-enqueued", item_id=record.id, event_id=event_id, phase=initial_phase)
+        # Predeclare all phases before delivery so one phase alone cannot make
         # the record terminal-delivered.
-        for phase in ("upload", "image"):
+        for phase in followup_phases:
             record = self.outbox.ensure_phase_pending(record.id, phase)
         return record
 
-    def drain_outbox(self, *, record_id: str | None = None) -> MatrixOutboxDrainResult:
+    def drain_outbox(self, *, record_id: str | None = None, max_records: int | None = None) -> MatrixOutboxDrainResult:
         """Drain pending/retrying outbox records, skipping already delivered phases."""
 
         records = [
@@ -143,6 +190,8 @@ class MatrixOutboxDelivery:
             for record in self.outbox.list_records()
             if record.state in {"pending", "retrying"} and (record_id is None or record.id == record_id)
         ]
+        if max_records is not None:
+            records = records[: max(0, int(max_records))]
         self._log("info", "matrix-outbox-drain-started", attempted_count=len(records), item_id=record_id)
         attempted = 0
         delivered = 0
@@ -166,7 +215,7 @@ class MatrixOutboxDelivery:
 
     def _drain_record(self, record: OutboxRecord) -> OutboxRecord:
         current = record
-        for phase in _OPEN_ALERT_PHASES:
+        for phase in _record_delivery_phases(current):
             if current.phase_states.get(phase) == "delivered":
                 self._log("info", "matrix-outbox-phase-skip", item_id=current.id, phase=phase, reason="already_delivered")
                 continue
@@ -233,7 +282,12 @@ class MatrixOutboxDelivery:
         retained_path = str(metadata.get("retained_snapshot_path") or metadata.get("snapshot_path", ""))
         if not retained_path.strip() or not Path(retained_path).is_file():
             raise MatrixError("Matrix retained snapshot evidence is missing", error_type="snapshot_missing_source")
-        snapshot = self._prepare_retained_snapshot(event=metadata, event_id=record.intent.event_id, source_path=retained_path)
+        snapshot = self._prepare_retained_snapshot(
+            event=metadata,
+            event_id=record.intent.event_id,
+            source_path=retained_path,
+            event_type=str(metadata.get("event_type") or OPEN_SPOT_EVENT_TYPE),
+        )
         self._log("info", "matrix-outbox-snapshot-prepared", item_id=record.id, phase="upload", **snapshot.log_context)
         upload = _matrix_snapshot_upload(snapshot, logger=self.logger)
         content_uri = self.client.upload_image(
@@ -248,17 +302,24 @@ class MatrixOutboxDelivery:
             result={
                 "content_uri": content_uri,
                 "filename": snapshot.filename,
-                "body": snapshot.body,
+                "body": str(metadata.get("image_body") or snapshot.body),
                 "info": info,
             },
         )
 
-    def _prepare_retained_snapshot(self, *, event: Mapping[str, Any], event_id: str, source_path: str) -> MatrixSnapshot:
+    def _prepare_retained_snapshot(
+        self,
+        *,
+        event: Mapping[str, Any],
+        event_id: str,
+        source_path: str,
+        event_type: str,
+    ) -> MatrixSnapshot:
         return prepare_event_snapshot(
             source_path=source_path,
             data_dir=self.data_dir,
             snapshots_dir=self.snapshots_dir,
-            event_type=OPEN_SPOT_EVENT_TYPE,
+            event_type=event_type,
             event_id=event_id,
             spot_id=str(event.get("spot_id", "")),
             observed_at=event.get("observed_at"),
@@ -352,6 +413,10 @@ def _transaction_id(record: OutboxRecord, phase: str) -> str:
     return f"{record.intent.event_id}:{phase}"
 
 
+def _record_delivery_phases(record: OutboxRecord) -> tuple[str, ...]:
+    return tuple(phase for phase in _OPEN_ALERT_PHASES if phase in record.phase_states)
+
+
 def _retry_reason(exc: Exception, *, phase: str) -> str:
     return _delivery_failure_reason(exc, phase=phase)
 
@@ -363,6 +428,20 @@ def _open_alert_metadata(event: Mapping[str, Any]) -> dict[str, str]:
         "observed_at": _safe_observed_at(event.get("observed_at")),
         "snapshot_path": redact_diagnostic_text(event.get("snapshot_path", "")),
     }
+
+
+def _occupied_alert_metadata(event: Mapping[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "event_type": OCCUPIED_SPOT_EVENT_TYPE,
+        "spot_id": redact_diagnostic_text(event.get("spot_id", "")),
+        "observed_at": _safe_observed_at(event.get("observed_at")),
+        "occupied_snapshot_path": redact_diagnostic_text(event.get("occupied_snapshot_path", "")),
+    }
+    for key in ("session_id", "profile_id", "source_timestamp"):
+        value = event.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            metadata[key] = value
+    return metadata
 
 
 def _safe_observed_at(value: Any) -> str:

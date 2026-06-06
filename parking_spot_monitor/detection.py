@@ -264,12 +264,33 @@ def filter_spot_detections(
     by_spot: dict[str, SpotDetectionResult] = {}
     rejection_counter: Counter[RejectionReason] = Counter()
     normalized_detections = list(detections)
+    spot_bounds = {spot_id: _polygon_bbox(polygon) for spot_id, polygon in spots.items()}
 
     for spot_id, polygon in spots.items():
         candidates: list[_EvaluatedCandidate] = []
         rejected: list[RejectedDetection] = []
+        spot_bbox = spot_bounds[spot_id]
 
         for vehicle in normalized_detections:
+            if vehicle.class_name not in allowed_class_set:
+                rejected_detection = _basic_rejection(vehicle, spot_id=spot_id, reason=RejectionReason.CLASS_NOT_ALLOWED)
+                rejected.append(rejected_detection)
+                rejection_counter[rejected_detection.reason] += 1
+                continue
+            membership_bbox = _lower_half_bbox(vehicle.bbox)
+            if not _bboxes_intersect(membership_bbox, spot_bbox):
+                area = bbox_area(vehicle.bbox)
+                rejected_detection = RejectedDetection(
+                    spot_id=spot_id,
+                    detection=vehicle,
+                    reason=RejectionReason.CENTROID_OUTSIDE,
+                    bbox_area_px=area,
+                    centroid=bbox_centroid(membership_bbox),
+                    overlap_ratio=0.0,
+                )
+                rejected.append(rejected_detection)
+                rejection_counter[rejected_detection.reason] += 1
+                continue
             candidate_or_rejection = _evaluate_detection_for_spot(
                 vehicle,
                 spot_id=spot_id,
@@ -297,6 +318,36 @@ def filter_spot_detections(
     return DetectionFilterResult(by_spot=by_spot, rejection_counts=dict(rejection_counter))
 
 
+def _basic_rejection(detection: VehicleDetection, *, spot_id: str, reason: RejectionReason) -> RejectedDetection:
+    area = bbox_area(detection.bbox)
+    membership_bbox = _lower_half_bbox(detection.bbox)
+    return RejectedDetection(
+        spot_id=spot_id,
+        detection=detection,
+        reason=reason,
+        bbox_area_px=area,
+        centroid=bbox_centroid(membership_bbox),
+        overlap_ratio=0.0,
+    )
+
+
+def _polygon_bbox(polygon: PolygonInput) -> BBoxTuple:
+    points = [_point_xy(point) for point in polygon]
+    return (min(x for x, _ in points), min(y for _, y in points), max(x for x, _ in points), max(y for _, y in points))
+
+
+def _point_xy(point: Any) -> tuple[float, float]:
+    if hasattr(point, "x") and hasattr(point, "y"):
+        return (float(point.x), float(point.y))
+    return (float(point[0]), float(point[1]))
+
+
+def _bboxes_intersect(first: Sequence[float], second: Sequence[float]) -> bool:
+    first_x_min, first_y_min, first_x_max, first_y_max = (float(value) for value in first)
+    second_x_min, second_y_min, second_x_max, second_y_max = (float(value) for value in second)
+    return first_x_min <= second_x_max and first_x_max >= second_x_min and first_y_min <= second_y_max and first_y_max >= second_y_min
+
+
 def _evaluate_detection_for_spot(
     detection: VehicleDetection,
     *,
@@ -316,11 +367,11 @@ def _evaluate_detection_for_spot(
     centroid_inside = point_in_polygon(centroid, polygon)
     overlap_ratio = bbox_polygon_overlap_ratio(membership_bbox, polygon) if centroid_inside else 0.0
 
-    if detection.class_name not in allowed_classes:
+    if area < min_bbox_area_px:
         return RejectedDetection(
             spot_id=spot_id,
             detection=detection,
-            reason=RejectionReason.CLASS_NOT_ALLOWED,
+            reason=RejectionReason.AREA_TOO_SMALL,
             bbox_area_px=area,
             centroid=centroid,
             overlap_ratio=overlap_ratio,
@@ -330,15 +381,6 @@ def _evaluate_detection_for_spot(
             spot_id=spot_id,
             detection=detection,
             reason=RejectionReason.CONFIDENCE_TOO_LOW,
-            bbox_area_px=area,
-            centroid=centroid,
-            overlap_ratio=overlap_ratio,
-        )
-    if area < min_bbox_area_px:
-        return RejectedDetection(
-            spot_id=spot_id,
-            detection=detection,
-            reason=RejectionReason.AREA_TOO_SMALL,
             bbox_area_px=area,
             centroid=centroid,
             overlap_ratio=overlap_ratio,

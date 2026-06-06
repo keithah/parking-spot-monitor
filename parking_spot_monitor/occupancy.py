@@ -306,9 +306,11 @@ def _spot_ids(
     configured_spot_ids: Sequence[str] | None,
 ) -> list[str]:
     ordered: list[str] = []
+    seen: set[str] = set()
     for source in (configured_spot_ids or (), previous_state.keys(), candidates_by_spot.keys()):
         for spot_id in source:
-            if spot_id not in ordered:
+            if spot_id not in seen:
+                seen.add(spot_id)
                 ordered.append(spot_id)
     return ordered
 

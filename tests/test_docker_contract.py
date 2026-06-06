@@ -56,7 +56,7 @@ def test_dockerfile_installs_runtime_and_defaults_to_package_entrypoint() -> Non
     assert "COPY requirements.txt ./" in dockerfile
     assert "pip install --no-cache-dir -r requirements.txt" in dockerfile
     assert "ultralytics>=8" not in requirements
-    assert "ultralytics>=8" in detector_requirements
+    assert "ultralytics==" in detector_requirements
     base_stage, detector_stage = dockerfile.split("FROM runtime-base AS runtime-detector", 1)
     assert "requirements-detector.txt" not in base_stage
     assert "COPY requirements-detector.txt ./" in detector_stage
@@ -184,7 +184,7 @@ def test_readme_documents_local_yolo_detection_and_deferred_live_tuning() -> Non
     readme = Path("README.md").read_text(encoding="utf-8")
 
     assert "## Local YOLO detection" in readme
-    assert "ultralytics>=8" in readme
+    assert "pins Ultralytics" in readme
     assert "runtime-base" in readme
     assert "runtime-detector" in readme
     assert "YOLO nano" in readme

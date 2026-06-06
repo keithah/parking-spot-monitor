@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from scripts.closeout_helpers import assert_no_forbidden_markers, bounded_text, redact_text, safe_output, smoke_env
+
 ROOT = Path(__file__).resolve().parents[1]
 TIMEOUT_SECONDS = 180
 DOCKER_TIMEOUT_SECONDS = 300
@@ -131,52 +133,23 @@ def _build_commands(temp_data_dir: Path) -> tuple[SmokeCommand, ...]:
 
 
 def _smoke_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
-    env = dict(os.environ if base is None else base)
-    env["RTSP_URL"] = PLACEHOLDER_RTSP_URL
-    env["MATRIX_ACCESS_TOKEN"] = PLACEHOLDER_MATRIX_TOKEN
-    return env
+    return smoke_env(rtsp_placeholder=PLACEHOLDER_RTSP_URL, matrix_token_placeholder=PLACEHOLDER_MATRIX_TOKEN, base=base)
 
 
 def _redact(text: str) -> str:
-    redacted = text
-    for pattern in SENSITIVE_PATTERNS:
-        if pattern.groups >= 3:
-            redacted = pattern.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", redacted)
-        else:
-            redacted = pattern.sub("<redacted>", redacted)
-    return redacted
+    return redact_text(text, SENSITIVE_PATTERNS)
 
 
 def _bounded(text: str, *, limit: int = OUTPUT_LIMIT) -> str:
-    if len(text) <= limit:
-        return text
-    marker = f"... <{len(text) - limit} chars omitted> ...\n"
-    tail_limit = max(0, limit - len(marker))
-    return f"{marker}{text[-tail_limit:]}"
+    return bounded_text(text, limit=limit)
 
 
 def _safe_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
-    def decode(value: str | bytes | None) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, bytes):
-            return value.decode("utf-8", errors="replace")
-        return value
-
-    rendered = ""
-    out = decode(stdout)
-    err = decode(stderr)
-    if out:
-        rendered += f"stdout:\n{out}"
-    if err:
-        rendered += f"\nstderr:\n{err}"
-    return _bounded(_redact(rendered.strip()))
+    return safe_output(stdout, stderr, patterns=SENSITIVE_PATTERNS, limit=OUTPUT_LIMIT)
 
 
 def _assert_no_forbidden_markers(rendered: str) -> None:
-    for marker in FORBIDDEN_OUTPUT_MARKERS:
-        if marker in rendered:
-            raise RuntimeError(f"redaction failure for marker: {marker}")
+    assert_no_forbidden_markers(rendered, FORBIDDEN_OUTPUT_MARKERS)
 
 
 def _run_command(command: SmokeCommand, *, env: Mapping[str, str]) -> int:

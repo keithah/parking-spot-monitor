@@ -109,25 +109,44 @@ def make_delivery(
     )
 
 
-def test_occupied_alert_sends_immediately_without_open_outbox_record(tmp_path: Path) -> None:
+def test_occupied_alert_queues_image_outbox_record_without_network(tmp_path: Path) -> None:
     source = tmp_path / "occupied.jpg"
-    source_bytes = write_jpeg(source, color=(110, 25, 80))
+    write_jpeg(source, color=(110, 25, 80))
     client = FakeMatrixClient()
     delivery = make_delivery(tmp_path, client)
 
-    snapshot = delivery.send_occupied_spot_alert(occupied_event(source))
+    record = delivery.send_occupied_spot_alert(occupied_event(source))
 
-    assert [call["kind"] for call in client.calls] == ["text", "upload", "image"]
-    assert client.calls[0]["txn_id"].startswith("occupancy-occupied-event:left_spot:")
-    assert client.calls[0]["txn_id"].endswith(":text")
-    assert client.calls[1]["filename"].startswith("occupancy-occupied-event-left-spot-")
-    assert client.calls[1]["data"] == source_bytes
-    assert client.calls[1]["content_type"] == "image/jpeg"
-    assert client.calls[2]["txn_id"].startswith("occupancy-occupied-event:left_spot:")
-    assert client.calls[2]["txn_id"].endswith(":image")
-    assert snapshot.path.exists()
-    assert snapshot.path.name.startswith("occupancy-occupied-event-left-spot-")
-    assert LocalOutbox(tmp_path / "matrix-outbox.json").list_records() == []
+    assert client.calls == []
+    assert record.phase_states == {"upload": "pending", "image": "pending"}
+    [persisted] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
+    assert persisted.id == record.id
+    assert persisted.intent.event_id.startswith("occupancy-occupied-event:left_spot:")
+    assert persisted.intent.body.startswith("Parking spot occupied: left_spot")
+    assert persisted.intent.phase == "upload"
+    assert str(persisted.intent.metadata["event_type"]) == "occupancy-occupied-event"
+    assert str(persisted.intent.metadata["image_body"]).startswith("Parking spot occupied: left_spot")
+    retained_path = Path(str(persisted.intent.metadata["retained_snapshot_path"]))
+    assert retained_path.exists()
+    assert retained_path.name.startswith("occupancy-occupied-event-left-spot-")
+
+
+def test_occupied_alert_drains_as_single_image_message_with_alert_body(tmp_path: Path) -> None:
+    source = tmp_path / "occupied.jpg"
+    write_jpeg(source, color=(110, 25, 80))
+    client = FakeMatrixClient()
+    delivery = make_delivery(tmp_path, client)
+    event = occupied_event(source)
+
+    delivery.enqueue_occupied_spot_alert(event)
+    result = delivery.drain_outbox()
+
+    assert result.delivered_count == 1
+    assert [call["kind"] for call in client.calls] == ["upload", "image"]
+    image_call = client.calls[1]
+    assert image_call["body"] == "Parking spot occupied: left_spot at 2026-05-20 2:22:54 PM PDT"
+    [persisted] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
+    assert persisted.phase_states == {"upload": "delivered", "image": "delivered"}
 
 
 def test_matrix_outbox_delivery_close_closes_owned_client(tmp_path: Path) -> None:
@@ -218,6 +237,33 @@ def test_occupied_alert_retention_preserves_retryable_open_outbox_evidence(tmp_p
 
     assert protected_path.exists()
     assert protected_path.read_bytes() == first_bytes
+
+
+def test_drain_outbox_respects_max_records_budget(tmp_path: Path) -> None:
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.jpg"
+    write_jpeg(first, color=(25, 50, 75))
+    write_jpeg(second, color=(90, 20, 120))
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    delivery.enqueue_open_spot_alert(open_event(first))
+    delivery.enqueue_occupied_spot_alert(occupied_event(second))
+
+    drain_client = FakeMatrixClient()
+    limited = MatrixOutboxDelivery(
+        client=drain_client,
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(tmp_path / "matrix-outbox.json"),
+    )
+
+    result = limited.drain_outbox(max_records=1)
+
+    assert result.attempted_count == 1
+    assert result.delivered_count == 1
+    assert [call["kind"] for call in drain_client.calls] == ["text", "upload", "image"]
+    records = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
+    assert [record.state for record in records] == ["delivered", "pending"]
 
 
 def test_snapshot_retention_preserves_retryable_outbox_evidence_while_pruning_unprotected(tmp_path: Path) -> None:

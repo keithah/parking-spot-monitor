@@ -33,6 +33,8 @@ from parking_spot_monitor.state import load_runtime_state
 from parking_spot_monitor.timeline_buffer import record_timeline_frame
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
+MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION = 1
+
 
 def drain_matrix_outbox_if_available(
     matrix_delivery: Any | None,
@@ -40,13 +42,19 @@ def drain_matrix_outbox_if_available(
     logger: StructuredLogger,
     iteration: int,
     trigger: str,
+    max_records: int | None = None,
 ) -> dict[str, Any] | None:
     drain = getattr(matrix_delivery, "drain_outbox", None)
     if drain is None or not callable(drain):
         return None
     logger.info("matrix-outbox-runtime-drain-attempt", trigger=trigger, iteration=iteration)
     try:
-        result = drain()
+        try:
+            result = drain(max_records=max_records) if max_records is not None else drain()
+        except TypeError:
+            if max_records is None:
+                raise
+            result = drain()
     except Exception as exc:
         context = safe_error_context(
             "matrix-outbox",
@@ -160,7 +168,13 @@ def run_capture_loop(
             iteration += 1
             logger.info("capture-loop-iteration", iteration=iteration, data_dir=str(data_dir))
             try:
-                outbox_error = drain_matrix_outbox_if_available(matrix_delivery, logger=logger, iteration=iteration, trigger="iteration")
+                outbox_error = drain_matrix_outbox_if_available(
+                    matrix_delivery,
+                    logger=logger,
+                    iteration=iteration,
+                    trigger="iteration",
+                    max_records=MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION,
+                )
                 health_state.record_matrix_result(outbox_error)
                 result = capture(settings, data_dir)
                 health_state.record_capture_success(timestamp=result.timestamp, selected_mode=result.selected_mode)

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import subprocess
@@ -14,6 +13,8 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.verification_helpers import load_result_json
 
 CONFIG_PATH = Path("config.yaml")
 DATA_DIR = Path("data")
@@ -121,15 +122,7 @@ class VerificationOutcome:
 
 
 def _load_result(path: Path) -> dict[str, Any]:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise VerificationError("result JSON is missing") from exc
-    except json.JSONDecodeError as exc:
-        raise VerificationError("result JSON is malformed") from exc
-    if not isinstance(raw, dict):
-        raise VerificationError("result JSON must be an object")
-    return raw
+    return load_result_json(path, VerificationError)
 
 
 def normalize_result_contract(result: Mapping[str, Any]) -> dict[str, Any]:

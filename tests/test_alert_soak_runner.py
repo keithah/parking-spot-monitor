@@ -259,7 +259,7 @@ def test_success_parses_organic_alerts_validates_jpegs_and_matrix_readback(tmp_p
     assert result["room_readback_status"] == "verified"
     assert result["health_summary"]["parse_ok"] is True
     assert result["state_summary"]["parse_ok"] is True
-    assert result["aliases"] if False else result["alerts"] == result["alert_summary"]
+    assert result["alerts"] == result["alert_summary"]
 
 
 
