@@ -12,6 +12,8 @@ def load_result_json(path: Path, error_type: type[VerificationErrorT]) -> dict[s
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise error_type("result JSON is missing") from exc
+    except OSError as exc:
+        raise error_type("result JSON cannot be read") from exc
     except json.JSONDecodeError as exc:
         raise error_type("result JSON is malformed") from exc
     if not isinstance(raw, dict):

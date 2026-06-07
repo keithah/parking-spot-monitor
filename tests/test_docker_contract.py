@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -45,6 +46,8 @@ def test_dockerfile_installs_runtime_and_defaults_to_package_entrypoint() -> Non
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     requirements = Path("requirements.txt").read_text(encoding="utf-8")
     detector_requirements = Path("requirements-detector.txt").read_text(encoding="utf-8")
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    detector_extra = pyproject["project"]["optional-dependencies"]["detector"]
 
     assert "FROM python:3.12-slim" in dockerfile or "FROM python:3.11-slim" in dockerfile
     assert "ffmpeg" in dockerfile
@@ -57,6 +60,7 @@ def test_dockerfile_installs_runtime_and_defaults_to_package_entrypoint() -> Non
     assert "pip install --no-cache-dir -r requirements.txt" in dockerfile
     assert "ultralytics>=8" not in requirements
     assert "ultralytics==" in detector_requirements
+    assert detector_extra == [line.strip() for line in detector_requirements.splitlines() if line.strip()]
     base_stage, detector_stage = dockerfile.split("FROM runtime-base AS runtime-detector", 1)
     assert "requirements-detector.txt" not in base_stage
     assert "COPY requirements-detector.txt ./" in detector_stage

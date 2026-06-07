@@ -154,7 +154,7 @@ def prepare_event_snapshot(
         if copied_snapshot:
             try:
                 destination.unlink()
-            except FileNotFoundError:
+            except OSError:
                 pass
         raise MatrixError(
             "Matrix snapshot metadata could not be read as JPEG",

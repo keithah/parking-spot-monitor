@@ -494,4 +494,7 @@ def test_vehicle_history_corrections_do_not_use_asserts_for_event_field_narrowin
             return isinstance(value.value, ast.Name) and value.value.id == "event"
         return False
 
-    assert not any(isinstance(node, ast.Assert) and accesses_event(node.test) for node in ast.walk(tree))
+    assert not any(
+        isinstance(node, ast.Assert) and any(accesses_event(child) for child in ast.walk(node.test))
+        for node in ast.walk(tree)
+    )

@@ -4,6 +4,8 @@ import os
 import re
 from collections.abc import Mapping, Sequence
 
+_SAFE_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TEMP", "TMP")
+
 
 def smoke_env(
     *,
@@ -12,7 +14,7 @@ def smoke_env(
     base: Mapping[str, str] | None = None,
     pythonpath_prefix: str | None = None,
 ) -> dict[str, str]:
-    env = dict(os.environ if base is None else base)
+    env = dict(base) if base is not None else {key: os.environ[key] for key in _SAFE_ENV_KEYS if key in os.environ}
     env["RTSP_URL"] = rtsp_placeholder
     env["MATRIX_ACCESS_TOKEN"] = matrix_token_placeholder
     if pythonpath_prefix is not None:
@@ -32,10 +34,14 @@ def redact_text(text: str, patterns: Sequence[re.Pattern[str]]) -> str:
 
 
 def bounded_text(text: str, *, limit: int) -> str:
+    if limit <= 0:
+        return ""
     if len(text) <= limit:
         return text
     marker = f"... <{len(text) - limit} chars omitted> ...\n"
-    tail_limit = max(0, limit - len(marker))
+    if len(marker) >= limit:
+        return marker[:limit]
+    tail_limit = limit - len(marker)
     return f"{marker}{text[-tail_limit:]}"
 
 
