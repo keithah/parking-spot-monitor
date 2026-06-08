@@ -7,9 +7,6 @@ import os
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -23,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from parking_spot_monitor.logging import redact_diagnostic_text
 from scripts.hardware_decode_evidence import collect_hardware_decode_summary
+from scripts.matrix_readback import fetch_matrix_room_messages
 
 CONFIG_PATH = Path("config.yaml")
 DATA_DIR = Path("data")
@@ -490,22 +488,6 @@ def _check_room_readback(
     status = "verified" if text_found and image_found else "gap"
     reason = None if status == "verified" else "live_proof_messages_not_found"
     return {"status": status, "reason": reason, "text_found": text_found, "image_found": image_found, "inspected_count": inspected_count}
-
-
-def fetch_matrix_room_messages(*, homeserver: str, room_id: str, access_token: str, timeout_seconds: float, limit: int = 20) -> dict[str, Any]:
-    room_segment = urllib.parse.quote(room_id, safe="")
-    query = urllib.parse.urlencode({"dir": "b", "limit": max(1, int(limit))})
-    url = f"{homeserver.rstrip('/')}/_matrix/client/v3/rooms/{room_segment}/messages?{query}"
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310 - operator-provided homeserver
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"matrix_readback_http_{exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError("matrix_readback_unavailable") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError("matrix_readback_malformed_json") from exc
 
 
 def _redact_proof_text(text: str, *, secrets: Sequence[str]) -> tuple[str, int]:

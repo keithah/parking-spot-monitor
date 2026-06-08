@@ -257,7 +257,7 @@ def _validate_jpeg_output(
     duration_seconds: float,
 ) -> int:
     try:
-        payload = output_path.read_bytes()
+        byte_size = output_path.stat().st_size
     except OSError as exc:
         raise _failure(
             "output-missing",
@@ -267,7 +267,7 @@ def _validate_jpeg_output(
             secrets=secrets,
             duration_seconds=duration_seconds,
         ) from exc
-    if not payload:
+    if byte_size <= 0:
         raise _failure(
             "output-empty",
             mode,
@@ -276,7 +276,23 @@ def _validate_jpeg_output(
             secrets=secrets,
             duration_seconds=duration_seconds,
         )
-    if not (payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9")):
+    try:
+        with output_path.open("rb") as handle:
+            prefix = handle.read(2)
+            suffix = b""
+            if byte_size >= 2:
+                handle.seek(-2, 2)
+                suffix = handle.read(2)
+    except OSError as exc:
+        raise _failure(
+            "output-missing",
+            mode,
+            output_path,
+            f"ffmpeg did not produce readable output: {exc}",
+            secrets=secrets,
+            duration_seconds=duration_seconds,
+        ) from exc
+    if not (prefix == b"\xff\xd8" and suffix == b"\xff\xd9"):
         raise _failure(
             "output-invalid-jpeg",
             mode,
@@ -285,7 +301,7 @@ def _validate_jpeg_output(
             secrets=secrets,
             duration_seconds=duration_seconds,
         )
-    return len(payload)
+    return byte_size
 
 
 def _failure(

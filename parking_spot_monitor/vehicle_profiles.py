@@ -187,9 +187,7 @@ def match_vehicle_profile(
             reason="no-candidates",
         )
 
-    scored = sorted((score_match_candidate(descriptor, profile) for profile in candidates), key=lambda item: item.distance)
-    best = scored[0]
-    second = scored[1] if len(scored) > 1 else None
+    best, second = _best_two_match_candidates(descriptor, candidates)
     best_separation = math.inf if second is None else second.distance - best.distance
 
     if best.distance <= match_distance_threshold and best.confidence >= min_match_confidence:
@@ -233,6 +231,24 @@ def match_vehicle_profile(
         best_candidate=best,
         second_candidate=second,
     )
+
+
+def _best_two_match_candidates(
+    descriptor: VehicleDescriptor,
+    candidates: Sequence[ProfileLike],
+) -> tuple[MatchCandidate, MatchCandidate | None]:
+    best: MatchCandidate | None = None
+    second: MatchCandidate | None = None
+    for profile in candidates:
+        scored = score_match_candidate(descriptor, profile)
+        if best is None or scored.distance < best.distance:
+            second = best
+            best = scored
+        elif second is None or scored.distance < second.distance:
+            second = scored
+    if best is None:
+        raise ValueError("at least one candidate is required")
+    return best, second
 
 
 def _normalized_rgb_histogram(image: Image.Image) -> tuple[float, ...]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 from typing import Sequence
+from unittest.mock import patch
 
 import pytest
 
@@ -102,6 +103,20 @@ def test_capture_latest_returns_result_shape_after_valid_jpeg_write(tmp_path: Pa
     assert result.duration_seconds >= 0
     assert result.byte_size == len(jpeg_bytes())
     assert calls and isinstance(calls[0], list)
+
+
+def test_capture_validation_reads_only_jpeg_edges_not_full_payload(tmp_path: Path) -> None:
+    settings = fake_settings()
+    payload = b"\xff\xd8" + (b"x" * 1024) + b"\xff\xd9"
+
+    def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        Path(argv[-1]).write_bytes(payload)
+        return subprocess.CompletedProcess(argv, 0, stderr="captured frame")
+
+    with patch.object(Path, "read_bytes", side_effect=AssertionError("capture validation should not read entire JPEG")):
+        result = capture_latest(settings, tmp_path, modes=[DecodeMode.SOFTWARE], runner=runner)
+
+    assert result.byte_size == len(payload)
 
 
 def test_capture_latest_falls_back_from_hardware_failures_to_software_success(tmp_path: Path) -> None:

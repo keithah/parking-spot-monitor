@@ -399,7 +399,7 @@ def test_archive_health_scan_errors_are_non_blocking_and_safely_recorded(tmp_pat
     def fail_archive_stats(directory: Path) -> tuple[int, int]:
         raise OSError("rtsp://camera.local/stream access_token=supersecret raw_image_bytes")
 
-    monkeypatch.setattr("parking_spot_monitor.vehicle_history._archive_directory_stats", fail_archive_stats)
+    monkeypatch.setattr("parking_spot_monitor.vehicle_history_maintenance._archive_directory_stats", fail_archive_stats)
 
     snapshot = archive.health_snapshot()
 
@@ -821,7 +821,7 @@ def test_match_or_create_profile_does_not_update_owner_profile_for_low_confidenc
             reason="forced-low-confidence-owner-match",
         )
 
-    monkeypatch.setattr("parking_spot_monitor.vehicle_history.match_vehicle_profile", low_confidence_owner_match)
+    monkeypatch.setattr("parking_spot_monitor.vehicle_history_profiles._match_vehicle_profile", low_confidence_owner_match)
 
     assignment = archive.match_or_create_profile(session_id=candidate.session_id)
 
@@ -935,22 +935,22 @@ def test_estimate_for_profile_uses_closed_matching_sessions_and_excludes_weak_or
     archive = VehicleHistoryArchive(tmp_path)
     first = archive.start_session(occupied_event(spot_id="estimate-a", observed_at="2026-05-18T08:00:00Z"))
     archive.close_session(open_event(spot_id="estimate-a", observed_at="2026-05-18T09:00:00Z"))
-    set_session_profile(tmp_path, archive_state="closed", session_id=first.session_id, profile_id="prof-repeat", profile_confidence=0.96)
+    set_session_profile(tmp_path, archive_state="closed", session_id=first.session_id, profile_id="prof_repeat", profile_confidence=0.96)
     second = archive.start_session(occupied_event(spot_id="estimate-b", observed_at="2026-05-19T08:10:00Z"))
     archive.close_session(open_event(spot_id="estimate-b", observed_at="2026-05-19T09:15:00Z"))
-    set_session_profile(tmp_path, archive_state="closed", session_id=second.session_id, profile_id="prof-repeat", profile_confidence=0.92)
+    set_session_profile(tmp_path, archive_state="closed", session_id=second.session_id, profile_id="prof_repeat", profile_confidence=0.92)
     weak = archive.start_session(occupied_event(spot_id="estimate-weak", observed_at="2026-05-20T08:00:00Z"))
     archive.close_session(open_event(spot_id="estimate-weak", observed_at="2026-05-20T22:00:00Z"))
-    set_session_profile(tmp_path, archive_state="closed", session_id=weak.session_id, profile_id="prof-repeat", profile_confidence=0.40)
+    set_session_profile(tmp_path, archive_state="closed", session_id=weak.session_id, profile_id="prof_repeat", profile_confidence=0.40)
     other = archive.start_session(occupied_event(spot_id="estimate-other", observed_at="2026-05-21T01:00:00Z"))
     archive.close_session(open_event(spot_id="estimate-other", observed_at="2026-05-21T23:00:00Z"))
-    set_session_profile(tmp_path, archive_state="closed", session_id=other.session_id, profile_id="prof-other", profile_confidence=0.99)
+    set_session_profile(tmp_path, archive_state="closed", session_id=other.session_id, profile_id="prof_other", profile_confidence=0.99)
 
-    result = archive.estimate_for_profile("prof-repeat")
+    result = archive.estimate_for_profile("prof_repeat")
 
     assert result.status == "estimated"
     assert result.reason is None
-    assert result.profile_id == "prof-repeat"
+    assert result.profile_id == "prof_repeat"
     assert result.sample_count == 2
     assert result.dwell_range is not None
     assert result.dwell_range.lower_seconds <= 3600
@@ -964,10 +964,10 @@ def test_estimate_for_profile_unknown_or_sparse_profile_returns_insufficient_his
     archive = VehicleHistoryArchive(tmp_path)
     closed = archive.start_session(occupied_event(spot_id="sparse", observed_at="2026-05-18T08:00:00Z"))
     archive.close_session(open_event(spot_id="sparse", observed_at="2026-05-18T09:00:00Z"))
-    set_session_profile(tmp_path, archive_state="closed", session_id=closed.session_id, profile_id="prof-repeat", profile_confidence=0.96)
+    set_session_profile(tmp_path, archive_state="closed", session_id=closed.session_id, profile_id="prof_repeat", profile_confidence=0.96)
 
     unknown = archive.estimate_for_profile(None)
-    sparse = archive.estimate_for_profile("prof-repeat")
+    sparse = archive.estimate_for_profile("prof_repeat")
 
     assert unknown.status == "insufficient_history"
     assert unknown.reason == "unknown-profile"
@@ -975,7 +975,7 @@ def test_estimate_for_profile_unknown_or_sparse_profile_returns_insufficient_his
     assert unknown.sample_count == 0
     assert sparse.status == "insufficient_history"
     assert sparse.reason == "insufficient-samples"
-    assert sparse.profile_id == "prof-repeat"
+    assert sparse.profile_id == "prof_repeat"
     assert sparse.sample_count == 1
 
 
@@ -983,15 +983,15 @@ def test_estimate_for_session_uses_active_profile_but_never_counts_active_sessio
     archive = VehicleHistoryArchive(tmp_path)
     historical = archive.start_session(occupied_event(spot_id="historical", observed_at="2026-05-18T08:00:00Z"))
     archive.close_session(open_event(spot_id="historical", observed_at="2026-05-18T09:00:00Z"))
-    set_session_profile(tmp_path, archive_state="closed", session_id=historical.session_id, profile_id="prof-repeat", profile_confidence=0.96)
+    set_session_profile(tmp_path, archive_state="closed", session_id=historical.session_id, profile_id="prof_repeat", profile_confidence=0.96)
     active = archive.start_session(occupied_event(spot_id="current", observed_at="2026-05-19T08:00:00Z"))
-    set_session_profile(tmp_path, archive_state="active", session_id=active.session_id, profile_id="prof-repeat", profile_confidence=1.0)
+    set_session_profile(tmp_path, archive_state="active", session_id=active.session_id, profile_id="prof_repeat", profile_confidence=1.0)
 
     result = archive.estimate_for_session(active.session_id)
 
     assert result.status == "insufficient_history"
     assert result.reason == "insufficient-samples"
-    assert result.profile_id == "prof-repeat"
+    assert result.profile_id == "prof_repeat"
     assert result.sample_count == 1
 
 
@@ -1017,18 +1017,18 @@ def test_estimate_helpers_preserve_closed_session_quarantine_and_module_convenie
     archive = VehicleHistoryArchive(tmp_path, logger=setup_logging(stream=stream))
     first = archive.start_session(occupied_event(spot_id="valid-a", observed_at="2026-05-18T08:00:00Z"))
     archive.close_session(open_event(spot_id="valid-a", observed_at="2026-05-18T09:00:00Z"))
-    set_session_profile(tmp_path, archive_state="closed", session_id=first.session_id, profile_id="prof-repeat", profile_confidence=0.96)
+    set_session_profile(tmp_path, archive_state="closed", session_id=first.session_id, profile_id="prof_repeat", profile_confidence=0.96)
     second = archive.start_session(occupied_event(spot_id="valid-b", observed_at="2026-05-19T08:00:00Z"))
     archive.close_session(open_event(spot_id="valid-b", observed_at="2026-05-19T09:05:00Z"))
-    set_session_profile(tmp_path, archive_state="closed", session_id=second.session_id, profile_id="prof-repeat", profile_confidence=0.96)
+    set_session_profile(tmp_path, archive_state="closed", session_id=second.session_id, profile_id="prof_repeat", profile_confidence=0.96)
     active = archive.start_session(occupied_event(spot_id="current", observed_at="2026-05-20T08:00:00Z"))
-    set_session_profile(tmp_path, archive_state="active", session_id=active.session_id, profile_id="prof-repeat", profile_confidence=1.0)
+    set_session_profile(tmp_path, archive_state="active", session_id=active.session_id, profile_id="prof_repeat", profile_confidence=1.0)
     bad_path = tmp_path / "vehicle-history" / "sessions" / "closed" / "broken.json"
     bad_path.write_text("{not-json rtsp://camera.local access_token=supersecret raw_image_bytes")
 
-    profile_result = archive.estimate_for_profile("prof-repeat")
+    profile_result = archive.estimate_for_profile("prof_repeat")
     session_result = estimate_session_history(tmp_path, session_id=active.session_id)
-    module_profile_result = estimate_profile_history(tmp_path, profile_id="prof-repeat")
+    module_profile_result = estimate_profile_history(tmp_path, profile_id="prof_repeat")
     snapshot = archive.health_snapshot()
 
     assert profile_result.status == "estimated"
@@ -1139,12 +1139,14 @@ def test_malformed_correction_jsonl_is_quarantined_and_health_reports_metadata(t
     archive.write_matrix_cursor({"next_batch": "s123"})
 
     loaded = archive.load_corrections()
+    loaded_again = archive.load_corrections()
     snapshot = archive.health_snapshot()
 
     assert [event.action for event in loaded] == ["rename_profile"]
+    assert [event.action for event in loaded_again] == ["rename_profile"]
     assert snapshot["correction_count"] == 1
-    assert snapshot["correction_invalid_count"] >= 1
-    assert snapshot["correction_quarantine_count"] >= 1
+    assert snapshot["correction_invalid_count"] == 1
+    assert snapshot["correction_quarantine_count"] == 1
     assert snapshot["last_correction_action"] == "rename_profile"
     assert snapshot["last_correction_created_at"] is not None
     assert snapshot["matrix_command_cursor_present"] is True
@@ -1248,6 +1250,65 @@ def test_prune_closed_sessions_dry_run_apply_and_reference_safety(tmp_path: Path
     assert (tmp_path / "vehicle-history" / "sessions" / "active" / f"{active.session_id}.json").exists()
     assert (tmp_path / "vehicle-history" / "sessions" / "closed" / f"{retained.session_id}.json").exists()
     assert archive.health_snapshot()["last_maintenance_metadata"]["operation"] == "prune"
+
+
+def test_prune_closed_sessions_deduplicates_image_refs_without_list_membership_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import parking_spot_monitor.vehicle_history_maintenance as maintenance
+
+    class HashOnlyPath:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def __fspath__(self) -> str:
+            return os.fspath(self.path)
+
+        def __hash__(self) -> int:
+            return hash(self.path)
+
+        def __eq__(self, other: object) -> bool:
+            raise AssertionError("deduplication should use a hash set, not repeated list membership")
+
+        def stat(self) -> os.stat_result:
+            return self.path.stat()
+
+        def is_file(self) -> bool:
+            return self.path.is_file()
+
+        def unlink(self, *, missing_ok: bool = False) -> None:
+            self.path.unlink(missing_ok=missing_ok)
+
+    archive = VehicleHistoryArchive(tmp_path)
+    old = archive.start_session(occupied_event(spot_id="old", observed_at="2026-01-01T08:00:00Z"))
+    archive.close_session(open_event(spot_id="old", observed_at="2026-01-01T09:00:00Z"))
+    image_path = tmp_path / "vehicle-history" / "images" / "occupied-full" / "old.jpg"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(b"old image")
+    monkeypatch.setattr(maintenance, "_record_archive_image_paths", lambda root, record: [HashOnlyPath(image_path), HashOnlyPath(image_path)])
+
+    result = archive.prune_closed_sessions(older_than="2026-02-01T00:00:00Z", dry_run=True)
+
+    assert result.pruned_file_count == 2
+
+
+def test_resolve_profile_id_uses_provided_merge_mapping_without_copying(tmp_path: Path) -> None:
+    class LookupOnlyMerges:
+        def __contains__(self, key: object) -> bool:
+            return key == "prof_source"
+
+        def __getitem__(self, key: str) -> str:
+            if key == "prof_source":
+                return "prof_target"
+            raise KeyError(key)
+
+        def __iter__(self) -> Any:
+            raise AssertionError("provided merge mapping should not be copied")
+
+        def __len__(self) -> int:
+            return 1
+
+    archive = VehicleHistoryArchive(tmp_path)
+
+    assert archive.resolve_profile_id("prof_source", merges=LookupOnlyMerges()) == "prof_target"
 
 
 def test_prune_counts_missing_image_refs_and_rejects_invalid_cutoff(tmp_path: Path) -> None:

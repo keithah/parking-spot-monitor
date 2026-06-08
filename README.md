@@ -4,6 +4,14 @@ Local Python service for monitoring configured street-parking regions in a UniFi
 
 The working product spec is in [`parking-spot-monitor-spec.md`](parking-spot-monitor-spec.md).
 
+## Runtime architecture and dependency split
+
+The service is intentionally split into focused runtime modules. The package entrypoint loads config, builds shared services, and delegates capture-loop work to runtime helpers for command polling, outbox draining, frame capture, detection, overlay generation, state updates, vehicle-history events, health writes, lifecycle notices, and Matrix dispatch. This keeps startup wiring separate from per-frame work and makes frame-loop behavior easier to test.
+
+Matrix delivery has two paths. Open-spot alerts created by the runtime frame loop are persisted to the local Matrix outbox before Matrix network I/O and are drained at startup and at the beginning of later capture-loop iterations. Occupied-spot alerts, quiet-window notices, owner-vehicle quiet-window alerts, lifecycle notices, and live-proof messages remain direct Matrix delivery paths. The outbox contract is documented in [`docs/outbox.md`](docs/outbox.md).
+
+The Docker build has two targets. `runtime-base` installs the shared runtime dependencies used by config validation, operator helpers, and non-detector tooling. `runtime-detector` extends that image with `requirements-detector.txt`, including pinned Ultralytics detector dependencies, and is the default final image for the live monitor. Use the base target when you need a smaller image that will not run YOLO inference; use the default detector image for normal camera monitoring.
+
 ## Local configuration
 
 Start from the tracked example and keep real secrets out of YAML and committed files:
@@ -153,6 +161,7 @@ The Compose service is named `parking-spot-monitor`. It builds the local Dockerf
 
 ```sh
 docker build -t parking-spot-monitor:test .
+docker build --target runtime-base -t parking-spot-monitor:base .
 docker compose config --no-interpolate
 ```
 
@@ -178,7 +187,7 @@ docker compose up parking-spot-monitor
 For unattended operation, run the same service detached and inspect it with Compose:
 
 ```sh
-docker compose up -d parking-spot-monitor
+docker compose up -d --build parking-spot-monitor
 docker compose logs -f parking-spot-monitor
 docker compose ps
 docker compose restart parking-spot-monitor
@@ -186,6 +195,8 @@ docker compose down
 ```
 
 `docker compose logs -f parking-spot-monitor` is the primary runtime log surface. Expect structured event names for startup/config/capture/detection/state/Matrix diagnostics, including `startup-ready`, `startup-config-invalid`, `capture-frame-written`, capture attempt/write/failure events, `detection-frame-processed`, `detection-frame-failed`, `state-loaded`, `state-saved`, `state-corrupt-quarantined`, `health-write-failed`, `occupancy-state-changed`, `occupancy-open-event`, `occupancy-open-suppressed`, Matrix delivery success/failure diagnostics, and quiet-window events such as `quiet-window-started` and `quiet-window-ended`.
+
+Use `docker compose up -d --build parking-spot-monitor` after code, dependency, Dockerfile, or requirements changes so the local image is rebuilt before the container is recreated. Use `docker compose restart parking-spot-monitor` only for config or environment changes that do not require a new image.
 
 ### 5. Run a finite Docker capture smoke and inspect first artifacts
 
@@ -778,7 +789,7 @@ Use `--older-than ISO_TIMESTAMP` when you need an explicit cutoff instead of a r
 
 ## Local YOLO detection and Model storage policy
 
-The runtime package includes `ultralytics>=8` so the local detector can load YOLO nano from the configured `detection.model` value, for example `yolov8n.pt`. `detection.model` accepts local model names and local POSIX paths only: use package/Ultralytics names such as `yolov8n.pt`, repo-relative operator paths such as `models/custom-detector.pt`, or mounted Docker paths such as `/models/yolov8n.pt`. Config validation rejects URL-like values (`https://...`, `s3://...`) and path traversal (`../...` or `/models/../...`) before runtime so model configuration failures are clear and do not leak secrets.
+The detector dependency set pins Ultralytics in `requirements-detector.txt` so the local detector can load YOLO nano from the configured `detection.model` value, for example `yolov8n.pt`, without surprise detector-image dependency drift. The Dockerfile has a `runtime-base` target with only the shared runtime dependencies and a `runtime-detector` target that adds the detector requirements; the default final image is `runtime-detector` for the live monitor, while tooling that only needs config parsing or operator helpers can build `--target runtime-base`. `detection.model` accepts local model names and local POSIX paths only: use package/Ultralytics names such as `yolov8n.pt`, repo-relative operator paths such as `models/custom-detector.pt`, or mounted Docker paths such as `/models/yolov8n.pt`. Config validation rejects URL-like values (`https://...`, `s3://...`) and path traversal (`../...` or `/models/../...`) before runtime so model configuration failures are clear and do not leak secrets.
 
 First-run Ultralytics downloads are allowed for local names such as `yolov8n.pt`, but they can block startup and require network access. For predictable Docker startup, pre-stage the model file on the host and set `detection.model: /models/yolov8n.pt`, then uncomment the optional read-only Compose mount:
 
@@ -795,14 +806,16 @@ Build and inspect the Docker runtime contract. If your shell has real live secre
 
 ```sh
 docker build -t parking-spot-monitor:test .
+docker build --target runtime-base -t parking-spot-monitor:base .
 docker compose config --no-interpolate
 ```
 
-Run the Compose default as the real capture runtime against a mounted operator config and data directory. The service definition intentionally does not bake secret env values into `docker-compose.yml`; provide them from the shell or service manager at runtime.
+Run the Compose default as the real capture runtime against a mounted operator config and data directory. The service definition intentionally does not bake secret env values into `docker-compose.yml`; provide them from the shell or service manager at runtime. Include `--build` when deploying code or dependency changes so the `runtime-detector` image is refreshed.
 
 ```sh
 mkdir -p data
-docker compose up parking-spot-monitor
+docker compose up -d --build parking-spot-monitor
+docker compose logs -f parking-spot-monitor
 ```
 
 Run the same finite capture proof in Docker when you want a bounded smoke check that writes `/data/latest.jpg` inside the container and `./data/latest.jpg` on the host:
@@ -880,6 +893,6 @@ That failure command should exit non-zero and emit structured `startup-config-in
 
 ## Hardware decode
 
-`docker-compose.yml` mounts `/dev/dri:/dev/dri` so hardware decode can work inside the container. The image installs `intel-media-va-driver` and `vainfo`, and sets `LIBVA_DRIVER_NAME=iHD`; VAAPI should initialize on Intel Iris Xe hosts when `/dev/dri/renderD128` is passed through. The capture path tries VAAPI, DRM, then software by default. QSV may still fail on this host even though FFmpeg is built with `--enable-libvpl`, `libvpl2` is installed, and QSV codecs are listed; the observed failure is `Error creating a MFX session: -9`, while VAAPI succeeds and runtime health/logs should show `selected_mode=vaapi`. Without device passthrough, FFmpeg cannot create hardware devices and the capture path falls back to software decode.
+`docker-compose.yml` mounts `/dev/dri:/dev/dri` so hardware decode can work inside the container. The image installs `intel-media-va-driver` and sets `LIBVA_DRIVER_NAME=iHD`; `vainfo` is treated as a diagnostic host/tooling dependency rather than a production image package. VAAPI should initialize on Intel Iris Xe hosts when `/dev/dri/renderD128` is passed through. The capture path tries VAAPI, DRM, then software by default. QSV may still fail on this host even though FFmpeg is built with `--enable-libvpl`, `libvpl2` is installed, and QSV codecs are listed; the observed failure is `Error creating a MFX session: -9`, while VAAPI succeeds and runtime health/logs should show `selected_mode=vaapi`. Without device passthrough, FFmpeg cannot create hardware devices and the capture path falls back to software decode.
 
 Verify the active container hardware surface with `python scripts/verify_hardware_decode.py --json`. For a concise text check, run `python scripts/verify_hardware_decode.py`; expected output on this host is `hardware_decode_status=vaapi_supported_qsv_unavailable`, which means VAAPI is working and QSV is documented as unavailable. `qsv_required_but_unavailable` is only a failure when `--require-qsv` is intentionally used after changing the host/kernel/libvpl stack. `verifier_timeout` or `vaapi_unavailable` means the container hardware surface needs investigation before claiming hardware acceleration. The same compact summary is embedded in live-proof and alert-soak result/evidence artifacts as `hardware_decode_summary`. Hosts without `/dev/dri` should remove or override the `devices` mapping for software-only operation.

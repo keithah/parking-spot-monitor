@@ -7,7 +7,7 @@ from typing import Any
 from parking_spot_monitor.capture import CaptureError, FrameCaptureResult
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.logging import StructuredLogger
-from parking_spot_monitor.matrix import MatrixError
+from parking_spot_monitor.matrix_support import MatrixError
 
 LIVE_RTSP_CAPTURE_OK = "LIVE_RTSP_CAPTURE_OK"
 LIVE_RTSP_CAPTURE_FAILED = "LIVE_RTSP_CAPTURE_FAILED"

@@ -356,29 +356,45 @@ parking-spot-monitor/
   Dockerfile
   docker-compose.yml
   requirements.txt
+  requirements-detector.txt
   config.yaml.example
+  parking_spot_monitor/
+    __main__.py
+    capture_loop.py
+    runtime_detection.py
+    runtime_health.py
+    runtime_state_update.py
+    runtime_vehicle_events.py
+    matrix_delivery.py
+    matrix_dispatch.py
+    matrix_commands.py
+    operator_cockpit.py
+    vehicle_history_archive.py
   src/
-    main.py
-    capture.py
-    detector.py
-    occupancy.py
-    scheduler.py
-    matrix_client.py
-    geometry.py
+    parking_monitor/
+      outbox.py
+      matrix_outbox_delivery.py
   tests/
-    test_geometry.py
-    test_occupancy.py
-    test_scheduler.py
+    test_config.py
+    test_docker_contract.py
+    test_detection.py
+    test_matrix.py
+    test_matrix_outbox_delivery.py
+    test_startup.py
   README.md
+  docs/outbox.md
 ```
 
 ### Dockerfile Requirements
 
 - Python 3.11 or 3.12 base image
 - FFmpeg installed
-- OpenCV headless
-- Ultralytics or ONNX Runtime
-- Non-root user if practical
+- Intel media driver installed for VAAPI on supported hosts
+- Shared runtime dependencies installed from `requirements.txt`
+- Detector dependencies installed from `requirements-detector.txt` in a detector image target
+- Default final image includes the detector target for live monitoring
+- Optional base target excludes detector dependencies for config/operator tooling
+- Non-root user remains future hardening until host bind-mount ownership is specified
 - `/config/config.yaml` as mounted config
 
 ### docker-compose.yml Requirements
@@ -387,13 +403,15 @@ parking-spot-monitor/
 services:
   parking-spot-monitor:
     build: .
-    container_name: parking-spot-monitor
+    image: parking-spot-monitor:local
+    command: ["python", "-m", "parking_spot_monitor", "--config", "/config/config.yaml", "--data-dir", "/data"]
     restart: unless-stopped
     devices:
       - /dev/dri:/dev/dri
     environment:
-      RTSP_URL: "<RTSP_URL>"
-      MATRIX_ACCESS_TOKEN: "${MATRIX_ACCESS_TOKEN}"
+      - RTSP_URL
+      - MATRIX_ACCESS_TOKEN
+      - TZ=America/Los_Angeles
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ./data:/data
@@ -414,7 +432,7 @@ Goal: ship a complete Dockerized service that watches the RTSP stream, evaluates
 Tasks:
 
 - Create repository structure.
-- Add `src/main.py` entrypoint.
+- Add package entrypoint.
 - Add `config.yaml.example` with stream, spots, detection, occupancy, Matrix, and quiet-window settings.
 - Add basic structured logging.
 - Load config from `/config/config.yaml`.
@@ -527,11 +545,12 @@ Acceptance criteria:
 Tasks:
 
 - Build Python image with FFmpeg installed.
-- Add OpenCV headless, Ultralytics, Matrix client, and scheduling dependencies.
+- Install shared runtime dependencies from the base requirements file.
+- Install Ultralytics detector dependencies from the detector requirements file in the live-monitor image target.
 - Add `/dev/dri` mount in compose for Intel GPU access.
 - Add `restart: unless-stopped`.
-- Add periodic heartbeat log.
-- Add optional health file or healthcheck endpoint.
+- Add capture-loop pacing and structured runtime progress logs.
+- Add a local health JSON file for operator inspection.
 
 Acceptance criteria:
 

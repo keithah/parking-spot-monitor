@@ -1353,7 +1353,7 @@ def test_matrix_operator_context_routes_parsed_analytics_command_to_cockpit(tmp_
         state_path=state_path,
     )
 
-    response = context.format_reply(command.action, analytics_window=command.subject_id)
+    response = context.analytics_reply(command.subject_id or "7d")
 
     assert response.image_path is None
     assert response.image_info is None
@@ -1363,4 +1363,3 @@ def test_matrix_operator_context_routes_parsed_analytics_command_to_cockpit(tmp_
     assert "left_spot" in response.text
     assert len(response.text.encode("utf-8")) <= 4096
     _assert_no_sensitive_text(response.text)
-

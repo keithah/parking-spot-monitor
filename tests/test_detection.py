@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import math
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
@@ -81,6 +82,24 @@ def test_filter_spot_detections_accepts_left_and_right_candidates() -> None:
     assert result.by_spot["left_spot"].accepted.overlap_ratio == pytest.approx(1.0)
     assert result.by_spot["right_spot"].accepted is not None
     assert result.rejection_counts == {RejectionReason.CENTROID_OUTSIDE: 2}
+
+
+def test_filter_spot_detections_selects_best_candidate_without_sorting_all_candidates() -> None:
+    with patch("parking_spot_monitor.detection.sorted", side_effect=AssertionError("full sort should not be used"), create=True):
+        result = filter_spot_detections(
+            [
+                detection((10, 10, 90, 90), confidence=0.80),
+                detection((15, 15, 85, 85), confidence=0.95),
+            ],
+            spots={"left_spot": LEFT_SPOT},
+            allowed_classes={"car"},
+            confidence_threshold=0.35,
+            min_bbox_area_px=100,
+            min_polygon_overlap_ratio=0.5,
+        )
+
+    assert result.by_spot["left_spot"].accepted is not None
+    assert result.by_spot["left_spot"].accepted.confidence == pytest.approx(0.95)
 
 
 def test_filter_spot_detections_rejects_driveway_bbox_by_centroid() -> None:

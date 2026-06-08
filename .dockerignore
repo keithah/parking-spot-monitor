@@ -1,0 +1,14 @@
+.git/
+.gsd/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.log
+data/
+htmlcov/
+.coverage
+*.egg-info/
+dist/
+build/

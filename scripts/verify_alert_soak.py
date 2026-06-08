@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from parking_spot_monitor.replay import scan_report_redactions
+from scripts.verification_helpers import load_result_json
 
 DATA_DIR = Path("data")
 RESULT_PATH = DATA_DIR / "alert-soak-result.json"
@@ -84,15 +84,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _load_result(path: Path) -> dict[str, Any]:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise VerificationError("result JSON is missing") from exc
-    except json.JSONDecodeError as exc:
-        raise VerificationError("result JSON is malformed") from exc
-    if not isinstance(raw, dict):
-        raise VerificationError("result JSON must be an object")
-    return raw
+    return load_result_json(path, VerificationError)
 
 
 def normalize_result_contract(result: Mapping[str, Any]) -> dict[str, Any]:

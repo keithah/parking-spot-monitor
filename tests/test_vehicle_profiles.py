@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from PIL import Image, ImageDraw
@@ -69,6 +70,32 @@ def test_similar_crop_matches_separated_existing_profile(tmp_path: Path) -> None
     assert result.confidence > 0.9
     assert result.best_candidate is not None
     assert result.best_candidate.profile_id == "profile-same"
+    assert result.second_candidate is not None
+    assert result.second_candidate.profile_id == "profile-other"
+
+
+def test_profile_matching_tracks_best_two_without_full_sort(tmp_path: Path) -> None:
+    query_path = tmp_path / "query.jpg"
+    similar_path = tmp_path / "same-car.jpg"
+    distinct_path = tmp_path / "other-car.jpg"
+    write_vehicle_jpeg(query_path, (120, 40, 40))
+    write_vehicle_jpeg(similar_path, (122, 42, 42))
+    write_vehicle_jpeg(distinct_path, (40, 130, 210), size=(64, 80))
+    query = extract_vehicle_descriptor(query_path)
+    similar = extract_vehicle_descriptor(similar_path)
+    distinct = extract_vehicle_descriptor(distinct_path)
+
+    with patch("parking_spot_monitor.vehicle_profiles.sorted", side_effect=AssertionError("full sort should not be used"), create=True):
+        result = match_vehicle_profile(
+            query,
+            [
+                VehicleProfileRecord("profile-other", distinct),
+                VehicleProfileRecord("profile-same", similar, sample_count=3),
+            ],
+        )
+
+    assert result.status == MatchStatus.MATCHED
+    assert result.profile_id == "profile-same"
     assert result.second_candidate is not None
     assert result.second_candidate.profile_id == "profile-other"
 

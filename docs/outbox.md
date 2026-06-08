@@ -2,7 +2,7 @@
 
 The local Matrix delivery outbox is wired into the default runtime open-spot Matrix delivery path and exposed through safe operator visibility surfaces. An open-spot alert is persisted before any Matrix network I/O, retryable failures survive process restart in `<data-dir>/matrix-outbox.json`, and later drains skip already delivered phases before retrying the remaining work.
 
-The persistence boundary lives in `parking_monitor.outbox`; the runtime open-alert executor lives in `parking_monitor.matrix_outbox_delivery` and is created by the default `parking_spot_monitor.__main__` Matrix delivery factory. Runtime health JSON and Matrix cockpit replies consume the redacted `LocalOutbox.status_summary()` shape; operators should use those summaries before inspecting the raw outbox file.
+The persistence boundary lives in `parking_monitor.outbox`; the runtime open-alert executor lives in `parking_monitor.matrix_outbox_delivery` and is created by the default runtime Matrix delivery factory. Runtime health JSON and Matrix cockpit replies consume the redacted `LocalOutbox.status_summary()` shape; operators should use those summaries before inspecting the raw outbox file.
 
 ## Runtime operator contract
 
@@ -28,7 +28,7 @@ The following Matrix paths remain direct delivery paths for now:
 - live-proof delivery;
 - tests or integrations that inject a custom `matrix_delivery_factory` without a `drain_outbox()` method.
 
-The runtime loop detects outbox-capable deliveries with a duck-typed `drain_outbox` hook. Legacy or test Matrix delivery fakes that do not expose that method are ignored.
+The runtime loop detects outbox-capable deliveries with duck-typed outbox hooks. A delivery object with `enqueue_open_spot_alert` lets frame dispatch persist an open alert without immediately draining Matrix network work. A delivery object with `drain_outbox` is drained at runtime startup and at the beginning of each capture-loop iteration. Legacy or test Matrix delivery fakes that do not expose those methods are ignored.
 
 ### Open-alert phase order and idempotency
 
@@ -38,7 +38,9 @@ Each open alert is represented by one outbox record with three phases:
 2. `upload` — prepares/copies the retained JPEG snapshot and uploads it to Matrix media.
 3. `image` — sends the Matrix image event using the uploaded `content_uri`.
 
-`send_open_spot_alert(event)` first enqueues the sanitized alert intent and predeclares all three phases before attempting network delivery. Delivery then drains phases in `text`, `upload`, `image` order.
+`enqueue_open_spot_alert(event)` enqueues the sanitized alert intent and predeclares all three phases without performing Matrix network I/O. The runtime frame dispatch path uses this enqueue-only method so frame processing does not block on Matrix text, upload, or image delivery.
+
+`send_open_spot_alert(event)` remains available as a direct helper for callers that want enqueue-and-drain behavior in one call. That helper enqueues the same three-phase record and then drains phases in `text`, `upload`, `image` order.
 
 Already delivered phases are skipped on later drains. This prevents a successful text phase from being sent again if upload fails, and prevents a successful upload from being repeated if image send fails after a restart. Upload success stores secret-safe phase result metadata needed by the image phase, including the Matrix `content_uri`, snapshot body, filename, and image info.
 
@@ -55,7 +57,7 @@ Runtime drain points:
 
 - once at capture-loop startup, before the first frame is captured;
 - once at the beginning of every capture-loop iteration;
-- immediately after enqueueing a new open alert.
+- direct `send_open_spot_alert(event)` calls outside the frame dispatch path.
 
 `MatrixOutboxDelivery.drain_outbox()` selects records in `pending` or `retrying` state. Terminal `delivered`, `failed`, and `dead_lettered` records are not re-sent.
 
