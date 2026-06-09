@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import quote
 
 import httpx
@@ -13,6 +13,7 @@ from parking_spot_monitor.matrix_support import MatrixError, _http_status_error,
 
 CLIENT_API_PREFIX = "/_matrix/client/v3"
 MEDIA_API_PREFIX = "/_matrix/media/v3"
+_T = TypeVar("_T")
 
 def _room_message_path(room_id: str, txn_id: str) -> str:
     room_segment = quote(_require_non_empty("room_id", room_id), safe="")
@@ -125,28 +126,24 @@ class MatrixClient:
         )
 
     def _request_required_key(self, *, operation: str, response_key: str, method: str, path: str, **kwargs: Any) -> str:
-        last_error: MatrixError | None = None
-        for attempt in range(1, self.retry_attempts + 1):
-            try:
-                response = self._request_once(method, path, attempt=attempt, **kwargs)
-                return _require_response_key(response, response_key, operation=operation, attempt=attempt)
-            except MatrixError as exc:
-                last_error = exc
-                if not self._should_retry(exc, attempt):
-                    raise
-                delay = self._retry_delay_seconds(exc, attempt=attempt)
-                self._log_retry_decision(error=exc, operation=operation, path=path, attempt=attempt, delay_seconds=delay)
-                if delay > 0:
-                    self._sleep(delay)
-        if last_error is not None:
-            raise last_error
-        raise MatrixError("Matrix request failed", error_type="request_error", operation=operation, path=path)
+        def request(attempt: int) -> str:
+            response = self._request_once(method, path, attempt=attempt, **kwargs)
+            return _require_response_key(response, response_key, operation=operation, attempt=attempt)
+
+        return self._retry_request(operation=operation, path=path, request=request)
 
     def _request_with_retry(self, *, operation: str, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        return self._retry_request(
+            operation=operation,
+            path=path,
+            request=lambda attempt: self._request_once(method, path, attempt=attempt, **kwargs),
+        )
+
+    def _retry_request(self, *, operation: str, path: str, request: Callable[[int], _T]) -> _T:
         last_error: MatrixError | None = None
         for attempt in range(1, self.retry_attempts + 1):
             try:
-                return self._request_once(method, path, attempt=attempt, **kwargs)
+                return request(attempt)
             except MatrixError as exc:
                 last_error = exc
                 if not self._should_retry(exc, attempt):
@@ -160,15 +157,16 @@ class MatrixClient:
         raise MatrixError("Matrix request failed", error_type="request_error", operation=operation, path=path)
 
     def _request_once(self, method: str, path: str, *, attempt: int, **kwargs: Any) -> httpx.Response:
+        request_kwargs = dict(kwargs)
         headers = {"Authorization": f"Bearer {self.access_token}"}
-        headers.update(kwargs.pop("headers", {}))
+        headers.update(request_kwargs.pop("headers", {}))
         try:
             response = self._client.request(
                 method,
                 self.homeserver + path if not path.startswith("http") else path,
                 headers=headers,
                 timeout=self.timeout_seconds,
-                **kwargs,
+                **request_kwargs,
             )
         except httpx.TimeoutException as exc:
             raise MatrixError(

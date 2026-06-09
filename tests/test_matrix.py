@@ -1039,8 +1039,10 @@ def test_upload_image_retries_malformed_response_then_succeeds() -> None:
         httpx.Response(200, json={"content_uri": "mxc://example.org/media-id"}),
     ]
     sleeps: list[float] = []
+    seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
         response = responses.pop(0)
         response.request = request
         return response
@@ -1057,6 +1059,7 @@ def test_upload_image_retries_malformed_response_then_succeeds() -> None:
 
     assert client.upload_image(filename="snapshot.jpg", data=b"jpeg", content_type="image/jpeg") == "mxc://example.org/media-id"
     assert sleeps == [0.1]
+    assert [request.headers["content-type"] for request in seen] == ["image/jpeg", "image/jpeg"]
 
 
 def test_retry_attempts_one_raises_final_error_without_sleep_or_retry_log() -> None:

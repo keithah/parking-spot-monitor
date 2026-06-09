@@ -2775,6 +2775,47 @@ def test_runtime_loop_reuses_vehicle_history_health_snapshot_within_cache_window
     assert_no_secret_leak(combined_output(capsys))
 
 
+def test_runtime_loop_noop_matrix_commands_keep_vehicle_history_health_snapshot_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from parking_spot_monitor import __main__ as cli
+
+    class CountingHistoryArchive:
+        latest: "CountingHistoryArchive | None" = None
+
+        def __init__(self, _root: Path, *, logger: StructuredLogger | None = None) -> None:
+            self.calls = 0
+            CountingHistoryArchive.latest = self
+
+        def health_snapshot(self) -> dict[str, Any]:
+            self.calls += 1
+            return {"archive_status": "cached", "calls": self.calls}
+
+    class NoopCommandService:
+        def poll_once(self) -> FakeCommandPollResult:
+            return FakeCommandPollResult()
+
+    monkeypatch.setattr(cli, "VehicleHistoryArchive", CountingHistoryArchive)
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z"),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_command_service_factory=lambda _settings, _data_dir, _logger, _archive: NoopCommandService(),
+        sleep=lambda _seconds: None,
+        max_iterations=3,
+        now=lambda: datetime(2026, 5, 18, 18, 0, tzinfo=timezone.utc),
+    )
+
+    assert exit_code == 0
+    assert CountingHistoryArchive.latest is not None
+    assert CountingHistoryArchive.latest.calls == 1
+    assert health_payload(tmp_path / "health.json")["vehicle_history"]["calls"] == 1
+    assert_no_secret_leak(combined_output(capsys))
+
+
 def test_runtime_loop_clears_transient_matrix_outbox_error_after_clean_iteration(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

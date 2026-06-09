@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -9,15 +10,25 @@ from parking_spot_monitor.runtime_decision_memory import _append_decision_memory
 from parking_spot_monitor.runtime_health import safe_error_context as _safe_error_context
 
 
+@dataclass(frozen=True)
+class MatrixCommandPollOutcome:
+    error: dict[str, Any] | None = None
+    processed_count: int | None = None
+
+    @property
+    def changed_vehicle_history(self) -> bool:
+        return isinstance(self.processed_count, int) and self.processed_count > 0
+
+
 def _poll_matrix_commands_once(
     matrix_command_service: Any | None,
     *,
     logger: StructuredLogger,
     iteration: int,
     decision_memory_path: Path | None = None,
-) -> dict[str, Any] | None:
+) -> MatrixCommandPollOutcome:
     if matrix_command_service is None:
-        return None
+        return MatrixCommandPollOutcome()
     logger.info(
         "matrix-command-poll-attempt",
         phase="matrix-command",
@@ -44,7 +55,7 @@ def _poll_matrix_commands_once(
             error_type=context.get("error_type"),
             logger=logger,
         )
-        return context
+        return MatrixCommandPollOutcome(error=context)
     processed_count = getattr(result, "processed_count", None)
     ignored_count = getattr(result, "ignored_count", None)
     error_count = getattr(result, "error_count", None)
@@ -96,5 +107,5 @@ def _poll_matrix_commands_once(
             error_type=context["error_type"],
             logger=logger,
         )
-        return context
-    return None
+        return MatrixCommandPollOutcome(error=context, processed_count=processed_count)
+    return MatrixCommandPollOutcome(processed_count=processed_count)

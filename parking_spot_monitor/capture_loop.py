@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,7 @@ from parking_spot_monitor.matrix_alerts import MONITOR_STARTED_EVENT_TYPE, monit
 from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 from parking_spot_monitor.paths import resolve_runtime_paths
 from parking_spot_monitor.runtime_health import RuntimeLoopHealthState, observed_at, safe_error_context, write_loop_health
+from parking_spot_monitor.runtime_health_cache import VehicleHistoryHealthSnapshotCache
 from parking_spot_monitor.runtime_commands import _poll_matrix_commands_once
 from parking_spot_monitor.runtime_detection import _configured_spot_polygons, _process_detection_for_capture
 from parking_spot_monitor.runtime_overlay import _write_overlay_for_capture
@@ -107,28 +108,11 @@ def run_capture_loop(
     health_state.record_matrix_result(startup_outbox_error)
     decision_memory_path = data_dir / "operator-decision-memory.json"
     shutdown_state = ShutdownState()
-    vehicle_history_health_cache: dict[str, Any] | None = None
-    vehicle_history_health_cached_at: datetime | None = None
-
-    def vehicle_history_health_snapshot(*, force: bool = False) -> dict[str, Any]:
-        nonlocal vehicle_history_health_cache, vehicle_history_health_cached_at
-        current = now_fn()
-        if (
-            not force
-            and vehicle_history_health_cache is not None
-            and vehicle_history_health_cached_at is not None
-            and current - vehicle_history_health_cached_at < timedelta(seconds=VEHICLE_HISTORY_HEALTH_CACHE_SECONDS)
-        ):
-            return dict(vehicle_history_health_cache)
-        snapshot = effective_history_archive.health_snapshot()
-        vehicle_history_health_cache = dict(snapshot)
-        vehicle_history_health_cached_at = current
-        return snapshot
-
-    def invalidate_vehicle_history_health_snapshot() -> None:
-        nonlocal vehicle_history_health_cache, vehicle_history_health_cached_at
-        vehicle_history_health_cache = None
-        vehicle_history_health_cached_at = None
+    vehicle_history_health = VehicleHistoryHealthSnapshotCache(
+        effective_history_archive,
+        now=now_fn,
+        ttl_seconds=VEHICLE_HISTORY_HEALTH_CACHE_SECONDS,
+    )
 
     def write_current_health(*, status: str, iteration: int) -> None:
         write_loop_health(
@@ -148,7 +132,7 @@ def run_capture_loop(
             last_matrix_command_error=health_state.last_matrix_command_error,
             vehicle_history_failure_count=health_state.vehicle_history_failure_count,
             last_vehicle_history_error=health_state.last_vehicle_history_error,
-            vehicle_history=vehicle_history_health_snapshot(
+            vehicle_history=vehicle_history_health.snapshot(
                 force=health_state.last_vehicle_history_error is not None
                 or health_state.vehicle_history_failure_count > 0
             ),
@@ -237,16 +221,16 @@ def run_capture_loop(
                         state_save_error=frame_update.state_save_error,
                     )
                     if frame_update.history_changed:
-                        invalidate_vehicle_history_health_snapshot()
-                    command_error = _poll_matrix_commands_once(
+                        vehicle_history_health.invalidate()
+                    command_result = _poll_matrix_commands_once(
                         matrix_command_service,
                         logger=logger,
                         iteration=iteration,
                         decision_memory_path=decision_memory_path,
                     )
-                    health_state.record_command_result(command_error)
-                    if matrix_command_service is not None:
-                        invalidate_vehicle_history_health_snapshot()
+                    health_state.record_command_result(command_result.error)
+                    if command_result.changed_vehicle_history:
+                        vehicle_history_health.invalidate()
                 logger.info("capture-loop-frame-written", iteration=iteration, **result.diagnostics())
                 write_current_health(status=health_state.status(), iteration=iteration)
                 logger.debug("capture-loop-paced", iteration=iteration, sleep_seconds=settings.runtime.frame_interval_seconds)
