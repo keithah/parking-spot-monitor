@@ -13,6 +13,20 @@ services:
       # Optional read-only model mount for operators who pre-stage YOLO weights.
       #   - ./models:/models:ro
     restart: unless-stopped
+    mem_limit: 4g
+    cpus: 2.0
+    pids_limit: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-m", "parking_spot_monitor.healthcheck", "--health-file", "/data/health.json", "--max-age-seconds", "120"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
     # Hardware decode passthrough for Intel QSV/VAAPI.
     # Hosts without /dev/dri should remove or override this device mapping.
     devices:

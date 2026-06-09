@@ -175,9 +175,8 @@ def _validate_frame(frame_path: str | Path, *, frame_time: datetime) -> Incident
         return None
     try:
         with Image.open(path) as image:
-            image.verify()
-        with Image.open(path) as image:
             width, height = image.size
+            image.verify()
         byte_size = path.stat().st_size
     except (OSError, UnidentifiedImageError, ValueError):
         return None

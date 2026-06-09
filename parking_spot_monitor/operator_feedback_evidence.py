@@ -32,10 +32,10 @@ def validate_timeline_feedback_evidence(
     try:
         byte_size = resolved.stat().st_size
         with Image.open(resolved) as image:
-            image.verify()
-        with Image.open(resolved) as image:
             width, height = image.size
-            if image.format != "JPEG" or width <= 0 or height <= 0:
+            image_format = image.format
+            image.verify()
+            if image_format != "JPEG" or width <= 0 or height <= 0:
                 return FeedbackEvidence("timeline_frame", safe_relative, False, False, None, None, byte_size, "invalid_jpeg")
     except (OSError, UnidentifiedImageError, ValueError) as exc:
         _log(logger, "warning", "operator-feedback-timeline-evidence-invalid", path=safe_relative, error_type=type(exc).__name__)
@@ -68,10 +68,10 @@ def validate_feedback_evidence(
     try:
         byte_size = candidate.stat().st_size
         with Image.open(candidate) as image:
-            image.verify()
-        with Image.open(candidate) as image:
             width, height = image.size
-            if image.format != "JPEG" or width <= 0 or height <= 0:
+            image_format = image.format
+            image.verify()
+            if image_format != "JPEG" or width <= 0 or height <= 0:
                 return FeedbackEvidence("alert_snapshot", safe_relative, False, False, None, None, byte_size, "invalid_jpeg")
     except (OSError, UnidentifiedImageError, ValueError) as exc:
         _log(logger, "warning", "operator-feedback-evidence-invalid", path=safe_relative, error_type=type(exc).__name__)

@@ -309,8 +309,16 @@ class VehicleHistoryCorrectionMixin:
 
     def _validate_correction_against_archive(self, event: ProfileCorrectionEvent) -> None:
         state = self.correction_replay_state()
-        profile_ids = self._known_profile_ids(state=state)
-        session_ids = {record.session_id for record in [*self.load_active_sessions(), *self.list_closed_sessions()]}
+        active_records = list(self.load_active_sessions())
+        closed_records = list(self.list_closed_sessions())
+        active_profiles = list(self.load_active_profiles())
+        session_by_id = {record.session_id: record for record in [*active_records, *closed_records]}
+        profile_ids = self._known_profile_ids(
+            state=state,
+            active_records=active_records,
+            closed_records=closed_records,
+            active_profiles=active_profiles,
+        )
         if event.action == CORRECTION_ACTION_RENAME_PROFILE:
             profile_id = _required_correction_field(event.profile_id, "profile_id")
             if self.resolve_profile_id(profile_id, merges=state.merges) not in profile_ids:
@@ -326,21 +334,30 @@ class VehicleHistoryCorrectionMixin:
                 raise ArchiveSchemaError("profile merge cycle detected")
         elif event.action == CORRECTION_ACTION_WRONG_MATCH:
             session_id = _required_correction_field(event.session_id, "session_id")
-            if session_id not in session_ids:
+            session = session_by_id.get(session_id)
+            if session is None:
                 raise ArchiveSchemaError("unknown session_id")
-            if event.profile_id is not None:
-                session = next(record for record in [*self.load_active_sessions(), *self.list_closed_sessions()] if record.session_id == session_id)
-                if self.resolve_profile_id(session.profile_id, merges=state.merges) != self.resolve_profile_id(event.profile_id, merges=state.merges):
-                    raise ArchiveSchemaError("wrong_match profile_id does not match session profile")
+            if event.profile_id is not None and self.resolve_profile_id(session.profile_id, merges=state.merges) != self.resolve_profile_id(event.profile_id, merges=state.merges):
+                raise ArchiveSchemaError("wrong_match profile_id does not match session profile")
         elif event.action == CORRECTION_ACTION_PROFILE_SUMMARY_REQUESTED:
             profile_id = _required_correction_field(event.profile_id, "profile_id")
             if self.resolve_profile_id(profile_id, merges=state.merges) not in profile_ids:
                 raise ArchiveSchemaError("unknown profile_id")
 
-    def _known_profile_ids(self, *, state: CorrectionReplayState | None = None) -> set[str]:
+    def _known_profile_ids(
+        self,
+        *,
+        state: CorrectionReplayState | None = None,
+        active_records: Sequence[SessionRecord] | None = None,
+        closed_records: Sequence[SessionRecord] | None = None,
+        active_profiles: Sequence[Any] | None = None,
+    ) -> set[str]:
         state = state if state is not None else self.correction_replay_state()
-        profile_ids = {self.resolve_profile_id(profile.profile_id, merges=state.merges) for profile in self.load_active_profiles()}
-        for record in [*self.load_active_sessions(), *self.list_closed_sessions()]:
+        profiles = active_profiles if active_profiles is not None else self.load_active_profiles()
+        active = active_records if active_records is not None else self.load_active_sessions()
+        closed = closed_records if closed_records is not None else self.list_closed_sessions()
+        profile_ids = {self.resolve_profile_id(profile.profile_id, merges=state.merges) for profile in profiles}
+        for record in [*active, *closed]:
             resolved = self.resolve_profile_id(record.profile_id, merges=state.merges)
             if resolved is not None:
                 profile_ids.add(resolved)

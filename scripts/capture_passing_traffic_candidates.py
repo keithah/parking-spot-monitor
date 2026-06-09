@@ -24,7 +24,8 @@ DEFAULT_LABELS = Path("data/s07-replay-evidence/real-traffic-labels.yaml")
 SCHEMA_VERSION = "parking-spot-monitor.passing-traffic-candidates.v1"
 REPLAY_PREFIX = "replay://passing-traffic-candidates"
 ALLOWED_STATUSES = {"needs_review", "accepted", "rejected"}
-STRICT_TAGS = ["real_capture", "bottom_driveway", "passing_traffic", "threshold_decision"]
+STRICT_TAGS = ("real_capture", "bottom_driveway", "passing_traffic", "threshold_decision")
+STRICT_TAG_SET = frozenset(STRICT_TAGS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -132,7 +133,11 @@ def latest_candidate(index_path: Path) -> dict[str, Any] | None:
 
 def promote_accepted_candidates(*, index_path: Path, labels_path: Path) -> int:
     index = _load_index(index_path)
-    accepted = [item for item in index["candidates"] if item.get("status") == "accepted" and set(STRICT_TAGS).issubset(set(item.get("semantic_tags") or []))]
+    accepted = [
+        item
+        for item in index["candidates"]
+        if item.get("status") == "accepted" and STRICT_TAG_SET.issubset(item.get("semantic_tags") or ())
+    ]
     if not accepted:
         return 0
     manifest = _load_labels(labels_path)

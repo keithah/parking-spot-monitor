@@ -59,6 +59,17 @@ def test_ffmpeg_command_builder_returns_argv_lists_not_shell_strings(tmp_path: P
     assert "qsv" in argv
 
 
+def test_ffmpeg_command_builder_sets_rtsp_network_timeouts_before_input(tmp_path: Path) -> None:
+    output_path = tmp_path / "latest.jpg"
+
+    argv = build_ffmpeg_argv(FAKE_RTSP_VALUE, output_path, DecodeMode.SOFTWARE, network_timeout_seconds=3.25)
+
+    assert argv[argv.index("-stimeout") + 1] == "3250000"
+    assert argv[argv.index("-rw_timeout") + 1] == "3250000"
+    assert argv.index("-stimeout") < argv.index("-i")
+    assert argv.index("-rw_timeout") < argv.index("-i")
+
+
 
 def test_vaapi_capture_downloads_hardware_frames_before_jpeg_encoding(tmp_path: Path) -> None:
     output_path = tmp_path / "latest.jpg"

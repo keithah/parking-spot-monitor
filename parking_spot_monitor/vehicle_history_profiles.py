@@ -248,6 +248,21 @@ class VehicleHistoryProfileMixin:
             min_profile_confidence=min_profile_confidence,
         )
 
+    def estimate_for_profile_id(
+        self,
+        profile_id: str | None,
+        *,
+        min_samples: int = 2,
+        min_profile_confidence: float = 0.76,
+    ) -> VehicleHistoryEstimate:
+        """Estimate repeat-vehicle history when the caller already knows the active profile id."""
+
+        return self.estimate_for_profile(
+            profile_id,
+            min_samples=min_samples,
+            min_profile_confidence=min_profile_confidence,
+        )
+
     def estimate_for_session(
         self,
         session_id: str,

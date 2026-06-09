@@ -61,7 +61,12 @@ class MatrixClient:
         params: dict[str, Any] = {"timeout": max(0, int(timeout_ms)), "limit": max(1, min(int(limit), 100))}
         if since is not None and since.strip():
             params["since"] = since
-        response = self._request_once("GET", f"{CLIENT_API_PREFIX}/sync", attempt=1, params=params)
+        response = self._request_with_retry(
+            operation="sync",
+            method="GET",
+            path=f"{CLIENT_API_PREFIX}/sync",
+            params=params,
+        )
         try:
             payload = response.json()
         except ValueError as exc:
@@ -129,9 +134,27 @@ class MatrixClient:
                 last_error = exc
                 if not self._should_retry(exc, attempt):
                     raise
-                self._log_retry_decision(error=exc, operation=operation, path=path, attempt=attempt)
-                if self.retry_backoff_seconds:
-                    self._sleep(self.retry_backoff_seconds)
+                delay = self._retry_delay_seconds(exc, attempt=attempt)
+                self._log_retry_decision(error=exc, operation=operation, path=path, attempt=attempt, delay_seconds=delay)
+                if delay > 0:
+                    self._sleep(delay)
+        if last_error is not None:
+            raise last_error
+        raise MatrixError("Matrix request failed", error_type="request_error", operation=operation, path=path)
+
+    def _request_with_retry(self, *, operation: str, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        last_error: MatrixError | None = None
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                return self._request_once(method, path, attempt=attempt, **kwargs)
+            except MatrixError as exc:
+                last_error = exc
+                if not self._should_retry(exc, attempt):
+                    raise
+                delay = self._retry_delay_seconds(exc, attempt=attempt)
+                self._log_retry_decision(error=exc, operation=operation, path=path, attempt=attempt, delay_seconds=delay)
+                if delay > 0:
+                    self._sleep(delay)
         if last_error is not None:
             raise last_error
         raise MatrixError("Matrix request failed", error_type="request_error", operation=operation, path=path)
@@ -180,7 +203,14 @@ class MatrixClient:
             return error.diagnostics.get("status_code") in {429, 500, 502, 503, 504}
         return False
 
-    def _log_retry_decision(self, *, error: MatrixError, operation: str, path: str, attempt: int) -> None:
+    def _retry_delay_seconds(self, error: MatrixError, *, attempt: int) -> float:
+        local_backoff = self.retry_backoff_seconds * (2 ** max(0, attempt - 1))
+        retry_after = error.diagnostics.get("retry_after_seconds")
+        if isinstance(retry_after, (int, float)):
+            return max(local_backoff, float(retry_after))
+        return local_backoff
+
+    def _log_retry_decision(self, *, error: MatrixError, operation: str, path: str, attempt: int, delay_seconds: float) -> None:
         if self._logger is None:
             return
         diagnostics = dict(error.diagnostics)
@@ -194,7 +224,7 @@ class MatrixClient:
             attempt=attempt,
             next_attempt=attempt + 1,
             max_attempts=self.retry_attempts,
-            backoff_seconds=self.retry_backoff_seconds,
+            backoff_seconds=round(delay_seconds, 6),
             **diagnostics,
         )
 

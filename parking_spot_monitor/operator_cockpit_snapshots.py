@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -12,7 +12,6 @@ from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.incident_review import build_incident_replay
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
 from parking_spot_monitor.matrix_models import MatrixCommandResponse
-from parking_spot_monitor.paths import resolve_runtime_paths
 from parking_spot_monitor.operator_cockpit_shared import (
     INCIDENT_MATRIX_SNAPSHOT_TEMPLATE,
     MAX_LINES_PER_SECTION,
@@ -26,7 +25,6 @@ from parking_spot_monitor.operator_cockpit_shared import (
     LatestSnapshotResponse,
     LatestSnapshotValidation,
     age_label,
-    bounded_lines,
     bounded_reply,
     format_health_line,
     utc_now,
@@ -271,9 +269,12 @@ def _resize_who_snapshot_for_matrix(path: Path, *, destination: Path, now: datet
         resized = working.copy()
         resized.thumbnail((max_dimension, max_dimension), resampling)
         for quality in WHO_MATRIX_JPEG_QUALITIES:
-            resized.save(destination, format="JPEG", quality=quality, optimize=True)
-            stat = destination.stat()
-            if stat.st_size <= MAX_WHO_MATRIX_IMAGE_BYTES:
+            buffer = BytesIO()
+            resized.save(buffer, format="JPEG", quality=quality, optimize=True)
+            data = buffer.getvalue()
+            if len(data) <= MAX_WHO_MATRIX_IMAGE_BYTES:
+                destination.write_bytes(data)
+                stat = destination.stat()
                 output_width, output_height = resized.size
                 _log_who_snapshot_resized(
                     logger,
@@ -283,13 +284,13 @@ def _resize_who_snapshot_for_matrix(path: Path, *, destination: Path, now: datet
                     source_height=height,
                     output_width=output_width,
                     output_height=output_height,
-                    byte_size=stat.st_size,
+                    byte_size=len(data),
                     quality=quality,
                 )
                 return LatestSnapshotValidation(
                     state="available",
                     path=destination,
-                    info={"mimetype": "image/jpeg", "size": stat.st_size, "w": output_width, "h": output_height},
+                    info={"mimetype": "image/jpeg", "size": len(data), "w": output_width, "h": output_height},
                     freshness="fresh",
                     age=age_label(datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc), now),
                 )
@@ -324,10 +325,9 @@ def _validate_latest_snapshot(path: Path, *, now: datetime, logger: StructuredLo
         return LatestSnapshotValidation(state="error", error_type="too large")
     try:
         with Image.open(path) as image:
-            image.verify()
-        with Image.open(path) as image:
             width, height = image.size
             image_format = image.format
+            image.verify()
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         _log_latest_snapshot_problem(logger, reason="invalid_jpeg", error_type="invalid JPEG", exception_type=exc.__class__.__name__)
         return LatestSnapshotValidation(state="error", error_type="invalid JPEG")

@@ -176,7 +176,7 @@ class FakeMatrixClient:
 
     def send_text(self, *, room_id, txn_id, body):
         self.calls.append({'kind': 'text', 'room_id': room_id, 'txn_id': txn_id, 'body': body})
-        return '$text-again:example.org'
+        return '$text:example.org'
 
     def upload_image(self, *, filename, data, content_type):
         self.calls.append({'kind': 'upload', 'filename': filename, 'content_type': content_type, 'bytes': len(data)})

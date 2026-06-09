@@ -95,7 +95,14 @@ def redact_diagnostic_text(text: object, *, secrets: Iterable[str] = ()) -> str:
     return redacted
 
 
-def build_ffmpeg_argv(rtsp_url: str, output_path: str | Path, mode: DecodeMode) -> list[str]:
+def build_ffmpeg_argv(
+    rtsp_url: str,
+    output_path: str | Path,
+    mode: DecodeMode,
+    *,
+    network_timeout_seconds: float = DEFAULT_CAPTURE_TIMEOUT_SECONDS,
+) -> list[str]:
+    network_timeout_us = max(1, int(max(0.001, network_timeout_seconds) * 1_000_000))
     argv = [
         "ffmpeg",
         "-hide_banner",
@@ -104,6 +111,10 @@ def build_ffmpeg_argv(rtsp_url: str, output_path: str | Path, mode: DecodeMode) 
         "-y",
         "-rtsp_transport",
         "tcp",
+        "-stimeout",
+        str(network_timeout_us),
+        "-rw_timeout",
+        str(network_timeout_us),
     ]
     if mode is DecodeMode.QSV:
         argv.extend(["-hwaccel", "qsv", "-hwaccel_device", "/dev/dri/renderD128", "-hwaccel_output_format", "qsv"])
@@ -165,7 +176,7 @@ def capture_latest(
 
     for mode in selected_modes:
         attempted_modes.append(mode)
-        argv = build_ffmpeg_argv(rtsp_url, output_path, mode)
+        argv = build_ffmpeg_argv(rtsp_url, output_path, mode, network_timeout_seconds=timeout_seconds)
         start = time.perf_counter()
         _log(logger, "info", "capture-decode-attempt", mode=mode.value, output_path=str(output_path), timeout_seconds=timeout_seconds)
         try:

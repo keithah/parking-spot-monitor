@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from itertools import chain
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -89,7 +90,7 @@ def analyze_occupancy(
 
     normalized: list[_NormalizedSession] = []
     invalid_count = 0
-    for raw in [*list(sessions), *list(active_sessions)]:
+    for raw in chain(sessions, active_sessions):
         record = _normalize_session(raw)
         if record is None:
             invalid_count += 1

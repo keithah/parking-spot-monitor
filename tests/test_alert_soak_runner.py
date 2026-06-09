@@ -244,7 +244,12 @@ def test_success_parses_organic_alerts_validates_jpegs_and_matrix_readback(tmp_p
         assert kwargs["homeserver"] == HOMESERVER
         assert kwargs["room_id"] == ROOM_ID
         assert kwargs["access_token"] == SECRET_TOKEN
-        return {"chunk": [{"content": {"msgtype": "m.text", "body": "Parking spot open: left_spot at now"}}, {"content": {"msgtype": "m.image", "body": "Raw full-frame snapshot for left_spot at now"}}]}
+        return {
+            "chunk": [
+                {"content": {"msgtype": "m.text", "body": "Parking spot open: left_spot at now"}},
+                {"content": {"msgtype": "m.image", "body": "Raw full-frame snapshot for left_spot at now"}},
+            ]
+        }
 
     exit_code = runner.main(["--config", str(config_path), "--data-dir", str(data_dir)], environ={"RTSP_URL": SECRET_RTSP, "MATRIX_ACCESS_TOKEN": SECRET_TOKEN}, popen_factory=lambda *args, **kwargs: CompletedProcess(stdout=alert_lines(include_live_proof_marker=True), returncode=0), readback=fake_readback)
 

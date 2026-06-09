@@ -59,10 +59,11 @@ class MatrixDelivery:
 
     def send_open_spot_alert(self, event: Mapping[str, Any]) -> MatrixSnapshot:
         event_id = open_spot_event_id(event)
+        body = format_open_spot_alert(event)
         self.client.send_text(
             room_id=self.room_id,
             txn_id=f"{event_id}:text",
-            body=format_open_spot_alert(event),
+            body=body,
         )
         snapshot = prepare_event_snapshot(
             source_path=str(event.get("snapshot_path", "")),
@@ -87,7 +88,7 @@ class MatrixDelivery:
         self.client.send_image(
             room_id=self.room_id,
             txn_id=f"{event_id}:image",
-            body=snapshot.body,
+            body=body,
             content_uri=content_uri,
             info=upload["info"],
         )
@@ -116,6 +117,12 @@ class MatrixDelivery:
                 operation="occupied-alert",
             )
         try:
+            body = format_occupied_spot_alert(event)
+            self.client.send_text(
+                room_id=self.room_id,
+                txn_id=f"{event_id}:text",
+                body=body,
+            )
             snapshot = prepare_event_snapshot(
                 source_path=source_path,
                 data_dir=self.data_dir,
@@ -140,7 +147,7 @@ class MatrixDelivery:
             self.client.send_image(
                 room_id=self.room_id,
                 txn_id=f"{event_id}:image",
-                body=format_occupied_spot_alert(event),
+                body=body,
                 content_uri=content_uri,
                 info=upload["info"],
             )

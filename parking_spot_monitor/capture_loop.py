@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,26 +14,18 @@ from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_alerts import MONITOR_STARTED_EVENT_TYPE, monitor_lifecycle_event
 from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 from parking_spot_monitor.paths import resolve_runtime_paths
-from parking_spot_monitor.runtime_health import (
-    RuntimeLoopHealthState,
-    observed_at,
-    safe_error_context,
-    write_loop_health,
-)
+from parking_spot_monitor.runtime_health import RuntimeLoopHealthState, observed_at, safe_error_context, write_loop_health
 from parking_spot_monitor.runtime_commands import _poll_matrix_commands_once
 from parking_spot_monitor.runtime_detection import _configured_spot_polygons, _process_detection_for_capture
 from parking_spot_monitor.runtime_overlay import _write_overlay_for_capture
 from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
-from parking_spot_monitor.runtime_lifecycle import (
-    ShutdownState,
-    monitor_signal_handlers,
-    return_if_shutdown_requested,
-)
+from parking_spot_monitor.runtime_lifecycle import ShutdownState, monitor_signal_handlers, return_if_shutdown_requested
 from parking_spot_monitor.state import load_runtime_state
 from parking_spot_monitor.timeline_buffer import record_timeline_frame
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
 MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION = 1
+VEHICLE_HISTORY_HEALTH_CACHE_SECONDS = 300
 
 
 def drain_matrix_outbox_if_available(
@@ -115,6 +107,28 @@ def run_capture_loop(
     health_state.record_matrix_result(startup_outbox_error)
     decision_memory_path = data_dir / "operator-decision-memory.json"
     shutdown_state = ShutdownState()
+    vehicle_history_health_cache: dict[str, Any] | None = None
+    vehicle_history_health_cached_at: datetime | None = None
+
+    def vehicle_history_health_snapshot(*, force: bool = False) -> dict[str, Any]:
+        nonlocal vehicle_history_health_cache, vehicle_history_health_cached_at
+        current = now_fn()
+        if (
+            not force
+            and vehicle_history_health_cache is not None
+            and vehicle_history_health_cached_at is not None
+            and current - vehicle_history_health_cached_at < timedelta(seconds=VEHICLE_HISTORY_HEALTH_CACHE_SECONDS)
+        ):
+            return dict(vehicle_history_health_cache)
+        snapshot = effective_history_archive.health_snapshot()
+        vehicle_history_health_cache = dict(snapshot)
+        vehicle_history_health_cached_at = current
+        return snapshot
+
+    def invalidate_vehicle_history_health_snapshot() -> None:
+        nonlocal vehicle_history_health_cache, vehicle_history_health_cached_at
+        vehicle_history_health_cache = None
+        vehicle_history_health_cached_at = None
 
     def write_current_health(*, status: str, iteration: int) -> None:
         write_loop_health(
@@ -134,7 +148,10 @@ def run_capture_loop(
             last_matrix_command_error=health_state.last_matrix_command_error,
             vehicle_history_failure_count=health_state.vehicle_history_failure_count,
             last_vehicle_history_error=health_state.last_vehicle_history_error,
-            vehicle_history=effective_history_archive.health_snapshot(),
+            vehicle_history=vehicle_history_health_snapshot(
+                force=health_state.last_vehicle_history_error is not None
+                or health_state.vehicle_history_failure_count > 0
+            ),
             matrix_outbox_file=runtime_paths.matrix_outbox_file,
         )
 
@@ -166,7 +183,7 @@ def run_capture_loop(
             if shutdown_exit is not None:
                 return shutdown_exit
             iteration += 1
-            logger.info("capture-loop-iteration", iteration=iteration, data_dir=str(data_dir))
+            logger.debug("capture-loop-iteration", iteration=iteration, data_dir=str(data_dir))
             try:
                 outbox_error = drain_matrix_outbox_if_available(
                     matrix_delivery,
@@ -180,7 +197,7 @@ def run_capture_loop(
                 health_state.record_capture_success(timestamp=result.timestamp, selected_mode=result.selected_mode)
                 _write_overlay_for_capture(settings, result.latest_path, data_dir, logger=logger, overlay=overlay)
                 timeline_result = record_timeline_frame(result.latest_path, data_dir=data_dir, observed_at=result.timestamp)
-                logger.info("timeline-frame-retained", iteration=iteration, **timeline_result.diagnostics())
+                logger.debug("timeline-frame-retained", iteration=iteration, **timeline_result.diagnostics())
                 try:
                     if detector is None:
                         detector = detector_factory(settings)
@@ -219,6 +236,8 @@ def run_capture_loop(
                         history_errors=frame_update.history_errors,
                         state_save_error=frame_update.state_save_error,
                     )
+                    if frame_update.history_changed:
+                        invalidate_vehicle_history_health_snapshot()
                     command_error = _poll_matrix_commands_once(
                         matrix_command_service,
                         logger=logger,
@@ -226,9 +245,11 @@ def run_capture_loop(
                         decision_memory_path=decision_memory_path,
                     )
                     health_state.record_command_result(command_error)
+                    if matrix_command_service is not None:
+                        invalidate_vehicle_history_health_snapshot()
                 logger.info("capture-loop-frame-written", iteration=iteration, **result.diagnostics())
                 write_current_health(status=health_state.status(), iteration=iteration)
-                logger.info("capture-loop-paced", iteration=iteration, sleep_seconds=settings.runtime.frame_interval_seconds)
+                logger.debug("capture-loop-paced", iteration=iteration, sleep_seconds=settings.runtime.frame_interval_seconds)
                 sleep(settings.runtime.frame_interval_seconds)
                 shutdown_exit = return_if_shutdown_requested(
                     shutdown_state=shutdown_state,

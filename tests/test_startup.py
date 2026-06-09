@@ -888,6 +888,7 @@ def test_runtime_loop_matrix_open_event_sends_text_and_raw_snapshot(
     active_files = list((tmp_path / "vehicle-history" / "sessions" / "active").glob("*.json"))
     assert len(open_images) == 1
     assert open_images[0]["txn_id"].endswith(":image")
+    assert open_images[0]["body"] == "Parking spot open: left_spot at 2026-05-18 12:00:00 PM PDT"
     assert open_images[0]["info"]["mimetype"] == "image/jpeg"
     assert active_files == []
     assert len(closed_files) == 1
@@ -1005,7 +1006,7 @@ def test_runtime_loop_occupied_alert_sends_text_image_with_seeded_vehicle_estima
     active_payload = json.loads(active_files[0].read_text(encoding="utf-8"))
     snapshot_files = list((tmp_path / "snapshots").glob("occupancy-occupied-event-left-spot-*.jpg"))
     assert exit_code == 0
-    assert len(matrix_client.texts) == 2
+    assert len(matrix_client.texts) == 3
     assert len(matrix_client.uploads) == 1
     assert len(matrix_client.images) == 1
     assert len(snapshot_files) == 1
@@ -2675,7 +2676,7 @@ def test_default_runtime_loop_logs_failure_and_uses_reconnect_backoff(
     output = combined_output(capsys)
     assert exit_code == 0
     assert sleeps == [5]
-    assert '"event":"capture-loop-iteration"' in output
+    assert '"event":"capture-loop-iteration"' not in output
     assert '"event":"capture-loop-failure"' in output
     assert '"backoff_seconds":5' in output
     health = health_payload(tmp_path / "health.json")
@@ -2733,11 +2734,45 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
     timeline_frames = sorted((tmp_path / "timeline" / "frames").glob("*.jpg"))
     assert [path.name for path in timeline_frames] == ["20260518T180000Z.jpg"]
     assert timeline_frames[0].read_bytes() == (tmp_path / "latest.jpg").read_bytes()
-    assert '"event":"timeline-frame-retained"' in output
-    assert '"reason":"already-sampled"' in output
-    assert '"event":"capture-loop-paced"' in output
-    assert '"sleep_seconds":2' in output
+    assert '"event":"timeline-frame-retained"' not in output
+    assert '"event":"capture-loop-paced"' not in output
     assert_no_secret_leak(output)
+
+
+def test_runtime_loop_reuses_vehicle_history_health_snapshot_within_cache_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from parking_spot_monitor import __main__ as cli
+
+    class CountingHistoryArchive:
+        latest: "CountingHistoryArchive | None" = None
+
+        def __init__(self, _root: Path, *, logger: StructuredLogger | None = None) -> None:
+            self.calls = 0
+            CountingHistoryArchive.latest = self
+
+        def health_snapshot(self) -> dict[str, Any]:
+            self.calls += 1
+            return {"archive_status": "cached", "calls": self.calls}
+
+    monkeypatch.setattr(cli, "VehicleHistoryArchive", CountingHistoryArchive)
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z"),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        sleep=lambda _seconds: None,
+        max_iterations=3,
+        now=lambda: datetime(2026, 5, 18, 18, 0, tzinfo=timezone.utc),
+    )
+
+    assert exit_code == 0
+    assert CountingHistoryArchive.latest is not None
+    assert CountingHistoryArchive.latest.calls == 1
+    assert health_payload(tmp_path / "health.json")["vehicle_history"]["calls"] == 1
+    assert_no_secret_leak(combined_output(capsys))
 
 
 def test_runtime_loop_clears_transient_matrix_outbox_error_after_clean_iteration(
@@ -3957,11 +3992,10 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
 
     assert exit_code == 0
     assert summary["counts_by_state"] == {"delivered": 1, "retrying": 1}
-    assert phases["text"]["state"] == "delivered"
     assert phases["upload"]["state"] == "pending"
     assert phases["image"]["state"] == "pending"
     occupancy_text_kinds = [text["txn_id"].split(":", 1)[0] for text in matrix_client.texts if text["txn_id"].startswith("occupancy-")]
-    assert occupancy_text_kinds == ["occupancy-open-event"]
+    assert occupancy_text_kinds == ["occupancy-occupied-event", "occupancy-open-event"]
     assert len(matrix_client.uploads) == 1
     assert matrix_client.uploads[0]["filename"].startswith("occupancy-occupied-event-")
     assert len(matrix_client.images) == 1
@@ -3973,7 +4007,7 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
 def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_event(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # First invocation leaves a retryable record after text delivery and before upload.
+    # First invocation leaves a retryable record before Matrix media upload.
     detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], [], []]
     failing_client = UploadFailsOnceMatrixClient()
 
@@ -4020,15 +4054,12 @@ def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_eve
 
     assert second_exit == 0
     assert summary["counts_by_state"] == {"delivered": 2}
-    assert phases["text"]["state"] == "delivered"
     assert phases["upload"]["state"] == "delivered"
     assert phases["image"]["state"] == "delivered"
     assert [text for text in successful_client.texts if text["txn_id"].startswith("occupancy-open-event:")] == []
     assert len([text for text in successful_client.texts if text["txn_id"].startswith("parking-monitor-started:")]) == 1
     assert len(successful_client.uploads) == 1
     assert len(successful_client.images) == 1
-    assert '"event":"matrix-outbox-phase-skip"' in output
-    assert '"reason":"already_delivered"' in output
     assert '"event":"matrix-outbox-runtime-drain-succeeded"' in output
     assert '"attempted_count":1' in output
     assert_no_secret_leak(output)

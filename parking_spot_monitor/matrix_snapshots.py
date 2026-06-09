@@ -44,7 +44,11 @@ class SnapshotRetentionResult:
     retained_count: int = 0
     failed_count: int = 0
 
-def _matrix_snapshot_upload(snapshot: MatrixSnapshot, *, logger: StructuredLogger | None) -> dict[str, Any]:
+def _matrix_snapshot_upload(
+    snapshot: MatrixSnapshot,
+    *,
+    logger: StructuredLogger | None,
+) -> dict[str, Any]:
     source_size = snapshot.path.stat().st_size
     if source_size <= MAX_MATRIX_UPLOAD_IMAGE_BYTES:
         raw = snapshot.path.read_bytes()
@@ -71,7 +75,9 @@ def _resize_jpeg_for_matrix_upload(path: Path) -> tuple[bytes, dict[str, int | s
 
         max_dimension = min(max(width, height), MATRIX_UPLOAD_INITIAL_MAX_DIMENSION)
         resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
-        while max_dimension >= MATRIX_UPLOAD_MIN_DIMENSION:
+        first_attempt = True
+        while first_attempt or max_dimension >= MATRIX_UPLOAD_MIN_DIMENSION:
+            first_attempt = False
             resized = image.copy()
             resized.thumbnail((max_dimension, max_dimension), resampling)
             if resized.mode != "RGB":

@@ -52,12 +52,17 @@ def _require_response_key(response: httpx.Response, key: str, *, operation: str,
 
 def _http_status_error(response: httpx.Response, *, method: str, path: str, attempt: int) -> MatrixError:
     errcode = None
+    retry_after_seconds = _retry_after_header_seconds(response.headers.get("Retry-After"))
     try:
         payload = response.json()
     except ValueError:
         payload = None
     if isinstance(payload, dict) and isinstance(payload.get("errcode"), str):
         errcode = payload["errcode"]
+    if isinstance(payload, dict):
+        retry_after_ms = payload.get("retry_after_ms")
+        if isinstance(retry_after_ms, (int, float)) and retry_after_ms >= 0:
+            retry_after_seconds = max(retry_after_seconds or 0.0, float(retry_after_ms) / 1000.0)
     return MatrixError(
         "Matrix request returned an error status",
         error_type="http_status",
@@ -66,7 +71,18 @@ def _http_status_error(response: httpx.Response, *, method: str, path: str, atte
         attempt=attempt,
         status_code=response.status_code,
         errcode=errcode,
+        retry_after_seconds=retry_after_seconds,
     )
+
+
+def _retry_after_header_seconds(value: str | None) -> float | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return max(0.0, seconds)
 
 
 _UNSAFE_DIAGNOSTIC_KEYS = {"raw_body", "response_body", "body", "headers", "authorization"}

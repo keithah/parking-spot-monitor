@@ -9,6 +9,7 @@ import httpx
 import pytest
 from PIL import Image
 
+from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix import (
     MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
     MONITOR_STARTED_EVENT_TYPE,
@@ -66,6 +67,61 @@ def test_send_text_puts_room_message_with_encoded_segments_and_returns_event_id(
     assert request.headers["authorization"] == f"Bearer {ACCESS_TOKEN}"
     assert request.headers["content-type"] == "application/json"
     assert request_json(request) == {"msgtype": "m.text", "body": "Parking spot is open"}
+
+
+def test_sync_retries_transient_matrix_statuses() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(500, json={"errcode": "M_UNAVAILABLE"}, request=request)
+        return httpx.Response(200, json={"next_batch": "batch-2", "rooms": {"join": {ROOM_ID: {"timeline": {"events": []}}}}})
+
+    client = MatrixClient(
+        homeserver=HOMESERVER,
+        access_token=ACCESS_TOKEN,
+        timeout_seconds=2,
+        retry_attempts=2,
+        retry_backoff_seconds=0.25,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=sleeps.append,
+    )
+
+    result = client.sync(room_id=ROOM_ID, timeout_ms=0)
+
+    assert result.next_batch == "batch-2"
+    assert attempts == 2
+    assert sleeps == [0.25]
+
+
+def test_matrix_retry_honors_server_retry_after_ms_before_local_backoff() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, json={"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 1750}, request=request)
+        return httpx.Response(200, json={"event_id": "$event:example.org"}, request=request)
+
+    client = MatrixClient(
+        homeserver=HOMESERVER,
+        access_token=ACCESS_TOKEN,
+        timeout_seconds=2,
+        retry_attempts=2,
+        retry_backoff_seconds=0.25,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=sleeps.append,
+    )
+
+    event_id = client.send_text(room_id=ROOM_ID, txn_id="txn", body="Parking spot is open")
+
+    assert event_id == "$event:example.org"
+    assert sleeps == [1.75]
 
 
 def test_upload_image_posts_media_with_filename_query_and_returns_content_uri() -> None:
@@ -153,7 +209,7 @@ def test_matrix_delivery_live_proof_sends_labelled_text_and_raw_image(tmp_path: 
         room_id=ROOM_ID,
         data_dir=tmp_path,
         snapshots_dir=tmp_path / "snapshots",
-        logger=None,  # type: ignore[arg-type]
+        logger=StructuredLogger(),
     )
 
     delivery.send_live_proof(latest_path=source, observed_at="2026-05-18T19:00:00Z", selected_mode="software")
@@ -191,7 +247,7 @@ def test_matrix_delivery_live_proof_image_uses_shared_upload_helper(tmp_path: Pa
         room_id=ROOM_ID,
         data_dir=tmp_path,
         snapshots_dir=tmp_path / "snapshots",
-        logger=None,  # type: ignore[arg-type]
+        logger=StructuredLogger(),
     )
 
     delivery.send_live_proof_image(latest_path=source, observed_at="2026-05-18T19:00:00Z", selected_mode="software")
@@ -481,8 +537,11 @@ def test_matrix_delivery_open_alert_uploads_resized_image_without_mutating_retai
 
     snapshot = delivery.send_open_spot_alert(open_event(source))
 
+    assert [item["kind"] for item in seen] == ["text", "upload", "image"]
+    texts = [item for item in seen if item["kind"] == "text"]
     uploads = [item for item in seen if item["kind"] == "upload"]
     images = [item for item in seen if item["kind"] == "image"]
+    assert texts[0]["body"] == "Parking spot open: left_spot at 2026-05-18 1:01:02 PM PDT"
     assert len(uploads) == 1
     assert len(images) == 1
     assert snapshot.path.read_bytes() == raw_bytes
@@ -493,7 +552,7 @@ def test_matrix_delivery_open_alert_uploads_resized_image_without_mutating_retai
     assert images[0]["info"]["size"] == len(uploads[0]["data"])
     assert images[0]["info"]["w"] < 1280
     assert images[0]["info"]["h"] < 720
-    assert images[0]["body"].startswith("Raw full-frame snapshot for left_spot")
+    assert images[0]["body"] == "Parking spot open: left_spot at 2026-05-18 1:01:02 PM PDT"
 
 def test_matrix_delivery_occupied_alert_sends_upload_and_image_with_alert_body(tmp_path: Path) -> None:
     source = tmp_path / "occupied.jpg"
@@ -533,17 +592,18 @@ def test_matrix_delivery_occupied_alert_sends_upload_and_image_with_alert_body(t
     snapshot = delivery.send_occupied_spot_alert(occupied_event(source))
 
     event_id = "occupancy-occupied-event:left_spot:2026-05-18T20:01:02Z"
-    assert [item["kind"] for item in seen] == ["upload", "image"]
-    assert seen[0]["content_type"] == "image/jpeg"
-    assert seen[0]["data"] == raw_bytes
-    assert seen[0]["filename"] == "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
+    assert [item["kind"] for item in seen] == ["text", "upload", "image"]
+    assert seen[0]["body"].startswith("Parking spot occupied: left_spot at 2026-05-18 1:01:02 PM PDT")
+    assert seen[1]["content_type"] == "image/jpeg"
+    assert seen[1]["data"] == raw_bytes
+    assert seen[1]["filename"] == "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
     assert snapshot.path == tmp_path / "snapshots" / "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
     assert snapshot.filename == "occupancy-occupied-event-left-spot-2026-05-18t20-01-02z.jpg"
-    assert seen[1]["txn_id"] == f"{event_id}:image"
-    assert seen[1]["body"].startswith("Parking spot occupied: left_spot at 2026-05-18 1:01:02 PM PDT")
-    assert "Likely vehicle: silver hatchback (profile prof_repeat)" in seen[1]["body"]
-    assert seen[1]["content_uri"] == "mxc://example.org/occupied"
-    assert seen[1]["info"] == {"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 9, "h": 7}
+    assert seen[2]["txn_id"] == f"{event_id}:image"
+    assert seen[2]["body"].startswith("Parking spot occupied: left_spot at 2026-05-18 1:01:02 PM PDT")
+    assert "Likely vehicle: silver hatchback (profile prof_repeat)" in seen[2]["body"]
+    assert seen[2]["content_uri"] == "mxc://example.org/occupied"
+    assert seen[2]["info"] == {"mimetype": "image/jpeg", "size": len(raw_bytes), "w": 9, "h": 7}
 
 
 def test_matrix_delivery_occupied_alert_rejects_invalid_snapshot_source(tmp_path: Path) -> None:
@@ -927,7 +987,7 @@ def test_send_text_retries_transient_http_statuses_and_logs_retry_decisions() ->
 
     output = stream.getvalue()
     records = [json.loads(line) for line in output.splitlines()]
-    assert sleeps == [0.25, 0.25]
+    assert sleeps == [0.25, 0.5]
     assert [record["event"] for record in records] == ["matrix-request-retry", "matrix-request-retry"]
     assert [record["attempt"] for record in records] == [1, 2]
     assert [record["next_attempt"] for record in records] == [2, 3]

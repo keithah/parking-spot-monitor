@@ -6,11 +6,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
-from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
-from parking_spot_monitor.matrix_alerts import _first_present, _int_field, _occupied_snapshot_body, _safe_text
-from parking_spot_monitor.matrix_models import MatrixCommandParseError, MatrixCommandResponse
+from parking_spot_monitor.logging import StructuredLogger
+from parking_spot_monitor.matrix_alerts import _first_present, _safe_text
+from parking_spot_monitor.matrix_models import MatrixCommandResponse
 from parking_spot_monitor.operator_cockpit import (
     build_incident_review_response,
     build_latest_snapshot_response,

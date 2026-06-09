@@ -138,7 +138,11 @@ def main(
             except subprocess.TimeoutExpired:
                 killed = True
                 proc.kill()
-                more_stdout, more_stderr = proc.communicate(timeout=10)
+                try:
+                    more_stdout, more_stderr = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired as kill_exc:
+                    more_stdout = getattr(kill_exc, "stdout", None) or getattr(kill_exc, "output", None)
+                    more_stderr = getattr(kill_exc, "stderr", None)
             stdout_raw = _combine_timeout_output(stdout_raw, more_stdout)
             stderr_raw = _combine_timeout_output(stderr_raw, more_stderr)
             docker_exit_code = proc.returncode
@@ -416,7 +420,8 @@ def _check_alert_readback(*, alerts: Sequence[Mapping[str, Any]], config_summary
     per_alert: list[dict[str, Any]] = []
     for alert in alerts[: max(1, min(limit, 50))]:
         spot_id = str(alert.get("spot_id") or "")
-        text_found = any(message["msgtype"] == "m.text" and f"Parking spot open: {spot_id}" in message["body"] for message in messages)
+        alert_text_found = f"Parking spot open: {spot_id}"
+        text_found = any(message["msgtype"] == "m.text" and alert_text_found in message["body"] for message in messages)
         image_found = any(message["msgtype"] == "m.image" and f"Raw full-frame snapshot for {spot_id}" in message["body"] for message in messages)
         per_alert.append({"event_id": alert.get("event_id"), "spot_id": spot_id, "text_found": text_found, "image_found": image_found})
     verified = all(item["text_found"] and item["image_found"] for item in per_alert)

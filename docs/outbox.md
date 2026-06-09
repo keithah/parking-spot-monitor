@@ -34,7 +34,7 @@ The runtime loop detects outbox-capable deliveries with duck-typed outbox hooks.
 
 Each open alert is represented by one outbox record with three phases:
 
-1. `text` — sends the Matrix text event.
+1. `text` — sends the Matrix text event with the human alert text.
 2. `upload` — prepares/copies the retained JPEG snapshot and uploads it to Matrix media.
 3. `image` — sends the Matrix image event using the uploaded `content_uri`.
 

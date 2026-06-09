@@ -23,7 +23,7 @@ def parse_incident_time(value: str, *, now: datetime) -> datetime:
 def nearest_timeline_frame(data_dir: Path, target_time: datetime) -> tuple[Path, datetime] | None:
     frames_dir = data_dir / "timeline" / "frames"
     try:
-        candidates = list(frames_dir.glob("*.jpg"))
+        candidates = frames_dir.glob("*.jpg")
     except OSError:
         return None
     nearest: tuple[Path, datetime] | None = None

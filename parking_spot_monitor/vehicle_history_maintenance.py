@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from parking_spot_monitor.vehicle_estimates import VehicleHistoryEstimate, estimate_vehicle_history
 from parking_spot_monitor.vehicle_history_maintenance_utils import (
     _archive_files_for_export,
     _archive_directory_stats,

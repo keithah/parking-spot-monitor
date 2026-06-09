@@ -61,7 +61,6 @@ def record_timeline_frame(
     pruned_count = 0
     pruned_bytes = 0
     if target.exists():
-        pruned_count, pruned_bytes = _prune_old_frames(frames_dir, observed=observed, retention_hours=retention_hours)
         return TimelineFrameResult(
             saved=False,
             path=target,

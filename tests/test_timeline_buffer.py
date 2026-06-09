@@ -54,6 +54,29 @@ def test_record_timeline_frame_keeps_one_frame_per_minute_and_prunes_older_than_
     assert sorted(path.name for path in frames_dir.glob("*.jpg")) == ["20260516T184200Z.jpg", "20260516T184300Z.jpg"]
 
 
+def test_record_timeline_frame_does_not_prune_on_duplicate_minute_sample(tmp_path: Path) -> None:
+    from parking_spot_monitor.timeline_buffer import record_timeline_frame
+
+    source = tmp_path / "latest.jpg"
+    _write_jpeg(source)
+    frames_dir = tmp_path / "timeline" / "frames"
+    existing = frames_dir / "20260516T184200Z.jpg"
+    stale = frames_dir / "20260516T064200Z.jpg"
+    _write_jpeg(existing)
+    _write_jpeg(stale)
+
+    duplicate = record_timeline_frame(
+        source,
+        data_dir=tmp_path,
+        observed_at=datetime(2026, 5, 16, 18, 42, 59, tzinfo=timezone.utc),
+    )
+
+    assert duplicate.saved is False
+    assert duplicate.reason == "already-sampled"
+    assert duplicate.pruned_count == 0
+    assert stale.exists()
+
+
 def test_record_timeline_frame_fails_safely_when_source_missing(tmp_path: Path) -> None:
     from parking_spot_monitor.timeline_buffer import record_timeline_frame
 

@@ -34,6 +34,7 @@ _T = TypeVar("_T")
 class VehicleHistoryEventResult:
     errors: list[dict[str, Any]]
     occupied_alerts: list[dict[str, Any]]
+    changed: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,7 @@ def _record_vehicle_history_events(
 ) -> VehicleHistoryEventResult:
     history_errors: list[dict[str, Any]] = []
     occupied_alerts: list[dict[str, Any]] = []
+    changed = False
     if history_archive is None:
         return VehicleHistoryEventResult(errors=history_errors, occupied_alerts=occupied_alerts)
     for event in events:
@@ -149,9 +151,11 @@ def _record_vehicle_history_events(
             )
             history_errors.extend(result.errors)
             occupied_alerts.extend(result.occupied_alerts)
+            changed = changed or result.changed
             continue
         if previous_status is OccupancyStatus.OCCUPIED and new_status is OccupancyStatus.EMPTY:
             history_errors.extend(_record_vehicle_history_close(history_archive, event, logger=logger))
+            changed = True
             continue
         logger.info(
             "vehicle-session-lifecycle-ignored",
@@ -161,7 +165,7 @@ def _record_vehicle_history_events(
             new_status=None if new_status is None else new_status.value,
             reason="not-lifecycle-transition",
         )
-    return VehicleHistoryEventResult(errors=history_errors, occupied_alerts=occupied_alerts)
+    return VehicleHistoryEventResult(errors=history_errors, occupied_alerts=occupied_alerts, changed=changed)
 
 
 def _record_vehicle_history_start(
@@ -197,7 +201,7 @@ def _record_vehicle_history_start(
         )
         errors.append(context)
         logger.error("vehicle-history-record-failed", **context)
-        return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts)
+        return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts, changed=True)
 
     image_record = _attach_occupied_images(
         history_archive,
@@ -210,7 +214,7 @@ def _record_vehicle_history_start(
     )
     errors.extend(image_record.errors)
     if image_record.value is None:
-        return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts)
+        return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts, changed=True)
 
     profile_assignment = _match_vehicle_profile_for_session(
         history_archive,
@@ -231,7 +235,7 @@ def _record_vehicle_history_start(
     )
     if occupied_alert is not None:
         occupied_alerts.append(occupied_alert)
-    return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts)
+    return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts, changed=True)
 
 
 def _record_vehicle_history_close(
@@ -391,7 +395,13 @@ def _occupied_alert_payload(
     match_reason = None if profile_assignment is None else profile_assignment.reason
 
     label = _profile_label_for_alert(history_archive, profile_id, logger=logger, spot_id=event.spot_id, session_id=session_id)
-    estimate = _estimate_for_alert(history_archive, session_id, logger=logger, spot_id=event.spot_id)
+    estimate = _estimate_for_alert(
+        history_archive,
+        session_id,
+        profile_id=profile_id,
+        logger=logger,
+        spot_id=event.spot_id,
+    )
 
     payload: dict[str, Any] = {
         "event_type": OCCUPIED_SPOT_EVENT_TYPE,
@@ -440,11 +450,16 @@ def _estimate_for_alert(
     history_archive: VehicleHistoryArchive,
     session_id: str,
     *,
+    profile_id: str | None,
     logger: StructuredLogger,
     spot_id: str,
 ) -> dict[str, Any]:
     try:
-        estimate = history_archive.estimate_for_session(session_id)
+        estimate_for_profile_id = getattr(history_archive, "estimate_for_profile_id", None)
+        if isinstance(profile_id, str) and profile_id.strip() and callable(estimate_for_profile_id):
+            estimate = estimate_for_profile_id(profile_id)
+        else:
+            estimate = history_archive.estimate_for_session(session_id)
     except Exception as exc:
         logger.warning(
             "vehicle-history-estimate-failed",

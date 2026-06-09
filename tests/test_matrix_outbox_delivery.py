@@ -118,14 +118,13 @@ def test_occupied_alert_queues_image_outbox_record_without_network(tmp_path: Pat
     record = delivery.send_occupied_spot_alert(occupied_event(source))
 
     assert client.calls == []
-    assert record.phase_states == {"upload": "pending", "image": "pending"}
+    assert record.phase_states == {"text": "pending", "upload": "pending", "image": "pending"}
     [persisted] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
     assert persisted.id == record.id
     assert persisted.intent.event_id.startswith("occupancy-occupied-event:left_spot:")
     assert persisted.intent.body.startswith("Parking spot occupied: left_spot")
-    assert persisted.intent.phase == "upload"
+    assert persisted.intent.phase == "text"
     assert str(persisted.intent.metadata["event_type"]) == "occupancy-occupied-event"
-    assert str(persisted.intent.metadata["image_body"]).startswith("Parking spot occupied: left_spot")
     retained_path = Path(str(persisted.intent.metadata["retained_snapshot_path"]))
     assert retained_path.exists()
     assert retained_path.name.startswith("occupancy-occupied-event-left-spot-")
@@ -142,11 +141,12 @@ def test_occupied_alert_drains_as_single_image_message_with_alert_body(tmp_path:
     result = delivery.drain_outbox()
 
     assert result.delivered_count == 1
-    assert [call["kind"] for call in client.calls] == ["upload", "image"]
-    image_call = client.calls[1]
-    assert image_call["body"] == "Parking spot occupied: left_spot at 2026-05-20 2:22:54 PM PDT"
+    assert [call["kind"] for call in client.calls] == ["text", "upload", "image"]
+    assert client.calls[0]["body"] == "Parking spot occupied: left_spot at 2026-05-20 2:22:54 PM PDT"
+    image_call = client.calls[2]
+    assert image_call["body"].startswith("Raw full-frame snapshot for left_spot")
     [persisted] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
-    assert persisted.phase_states == {"upload": "delivered", "image": "delivered"}
+    assert persisted.phase_states == {"text": "delivered", "upload": "delivered", "image": "delivered"}
 
 
 def test_matrix_outbox_delivery_close_closes_owned_client(tmp_path: Path) -> None:
@@ -158,30 +158,18 @@ def test_matrix_outbox_delivery_close_closes_owned_client(tmp_path: Path) -> Non
     assert client.closed is True
 
 
-def test_text_failure_persists_three_phase_record_before_network_and_leaves_text_pending(tmp_path: Path) -> None:
+def test_open_alert_queues_image_outbox_record_without_network(tmp_path: Path) -> None:
     source = tmp_path / "latest.jpg"
     write_jpeg(source)
-    store_path = tmp_path / "matrix-outbox.json"
-
-    def assert_enqueued_before_network() -> None:
-        persisted = LocalOutbox(store_path).list_records()
-        assert len(persisted) == 1
-        assert persisted[0].phase_states == {"text": "pending", "upload": "pending", "image": "pending"}
-
-    client = FakeMatrixClient(
-        fail={"text": MatrixError("timeout access_token=secret", error_type="timeout")},
-        on_send_text=assert_enqueued_before_network,
-    )
+    client = FakeMatrixClient()
     delivery = make_delivery(tmp_path, client)
 
-    result = delivery.send_open_spot_alert(open_event(source))
+    record = delivery.enqueue_open_spot_alert(open_event(source))
 
-    assert result.retrying_count == 1
-    [record] = LocalOutbox(store_path).list_records()
-    assert record.state == "retrying"
-    assert record.retry_reason == "matrix_text_timeout"
+    assert client.calls == []
     assert record.phase_states == {"text": "pending", "upload": "pending", "image": "pending"}
-    assert [call["kind"] for call in client.calls] == ["text"]
+    assert record.intent.body == "Parking spot open: left_spot at 2026-05-18 1:01:02 PM PDT"
+    assert record.intent.phase == "text"
 
 
 
@@ -190,7 +178,7 @@ def test_text_retry_uploads_retained_event_snapshot_not_changed_latest(tmp_path:
     original_bytes = write_jpeg(source, color=(25, 50, 75))
     store_path = tmp_path / "matrix-outbox.json"
 
-    first_client = FakeMatrixClient(fail={"text": MatrixError("timeout", error_type="timeout")})
+    first_client = FakeMatrixClient(fail={"upload": MatrixError("timeout", error_type="timeout")})
     make_delivery(tmp_path, first_client).send_open_spot_alert(open_event(source))
 
     [retrying] = LocalOutbox(store_path).list_records()
@@ -224,7 +212,7 @@ def test_occupied_alert_retention_preserves_retryable_open_outbox_evidence(tmp_p
     first_bytes = write_jpeg(source, color=(25, 50, 75))
     store_path = tmp_path / "matrix-outbox.json"
 
-    first_client = FakeMatrixClient(fail={"text": MatrixError("timeout", error_type="timeout")})
+    first_client = FakeMatrixClient(fail={"upload": MatrixError("timeout", error_type="timeout")})
     make_delivery(tmp_path, first_client, snapshot_retention_count=1).send_open_spot_alert(open_event(source))
     [retrying] = LocalOutbox(store_path).list_records()
     protected_path = Path(str(retrying.intent.metadata["retained_snapshot_path"]))
@@ -271,7 +259,7 @@ def test_snapshot_retention_preserves_retryable_outbox_evidence_while_pruning_un
     first_bytes = write_jpeg(source, color=(25, 50, 75))
     store_path = tmp_path / "matrix-outbox.json"
 
-    first_client = FakeMatrixClient(fail={"text": MatrixError("timeout", error_type="timeout")})
+    first_client = FakeMatrixClient(fail={"upload": MatrixError("timeout", error_type="timeout")})
     make_delivery(tmp_path, first_client, snapshot_retention_count=1).send_open_spot_alert(open_event(source))
     [retrying] = LocalOutbox(store_path).list_records()
     protected_path = Path(str(retrying.intent.metadata["retained_snapshot_path"]))
@@ -296,7 +284,7 @@ def test_snapshot_retention_preserves_retryable_outbox_evidence_while_pruning_un
     assert newest.exists()
     assert not unrelated_old.exists()
 
-def test_upload_failure_after_text_leaves_text_delivered_and_upload_pending_across_restart(tmp_path: Path) -> None:
+def test_upload_failure_leaves_upload_pending_across_restart(tmp_path: Path) -> None:
     source = tmp_path / "latest.jpg"
     write_jpeg(source)
     store_path = tmp_path / "matrix-outbox.json"
@@ -393,7 +381,7 @@ def test_retry_logs_use_safe_reason_codes_and_redact_unsafe_diagnostics(tmp_path
     write_jpeg(source)
     stream = StringIO()
     client = FakeMatrixClient(
-        fail={"text": MatrixError("Authorization: Bearer secret-token", error_type="timeout", access_token="secret-token")}
+        fail={"upload": MatrixError("Authorization: Bearer secret-token", error_type="timeout", access_token="secret-token")}
     )
 
     make_delivery(tmp_path, client, stream=stream).send_open_spot_alert(open_event(source))
@@ -405,7 +393,7 @@ def test_retry_logs_use_safe_reason_codes_and_redact_unsafe_diagnostics(tmp_path
     assert "matrix-outbox-drain-started" in events
     assert "matrix-outbox-phase-attempt" in events
     assert "matrix-outbox-phase-retryable-failure" in events
-    assert any(record.get("reason") == "matrix_text_timeout" for record in records)
+    assert any(record.get("reason") == "matrix_upload_timeout" for record in records)
     assert "secret-token" not in output
     assert "Authorization" not in output
     assert "Bearer" not in output
@@ -417,7 +405,7 @@ def test_non_retryable_matrix_4xx_dead_letters_and_is_not_drained_after_restart(
     store_path = tmp_path / "matrix-outbox.json"
     client = FakeMatrixClient(
         fail={
-            "text": MatrixError(
+            "image": MatrixError(
                 "Authorization: Bearer secret-token",
                 error_type="http_status",
                 status_code=401,
@@ -433,12 +421,12 @@ def test_non_retryable_matrix_4xx_dead_letters_and_is_not_drained_after_restart(
     assert result.retrying_count == 0
     [dead] = LocalOutbox(store_path).list_records()
     assert dead.state == "dead_lettered"
-    assert dead.dead_letter_reason == "matrix_text_http_401"
+    assert dead.dead_letter_reason == "matrix_image_http_401"
     assert dead.retry_reason is None
-    assert dead.phase_states == {"text": "failed", "upload": "pending", "image": "pending"}
+    assert dead.phase_states == {"text": "delivered", "upload": "delivered", "image": "failed"}
     summary = LocalOutbox(store_path).status_summary()
     assert summary["counts_by_state"] == {"dead_lettered": 1}
-    assert summary["dead_letter_reason_counts"] == {"matrix_text_http_401": 1}
+    assert summary["dead_letter_reason_counts"] == {"matrix_image_http_401": 1}
     rendered = json.dumps(summary)
     assert "secret-token" not in rendered
     assert "Authorization" not in rendered
@@ -464,7 +452,7 @@ def test_retryable_matrix_statuses_remain_retrying(tmp_path: Path, status_code: 
     source = tmp_path / "latest.jpg"
     write_jpeg(source)
     client = FakeMatrixClient(
-        fail={"text": MatrixError("temporary", error_type="http_status", status_code=status_code)}
+        fail={"image": MatrixError("temporary", error_type="http_status", status_code=status_code)}
     )
 
     result = make_delivery(tmp_path, client).send_open_spot_alert(open_event(source))
@@ -472,7 +460,7 @@ def test_retryable_matrix_statuses_remain_retrying(tmp_path: Path, status_code: 
     assert result.retrying_count == 1
     [record] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
     assert record.state == "retrying"
-    assert record.retry_reason == f"matrix_text_http_{status_code}"
+    assert record.retry_reason == f"matrix_image_http_{status_code}"
     assert record.dead_letter_reason is None
 
 
@@ -509,7 +497,7 @@ def test_missing_retained_snapshot_evidence_dead_letters_upload_without_raw_path
     source = tmp_path / "latest.jpg"
     write_jpeg(source)
     store_path = tmp_path / "matrix-outbox.json"
-    first_client = FakeMatrixClient(fail={"text": MatrixError("timeout", error_type="timeout")})
+    first_client = FakeMatrixClient(fail={"upload": MatrixError("timeout", error_type="timeout")})
     make_delivery(tmp_path, first_client).send_open_spot_alert(open_event(source))
     [retrying] = LocalOutbox(store_path).list_records()
     retained_path = Path(str(retrying.intent.metadata["retained_snapshot_path"]))

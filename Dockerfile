@@ -17,9 +17,14 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+FROM runtime-base AS runtime-app
+
 COPY parking_spot_monitor ./parking_spot_monitor
 COPY src ./src
 COPY main.py config.yaml.example ./
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+    CMD python -m parking_spot_monitor.healthcheck --health-file /data/health.json --max-age-seconds 120
 
 CMD ["python", "-m", "parking_spot_monitor", "--config", "/config/config.yaml"]
 
@@ -27,5 +32,12 @@ FROM runtime-base AS runtime-detector
 
 COPY requirements-detector.txt ./
 RUN pip install --no-cache-dir -r requirements-detector.txt
+
+COPY parking_spot_monitor ./parking_spot_monitor
+COPY src ./src
+COPY main.py config.yaml.example ./
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+    CMD python -m parking_spot_monitor.healthcheck --health-file /data/health.json --max-age-seconds 120
 
 CMD ["python", "-m", "parking_spot_monitor", "--config", "/config/config.yaml"]

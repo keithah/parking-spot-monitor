@@ -1,6 +1,6 @@
-"""Durable Matrix open-alert outbox delivery executor.
+"""Durable Matrix snapshot-alert outbox delivery executor.
 
-The executor persists an open-spot alert intent before touching Matrix and then
+The executor persists a snapshot alert intent before touching Matrix and then
 phase-drains the durable record in Matrix's idempotent transaction order:
 text, upload, image. Phase results are stored in the local outbox so process
 restarts retry only missing work.
@@ -31,7 +31,7 @@ from parking_spot_monitor.matrix import (
 )
 from parking_spot_monitor.matrix_snapshots import _matrix_snapshot_upload
 
-_OPEN_ALERT_PHASES = ("text", "upload", "image")
+_SNAPSHOT_ALERT_PHASES = ("text", "upload", "image")
 
 
 @dataclass(frozen=True)
@@ -106,14 +106,15 @@ class MatrixOutboxDelivery:
         return self.drain_outbox(record_id=record.id)
 
     def enqueue_open_spot_alert(self, event: Mapping[str, Any]) -> OutboxRecord:
-        """Persist a three-phase open-alert record without performing network I/O."""
+        """Persist a text-plus-image open-alert record without performing network I/O."""
 
         event_id = open_spot_event_id(event)
         metadata = _open_alert_metadata(event)
+        body = format_open_spot_alert(event)
         return self._enqueue_snapshot_alert(
             event=event,
             event_id=event_id,
-            body=format_open_spot_alert(event),
+            body=body,
             metadata=metadata,
             snapshot_source_path=str(metadata.get("snapshot_path", "")),
             snapshot_event_type=OPEN_SPOT_EVENT_TYPE,
@@ -123,7 +124,7 @@ class MatrixOutboxDelivery:
         )
 
     def enqueue_occupied_spot_alert(self, event: Mapping[str, Any]) -> OutboxRecord:
-        """Persist a three-phase occupied-alert record without performing network I/O."""
+        """Persist a text-plus-image occupied-alert record without performing network I/O."""
 
         event_id = occupied_spot_event_id(event)
         metadata = _occupied_alert_metadata(event)
@@ -134,9 +135,9 @@ class MatrixOutboxDelivery:
             metadata=metadata,
             snapshot_source_path=str(metadata.get("occupied_snapshot_path", "")),
             snapshot_event_type=OCCUPIED_SPOT_EVENT_TYPE,
-            image_body=format_occupied_spot_alert(event),
-            initial_phase="upload",
-            followup_phases=("image",),
+            image_body=None,
+            initial_phase="text",
+            followup_phases=("upload", "image"),
         )
 
     def _enqueue_snapshot_alert(
@@ -289,6 +290,7 @@ class MatrixOutboxDelivery:
             event_type=str(metadata.get("event_type") or OPEN_SPOT_EVENT_TYPE),
         )
         self._log("info", "matrix-outbox-snapshot-prepared", item_id=record.id, phase="upload", **snapshot.log_context)
+        image_body = str(metadata.get("image_body") or snapshot.body)
         upload = _matrix_snapshot_upload(snapshot, logger=self.logger)
         content_uri = self.client.upload_image(
             filename=snapshot.filename,
@@ -302,7 +304,7 @@ class MatrixOutboxDelivery:
             result={
                 "content_uri": content_uri,
                 "filename": snapshot.filename,
-                "body": str(metadata.get("image_body") or snapshot.body),
+                "body": image_body,
                 "info": info,
             },
         )
@@ -414,7 +416,7 @@ def _transaction_id(record: OutboxRecord, phase: str) -> str:
 
 
 def _record_delivery_phases(record: OutboxRecord) -> tuple[str, ...]:
-    return tuple(phase for phase in _OPEN_ALERT_PHASES if phase in record.phase_states)
+    return tuple(phase for phase in _SNAPSHOT_ALERT_PHASES if phase in record.phase_states)
 
 
 def _retry_reason(exc: Exception, *, phase: str) -> str:
