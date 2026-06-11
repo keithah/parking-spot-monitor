@@ -147,9 +147,7 @@ def test_capture_latest_uses_selected_stream_profile(tmp_path: Path) -> None:
 
     result = capture_latest(settings, tmp_path, stream_profile="high_resolution", modes=[DecodeMode.SOFTWARE], runner=runner)
 
-    assert result.stream_profile == "high_resolution"
     assert result.frame_geometry == FrameGeometry(stream_profile="high_resolution", expected_size=(3840, 2160))
-    assert result.expected_frame_size == (3840, 2160)
     assert high_url in calls[0]
     assert FAKE_RTSP_VALUE not in calls[0]
     assert result.diagnostics()["stream_profile"] == "high_resolution"

@@ -94,7 +94,7 @@ def test_missing_escalation_profile_does_not_recapture_primary_stream(tmp_path: 
     )
 
     assert captured_profiles == [None]
-    assert frame_result.final_capture.stream_profile == "primary"
+    assert frame_result.final_capture.frame_geometry.stream_profile == "primary"
 
 
 def test_escalation_returns_final_frame_for_caller_owned_memory_recording(tmp_path: Path) -> None:
@@ -151,7 +151,7 @@ def test_escalation_returns_final_frame_for_caller_owned_memory_recording(tmp_pa
     result = frame_result.final_capture
 
     assert captured_profiles == [None, "high_resolution"]
-    assert result.stream_profile == "high_resolution"
+    assert result.frame_geometry.stream_profile == "high_resolution"
     assert not memory_path.exists()
 
     record_detection_memory_records(

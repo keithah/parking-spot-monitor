@@ -329,7 +329,7 @@ def test_runtime_stream_escalation_stays_pure_orchestration() -> None:
 
     assert "inspect" not in source
     assert "_append_detection_memory_records" not in source
-    assert "StreamEscalationCaptureError" not in loop_source
+    assert "StreamEscalationCaptureFailed" not in loop_source
     assert "StreamProfileCapture" not in escalation_classes
     assert "StreamProfileCapture" in capture_classes
     assert "StreamProfileCapture" in main_arg_annotations["capture"]

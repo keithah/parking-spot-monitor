@@ -15,8 +15,8 @@ from parking_spot_monitor.runtime_frame_outcome import (
     RuntimeFrameDetectionFailed,
 )
 from parking_spot_monitor.runtime_stream_escalation import (
-    StreamEscalationCaptureError,
-    StreamEscalationDetectionError,
+    StreamEscalationCaptureFailed,
+    StreamEscalationDetectionFailed,
     detect_with_stream_escalation,
 )
 from parking_spot_monitor.state import RuntimeState
@@ -41,7 +41,7 @@ def capture_and_detect_runtime_frame(
 
     try:
         detector = detector if detector is not None else detector_factory(settings)
-        frame_result = detect_with_stream_escalation(
+        outcome = detect_with_stream_escalation(
             settings,
             data_dir,
             capture=capture,
@@ -52,19 +52,20 @@ def capture_and_detect_runtime_frame(
             mode=mode,
             iteration=iteration,
         )
-    except StreamEscalationCaptureError as exc:
-        return RuntimeFrameCaptureEscalationFailed(
-            capture=exc.last_successful_capture,
-            detector=detector,
-            error=exc,
-        )
-    except StreamEscalationDetectionError as exc:
-        return RuntimeFrameDetectionFailed(capture=exc.last_successful_capture, detector=detector, error=exc)
     except DetectionError as exc:
         return RuntimeFrameDetectionFailed(capture=primary_result, detector=detector, error=exc)
 
+    if isinstance(outcome, StreamEscalationCaptureFailed):
+        return RuntimeFrameCaptureEscalationFailed(
+            capture=outcome.last_successful_capture,
+            detector=detector,
+            error=outcome.error,
+        )
+    if isinstance(outcome, StreamEscalationDetectionFailed):
+        return RuntimeFrameDetectionFailed(capture=outcome.last_successful_capture, detector=detector, error=outcome.error)
+
     return RuntimeFrameDetected(
-        capture=frame_result.final_capture,
+        capture=outcome.final_capture,
         detector=detector,
-        detection=frame_result.detection,
+        detection=outcome.detection,
     )

@@ -50,14 +50,6 @@ class FrameCaptureResult:
     byte_size: int
     frame_geometry: FrameGeometry
 
-    @property
-    def stream_profile(self) -> str:
-        return self.frame_geometry.stream_profile
-
-    @property
-    def expected_frame_size(self) -> tuple[int, int] | None:
-        return self.frame_geometry.expected_size
-
     def diagnostics(self) -> dict[str, Any]:
         return {
             "timestamp": self.timestamp,
@@ -65,7 +57,7 @@ class FrameCaptureResult:
             "selected_mode": self.selected_mode.value,
             "duration_seconds": round(self.duration_seconds, 6),
             "byte_size": self.byte_size,
-            "stream_profile": self.stream_profile,
+            "stream_profile": self.frame_geometry.stream_profile,
             "expected_frame_size": self.frame_geometry.expected_size_diagnostics(),
         }
 

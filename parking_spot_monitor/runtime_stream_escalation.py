@@ -18,32 +18,19 @@ class StreamDetectionResult:
     detection: DetectionFilterResult
 
 
-class StreamEscalationCaptureError(CaptureError):
-    def __init__(self, error: CaptureError, *, last_successful_capture: FrameCaptureResult) -> None:
-        self.last_successful_capture = last_successful_capture
-        super().__init__(
-            reason=error.reason,
-            mode=error.mode,
-            output_path=error.output_path,
-            message=error.message,
-            stderr_tail=error.stderr_tail,
-            duration_seconds=error.duration_seconds,
-            timeout_seconds=error.timeout_seconds,
-            returncode=error.returncode,
-            attempted_modes=list(error.attempted_modes),
-        )
+@dataclass(frozen=True)
+class StreamEscalationCaptureFailed:
+    last_successful_capture: FrameCaptureResult
+    error: CaptureError
 
 
-class StreamEscalationDetectionError(DetectionError):
-    def __init__(self, error: DetectionError, *, last_successful_capture: FrameCaptureResult) -> None:
-        self.last_successful_capture = last_successful_capture
-        super().__init__(
-            error.message,
-            model_path=error.model_path,
-            frame_path=error.frame_path,
-            phase=error.phase,
-            error_type=error.error_type,
-        )
+@dataclass(frozen=True)
+class StreamEscalationDetectionFailed:
+    last_successful_capture: FrameCaptureResult
+    error: DetectionError
+
+
+StreamEscalationOutcome = StreamDetectionResult | StreamEscalationCaptureFailed | StreamEscalationDetectionFailed
 
 
 def detect_with_stream_escalation(
@@ -57,7 +44,7 @@ def detect_with_stream_escalation(
     logger: StructuredLogger,
     mode: str,
     iteration: int,
-) -> StreamDetectionResult:
+) -> StreamEscalationOutcome:
     primary_detection = _process_detection_for_capture(
         settings,
         detector,
@@ -76,7 +63,7 @@ def detect_with_stream_escalation(
 
     logger.info(
         "stream-profile-escalated",
-        from_profile=primary_result.stream_profile,
+        from_profile=primary_result.frame_geometry.stream_profile,
         to_profile=escalation_profile,
         reason="weak-primary-detection",
         min_authoritative_confidence=settings.stream.escalation_min_confidence,
@@ -85,7 +72,7 @@ def detect_with_stream_escalation(
     try:
         high_result = capture(settings, data_dir, stream_profile=escalation_profile)
     except CaptureError as exc:
-        raise StreamEscalationCaptureError(exc, last_successful_capture=primary_result) from exc
+        return StreamEscalationCaptureFailed(last_successful_capture=primary_result, error=exc)
     try:
         high_detection = _process_detection_for_capture(
             settings,
@@ -98,7 +85,7 @@ def detect_with_stream_escalation(
             frame_geometry=high_result.frame_geometry,
         )
     except DetectionError as exc:
-        raise StreamEscalationDetectionError(exc, last_successful_capture=high_result) from exc
+        return StreamEscalationDetectionFailed(last_successful_capture=high_result, error=exc)
     return StreamDetectionResult(final_capture=high_result, detection=high_detection)
 
 
