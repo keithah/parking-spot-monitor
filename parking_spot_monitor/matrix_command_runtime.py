@@ -62,8 +62,5 @@ class MatrixCommandRuntime:
     def correction_already_seen(self, event_id: str) -> bool:
         return any(correction.matrix_event_id == event_id for correction in self.archive.load_corrections())
 
-    def resolve_wrong_match_subject(self, subject_id: str) -> str:
-        return self.archive.resolve_wrong_match_subject(subject_id)
-
     def profile_summary(self, profile_id: str, *, event: MatrixTextEvent) -> Mapping[str, Any]:
         return self.archive.profile_summary(profile_id, **self.event_metadata(event))

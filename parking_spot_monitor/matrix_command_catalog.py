@@ -266,7 +266,7 @@ class WrongMatchCommand:
     def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         if runtime.correction_already_seen(event.event_id):
             return "Command already applied; acknowledgement repeated."
-        session_id = runtime.resolve_wrong_match_subject(self.subject_id)
+        session_id = runtime.archive.resolve_wrong_match_subject(self.subject_id)
         applied = runtime.archive.mark_wrong_match(session_id, **runtime.event_metadata(event))
         return f"Wrong match recorded for session {session_id}. Correction {applied.correction_id} recorded."
 
