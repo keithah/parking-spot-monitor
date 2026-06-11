@@ -102,7 +102,7 @@ def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
     assert "./config.yaml:/config/config.yaml:ro" in service["volumes"]
     assert "./data:/data" in service["volumes"]
     assert "env_file" not in service
-    assert service["environment"] == ["RTSP_URL", "RTSP_URL_4K", "MATRIX_ACCESS_TOKEN", "TZ=America/Los_Angeles"]
+    assert service["environment"] == ["RTSP_URL", "RTSP_URL_4K", "RTSP_URL_360P", "MATRIX_ACCESS_TOKEN", "TZ=America/Los_Angeles"]
     assert service["command"] == [
         "python",
         "-m",
