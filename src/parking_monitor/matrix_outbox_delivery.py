@@ -118,9 +118,6 @@ class MatrixOutboxDelivery:
             metadata=metadata,
             snapshot_source_path=str(metadata.get("snapshot_path", "")),
             snapshot_event_type=OPEN_SPOT_EVENT_TYPE,
-            image_body=None,
-            initial_phase="text",
-            followup_phases=("upload", "image"),
         )
 
     def enqueue_occupied_spot_alert(self, event: Mapping[str, Any]) -> OutboxRecord:
@@ -135,9 +132,6 @@ class MatrixOutboxDelivery:
             metadata=metadata,
             snapshot_source_path=str(metadata.get("occupied_snapshot_path", "")),
             snapshot_event_type=OCCUPIED_SPOT_EVENT_TYPE,
-            image_body=None,
-            initial_phase="text",
-            followup_phases=("upload", "image"),
         )
 
     def _enqueue_snapshot_alert(
@@ -149,9 +143,6 @@ class MatrixOutboxDelivery:
         metadata: dict[str, Any],
         snapshot_source_path: str,
         snapshot_event_type: str,
-        image_body: str | None,
-        initial_phase: str,
-        followup_phases: tuple[str, ...],
     ) -> OutboxRecord:
         snapshot = self._prepare_retained_snapshot(
             event=event,
@@ -166,8 +157,7 @@ class MatrixOutboxDelivery:
                 "retained_snapshot_filename": snapshot.filename,
             }
         )
-        if image_body is not None:
-            metadata["image_body"] = image_body
+        initial_phase, *followup_phases = _SNAPSHOT_ALERT_PHASES
         intent = AlertIntent(
             event_id=event_id,
             phase=initial_phase,
@@ -290,7 +280,7 @@ class MatrixOutboxDelivery:
             event_type=str(metadata.get("event_type") or OPEN_SPOT_EVENT_TYPE),
         )
         self._log("info", "matrix-outbox-snapshot-prepared", item_id=record.id, phase="upload", **snapshot.log_context)
-        image_body = str(metadata.get("image_body") or snapshot.body)
+        image_body = str(snapshot.body)
         upload = _matrix_snapshot_upload(snapshot, logger=self.logger)
         content_uri = self.client.upload_image(
             filename=snapshot.filename,
