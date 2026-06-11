@@ -11,7 +11,7 @@ from typing import Any
 
 from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery
 from parking_monitor.outbox import LocalOutbox
-from parking_spot_monitor.capture import CaptureError, capture_latest
+from parking_spot_monitor.capture import CaptureError, FrameCaptureResult, StreamProfileCapture, capture_latest
 from parking_spot_monitor.detection import (
     DetectionError,
     UltralyticsVehicleDetector,
@@ -84,7 +84,7 @@ def _main(
     argv: Sequence[str] | None = None,
     environ: Mapping[str, str] | None = None,
     *,
-    capture: Callable[[RuntimeSettings, str | Path], Any] | None = None,
+    capture: StreamProfileCapture | None = None,
     overlay: Callable[..., Any] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     max_iterations: int | None = None,
@@ -148,11 +148,20 @@ def _main(
     )
 
     logger.info("startup-ready", config_path=config_path, data_dir=str(paths.data_dir), mode=mode)
-    capture_fn = capture if capture is not None else lambda loaded_settings, output_dir: capture_latest(
-        loaded_settings,
-        output_dir,
-        logger=logger,
-    )
+    def default_capture(
+        loaded_settings: RuntimeSettings,
+        output_dir: str | Path,
+        *,
+        stream_profile: str | None = None,
+    ) -> FrameCaptureResult:
+        return capture_latest(
+            loaded_settings,
+            output_dir,
+            logger=logger,
+            stream_profile=stream_profile,
+        )
+
+    capture_fn = capture if capture is not None else default_capture
     overlay_fn = overlay if overlay is not None else _write_debug_overlay
     detector_fn = detector_factory if detector_factory is not None else _default_detector_factory
     matrix_factory = matrix_delivery_factory if matrix_delivery_factory is not None else _default_matrix_delivery_factory
@@ -203,7 +212,7 @@ def _capture_once(
     data_dir: Path,
     *,
     logger: StructuredLogger,
-    capture: Callable[[RuntimeSettings, str | Path], Any],
+    capture: StreamProfileCapture,
     overlay: Callable[..., Any],
     detector_factory: Callable[[RuntimeSettings], Any],
 ) -> int:
@@ -216,7 +225,15 @@ def _capture_once(
         return 1
     try:
         detector = detector_factory(settings)
-        _process_detection_for_capture(settings, detector, result.latest_path, frame_timestamp=result.timestamp, logger=logger, mode="capture-once")
+        _process_detection_for_capture(
+            settings,
+            detector,
+            result.latest_path,
+            frame_timestamp=result.timestamp,
+            logger=logger,
+            mode="capture-once",
+            frame_geometry=result.frame_geometry,
+        )
     except DetectionError as exc:
         logger.error("detection-frame-failed", mode="capture-once", **exc.diagnostics())
         return 1

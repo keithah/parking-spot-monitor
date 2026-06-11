@@ -5,7 +5,7 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
 from parking_spot_monitor.vehicle_history_models import (
@@ -36,6 +36,14 @@ class VehicleHistoryStorageMixin:
         self.logger = logger
         self._failure_count = 0
         self._last_error: dict[str, Any] | None = None
+        self._mutation_revision = 0
+
+    def mutation_revision(self) -> int:
+        """Monotonic counter bumped on every archive write that affects health_snapshot."""
+        return self._mutation_revision
+
+    def _bump_revision(self) -> None:
+        self._mutation_revision += 1
 
     def load_active_sessions(self) -> list[SessionRecord]:
         return self._load_records(self.active_dir)
@@ -43,13 +51,28 @@ class VehicleHistoryStorageMixin:
     def list_closed_sessions(self) -> list[SessionRecord]:
         return self._load_records(self.closed_dir)
 
+    def resolve_wrong_match_subject(self, subject_id: str) -> str:
+        for directory in (self.active_dir, self.closed_dir):
+            path = directory / f"{subject_id}.json"
+            if path.exists():
+                record = self._load_record(path)
+                if record is not None and record.session_id == subject_id:
+                    return subject_id
+
+        latest_match: SessionRecord | None = None
+        for record in self._iter_records(self.active_dir):
+            if record.spot_id == subject_id:
+                latest_match = _latest_session_record(latest_match, record)
+        for record in self._iter_records(self.closed_dir):
+            if record.spot_id == subject_id:
+                latest_match = _latest_session_record(latest_match, record)
+        return subject_id if latest_match is None else latest_match.session_id
+
     def _load_records(self, directory: Path) -> list[SessionRecord]:
         directory.mkdir(parents=True, exist_ok=True)
         records: list[SessionRecord] = []
-        for path in sorted(directory.glob("*.json")):
-            record = self._load_record(path)
-            if record is not None:
-                records.append(record)
+        for record in self._iter_records(directory):
+            records.append(record)
         self._log(
             "info",
             "vehicle-archive-loaded",
@@ -57,6 +80,13 @@ class VehicleHistoryStorageMixin:
             session_count=len(records),
         )
         return records
+
+    def _iter_records(self, directory: Path) -> Iterator[SessionRecord]:
+        directory.mkdir(parents=True, exist_ok=True)
+        for path in sorted(directory.glob("*.json")):
+            record = self._load_record(path)
+            if record is not None:
+                yield record
 
     def _load_record(self, path: Path) -> SessionRecord | None:
         try:
@@ -135,6 +165,7 @@ class VehicleHistoryStorageMixin:
                     pass
             self._record_failure(phase=phase, path_name=path.name, error=exc)
             raise ArchiveWriteError(_safe_error_message(exc)) from exc
+        self._bump_revision()
 
     def _write_record(self, path: Path, record: SessionRecord, *, phase: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +194,7 @@ class VehicleHistoryStorageMixin:
                     pass
             self._record_failure(phase=phase, path_name=path.name, error=exc)
             raise ArchiveWriteError(_safe_error_message(exc)) from exc
+        self._bump_revision()
 
     def _quarantine(self, path: Path, *, phase: str, error: BaseException) -> None:
         self.quarantine_dir.mkdir(parents=True, exist_ok=True)
@@ -177,6 +209,7 @@ class VehicleHistoryStorageMixin:
         except OSError as exc:
             self._record_failure(phase="quarantine", path_name=path.name, error=exc)
             raise ArchiveWriteError(_safe_error_message(exc)) from exc
+        self._bump_revision()
         self._record_failure(phase=phase, path_name=path.name, error=error)
         self._log(
             "warning",
@@ -201,6 +234,7 @@ class VehicleHistoryStorageMixin:
         except OSError as exc:
             self._record_failure(phase="profile-quarantine", path_name=path.name, error=exc)
             raise ArchiveWriteError(_safe_error_message(exc)) from exc
+        self._bump_revision()
         self._record_failure(phase=phase, path_name=path.name, error=error)
         self._log(
             "warning",
@@ -278,3 +312,11 @@ class VehicleHistoryStorageMixin:
         if self.logger is None:
             return
         getattr(self.logger, level)(event, **fields)
+
+
+def _latest_session_record(current: SessionRecord | None, candidate: SessionRecord) -> SessionRecord:
+    if current is None:
+        return candidate
+    current_time = str(current.ended_at or current.started_at)
+    candidate_time = str(candidate.ended_at or candidate.started_at)
+    return candidate if candidate_time >= current_time else current

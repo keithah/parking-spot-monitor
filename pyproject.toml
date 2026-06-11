@@ -13,6 +13,8 @@ dependencies = [
 
 [project.optional-dependencies]
 detector = [
+    "torch==2.7.1+cpu",
+    "torchvision==0.22.1+cpu",
     "ultralytics==8.4.60",
 ]
 dev = [

@@ -23,6 +23,7 @@ cp config.yaml.example config.yaml
 `config.yaml` should contain environment variable names only. The service resolves these required variables at startup; provide them through your shell, service manager, or ignored `.env` file used by the live-proof wrapper:
 
 - `RTSP_URL`
+- `RTSP_URL_4K`
 - `MATRIX_ACCESS_TOKEN`
 
 Runtime artifact paths are anchored by the effective `--data-dir` value. Keep `storage.snapshots_dir` and `runtime.health_file` relative to the effective `--data-dir` unless you intentionally want an absolute operator override:
@@ -52,11 +53,12 @@ Start from the tracked example and keep secret values in environment variables, 
 ```sh
 cp config.yaml.example config.yaml
 RTSP_URL="<operator-provided-camera-stream>" \
+RTSP_URL_4K="<operator-provided-high-resolution-camera-stream>" \
 MATRIX_ACCESS_TOKEN="<operator-provided-matrix-token>" \
 python -m parking_spot_monitor --config config.yaml --validate-config
 ```
 
-Validation resolves `stream.rtsp_url_env` and `matrix.access_token_env` by name, then checks the schema before runtime. Failure diagnostics should name fields or environment variable names such as `RTSP_URL` and `MATRIX_ACCESS_TOKEN`; they must not include resolved camera URLs, Matrix access tokens, Authorization headers, Matrix response bodies, tracebacks, YAML dumps, or image bytes.
+Validation resolves `stream.rtsp_url_env`, configured `stream.profiles.*.rtsp_url_env`, and `matrix.access_token_env` by name, then checks the schema before runtime. Failure diagnostics should name fields or environment variable names such as `RTSP_URL`, `RTSP_URL_4K`, and `MATRIX_ACCESS_TOKEN`; they must not include resolved camera URLs, Matrix access tokens, Authorization headers, Matrix response bodies, tracebacks, YAML dumps, or image bytes.
 
 ### 2. Edit spot polygons safely
 
@@ -70,6 +72,7 @@ A safe local calibration loop is:
 cp config.yaml.example config.yaml
 # Edit only config.yaml: spot polygons plus shared detection/occupancy thresholds.
 RTSP_URL="<operator-provided-camera-stream>" \
+RTSP_URL_4K="<operator-provided-high-resolution-camera-stream>" \
 MATRIX_ACCESS_TOKEN="<operator-provided-matrix-token>" \
 python -m parking_spot_monitor --config config.yaml --validate-config
 mkdir -p data
@@ -88,7 +91,7 @@ ls -l data/latest.jpg data/debug_latest.jpg
 
 ### 3. Operator-level config map
 
-- `stream` / camera: `rtsp_url_env` names the camera URL environment variable, `frame_width` and `frame_height` define the coordinate system for polygons, and `reconnect_seconds` controls capture retry backoff after capture failures.
+- `stream` / camera: `rtsp_url_env` names the primary camera URL environment variable, `frame_width` and `frame_height` define the coordinate system for polygons, and `reconnect_seconds` controls capture retry backoff after capture failures. The production profile convention is `RTSP_URL` for the 720p primary stream and `RTSP_URL_4K` for high-resolution retry when primary evidence is weak. `escalation_profile` selects the configured non-primary profile used for authoritative retries; omit it to disable stream escalation. `escalation_min_confidence` controls when an accepted primary detection is considered too weak to trust without retrying. The runtime also retries the high-resolution profile before an occupied spot would release to empty from missing primary evidence.
 - `spots`: each configured spot has a human-readable `name` and a polygon. Tune these polygons to cover only the street parking regions being monitored; exclude driveway cars or unrelated curb areas by moving polygon points, not by adding Python logic.
 - `detection`: `model` selects the local YOLO model name/path, `confidence_threshold` is the shared minimum detector confidence, `inference_image_size` sets the Ultralytics YOLO `imgsz` used for prediction, `spot_crop_inference` optionally runs additional YOLO passes on configured spot crops, `spot_crop_margin_px` controls the crop padding, `open_suppression_min_confidence` keeps lower-confidence detector output available for false-open suppression, `open_suppression_classes` lists class names that may suppress open alerts when they overlap a spot, `min_bbox_area_px` filters tiny detections, `min_polygon_overlap_ratio` requires overlap with a configured spot polygon, and `vehicle_classes` lists accepted vehicle class names. These thresholds are shared across configured spots.
 - `occupancy`: `iou_threshold`, `confirm_frames`, and `release_frames` debounce detector output into stable occupied/empty state. These are shared occupancy controls, not spot-specific schema. Weak in-spot evidence can suppress open alerts without confirming a new occupied state; this uses `detection.open_suppression_min_confidence` and `detection.open_suppression_classes` so visible low-confidence vehicles do not become false open alerts.
@@ -147,13 +150,14 @@ cp config.yaml.example config.yaml
 
 ```sh
 export RTSP_URL="<operator-provided-camera-stream>"
+export RTSP_URL_4K="<operator-provided-high-resolution-camera-stream>"
 export MATRIX_ACCESS_TOKEN="<operator-provided-matrix-token>"
 python -m parking_spot_monitor --config config.yaml --validate-config
 ```
 
-Missing or empty values should fail validation with diagnostics naming `RTSP_URL` and/or `MATRIX_ACCESS_TOKEN` only. Do not paste resolved camera URLs, Matrix tokens, room-private responses, or raw logs into docs, tickets, or committed files.
+Missing or empty values should fail validation with diagnostics naming `RTSP_URL`, `RTSP_URL_4K`, and/or `MATRIX_ACCESS_TOKEN` only. Do not paste resolved camera URLs, Matrix tokens, room-private responses, or raw logs into docs, tickets, or committed files.
 
-The tracked Compose file does not define an `env_file`. It passes `RTSP_URL` and `MATRIX_ACCESS_TOKEN` by name from the environment where `docker compose` is invoked.
+The tracked Compose file does not define an `env_file`. It passes `RTSP_URL`, `RTSP_URL_4K`, and `MATRIX_ACCESS_TOKEN` by name from the environment where `docker compose` is invoked.
 
 ### 3. Inspect the actual Compose contract
 
@@ -171,7 +175,7 @@ Use `docker compose config --no-interpolate` for structure-only inspection becau
 - Runtime command: `python -m parking_spot_monitor --config /config/config.yaml --data-dir /data`.
 - Config mount: `./config.yaml:/config/config.yaml:ro`.
 - Data mount: `./data:/data`.
-- Environment names passed through by name: `RTSP_URL` and `MATRIX_ACCESS_TOKEN`.
+- Environment names passed through by name: `RTSP_URL`, `RTSP_URL_4K`, and `MATRIX_ACCESS_TOKEN`.
 - No `env_file` contract in `docker-compose.yml`.
 - Optional model mount shown as a commented example: `./models:/models:ro`.
 
@@ -789,7 +793,7 @@ Use `--older-than ISO_TIMESTAMP` when you need an explicit cutoff instead of a r
 
 ## Local YOLO detection and Model storage policy
 
-The detector dependency set pins Ultralytics in `requirements-detector.txt` so the local detector can load YOLO nano from the configured `detection.model` value, for example `yolov8n.pt`, without surprise detector-image dependency drift. The Dockerfile has a `runtime-base` target with only the shared runtime dependencies and a `runtime-detector` target that adds the detector requirements; the default final image is `runtime-detector` for the live monitor, while tooling that only needs config parsing or operator helpers can build `--target runtime-base`. `detection.model` accepts local model names and local POSIX paths only: use package/Ultralytics names such as `yolov8n.pt`, repo-relative operator paths such as `models/custom-detector.pt`, or mounted Docker paths such as `/models/yolov8n.pt`. Config validation rejects URL-like values (`https://...`, `s3://...`) and path traversal (`../...` or `/models/../...`) before runtime so model configuration failures are clear and do not leak secrets.
+The detector dependency set pins Ultralytics and CPU-only PyTorch wheels so the local detector can load YOLO nano from the configured `detection.model` value, for example `yolov8n.pt`, without surprise detector-image dependency drift or GPU wheel downloads. Docker uses `requirements-detector.txt`; local editable installs should use the PyTorch CPU wheel index too, for example `pip install --extra-index-url https://download.pytorch.org/whl/cpu '.[detector]'`. The Dockerfile has a digest-pinned `runtime-base` target with only the shared runtime dependencies and a `runtime-detector` target that adds the detector requirements; the default final image is `runtime-detector` for the live monitor, while tooling that only needs config parsing or operator helpers can build `--target runtime-base`. `detection.model` accepts local model names and local POSIX paths only: use package/Ultralytics names such as `yolov8n.pt`, repo-relative operator paths such as `models/custom-detector.pt`, or mounted Docker paths such as `/models/yolov8n.pt`. Config validation rejects URL-like values (`https://...`, `s3://...`) and path traversal (`../...` or `/models/../...`) before runtime so model configuration failures are clear and do not leak secrets.
 
 First-run Ultralytics downloads are allowed for local names such as `yolov8n.pt`, but they can block startup and require network access. For predictable Docker startup, pre-stage the model file on the host and set `detection.model: /models/yolov8n.pt`, then uncomment the optional read-only Compose mount:
 

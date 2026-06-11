@@ -14,15 +14,23 @@ from parking_spot_monitor.matrix_cockpit import (
     _format_active_spot_assignments_reply,
 )
 from parking_spot_monitor.matrix_command_runtime import MatrixCommandRuntime
-from parking_spot_monitor.matrix_models import MatrixCommand, MatrixCommandParseError, MatrixCommandResponse, MatrixTextEvent
+from parking_spot_monitor.matrix_models import (
+    MatrixCommand,
+    MatrixCommandParseError,
+    MatrixCommandResponse,
+    MatrixTextEvent,
+)
 from parking_spot_monitor.matrix_support import _require_non_empty
+
+
+MatrixCommandApplyResult: TypeAlias = str | MatrixCommandResponse
 
 
 @dataclass(frozen=True)
 class StatusCommand:
     action: str = field(default="status", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         return _cockpit_reply(runtime, self.action, {}, lambda context: context.status_reply(logger=runtime.logger))
 
@@ -34,7 +42,7 @@ class StatusCommand:
 class ConfigCommand:
     action: str = field(default="config", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         return _cockpit_reply(runtime, self.action, {}, lambda context: context.config_reply(logger=runtime.logger))
 
@@ -46,7 +54,7 @@ class ConfigCommand:
 class LatestCommand:
     action: str = field(default="latest", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         return _cockpit_reply(runtime, self.action, {}, lambda context: context.latest_reply(logger=runtime.logger))
 
@@ -58,7 +66,7 @@ class LatestCommand:
 class RecentCommand:
     action: str = field(default="recent", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         return _cockpit_reply(runtime, self.action, {}, lambda context: context.recent_reply(logger=runtime.logger))
 
@@ -70,7 +78,7 @@ class RecentCommand:
 class ConfidenceCommand:
     action: str = field(default="confidence", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         return _cockpit_reply(runtime, self.action, {}, lambda context: context.confidence_reply(logger=runtime.logger))
 
@@ -83,7 +91,7 @@ class SpotCockpitCommand:
     action: str
     spot_id: str
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         return _cockpit_reply(
             runtime,
@@ -101,7 +109,7 @@ class AnalyticsCommand:
     window: str
     action: str = field(default="analytics", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         return _cockpit_reply(
             runtime,
@@ -120,7 +128,7 @@ class IncidentReviewCommand:
     spot_id: str
     action: str = field(default="incident_review", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         return _cockpit_reply(
             runtime,
@@ -142,7 +150,7 @@ class LabRunCommand:
     kind: str
     action: str = field(default="lab_run", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         return _cockpit_reply(
             runtime,
@@ -160,7 +168,7 @@ class LabStatusCommand:
     job_id: str
     action: str = field(default="lab_status", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         return _cockpit_reply(
             runtime,
@@ -179,7 +187,7 @@ class CorrectSpotStateCommand:
     actual_state: str
     action: str = field(default="correct_spot_state", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         if runtime.feedback_labeler is None:
             raise RuntimeError("operator feedback labeler is not configured")
         result = runtime.feedback_labeler.record_correction(
@@ -200,7 +208,7 @@ class LearnLabelCommand:
     requested_time: str
     action: str = field(default="learn_label", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         if runtime.feedback_labeler is None:
             raise RuntimeError("operator feedback labeler is not configured")
         result = runtime.feedback_labeler.record_learn_label(
@@ -224,7 +232,7 @@ class RenameProfileCommand:
     label: str
     action: str = field(default="rename_profile", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         if runtime.correction_already_seen(event.event_id):
             return "Command already applied; acknowledgement repeated."
         applied = runtime.archive.rename_profile(self.profile_id, self.label, **runtime.event_metadata(event))
@@ -240,7 +248,7 @@ class MergeProfilesCommand:
     target_profile_id: str
     action: str = field(default="merge_profiles", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         if runtime.correction_already_seen(event.event_id):
             return "Command already applied; acknowledgement repeated."
         applied = runtime.archive.merge_profiles(self.source_profile_id, self.target_profile_id, **runtime.event_metadata(event))
@@ -255,7 +263,7 @@ class WrongMatchCommand:
     subject_id: str
     action: str = field(default="wrong_match", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         if runtime.correction_already_seen(event.event_id):
             return "Command already applied; acknowledgement repeated."
         session_id = runtime.resolve_wrong_match_subject(self.subject_id)
@@ -271,7 +279,7 @@ class AssignOwnerCommand:
     spot_id: str
     action: str = field(default="assign_owner", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         assignment = runtime.archive.assign_owner_profile_to_active_spot(self.spot_id)
         profile_id = _safe_text(assignment.profile_id, default="unknown")
@@ -287,7 +295,7 @@ class AssignOwnerCommand:
 class ActiveSpotAssignmentsCommand:
     action: str = field(default="active_spot_assignments", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str | MatrixCommandResponse:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         assignments = _active_spot_assignments_with_runtime_status(
             runtime.archive.active_spot_assignments(),
@@ -307,7 +315,7 @@ class ActiveSpotAssignmentsCommand:
 class HelpCommand:
     action: str = field(default="help", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         del event
         return runtime.help_formatter(runtime.command_prefix)
 
@@ -320,7 +328,7 @@ class ProfileSummaryCommand:
     profile_id: str
     action: str = field(default="profile_summary", init=False)
 
-    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> str:
+    def apply(self, runtime: MatrixCommandRuntime, event: MatrixTextEvent) -> MatrixCommandApplyResult:
         return _format_profile_summary_reply(runtime.profile_summary(self.profile_id, event=event))
 
     def to_matrix_command(self) -> MatrixCommand:
@@ -575,7 +583,6 @@ def _cockpit_reply(
     if runtime.cockpit_context is not None:
         return context_reply(runtime.cockpit_context)
     raise RuntimeError("operator cockpit provider is not configured")
-
 
 def _confidence_text(value: object) -> str:
     if isinstance(value, (int, float)) and math.isfinite(float(value)):

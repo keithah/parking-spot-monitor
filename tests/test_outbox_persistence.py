@@ -168,6 +168,22 @@ def test_corrupt_json_is_quarantined_and_startup_continues_without_raw_diagnosti
     assert quarantine_path.read_text(encoding="utf-8") == store_path.read_text(encoding="utf-8")
 
 
+def test_oversized_json_is_quarantined_before_json_load(tmp_path, monkeypatch):
+    monkeypatch.setattr("parking_monitor.outbox._MAX_OUTBOX_FILE_BYTES", 16)
+    store_path = tmp_path / "matrix-outbox.json"
+    store_path.write_text('{"items": []} extra bytes', encoding="utf-8")
+
+    outbox = LocalOutbox(store_path)
+
+    assert outbox.list_records() == []
+    summary = outbox.status_summary()
+    assert summary["recovery"]["quarantined_count"] == 1
+    assert summary["recovery"]["reason_counts"] == {"oversized_file": 1}
+    quarantine_path = Path(summary["recovery"]["events"][0]["quarantine_path"])
+    assert quarantine_path.exists()
+    assert quarantine_path.read_text(encoding="utf-8") == store_path.read_text(encoding="utf-8")
+
+
 def test_unsupported_schema_version_is_quarantined_with_empty_recovery(tmp_path):
     store_path = tmp_path / "matrix-outbox.json"
     store_path.write_text(json.dumps({"schema_version": 999, "items": []}), encoding="utf-8")

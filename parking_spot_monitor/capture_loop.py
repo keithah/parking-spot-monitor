@@ -1,5 +1,3 @@
-"""Long-running capture / detect / notify runtime loop."""
-
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -7,17 +5,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from parking_spot_monitor.capture import CaptureError
+from parking_spot_monitor.capture import CaptureError, StreamProfileCapture
 from parking_spot_monitor.config import RuntimeSettings
-from parking_spot_monitor.detection import DetectionError
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_alerts import MONITOR_STARTED_EVENT_TYPE, monitor_lifecycle_event
 from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 from parking_spot_monitor.paths import resolve_runtime_paths
+from parking_spot_monitor.runtime_frame import capture_and_detect_runtime_frame
+from parking_spot_monitor.runtime_frame_outcome import prepare_runtime_frame_loop_result
 from parking_spot_monitor.runtime_health import RuntimeLoopHealthState, observed_at, safe_error_context, write_loop_health
 from parking_spot_monitor.runtime_health_cache import VehicleHistoryHealthSnapshotCache
 from parking_spot_monitor.runtime_commands import _poll_matrix_commands_once
-from parking_spot_monitor.runtime_detection import _configured_spot_polygons, _process_detection_for_capture
+from parking_spot_monitor.runtime_detection import _configured_spot_polygons, record_detection_memory_records
 from parking_spot_monitor.runtime_overlay import _write_overlay_for_capture
 from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
 from parking_spot_monitor.runtime_lifecycle import ShutdownState, monitor_signal_handlers, return_if_shutdown_requested
@@ -82,7 +81,7 @@ def run_capture_loop(
     data_dir: Path,
     *,
     logger: StructuredLogger,
-    capture: Callable[[RuntimeSettings, str | Path], Any],
+    capture: StreamProfileCapture,
     overlay: Callable[..., Any],
     detector_factory: Callable[[RuntimeSettings], Any],
     matrix_delivery: Any | None,
@@ -100,7 +99,9 @@ def run_capture_loop(
     runtime_paths = resolve_runtime_paths(settings, data_dir)
     runtime_state = load_runtime_state(state_path, spot_ids, logger=logger)
     effective_history_archive = (
-        history_archive if history_archive is not None else VehicleHistoryArchive(data_dir / "vehicle-history", logger=logger)
+        history_archive
+        if history_archive is not None
+        else VehicleHistoryArchive(data_dir / "vehicle-history", logger=logger)
     )
     now_fn = now if now is not None else lambda: datetime.now(timezone.utc)
     health_state = RuntimeLoopHealthState(retention_failure_count=startup_retention_failure_count)
@@ -122,6 +123,8 @@ def run_capture_loop(
             iteration=iteration,
             last_frame_at=health_state.last_frame_at,
             selected_decode_mode=health_state.selected_decode_mode,
+            capture_last_success_at=health_state.capture_last_success_at,
+            capture_selected_decode_mode=health_state.capture_selected_decode_mode,
             consecutive_capture_failures=health_state.consecutive_capture_failures,
             consecutive_detection_failures=health_state.consecutive_detection_failures,
             last_matrix_error=health_state.last_matrix_error,
@@ -177,28 +180,39 @@ def run_capture_loop(
                     max_records=MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION,
                 )
                 health_state.record_matrix_result(outbox_error)
-                result = capture(settings, data_dir)
-                health_state.record_capture_success(timestamp=result.timestamp, selected_mode=result.selected_mode)
-                _write_overlay_for_capture(settings, result.latest_path, data_dir, logger=logger, overlay=overlay)
-                timeline_result = record_timeline_frame(result.latest_path, data_dir=data_dir, observed_at=result.timestamp)
-                logger.debug("timeline-frame-retained", iteration=iteration, **timeline_result.diagnostics())
-                try:
-                    if detector is None:
-                        detector = detector_factory(settings)
-                    detection_result = _process_detection_for_capture(
-                        settings,
-                        detector,
-                        result.latest_path,
-                        frame_timestamp=result.timestamp,
+                frame_attempt = capture_and_detect_runtime_frame(
+                    settings,
+                    data_dir,
+                    capture=capture,
+                    detector=detector,
+                    detector_factory=detector_factory,
+                    runtime_state=runtime_state,
+                    logger=logger,
+                    mode="runtime-loop",
+                    iteration=iteration,
+                )
+                frame_result = prepare_runtime_frame_loop_result(
+                    frame_attempt,
+                    health_state=health_state,
+                    logger=logger,
+                    iteration=iteration,
+                )
+                detector = frame_result.detector
+                result = frame_result.capture
+                detection_result = frame_result.detection
+                if detection_result is not None:
+                    health_state.record_processed_frame(timestamp=result.timestamp, selected_mode=result.selected_mode)
+                    record_detection_memory_records(
+                        decision_memory_path,
+                        detection_result,
+                        observed_at=result.timestamp,
                         logger=logger,
                         mode="runtime-loop",
                         iteration=iteration,
-                        decision_memory_path=decision_memory_path,
                     )
-                except DetectionError as exc:
-                    health_state.record_detection_failure(exc, iteration=iteration)
-                    logger.error("detection-frame-failed", mode="runtime-loop", iteration=iteration, **exc.diagnostics())
-                else:
+                    _write_overlay_for_capture(settings, result.latest_path, data_dir, logger=logger, overlay=overlay)
+                    timeline_result = record_timeline_frame(result.latest_path, data_dir=data_dir, observed_at=result.timestamp)
+                    logger.debug("timeline-frame-retained", iteration=iteration, **timeline_result.diagnostics())
                     health_state.record_detection_success()
                     frame_observed_at = observed_at(result.timestamp, now_fn)
                     frame_update = _update_runtime_state_for_frame(
@@ -220,17 +234,13 @@ def run_capture_loop(
                         history_errors=frame_update.history_errors,
                         state_save_error=frame_update.state_save_error,
                     )
-                    if frame_update.history_changed:
-                        vehicle_history_health.invalidate()
-                    command_result = _poll_matrix_commands_once(
+                    command_error = _poll_matrix_commands_once(
                         matrix_command_service,
                         logger=logger,
                         iteration=iteration,
                         decision_memory_path=decision_memory_path,
                     )
-                    health_state.record_command_result(command_result.error)
-                    if command_result.changed_vehicle_history:
-                        vehicle_history_health.invalidate()
+                    health_state.record_command_result(command_error)
                 logger.info("capture-loop-frame-written", iteration=iteration, **result.diagnostics())
                 write_current_health(status=health_state.status(), iteration=iteration)
                 logger.debug("capture-loop-paced", iteration=iteration, sleep_seconds=settings.runtime.frame_interval_seconds)

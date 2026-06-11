@@ -49,18 +49,28 @@ def test_dockerfile_installs_runtime_and_defaults_to_package_entrypoint() -> Non
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     detector_extra = pyproject["project"]["optional-dependencies"]["detector"]
 
-    assert "FROM python:3.12-slim" in dockerfile or "FROM python:3.11-slim" in dockerfile
+    assert "FROM python:3.12-slim@sha256:" in dockerfile or "FROM python:3.11-slim@sha256:" in dockerfile
     assert "ffmpeg" in dockerfile
     assert "intel-media-va-driver" in dockerfile
     assert "vainfo" not in dockerfile
     assert "LIBVA_DRIVER_NAME=iHD" in dockerfile
-    assert "FROM python:3.12-slim AS runtime-base" in dockerfile or "FROM python:3.11-slim AS runtime-base" in dockerfile
+    assert "FROM python:3.12-slim@sha256:" in dockerfile or "FROM python:3.11-slim@sha256:" in dockerfile
+    assert " AS runtime-base" in dockerfile
     assert "FROM runtime-base AS runtime-detector" in dockerfile
     assert "COPY requirements.txt ./" in dockerfile
     assert "pip install --no-cache-dir -r requirements.txt" in dockerfile
     assert "ultralytics>=8" not in requirements
     assert "ultralytics==" in detector_requirements
-    assert detector_extra == [line.strip() for line in detector_requirements.splitlines() if line.strip()]
+    assert "--extra-index-url https://download.pytorch.org/whl/cpu" in detector_requirements
+    assert "torch==2.7.1+cpu" in detector_requirements
+    assert "torchvision==0.22.1+cpu" in detector_requirements
+    detector_requirement_packages = [
+        line.strip()
+        for line in detector_requirements.splitlines()
+        if line.strip() and not line.startswith("--")
+    ]
+    assert detector_extra == ["torch==2.7.1+cpu", "torchvision==0.22.1+cpu", "ultralytics==8.4.60"]
+    assert "ultralytics==8.4.60" in detector_requirement_packages
     base_stage, detector_stage = dockerfile.split("FROM runtime-base AS runtime-detector", 1)
     assert "requirements-detector.txt" not in base_stage
     assert "COPY requirements-detector.txt ./" in detector_stage
@@ -92,7 +102,7 @@ def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
     assert "./config.yaml:/config/config.yaml:ro" in service["volumes"]
     assert "./data:/data" in service["volumes"]
     assert "env_file" not in service
-    assert service["environment"] == ["RTSP_URL", "MATRIX_ACCESS_TOKEN", "TZ=America/Los_Angeles"]
+    assert service["environment"] == ["RTSP_URL", "RTSP_URL_4K", "MATRIX_ACCESS_TOKEN", "TZ=America/Los_Angeles"]
     assert service["command"] == [
         "python",
         "-m",

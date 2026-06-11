@@ -33,12 +33,30 @@ DEFAULT_DECODE_MODES = (DecodeMode.VAAPI, DecodeMode.DRM, DecodeMode.SOFTWARE)
 
 
 @dataclass(frozen=True)
+class FrameGeometry:
+    stream_profile: str = "primary"
+    expected_size: tuple[int, int] | None = None
+
+    def expected_size_diagnostics(self) -> dict[str, int] | None:
+        return _frame_size_diagnostics(self.expected_size)
+
+
+@dataclass(frozen=True)
 class FrameCaptureResult:
     timestamp: Any
     latest_path: Path
     selected_mode: DecodeMode
     duration_seconds: float
     byte_size: int
+    frame_geometry: FrameGeometry
+
+    @property
+    def stream_profile(self) -> str:
+        return self.frame_geometry.stream_profile
+
+    @property
+    def expected_frame_size(self) -> tuple[int, int] | None:
+        return self.frame_geometry.expected_size
 
     def diagnostics(self) -> dict[str, Any]:
         return {
@@ -47,6 +65,8 @@ class FrameCaptureResult:
             "selected_mode": self.selected_mode.value,
             "duration_seconds": round(self.duration_seconds, 6),
             "byte_size": self.byte_size,
+            "stream_profile": self.stream_profile,
+            "expected_frame_size": self.frame_geometry.expected_size_diagnostics(),
         }
 
 
@@ -85,6 +105,22 @@ class SubprocessRunner(Protocol):
     def __call__(self, argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]: ...
 
 
+class StreamProfileCapture(Protocol):
+    def __call__(
+        self,
+        settings: RuntimeSettings,
+        data_dir: str | Path,
+        *,
+        stream_profile: str | None = None,
+    ) -> FrameCaptureResult: ...
+
+
+def _frame_size_diagnostics(size: tuple[int, int] | None) -> dict[str, int] | None:
+    if size is None:
+        return None
+    return {"width": int(size[0]), "height": int(size[1])}
+
+
 def redact_diagnostic_text(text: object, *, secrets: Iterable[str] = ()) -> str:
     redacted = _coerce_text(text)
     for secret in secrets:
@@ -111,9 +147,7 @@ def build_ffmpeg_argv(
         "-y",
         "-rtsp_transport",
         "tcp",
-        "-stimeout",
-        str(network_timeout_us),
-        "-rw_timeout",
+        "-timeout",
         str(network_timeout_us),
     ]
     if mode is DecodeMode.QSV:
@@ -149,10 +183,13 @@ def capture_latest(
     modes: Sequence[DecodeMode] | None = None,
     timeout_seconds: float = DEFAULT_CAPTURE_TIMEOUT_SECONDS,
     now: Callable[[], Any] | None = None,
+    stream_profile: str | None = None,
 ) -> FrameCaptureResult:
     output_dir = Path(data_dir)
     output_path = output_dir / "latest.jpg"
-    rtsp_url = settings.stream.rtsp_url.value
+    selected_profile = settings.stream.profile(stream_profile)
+    profile_name = selected_profile.name
+    rtsp_url = selected_profile.rtsp_url.value
     secrets = [rtsp_url, settings.matrix.access_token.value]
     selected_modes = list(modes if modes is not None else DEFAULT_DECODE_MODES)
     if not selected_modes:
@@ -178,7 +215,15 @@ def capture_latest(
         attempted_modes.append(mode)
         argv = build_ffmpeg_argv(rtsp_url, output_path, mode, network_timeout_seconds=timeout_seconds)
         start = time.perf_counter()
-        _log(logger, "info", "capture-decode-attempt", mode=mode.value, output_path=str(output_path), timeout_seconds=timeout_seconds)
+        _log(
+            logger,
+            "info",
+            "capture-decode-attempt",
+            mode=mode.value,
+            output_path=str(output_path),
+            timeout_seconds=timeout_seconds,
+            stream_profile=profile_name,
+        )
         try:
             completed = run(argv, timeout=timeout_seconds)
             duration = time.perf_counter() - start
@@ -246,6 +291,10 @@ def capture_latest(
             selected_mode=mode,
             duration_seconds=duration,
             byte_size=byte_size,
+            frame_geometry=FrameGeometry(
+                stream_profile=profile_name,
+                expected_size=(selected_profile.frame_width, selected_profile.frame_height),
+            ),
         )
         _log(logger, "info", "capture-frame-written", **result.diagnostics())
         return result

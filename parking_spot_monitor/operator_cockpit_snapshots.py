@@ -266,14 +266,14 @@ def _resize_who_snapshot_for_matrix(path: Path, *, destination: Path, now: datet
     resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
     destination.parent.mkdir(parents=True, exist_ok=True)
     while max_dimension >= WHO_MATRIX_MIN_DIMENSION:
-        resized = working.copy()
-        resized.thumbnail((max_dimension, max_dimension), resampling)
+        target_width, target_height = _bounded_dimensions(width, height, max_dimension)
+        resized = working.resize((target_width, target_height), resampling)
         for quality in WHO_MATRIX_JPEG_QUALITIES:
             buffer = BytesIO()
             resized.save(buffer, format="JPEG", quality=quality, optimize=True)
-            data = buffer.getvalue()
-            if len(data) <= MAX_WHO_MATRIX_IMAGE_BYTES:
-                destination.write_bytes(data)
+            if buffer.tell() <= MAX_WHO_MATRIX_IMAGE_BYTES:
+                payload = buffer.getbuffer()
+                destination.write_bytes(payload)
                 stat = destination.stat()
                 output_width, output_height = resized.size
                 _log_who_snapshot_resized(
@@ -284,18 +284,23 @@ def _resize_who_snapshot_for_matrix(path: Path, *, destination: Path, now: datet
                     source_height=height,
                     output_width=output_width,
                     output_height=output_height,
-                    byte_size=len(data),
+                    byte_size=payload.nbytes,
                     quality=quality,
                 )
                 return LatestSnapshotValidation(
                     state="available",
                     path=destination,
-                    info={"mimetype": "image/jpeg", "size": len(data), "w": output_width, "h": output_height},
+                    info={"mimetype": "image/jpeg", "size": payload.nbytes, "w": output_width, "h": output_height},
                     freshness="fresh",
                     age=age_label(datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc), now),
                 )
         max_dimension = int(max_dimension * 0.85)
     raise ValueError("resized image exceeds Matrix upload budget")
+
+
+def _bounded_dimensions(width: int, height: int, max_dimension: int) -> tuple[int, int]:
+    scale = min(1.0, max_dimension / max(width, height))
+    return max(1, int(width * scale)), max(1, int(height * scale))
 
 
 def _log_who_snapshot_resized(logger: StructuredLogger | None, **fields: Any) -> None:

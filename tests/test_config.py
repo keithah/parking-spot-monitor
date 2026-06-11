@@ -17,6 +17,8 @@ FAKE_MATRIX_TOKEN = f"matrix-secret-{SECRET_MARKER}"
 def fake_environ(**overrides: str) -> dict[str, str]:
     environ = {
         "RTSP_URL": FAKE_RTSP_URL,
+        "RTSP_URL_4K": f"{FAKE_RTSP_URL}-4k",
+        "RTSP_URL_360P": f"{FAKE_RTSP_URL}-360p",
         "MATRIX_ACCESS_TOKEN": FAKE_MATRIX_TOKEN,
     }
     environ.update(overrides)
@@ -76,6 +78,10 @@ def test_example_config_loads_with_fake_env_values() -> None:
     settings = load_settings("config.yaml.example", environ=fake_environ())
 
     assert settings.stream.rtsp_url.value == FAKE_RTSP_URL
+    assert settings.stream.primary_profile.name == "primary"
+    assert settings.stream.primary_profile.frame_width == settings.stream.frame_width
+    assert settings.stream.primary_profile.frame_height == settings.stream.frame_height
+    assert set(settings.stream.profiles) == {"high_resolution"}
     assert settings.matrix.access_token.value == FAKE_MATRIX_TOKEN
     assert settings.spots.left_spot.name == "Left spot"
     assert settings.spots.right_spot.name == "Right spot"
@@ -84,6 +90,99 @@ def test_example_config_loads_with_fake_env_values() -> None:
     assert settings.detection.spot_crop_margin_px == 48
     assert settings.detection.open_suppression_min_confidence == 0.1
     assert settings.detection.open_suppression_classes == ["car", "truck", "bus", "suitcase", "umbrella"]
+
+
+def test_stream_profiles_resolve_secret_env_values_and_sanitize_names_only(tmp_path: Path) -> None:
+    high_url = f"high-res-camera-{SECRET_MARKER}"
+    low_url = f"low-res-camera-{SECRET_MARKER}"
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "      frame_height: 2160\n",
+        "\n".join(
+            [
+                "      frame_height: 2160",
+                "    low_resolution:",
+                "      rtsp_url_env: RTSP_URL_360P",
+                "      frame_width: 640",
+                "      frame_height: 360",
+                "",
+            ]
+        ),
+    )
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(
+        path,
+        environ=fake_environ(RTSP_URL_4K=high_url, RTSP_URL_360P=low_url),
+    )
+
+    assert settings.stream.profile("primary").rtsp_url.value == FAKE_RTSP_URL
+    assert settings.stream.profile("high_resolution").rtsp_url.value == high_url
+    assert settings.stream.profile("high_resolution").frame_width == 3840
+    assert settings.stream.profile("low_resolution").rtsp_url.value == low_url
+    summary = settings.sanitized_summary()
+    rendered = repr(summary) + settings.model_dump_json()
+    assert "RTSP_URL_4K" in rendered
+    assert "RTSP_URL_360P" in rendered
+    assert high_url not in rendered
+    assert low_url not in rendered
+    assert SECRET_MARKER not in rendered
+
+
+def test_stream_profile_missing_env_is_rejected_without_secret_leaks(tmp_path: Path) -> None:
+    path = write_config(tmp_path, Path("config.yaml.example").read_text(encoding="utf-8"))
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(
+            path,
+            environ={"RTSP_URL": FAKE_RTSP_URL, "MATRIX_ACCESS_TOKEN": FAKE_MATRIX_TOKEN},
+        )
+
+    message = str(exc_info.value)
+    assert "RTSP_URL_4K" in message
+    assert FAKE_RTSP_URL not in message
+    assert FAKE_MATRIX_TOKEN not in message
+    assert SECRET_MARKER not in message
+
+
+def test_default_config_does_not_require_low_resolution_diagnostic_stream(tmp_path: Path) -> None:
+    path = write_config(tmp_path, Path("config.yaml.example").read_text(encoding="utf-8"))
+
+    settings = load_settings(
+        path,
+        environ={
+            "RTSP_URL": FAKE_RTSP_URL,
+            "RTSP_URL_4K": f"{FAKE_RTSP_URL}-4k",
+            "MATRIX_ACCESS_TOKEN": FAKE_MATRIX_TOKEN,
+        },
+    )
+
+    assert set(settings.stream.profiles) == {"high_resolution"}
+
+
+def test_stream_profile_shape_errors_are_rejected_at_config_boundary(tmp_path: Path) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "    high_resolution:\n      rtsp_url_env: RTSP_URL_4K\n      frame_width: 3840\n      frame_height: 2160\n",
+        "    high_resolution: RTSP_URL_4K\n",
+    )
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert "stream.profiles.high_resolution" in str(exc_info.value)
+
+
+def test_escalation_profile_must_reference_configured_stream_profile(tmp_path: Path) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "  escalation_profile: high_resolution\n",
+        "  escalation_profile: missing_profile\n",
+    )
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert "stream.escalation_profile" in str(exc_info.value)
 
 
 @pytest.mark.parametrize("model_value", ["yolov8n.pt", "models/custom-detector.pt"])

@@ -16,6 +16,8 @@ def smoke_env(
 ) -> dict[str, str]:
     env = dict(base) if base is not None else {key: os.environ[key] for key in _SAFE_ENV_KEYS if key in os.environ}
     env["RTSP_URL"] = rtsp_placeholder
+    env["RTSP_URL_4K"] = f"{rtsp_placeholder}-4k"
+    env["RTSP_URL_360P"] = f"{rtsp_placeholder}-360p"
     env["MATRIX_ACCESS_TOKEN"] = matrix_token_placeholder
     if pythonpath_prefix is not None:
         existing_pythonpath = env.get("PYTHONPATH")

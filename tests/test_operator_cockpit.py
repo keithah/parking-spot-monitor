@@ -16,7 +16,16 @@ ACCESS_TOKEN = "secret-token-value"
 def load_test_settings(tmp_path: Path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(Path("config.yaml.example").read_text(encoding="utf-8"), encoding="utf-8")
-    return load_settings(config_path, environ={"RTSP_URL": "rtsp://operator:secret@camera/live", "MATRIX_ACCESS_TOKEN": ACCESS_TOKEN})
+    rtsp_url = "rtsp://operator:secret@camera/live"
+    return load_settings(
+        config_path,
+        environ={
+            "RTSP_URL": rtsp_url,
+            "RTSP_URL_4K": f"{rtsp_url}/4k",
+            "RTSP_URL_360P": f"{rtsp_url}/360p",
+            "MATRIX_ACCESS_TOKEN": ACCESS_TOKEN,
+        },
+    )
 
 
 def write_runtime_artifacts(tmp_path: Path) -> tuple[Path, Path]:

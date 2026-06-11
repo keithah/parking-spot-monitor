@@ -45,6 +45,7 @@ class MatrixCommandResponse:
     image_path: Path | None = None
     image_info: Mapping[str, Any] | None = None
 
+
 @dataclass(frozen=True)
 class MatrixCommandPollResult:
     """Metadata-only summary of one command poll."""

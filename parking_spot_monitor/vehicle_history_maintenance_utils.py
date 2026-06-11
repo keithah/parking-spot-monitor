@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -155,17 +155,25 @@ def _archive_directory_stats(directory: Path) -> tuple[int, int]:
     return (count, total_bytes)
 
 
-def _oldest_retained_session_started_at(records: Sequence[SessionRecord]) -> str | None:
-    oldest_record: SessionRecord | None = None
+def _session_health_stats(records: Iterable[SessionRecord]) -> dict[str, int | str | None]:
+    missing_refs = 0
+    profile_unknown_sessions = 0
+    oldest_started_at: str | None = None
     oldest_timestamp: datetime | None = None
     for record in records:
+        if record.occupied_snapshot_path is None or record.occupied_crop_path is None:
+            missing_refs += 1
+        if record.occupied_crop_path is not None and record.profile_id is None:
+            profile_unknown_sessions += 1
         parsed = _parse_timestamp(record.started_at)
-        if parsed is None:
-            continue
-        if oldest_timestamp is None or parsed < oldest_timestamp:
+        if parsed is not None and (oldest_timestamp is None or parsed < oldest_timestamp):
             oldest_timestamp = parsed
-            oldest_record = record
-    return None if oldest_record is None else oldest_record.started_at
+            oldest_started_at = record.started_at
+    return {
+        "missing_refs": missing_refs,
+        "profile_unknown_sessions": profile_unknown_sessions,
+        "oldest_started_at": oldest_started_at,
+    }
 
 
 def _safe_maintenance_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -216,7 +224,3 @@ def _image_directory_stats(directory: Path) -> tuple[int, int]:
             count += 1
             total_bytes += stat_result.st_size
     return (count, total_bytes)
-
-
-def _missing_occupied_image_reference_count(records: Sequence[SessionRecord]) -> int:
-    return sum(1 for record in records if record.occupied_snapshot_path is None or record.occupied_crop_path is None)

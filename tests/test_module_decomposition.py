@@ -137,6 +137,14 @@ def _class_names(relative_path: str) -> set[str]:
     return {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
 
 
+def _class_method_names(relative_path: str, class_name: str) -> set[str]:
+    tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return {child.name for child in node.body if isinstance(child, ast.FunctionDef)}
+    raise AssertionError(f"{class_name} not found in {relative_path}")
+
+
 def _function_calls(relative_path: str, function_name: str) -> set[str]:
     tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
     for node in ast.walk(tree):
@@ -279,7 +287,7 @@ def test_vehicle_history_module_is_a_small_compatibility_shim() -> None:
         "parking_spot_monitor/vehicle_history_profile_utils.py": 120,
         "parking_spot_monitor/vehicle_history_profiles.py": 320,
         "parking_spot_monitor/vehicle_history_sessions.py": 220,
-        "parking_spot_monitor/vehicle_history_storage.py": 320,
+        "parking_spot_monitor/vehicle_history_storage.py": 330,
     }
     for path, max_lines in module_caps.items():
         assert (ROOT / path).exists()
@@ -293,17 +301,76 @@ def test_runtime_modules_stay_decomposed() -> None:
         "parking_spot_monitor/runtime_commands.py": 120,
         "parking_spot_monitor/runtime_decision_memory.py": 240,
         "parking_spot_monitor/runtime_detection.py": 250,
+        "parking_spot_monitor/runtime_frame.py": 90,
+        "parking_spot_monitor/runtime_frame_outcome.py": 90,
         "parking_spot_monitor/runtime_frame_plan.py": 160,
         "parking_spot_monitor/runtime_health.py": 290,
         "parking_spot_monitor/runtime_lifecycle.py": 150,
         "parking_spot_monitor/runtime_overlay.py": 90,
         "parking_spot_monitor/runtime_presence.py": 150,
         "parking_spot_monitor/runtime_state_update.py": 180,
+        "parking_spot_monitor/runtime_stream_escalation.py": 170,
         "parking_spot_monitor/runtime_vehicle_events.py": 500,
     }
     for path, max_lines in module_caps.items():
         assert (ROOT / path).exists()
         assert _line_count(path) <= max_lines
+
+
+def test_runtime_stream_escalation_stays_pure_orchestration() -> None:
+    source = (ROOT / "parking_spot_monitor/runtime_stream_escalation.py").read_text(encoding="utf-8")
+    loop_source = (ROOT / "parking_spot_monitor/capture_loop.py").read_text(encoding="utf-8")
+    capture_source = (ROOT / "parking_spot_monitor/capture.py").read_text(encoding="utf-8")
+    escalation_classes = _class_names("parking_spot_monitor/runtime_stream_escalation.py")
+    capture_classes = _class_names("parking_spot_monitor/capture.py")
+    capture_fields = _class_field_annotations("parking_spot_monitor/capture.py", "FrameCaptureResult")
+    capture_methods = _class_method_names("parking_spot_monitor/capture.py", "FrameCaptureResult")
+    main_arg_annotations = _function_arg_annotations("parking_spot_monitor/__main__.py", "_main")
+
+    assert "inspect" not in source
+    assert "_append_detection_memory_records" not in source
+    assert "StreamEscalationCaptureError" not in loop_source
+    assert "StreamProfileCapture" not in escalation_classes
+    assert "StreamProfileCapture" in capture_classes
+    assert "StreamProfileCapture" in main_arg_annotations["capture"]
+    assert capture_fields["frame_geometry"] == "FrameGeometry"
+    assert "stream_profile" not in capture_fields
+    assert "expected_frame_size" not in capture_fields
+    assert "__init__" not in capture_methods
+    assert "expected_frame_size: tuple[int, int] | None = None" not in capture_source
+
+
+def test_capture_loop_does_not_own_runtime_frame_outcome_policy() -> None:
+    loop_source = (ROOT / "parking_spot_monitor/capture_loop.py").read_text(encoding="utf-8")
+
+    assert "RuntimeFrameCaptureFailed" not in loop_source
+    assert "RuntimeFrameCaptureEscalationFailed" not in loop_source
+    assert "RuntimeFrameDetectionFailed" not in loop_source
+    assert "record_capture_success" not in loop_source
+
+
+def test_stream_profile_identity_is_not_stored_in_raw_config_model() -> None:
+    config_classes = _class_names("parking_spot_monitor/config.py")
+    profile_fields = _class_field_annotations("parking_spot_monitor/config.py", "StreamProfileConfig")
+
+    assert "ResolvedStreamProfile" in config_classes
+    assert "name" not in profile_fields
+
+
+def test_matrix_command_history_changes_are_not_inferred_from_action_names() -> None:
+    command_source = (ROOT / "parking_spot_monitor/matrix_commands.py").read_text(encoding="utf-8")
+    startup_source = (ROOT / "tests/test_startup.py").read_text(encoding="utf-8")
+    storage_source = (ROOT / "parking_spot_monitor/vehicle_history_storage.py").read_text(encoding="utf-8")
+
+    assert "_HISTORY_MUTATING_ACTIONS" not in command_source
+    assert "command.action in" not in command_source
+    assert "_coerce_application_result" not in command_source
+    # The dirty signal for the health-snapshot cache is owned by the archive's
+    # mutation revision (bumped on writes), not threaded up through command results.
+    assert "def mutation_revision" in storage_source
+    assert "_bump_revision" in storage_source
+    assert "detections.pop(0) if detections else []" not in startup_source
+    assert "allow_exhausted=True" in startup_source
 
 
 def test_operator_modules_stay_decomposed() -> None:
@@ -411,6 +478,22 @@ def test_operator_cockpit_compat_surface_stays_thin() -> None:
     assert "_summarize_timeline_frames" not in cockpit_functions
     assert "_format_lab_status_lines" not in cockpit_functions
     assert "_outbox_item_lines" not in cockpit_functions
+
+
+def test_optimizer_hot_paths_do_not_reintroduce_unbounded_materialization_patterns() -> None:
+    snapshot_source = (ROOT / "parking_spot_monitor/operator_cockpit_snapshots.py").read_text(encoding="utf-8")
+    analytics_source = (ROOT / "parking_spot_monitor/operator_cockpit_analytics.py").read_text(encoding="utf-8")
+    maintenance_source = (ROOT / "parking_spot_monitor/vehicle_history_maintenance.py").read_text(encoding="utf-8")
+    correction_source = (ROOT / "parking_spot_monitor/vehicle_history_corrections.py").read_text(encoding="utf-8")
+
+    assert "resized = working.copy()" not in snapshot_source
+    assert "data = buffer.getvalue()" not in snapshot_source
+    assert "paths = sorted(path for path in directory.glob" not in analytics_source
+    assert "retained_records = [record for record in [*active_records, *closed_records]" not in maintenance_source
+    assert "prune_paths = [*session_paths, *image_paths]" not in maintenance_source
+    assert "record for record in [*closed, *active]" not in correction_source
+    assert "record for record in [*active_records, *closed_records]" not in correction_source
+    assert "for record in [*active, *closed]" not in correction_source
 
 
 def test_matrix_cockpit_uses_canonical_operator_functions_without_forwarding_wrappers() -> None:

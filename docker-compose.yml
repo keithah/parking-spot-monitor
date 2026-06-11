@@ -5,6 +5,7 @@ services:
     command: ["python", "-m", "parking_spot_monitor", "--config", "/config/config.yaml", "--data-dir", "/data"]
     environment:
       - RTSP_URL
+      - RTSP_URL_4K
       - MATRIX_ACCESS_TOKEN
       - TZ=America/Los_Angeles
     volumes:

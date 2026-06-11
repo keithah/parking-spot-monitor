@@ -131,6 +131,19 @@ def test_start_and_close_session_round_trip_writes_inspectable_json(tmp_path: Pa
     assert "Infinity" not in rendered
 
 
+def test_resolve_wrong_match_subject_prefers_exact_session_then_latest_spot_session(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    first = archive.start_session(occupied_event(spot_id="left_spot", observed_at="2026-05-18T13:00:00Z"))
+    archive.close_session(open_event(spot_id="left_spot", observed_at="2026-05-18T13:05:00Z"))
+    second = archive.start_session(occupied_event(spot_id="left_spot", observed_at="2026-05-18T14:00:00Z"))
+    archive.close_session(open_event(spot_id="left_spot", observed_at="2026-05-18T14:05:00Z"))
+
+    assert archive.resolve_wrong_match_subject(first.session_id) == first.session_id
+    assert archive.resolve_wrong_match_subject("left_spot") == second.session_id
+    assert archive.resolve_wrong_match_subject("missing_spot") == "missing_spot"
+    assert archive.health_snapshot()["vehicle_history_failure_count"] == 0
+
+
 def test_duplicate_start_for_same_spot_is_noop_and_logs_safe_warning(tmp_path: Path) -> None:
     stream = StringIO()
     archive = VehicleHistoryArchive(tmp_path, logger=setup_logging(stream=stream))
@@ -292,6 +305,24 @@ def test_atomic_write_failure_preserves_existing_active_file_and_logs_safe_error
     assert "supersecret" not in rendered
     assert "Traceback" not in rendered
     assert "raw_image_bytes" not in rendered
+
+
+def test_mutation_revision_advances_on_writes_and_is_stable_on_reads(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+
+    start = archive.mutation_revision()
+    record = archive.start_session(occupied_event(spot_id="left", observed_at="2026-05-18T13:00:00Z"))
+    after_start = archive.mutation_revision()
+    assert after_start > start
+
+    # Reads must not advance the revision, so the health cache stays warm.
+    archive.health_snapshot()
+    archive.load_active_sessions()
+    assert archive.mutation_revision() == after_start
+
+    archive.close_session(open_event(spot_id="left", observed_at="2026-05-18T13:30:00Z"))
+    assert archive.mutation_revision() > after_start
+    assert record.session_id
 
 
 def test_health_snapshot_summarizes_archive_counts_image_growth_retention_and_latest_failure(tmp_path: Path) -> None:

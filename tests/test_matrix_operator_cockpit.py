@@ -996,7 +996,7 @@ def test_operator_cockpit_detection_lab_status_failures_are_safe_and_redacted(tm
 
 
 def test_build_who_snapshot_response_captures_once_and_attaches_validated_image(tmp_path: Path) -> None:
-    from parking_spot_monitor.capture import DecodeMode, FrameCaptureResult
+    from parking_spot_monitor.capture import DecodeMode, FrameCaptureResult, FrameGeometry
     from parking_spot_monitor.operator_cockpit import build_who_snapshot_response
 
     latest_path = tmp_path / "latest.jpg"
@@ -1011,6 +1011,7 @@ def test_build_who_snapshot_response_captures_once_and_attaches_validated_image(
             selected_mode=DecodeMode.SOFTWARE,
             duration_seconds=0.25,
             byte_size=raw_bytes,
+            frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(13, 9)),
         )
 
     settings = object()
@@ -1030,7 +1031,7 @@ def test_build_who_snapshot_response_captures_once_and_attaches_validated_image(
 
 
 def test_build_who_snapshot_response_resizes_oversized_fresh_capture_for_matrix(tmp_path: Path) -> None:
-    from parking_spot_monitor.capture import DecodeMode, FrameCaptureResult
+    from parking_spot_monitor.capture import DecodeMode, FrameCaptureResult, FrameGeometry
     from parking_spot_monitor.operator_cockpit import build_who_snapshot_response
 
     latest_path = tmp_path / "latest.jpg"
@@ -1046,6 +1047,7 @@ def test_build_who_snapshot_response_resizes_oversized_fresh_capture_for_matrix(
             selected_mode=DecodeMode.SOFTWARE,
             duration_seconds=0.25,
             byte_size=raw_size,
+            frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1280, 720)),
         )
 
     response = build_who_snapshot_response(

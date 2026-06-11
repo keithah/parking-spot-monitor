@@ -67,6 +67,9 @@ def test_example_config_exposes_operator_calibration_and_runtime_fields() -> Non
         ("stream", "frame_width"),
         ("stream", "frame_height"),
         ("stream", "reconnect_seconds"),
+        ("stream", "escalation_profile"),
+        ("stream", "escalation_min_confidence"),
+        ("stream", "profiles"),
         ("spots", "left_spot", "polygon"),
         ("spots", "right_spot", "polygon"),
         ("detection", "confidence_threshold"),
@@ -98,6 +101,7 @@ def test_example_config_exposes_operator_calibration_and_runtime_fields() -> Non
             value = value[key]
 
     assert config["stream"]["rtsp_url_env"] == "RTSP_URL"
+    assert config["stream"]["profiles"]["high_resolution"]["rtsp_url_env"] == "RTSP_URL_4K"
     assert config["matrix"]["access_token_env"] == "MATRIX_ACCESS_TOKEN"
 
 def test_example_spot_polygons_are_in_frame_and_have_minimum_shape() -> None:

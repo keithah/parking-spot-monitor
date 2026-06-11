@@ -12,6 +12,7 @@ from parking_spot_monitor.capture import (
     CaptureError,
     DecodeMode,
     FrameCaptureResult,
+    FrameGeometry,
     build_ffmpeg_argv,
     capture_latest,
     redact_diagnostic_text,
@@ -27,7 +28,12 @@ FAKE_MATRIX_VALUE = f"matrix-value-{SECRET_MARKER}"
 def fake_settings():
     return load_settings(
         "config.yaml.example",
-        environ={"RTSP_URL": FAKE_RTSP_VALUE, "MATRIX_ACCESS_TOKEN": FAKE_MATRIX_VALUE},
+        environ={
+            "RTSP_URL": FAKE_RTSP_VALUE,
+            "RTSP_URL_4K": f"{FAKE_RTSP_VALUE}/4k",
+            "RTSP_URL_360P": f"{FAKE_RTSP_VALUE}/360p",
+            "MATRIX_ACCESS_TOKEN": FAKE_MATRIX_VALUE,
+        },
     )
 
 
@@ -64,10 +70,9 @@ def test_ffmpeg_command_builder_sets_rtsp_network_timeouts_before_input(tmp_path
 
     argv = build_ffmpeg_argv(FAKE_RTSP_VALUE, output_path, DecodeMode.SOFTWARE, network_timeout_seconds=3.25)
 
-    assert argv[argv.index("-stimeout") + 1] == "3250000"
-    assert argv[argv.index("-rw_timeout") + 1] == "3250000"
-    assert argv.index("-stimeout") < argv.index("-i")
-    assert argv.index("-rw_timeout") < argv.index("-i")
+    assert argv[argv.index("-timeout") + 1] == "3250000"
+    assert argv.index("-timeout") < argv.index("-i")
+    assert "-rw_timeout" not in argv
 
 
 
@@ -114,6 +119,40 @@ def test_capture_latest_returns_result_shape_after_valid_jpeg_write(tmp_path: Pa
     assert result.duration_seconds >= 0
     assert result.byte_size == len(jpeg_bytes())
     assert calls and isinstance(calls[0], list)
+
+
+def test_capture_latest_uses_selected_stream_profile(tmp_path: Path) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "  reconnect_seconds: 5\n",
+        "  reconnect_seconds: 5\n  profiles:\n    high_resolution:\n      rtsp_url_env: RTSP_URL_4K\n      frame_width: 3840\n      frame_height: 2160\n",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(config, encoding="utf-8")
+    high_url = f"rtsps://high-camera/{SECRET_MARKER}"
+    settings = load_settings(
+        config_path,
+        environ={
+            "RTSP_URL": FAKE_RTSP_VALUE,
+            "RTSP_URL_4K": high_url,
+            "RTSP_URL_360P": f"{FAKE_RTSP_VALUE}/360p",
+            "MATRIX_ACCESS_TOKEN": FAKE_MATRIX_VALUE,
+        },
+    )
+    calls: list[Sequence[str]] = []
+
+    def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        Path(argv[-1]).write_bytes(jpeg_bytes())
+        return subprocess.CompletedProcess(argv, 0, stderr="captured high-res frame")
+
+    result = capture_latest(settings, tmp_path, stream_profile="high_resolution", modes=[DecodeMode.SOFTWARE], runner=runner)
+
+    assert result.stream_profile == "high_resolution"
+    assert result.frame_geometry == FrameGeometry(stream_profile="high_resolution", expected_size=(3840, 2160))
+    assert result.expected_frame_size == (3840, 2160)
+    assert high_url in calls[0]
+    assert FAKE_RTSP_VALUE not in calls[0]
+    assert result.diagnostics()["stream_profile"] == "high_resolution"
 
 
 def test_capture_validation_reads_only_jpeg_edges_not_full_payload(tmp_path: Path) -> None:

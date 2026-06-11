@@ -11,7 +11,7 @@ from PIL import Image
 
 from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery
 from parking_monitor.outbox import AlertIntent, LocalOutbox
-from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult
+from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult, FrameGeometry
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import load_decision_memory
@@ -34,6 +34,8 @@ FAKE_MATRIX_VALUE = f"matrix-value-{SECRET_MARKER}"
 def fake_environ(**overrides: str) -> dict[str, str]:
     environ = {
         "RTSP_URL": FAKE_RTSP_VALUE,
+        "RTSP_URL_4K": f"{FAKE_RTSP_VALUE}-4k",
+        "RTSP_URL_360P": f"{FAKE_RTSP_VALUE}-360p",
         "MATRIX_ACCESS_TOKEN": FAKE_MATRIX_VALUE,
     }
     environ.update(overrides)
@@ -72,11 +74,23 @@ def captured_frame(tmp_path: Path, timestamp: str = "2026-05-18T20:30:00Z") -> F
         selected_mode=DecodeMode.SOFTWARE,
         duration_seconds=0.01,
         byte_size=latest_path.stat().st_size,
+        frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
     )
 
 
 def left_spot_vehicle() -> VehicleDetection:
     return VehicleDetection(class_name="car", confidence=0.9, bbox=(350, 200, 550, 330))
+
+
+def next_detection(
+    detections: list[list[VehicleDetection]],
+    *,
+    allow_exhausted: bool = False,
+) -> list[VehicleDetection]:
+    if detections:
+        return detections.pop(0)
+    assert allow_exhausted, "unexpected extra detector call"
+    return []
 
 
 def runtime_state_payload(path: Path) -> dict[str, Any]:
@@ -327,7 +341,14 @@ def test_dispatch_matrix_open_alert_enqueue_records_queued_memory(tmp_path: Path
 
 
 class FakeCommandPollResult:
-    def __init__(self, *, processed_count: int = 0, ignored_count: int = 0, error_count: int = 0, bootstrapped: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        processed_count: int = 0,
+        ignored_count: int = 0,
+        error_count: int = 0,
+        bootstrapped: bool = False,
+    ) -> None:
         self.next_batch = "fake-next"
         self.processed_count = processed_count
         self.ignored_count = ignored_count
@@ -381,6 +402,7 @@ def test_process_detection_uses_spot_crop_inference_to_recover_full_frame_miss(
         frame,
         logger=StructuredLogger(),
         mode="test",
+        frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
     )
 
     right = result.by_spot["right_spot"].accepted
@@ -411,6 +433,7 @@ def test_process_detection_scales_configured_polygons_to_actual_frame_size(
         frame,
         logger=StructuredLogger(),
         mode="test",
+        frame_geometry=FrameGeometry(stream_profile="low_resolution", expected_size=(640, 360)),
     )
 
     output = combined_output(capsys)
@@ -429,12 +452,12 @@ def test_runtime_loop_matrix_state_change_skip_log_explains_policy(
     detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()]]
     delivery = FakeMatrixDelivery()
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -472,12 +495,12 @@ def test_runtime_loop_vehicle_history_confirmed_occupied_creates_one_active_sess
     detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()]]
     delivery = FakeMatrixDelivery()
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -605,7 +628,7 @@ def test_runtime_loop_owner_vehicle_in_quiet_window_sends_deduped_alert(
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(data_dir)],
         environ=fake_environ(),
-        capture=lambda _settings, _data_dir: captured_frame(data_dir, timestamp="2026-05-18T20:05:06Z"),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(data_dir, timestamp="2026-05-18T20:05:06Z"),
         overlay=noop_overlay,
         detector_factory=lambda _settings: EmptyDetector(),
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
@@ -715,7 +738,7 @@ def test_runtime_loop_owner_vehicle_quiet_window_ignores_low_confidence_profile_
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(data_dir)],
         environ=fake_environ(),
-        capture=lambda _settings, _data_dir: captured_frame(data_dir, timestamp="2026-05-18T20:05:06Z"),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(data_dir, timestamp="2026-05-18T20:05:06Z"),
         overlay=noop_overlay,
         detector_factory=lambda _settings: EmptyDetector(),
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
@@ -739,7 +762,7 @@ def test_runtime_loop_matrix_quiet_window_start_notice_sent_once_by_event_id(
 ) -> None:
     delivery = FakeMatrixDelivery()
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T20:30:00Z")
 
     exit_code = _main(
@@ -771,7 +794,7 @@ def test_runtime_loop_matrix_quiet_window_upcoming_notice_sent_once_by_event_id(
 ) -> None:
     delivery = FakeMatrixDelivery()
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     exit_code = _main(
@@ -812,7 +835,7 @@ def test_runtime_loop_matrix_quiet_window_end_notice_sent_once_by_event_id(
     )
     delivery = FakeMatrixDelivery()
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T22:30:00Z")
 
     exit_code = _main(
@@ -842,12 +865,12 @@ def test_runtime_loop_matrix_open_event_sends_text_and_raw_snapshot(
     detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], []]
     matrix_client = FakeMatrixClient()
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixDelivery:
         return MatrixDelivery(
@@ -973,12 +996,12 @@ def test_runtime_loop_occupied_alert_sends_text_image_with_seeded_vehicle_estima
             encoding="utf-8",
         )
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixDelivery:
         return MatrixDelivery(
@@ -1147,9 +1170,9 @@ def test_runtime_loop_vehicle_history_final_integrated_regression_includes_reten
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixDelivery:
@@ -1332,12 +1355,12 @@ def test_runtime_loop_matrix_command_merge_and_rename_affect_later_occupied_aler
                 return FakeCommandPollResult(processed_count=2)
             return FakeCommandPollResult()
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -1380,12 +1403,12 @@ def test_runtime_loop_matrix_command_failure_is_non_blocking_and_redacted(
         def poll_once(self) -> FakeCommandPollResult:
             raise RuntimeError(f"sync failed token={SECRET_MARKER} rtsp://camera.local/raw_image_bytes")
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -1426,7 +1449,7 @@ def test_runtime_loop_matrix_command_result_errors_degrade_health(
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, _data_dir: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
@@ -1471,6 +1494,9 @@ def test_runtime_loop_vehicle_history_close_failure_degrades_health_without_bloc
         def health_snapshot(self) -> dict[str, Any]:
             return {"archive_status": "test-double"}
 
+        def mutation_revision(self) -> int:
+            return 0
+
         def start_session(self, event: object) -> object:
             return type("SessionRecord", (), {"session_id": "session-left"})()
 
@@ -1489,14 +1515,14 @@ def test_runtime_loop_vehicle_history_close_failure_degrades_health_without_bloc
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     monkeypatch.setattr(cli, "VehicleHistoryArchive", FailingCloseHistoryArchive)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, _data_dir: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
@@ -1533,7 +1559,7 @@ def test_runtime_loop_vehicle_history_image_capture_failure_degrades_health_with
     delivery = FakeMatrixDelivery()
     capture_calls = 0
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         nonlocal capture_calls
         capture_calls += 1
         latest_path = tmp_path / "latest.jpg"
@@ -1547,11 +1573,12 @@ def test_runtime_loop_vehicle_history_image_capture_failure_degrades_health_with
             selected_mode=DecodeMode.SOFTWARE,
             duration_seconds=0.01,
             byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
         )
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -1605,6 +1632,9 @@ def test_runtime_loop_vehicle_history_profile_failure_degrades_health_after_reco
         def health_snapshot(self) -> dict[str, Any]:
             return {"archive_status": "test-double"}
 
+        def mutation_revision(self) -> int:
+            return 0
+
         def start_session(self, event: object) -> object:
             return type("SessionRecord", (), {"session_id": "session-left"})()
 
@@ -1624,14 +1654,14 @@ def test_runtime_loop_vehicle_history_profile_failure_degrades_health_after_reco
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     monkeypatch.setattr(cli, "VehicleHistoryArchive", FailingProfileHistoryArchive)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, _data_dir: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
@@ -1679,6 +1709,9 @@ def test_runtime_loop_capture_failure_remains_down_with_prior_vehicle_history_er
         def health_snapshot(self) -> dict[str, Any]:
             return {"archive_status": "test-double"}
 
+        def mutation_revision(self) -> int:
+            return 0
+
         def start_session(self, event: object) -> object:
             raise RuntimeError(f"history start denied token={SECRET_MARKER}")
 
@@ -1695,7 +1728,7 @@ def test_runtime_loop_capture_failure_remains_down_with_prior_vehicle_history_er
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
             return [left_spot_vehicle()]
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         nonlocal calls
         calls += 1
         if calls <= 3:
@@ -1754,7 +1787,7 @@ def test_live_proof_once_captures_raw_frame_and_sends_labelled_matrix_evidence(
 ) -> None:
     delivery = FakeMatrixDelivery()
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z")
 
     exit_code = _main(
@@ -1782,7 +1815,7 @@ def test_live_proof_once_captures_raw_frame_and_sends_labelled_matrix_evidence(
 def test_live_proof_once_capture_failure_returns_safe_nonzero(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         raise CaptureError(
             reason="ffmpeg-timeout",
             mode=DecodeMode.SOFTWARE,
@@ -1820,7 +1853,7 @@ def test_live_proof_once_matrix_text_failure_returns_safe_nonzero(
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path), "--live-proof-once"],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: TextFailDelivery(),
     )
 
@@ -1845,7 +1878,7 @@ def test_live_proof_once_matrix_image_failure_returns_safe_nonzero(
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path), "--live-proof-once"],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: ImageFailDelivery(),
     )
 
@@ -1882,12 +1915,12 @@ def test_runtime_loop_matrix_suppressed_open_event_sends_no_open_alert(
     detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], []]
     delivery = FakeMatrixDelivery()
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T20:30:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -1918,12 +1951,12 @@ def test_runtime_loop_matrix_delivery_failure_logs_and_continues(
     detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], []]
     delivery = FakeMatrixDelivery(fail=True)
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -1984,7 +2017,7 @@ def test_runtime_loop_startup_prunes_existing_event_snapshots_without_touching_r
     config_path = tmp_path / "config.yaml"
     config_path.write_text(base.replace("snapshot_retention_count: 50", "snapshot_retention_count: 1"), encoding="utf-8")
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z")
 
     exit_code = _main(
@@ -2028,7 +2061,7 @@ def test_runtime_loop_startup_retention_failure_logs_and_continues(
     exit_code = _main(
         ["--config", str(config_path), "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         sleep=lambda _seconds: None,
@@ -2054,7 +2087,7 @@ def test_runtime_loop_passes_effective_paths_to_capture_state_and_matrix(
     captured_data_dirs: list[Path] = []
     matrix_paths: list[tuple[Path, Path]] = []
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         captured_data_dirs.append(Path(data_dir))
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
@@ -2243,7 +2276,7 @@ def test_capture_once_success_writes_debug_overlay_then_spot_filtered_detection(
     debug_path = tmp_path / "debug_latest.jpg"
     calls: list[tuple[str, Path]] = []
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         assert Path(data_dir) == tmp_path
         assert not latest_path.exists()
         Image.new("RGB", (1458, 806), (20, 30, 40)).save(latest_path, format="JPEG")
@@ -2254,6 +2287,7 @@ def test_capture_once_success_writes_debug_overlay_then_spot_filtered_detection(
             selected_mode=DecodeMode.SOFTWARE,
             duration_seconds=0.01,
             byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
         )
 
     def fake_overlay(_settings: object, source_path: Path, output_path: Path, *, logger: Any) -> object:
@@ -2322,7 +2356,7 @@ def test_capture_once_failure_skips_debug_overlay(
 ) -> None:
     overlay_calls: list[Path] = []
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         raise CaptureError(
             reason="ffmpeg-nonzero-exit",
             mode=DecodeMode.QSV,
@@ -2365,7 +2399,7 @@ def test_capture_once_overlay_failure_returns_nonzero_with_safe_diagnostics(
 ) -> None:
     latest_path = tmp_path / "latest.jpg"
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         Image.new("RGB", (1458, 806), (20, 30, 40)).save(latest_path, format="JPEG")
         return FrameCaptureResult(
             timestamp="2025-01-01T00:00:00Z",
@@ -2373,6 +2407,7 @@ def test_capture_once_overlay_failure_returns_nonzero_with_safe_diagnostics(
             selected_mode=DecodeMode.SOFTWARE,
             duration_seconds=0.01,
             byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
         )
 
     def fake_overlay(_settings: object, source_path: Path, output_path: Path, *, logger: Any) -> object:
@@ -2409,7 +2444,7 @@ def test_capture_once_detection_failure_returns_nonzero_with_safe_diagnostics(
 ) -> None:
     latest_path = tmp_path / "latest.jpg"
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         Image.new("RGB", (1458, 806), (20, 30, 40)).save(latest_path, format="JPEG")
         return FrameCaptureResult(
             timestamp="2025-01-01T00:00:00Z",
@@ -2417,6 +2452,7 @@ def test_capture_once_detection_failure_returns_nonzero_with_safe_diagnostics(
             selected_mode=DecodeMode.SOFTWARE,
             duration_seconds=0.01,
             byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
         )
 
     class FailingDetector:
@@ -2455,7 +2491,7 @@ def test_runtime_loop_overlay_failure_logs_and_continues(
     sleeps: list[float] = []
     overlay_calls: list[Path] = []
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         Image.new("RGB", (1458, 806), (20, 30, 40)).save(latest_path, format="JPEG")
         return FrameCaptureResult(
             timestamp="2025-01-01T00:00:00Z",
@@ -2463,6 +2499,7 @@ def test_runtime_loop_overlay_failure_logs_and_continues(
             selected_mode=DecodeMode.SOFTWARE,
             duration_seconds=0.01,
             byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
         )
 
     def fake_overlay(_settings: object, source_path: Path, output_path: Path, *, logger: Any) -> object:
@@ -2499,59 +2536,13 @@ def test_runtime_loop_overlay_failure_logs_and_continues(
     assert_no_secret_leak(output)
 
 
-def test_runtime_loop_detector_failure_logs_and_continues(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    latest_path = tmp_path / "latest.jpg"
-    sleeps: list[float] = []
-
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
-        Image.new("RGB", (1458, 806), (20, 30, 40)).save(latest_path, format="JPEG")
-        return FrameCaptureResult(
-            timestamp="2025-01-01T00:00:00Z",
-            latest_path=latest_path,
-            selected_mode=DecodeMode.SOFTWARE,
-            duration_seconds=0.01,
-            byte_size=latest_path.stat().st_size,
-        )
-
-    class FailingDetector:
-        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            raise DetectionError(
-                f"predict failed matrix_token={SECRET_MARKER}",
-                model_path="yolov8n.pt",
-                frame_path=str(frame_path),
-                phase="predict",
-                error_type="RuntimeError",
-            )
-
-    exit_code = _main(
-        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
-        environ=fake_environ(),
-        capture=fake_capture,
-        detector_factory=lambda _settings: FailingDetector(),
-        sleep=sleeps.append,
-        max_iterations=1,
-    )
-
-    output = combined_output(capsys)
-    assert exit_code == 0
-    assert sleeps == [30]
-    assert '"event":"detection-frame-failed"' in output
-    assert '"iteration":1' in output
-    assert '"event":"capture-loop-frame-written"' in output
-    assert '"event":"detection-frame-processed"' not in output
-    assert "Traceback" not in output
-    assert_no_secret_leak(output)
-
-
 def test_runtime_loop_success_logs_detection_frame_processed_with_metadata(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     latest_path = tmp_path / "latest.jpg"
     sleeps: list[float] = []
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         assert Path(data_dir) == tmp_path
         Image.new("RGB", (1458, 806), (20, 30, 40)).save(latest_path, format="JPEG")
         return FrameCaptureResult(
@@ -2560,6 +2551,7 @@ def test_runtime_loop_success_logs_detection_frame_processed_with_metadata(
             selected_mode=DecodeMode.SOFTWARE,
             duration_seconds=0.01,
             byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
         )
 
     class FakeDetector:
@@ -2590,39 +2582,11 @@ def test_runtime_loop_success_logs_detection_frame_processed_with_metadata(
     assert "Traceback" not in output
     assert_no_secret_leak(output)
 
-    latest_path = tmp_path / "latest.jpg"
-
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
-        assert Path(data_dir) == tmp_path
-        Image.new("RGB", (1458, 806), (20, 30, 40)).save(latest_path, format="JPEG")
-        return FrameCaptureResult(
-            timestamp="2025-01-01T00:00:00Z",
-            latest_path=latest_path,
-            selected_mode=DecodeMode.SOFTWARE,
-            duration_seconds=0.01,
-            byte_size=latest_path.stat().st_size,
-        )
-
-    exit_code = _main(
-        ["--config", "config.yaml.example", "--data-dir", str(tmp_path), "--capture-once"],
-        environ=fake_environ(),
-        capture=fake_capture,
-        detector_factory=noop_detector_factory,
-    )
-
-    output = combined_output(capsys)
-    assert exit_code == 0
-    assert latest_path.exists()
-    assert '"event":"capture-once-complete"' in output
-    assert '"selected_mode":"software"' in output
-    assert '"mode":"capture-once"' in output
-    assert_no_secret_leak(output)
-
 
 def test_capture_once_failure_returns_nonzero_without_traceback_or_secret(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         raise CaptureError(
             reason="ffmpeg-nonzero-exit",
             mode=DecodeMode.QSV,
@@ -2655,7 +2619,7 @@ def test_default_runtime_loop_logs_failure_and_uses_reconnect_backoff(
 ) -> None:
     sleeps: list[float] = []
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         raise CaptureError(
             reason="ffmpeg-timeout",
             mode=DecodeMode.SOFTWARE,
@@ -2701,7 +2665,7 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
         encoding="utf-8",
     )
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z")
 
     exit_code = _main(
@@ -2755,12 +2719,15 @@ def test_runtime_loop_reuses_vehicle_history_health_snapshot_within_cache_window
             self.calls += 1
             return {"archive_status": "cached", "calls": self.calls}
 
+        def mutation_revision(self) -> int:
+            return 0
+
     monkeypatch.setattr(cli, "VehicleHistoryArchive", CountingHistoryArchive)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z"),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z"),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         sleep=lambda _seconds: None,
@@ -2791,6 +2758,9 @@ def test_runtime_loop_noop_matrix_commands_keep_vehicle_history_health_snapshot_
             self.calls += 1
             return {"archive_status": "cached", "calls": self.calls}
 
+        def mutation_revision(self) -> int:
+            return 0
+
     class NoopCommandService:
         def poll_once(self) -> FakeCommandPollResult:
             return FakeCommandPollResult()
@@ -2800,10 +2770,54 @@ def test_runtime_loop_noop_matrix_commands_keep_vehicle_history_health_snapshot_
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z"),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z"),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         matrix_command_service_factory=lambda _settings, _data_dir, _logger, _archive: NoopCommandService(),
+        sleep=lambda _seconds: None,
+        max_iterations=3,
+        now=lambda: datetime(2026, 5, 18, 18, 0, tzinfo=timezone.utc),
+    )
+
+    assert exit_code == 0
+    assert CountingHistoryArchive.latest is not None
+    assert CountingHistoryArchive.latest.calls == 1
+    assert health_payload(tmp_path / "health.json")["vehicle_history"]["calls"] == 1
+    assert_no_secret_leak(combined_output(capsys))
+
+
+def test_runtime_loop_read_only_matrix_commands_keep_vehicle_history_health_snapshot_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from parking_spot_monitor import __main__ as cli
+
+    class CountingHistoryArchive:
+        latest: "CountingHistoryArchive | None" = None
+
+        def __init__(self, _root: Path, *, logger: StructuredLogger | None = None) -> None:
+            self.calls = 0
+            CountingHistoryArchive.latest = self
+
+        def health_snapshot(self) -> dict[str, Any]:
+            self.calls += 1
+            return {"archive_status": "cached", "calls": self.calls}
+
+        def mutation_revision(self) -> int:
+            return 0
+
+    class ReadOnlyCommandService:
+        def poll_once(self) -> FakeCommandPollResult:
+            return FakeCommandPollResult(processed_count=1)
+
+    monkeypatch.setattr(cli, "VehicleHistoryArchive", CountingHistoryArchive)
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z"),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_command_service_factory=lambda _settings, _data_dir, _logger, _archive: ReadOnlyCommandService(),
         sleep=lambda _seconds: None,
         max_iterations=3,
         now=lambda: datetime(2026, 5, 18, 18, 0, tzinfo=timezone.utc),
@@ -2835,7 +2849,7 @@ def test_runtime_loop_clears_transient_matrix_outbox_error_after_clean_iteration
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z"),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z"),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
@@ -2858,7 +2872,7 @@ def test_runtime_loop_sends_matrix_startup_lifecycle_notice(
 ) -> None:
     delivery = FakeMatrixDelivery()
 
-    def fake_capture(_settings: object, data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z")
 
     exit_code = _main(
@@ -2950,7 +2964,7 @@ def test_runtime_loop_shutdown_during_sleep_sends_one_shutdown_notice(
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir)),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir)),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
@@ -2970,52 +2984,6 @@ def test_runtime_loop_shutdown_during_sleep_sends_one_shutdown_notice(
     assert_no_secret_leak(output)
 
 
-def test_runtime_loop_detection_failure_updates_health_without_advancing_state(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    state_path = tmp_path / "state.json"
-    save_runtime_state(
-        state_path,
-        RuntimeState(
-            state_by_spot={
-                "left_spot": SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=3, miss_streak=0),
-                "right_spot": SpotOccupancyState(),
-            }
-        ),
-    )
-
-    class FailingDetector:
-        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            raise DetectionError(
-                f"predict failed token={SECRET_MARKER}",
-                model_path="yolov8n.pt",
-                frame_path=str(frame_path),
-                phase="predict",
-                error_type="RuntimeError",
-            )
-
-    exit_code = _main(
-        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
-        environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
-        overlay=noop_overlay,
-        detector_factory=lambda _settings: FailingDetector(),
-        sleep=lambda _seconds: None,
-        max_iterations=1,
-    )
-
-    output = combined_output(capsys)
-    health = health_payload(tmp_path / "health.json")
-    assert exit_code == 0
-    assert runtime_state_payload(state_path)["spots"]["left_spot"]["miss_streak"] == 0
-    assert health["status"] == "degraded"
-    assert health["consecutive_capture_failures"] == 0
-    assert health["consecutive_detection_failures"] == 1
-    assert health["last_error"]["phase"] == "detection"
-    assert SECRET_MARKER not in json.dumps(health)
-    assert_no_secret_leak(output)
-
-
 def test_runtime_loop_matrix_failure_updates_health_and_loop_continues(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3024,12 +2992,12 @@ def test_runtime_loop_matrix_failure_updates_health_and_loop_continues(
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, _data_dir: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
@@ -3045,6 +3013,7 @@ def test_runtime_loop_matrix_failure_updates_health_and_loop_continues(
     assert health["status"] == "degraded"
     assert health["last_matrix_error"]["event_type"] == "occupancy-open-event"
     assert health["last_matrix_error"]["error_type"] == "RuntimeError"
+    assert detections == []
     assert SECRET_MARKER not in json.dumps(health)
     assert '"event":"capture-loop-frame-written"' in output
     assert_no_secret_leak(output)
@@ -3063,7 +3032,7 @@ def test_runtime_loop_state_save_failure_updates_health_and_loop_continues(
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         sleep=lambda _seconds: None,
@@ -3113,7 +3082,7 @@ def test_runtime_loop_state_save_failure_still_emits_matrix_transition(
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
@@ -3165,7 +3134,7 @@ def test_runtime_loop_state_save_failure_continues_from_previous_durable_state(
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         sleep=lambda _seconds: None,
@@ -3197,7 +3166,7 @@ def test_runtime_loop_health_write_failure_logs_safely_and_continues(
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         sleep=lambda _seconds: None,
@@ -3219,12 +3188,12 @@ def test_runtime_loop_confirms_occupied_releases_empty_and_logs_open_event(
 ) -> None:
     detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], []]
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -3257,7 +3226,7 @@ def test_runtime_loop_confirms_occupied_releases_empty_and_logs_open_event(
 def test_runtime_loop_startup_unknown_empty_frames_emit_no_open_event(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     exit_code = _main(
@@ -3286,12 +3255,12 @@ def test_runtime_loop_quiet_window_suppresses_open_event_and_emits_notice(
 ) -> None:
     detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], []]
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T20:30:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -3324,7 +3293,7 @@ def test_runtime_loop_persists_occupied_state_across_invocations_before_open_eve
 ) -> None:
     hit_detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()]]
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class HitDetector:
@@ -3388,7 +3357,7 @@ def test_runtime_loop_detection_and_capture_failures_do_not_advance_miss_counter
         ),
     )
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class FailingDetector:
@@ -3449,7 +3418,7 @@ def test_runtime_loop_corrupt_state_is_quarantined_and_defaults_unknown(
     state_path = tmp_path / "state.json"
     state_path.write_text("{not json rtsp://camera access_token=supersecret Traceback raw_image_bytes", encoding="utf-8")
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     exit_code = _main(
@@ -3497,12 +3466,12 @@ def test_runtime_loop_matrix_upload_failure_logs_safe_context_and_retains_copied
 
     matrix_client = UploadFailingMatrixClient()
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixDelivery:
         return MatrixDelivery(
@@ -3588,7 +3557,7 @@ def test_runtime_loop_low_confidence_in_spot_vehicle_suppresses_open_alert(
     exit_code = _main(
         ["--config", str(config_path), "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, data_dir: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=lambda _settings: detector,
         sleep=lambda _seconds: None,
@@ -3655,12 +3624,12 @@ def test_runtime_loop_appends_sanitized_decision_memory_records(tmp_path: Path, 
     detections = [[left_spot_vehicle()]]
     delivery = FakeMatrixDelivery()
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -3692,7 +3661,7 @@ def test_runtime_loop_decision_memory_append_failure_is_non_fatal(tmp_path: Path
     (tmp_path / "operator-decision-memory.json.quarantine").mkdir()
     ((tmp_path / "operator-decision-memory.json.quarantine") / "existing").write_text("block quarantine", encoding="utf-8")
 
-    def fake_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
+    def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
     exit_code = _main(
@@ -3913,7 +3882,7 @@ def test_runtime_health_json_includes_resolved_matrix_outbox_summary(tmp_path: P
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, _data_dir: captured_frame(tmp_path),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: FakeMatrixDelivery(),
@@ -3968,7 +3937,7 @@ def test_runtime_loop_closes_matrix_services_on_exit(tmp_path: Path) -> None:
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, _data_dir: captured_frame(tmp_path),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path),
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
         matrix_delivery_factory=lambda _settings, _data_dir, _logger: CloseableDelivery(),
@@ -4011,12 +3980,12 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, _data_dir: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=lambda _settings, data_dir, logger: outbox_delivery(matrix_client, data_dir, logger),
@@ -4054,12 +4023,12 @@ def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_eve
 
     class SequencedDetector:
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
-            return detections.pop(0)
+            return next_detection(detections, allow_exhausted=True)
 
     first_exit = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
-        capture=lambda _settings, _data_dir: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=lambda _settings, data_dir, logger: outbox_delivery(failing_client, data_dir, logger),

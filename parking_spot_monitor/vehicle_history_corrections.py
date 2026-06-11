@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 from collections.abc import Mapping, Sequence
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,7 @@ class VehicleHistoryCorrectionMixin:
         except OSError as exc:
             self._record_failure(phase="correction-append", path_name=self.corrections_path.name, error=exc)
             raise ArchiveWriteError(_safe_error_message(exc)) from exc
+        self._bump_revision()
         self._log(
             "info",
             "vehicle-profile-correction-appended",
@@ -223,8 +225,9 @@ class VehicleHistoryCorrectionMixin:
         state = self.correction_replay_state()
         closed = self._effective_sessions(self.list_closed_sessions(), state=state, exclude_wrong_matches=False)
         active = self._effective_sessions(self.load_active_sessions(), state=state, exclude_wrong_matches=False)
-        relevant = [record for record in [*closed, *active] if record.profile_id == canonical]
-        excluded = [record for record in relevant if record.session_id in state.wrong_match_session_ids]
+        closed_session_count, closed_excluded = _profile_session_counts(closed, profile_id=canonical, wrong_matches=state.wrong_match_session_ids)
+        active_session_count, active_excluded = _profile_session_counts(active, profile_id=canonical, wrong_matches=state.wrong_match_session_ids)
+        excluded_count = closed_excluded + active_excluded
         estimate = self.estimate_for_profile(canonical)
         self.append_correction(
             ProfileCorrectionEvent(
@@ -242,9 +245,9 @@ class VehicleHistoryCorrectionMixin:
             "profile_id": canonical,
             "requested_profile_id": profile_id,
             "label": self.effective_label(canonical),
-            "closed_session_count": sum(1 for record in closed if record.profile_id == canonical and record.session_id not in state.wrong_match_session_ids),
-            "active_session_count": sum(1 for record in active if record.profile_id == canonical and record.session_id not in state.wrong_match_session_ids),
-            "wrong_match_excluded_session_count": len(excluded),
+            "closed_session_count": closed_session_count,
+            "active_session_count": active_session_count,
+            "wrong_match_excluded_session_count": excluded_count,
             "merged_profile_ids": sorted(source for source, target in state.merges.items() if target == canonical),
             "estimate_status": estimate.status,
             "estimate_reason": estimate.reason,
@@ -309,16 +312,9 @@ class VehicleHistoryCorrectionMixin:
 
     def _validate_correction_against_archive(self, event: ProfileCorrectionEvent) -> None:
         state = self.correction_replay_state()
-        active_records = list(self.load_active_sessions())
-        closed_records = list(self.list_closed_sessions())
-        active_profiles = list(self.load_active_profiles())
-        session_by_id = {record.session_id: record for record in [*active_records, *closed_records]}
-        profile_ids = self._known_profile_ids(
-            state=state,
-            active_records=active_records,
-            closed_records=closed_records,
-            active_profiles=active_profiles,
-        )
+        active_records, closed_records, active_profiles = self.load_active_sessions(), self.list_closed_sessions(), self.load_active_profiles()
+        session_by_id = {record.session_id: record for record in chain(active_records, closed_records)}
+        profile_ids = self._known_profile_ids(state=state, active_records=active_records, closed_records=closed_records, active_profiles=active_profiles)
         if event.action == CORRECTION_ACTION_RENAME_PROFILE:
             profile_id = _required_correction_field(event.profile_id, "profile_id")
             if self.resolve_profile_id(profile_id, merges=state.merges) not in profile_ids:
@@ -344,20 +340,13 @@ class VehicleHistoryCorrectionMixin:
             if self.resolve_profile_id(profile_id, merges=state.merges) not in profile_ids:
                 raise ArchiveSchemaError("unknown profile_id")
 
-    def _known_profile_ids(
-        self,
-        *,
-        state: CorrectionReplayState | None = None,
-        active_records: Sequence[SessionRecord] | None = None,
-        closed_records: Sequence[SessionRecord] | None = None,
-        active_profiles: Sequence[Any] | None = None,
-    ) -> set[str]:
+    def _known_profile_ids(self, *, state: CorrectionReplayState | None = None, active_records: Sequence[SessionRecord] | None = None, closed_records: Sequence[SessionRecord] | None = None, active_profiles: Sequence[Any] | None = None) -> set[str]:
         state = state if state is not None else self.correction_replay_state()
         profiles = active_profiles if active_profiles is not None else self.load_active_profiles()
         active = active_records if active_records is not None else self.load_active_sessions()
         closed = closed_records if closed_records is not None else self.list_closed_sessions()
         profile_ids = {self.resolve_profile_id(profile.profile_id, merges=state.merges) for profile in profiles}
-        for record in [*active, *closed]:
+        for record in chain(active, closed):
             resolved = self.resolve_profile_id(record.profile_id, merges=state.merges)
             if resolved is not None:
                 profile_ids.add(resolved)
@@ -408,3 +397,12 @@ def _required_correction_field(value: str | None, field_name: str) -> str:
     if value is None:
         raise ArchiveSchemaError(f"correction missing {field_name}")
     return value
+
+
+def _profile_session_counts(records: Sequence[SessionRecord], *, profile_id: str, wrong_matches: set[str] | frozenset[str]) -> tuple[int, int]:
+    kept = excluded = 0
+    for record in records:
+        if record.profile_id == profile_id:
+            excluded += int(record.session_id in wrong_matches)
+            kept += int(record.session_id not in wrong_matches)
+    return kept, excluded

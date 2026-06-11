@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Mapping, Self
@@ -67,11 +68,57 @@ class SpotsConfig(StrictModel):
     right_spot: SpotConfig
 
 
+class StreamProfileConfig(StrictModel):
+    rtsp_url: ResolvedSecret
+    frame_width: int = Field(gt=0)
+    frame_height: int = Field(gt=0)
+
+
+@dataclass(frozen=True)
+class ResolvedStreamProfile:
+    name: str
+    rtsp_url: ResolvedSecret
+    frame_width: int
+    frame_height: int
+
+
 class StreamConfig(StrictModel):
     rtsp_url: ResolvedSecret
     frame_width: int = Field(gt=0)
     frame_height: int = Field(gt=0)
     reconnect_seconds: int = Field(default=5, gt=0)
+    profiles: dict[str, StreamProfileConfig] = Field(default_factory=dict)
+    escalation_profile: str | None = None
+    escalation_min_confidence: float = Field(default=0.75, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def escalation_profile_must_resolve(self) -> Self:
+        if self.escalation_profile is None:
+            return self
+        if self.escalation_profile == "primary" or self.escalation_profile not in self.profiles:
+            raise ValueError("stream.escalation_profile must reference a configured non-primary stream profile")
+        return self
+
+    @property
+    def primary_profile(self) -> ResolvedStreamProfile:
+        return ResolvedStreamProfile(
+            name="primary",
+            rtsp_url=self.rtsp_url,
+            frame_width=self.frame_width,
+            frame_height=self.frame_height,
+        )
+
+    def profile(self, name: str | None) -> ResolvedStreamProfile:
+        profile_name = name or "primary"
+        if profile_name == "primary":
+            return self.primary_profile
+        profile = self.profiles[profile_name]
+        return ResolvedStreamProfile(
+            name=profile_name,
+            rtsp_url=profile.rtsp_url,
+            frame_width=profile.frame_width,
+            frame_height=profile.frame_height,
+        )
 
 
 class DetectionConfig(StrictModel):
@@ -220,6 +267,16 @@ class RuntimeSettings(StrictModel):
                 "frame_width": self.stream.frame_width,
                 "frame_height": self.stream.frame_height,
                 "reconnect_seconds": self.stream.reconnect_seconds,
+                "escalation_profile": self.stream.escalation_profile,
+                "escalation_min_confidence": self.stream.escalation_min_confidence,
+                "profiles": {
+                    name: {
+                        "rtsp_url": profile.rtsp_url.sanitized_summary(),
+                        "frame_width": profile.frame_width,
+                        "frame_height": profile.frame_height,
+                    }
+                    for name, profile in self.stream.profiles.items()
+                },
             },
             "spots": {
                 "left_spot": {"name": self.spots.left_spot.name, "points": len(self.spots.left_spot.polygon)},
@@ -317,6 +374,15 @@ def _resolve_secret_references(raw_config: dict[str, Any], environ: Mapping[str,
     stream = config.get("stream")
     if isinstance(stream, dict):
         stream["rtsp_url"] = _resolve_env_secret(stream.pop("rtsp_url_env", None), environ, missing)
+        profiles = stream.get("profiles")
+        if isinstance(profiles, dict):
+            resolved_profiles: dict[str, Any] = {}
+            for name, profile in profiles.items():
+                if isinstance(profile, dict):
+                    profile_secret = _resolve_env_secret(profile.pop("rtsp_url_env", None), environ, missing)
+                    profile["rtsp_url"] = profile_secret
+                resolved_profiles[str(name)] = profile
+            stream["profiles"] = resolved_profiles
 
     matrix = config.get("matrix")
     if isinstance(matrix, dict):

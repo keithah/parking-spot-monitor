@@ -14,6 +14,7 @@ class MatrixCommandArchive(Protocol):
     def load_corrections(self) -> Sequence[ProfileCorrectionEvent]: ...
     def load_active_sessions(self) -> Sequence[SessionRecord]: ...
     def list_closed_sessions(self) -> Sequence[SessionRecord]: ...
+    def resolve_wrong_match_subject(self, subject_id: str) -> str: ...
     def rename_profile(self, profile_id: str, label: str, **metadata: str) -> ProfileCorrectionEvent: ...
     def merge_profiles(self, source_profile_id: str, target_profile_id: str, **metadata: str) -> ProfileCorrectionEvent: ...
     def mark_wrong_match(self, session_id: str, **metadata: str) -> ProfileCorrectionEvent: ...
@@ -62,15 +63,7 @@ class MatrixCommandRuntime:
         return any(correction.matrix_event_id == event_id for correction in self.archive.load_corrections())
 
     def resolve_wrong_match_subject(self, subject_id: str) -> str:
-        records = [*self.archive.load_active_sessions(), *self.archive.list_closed_sessions()]
-        for record in records:
-            if record.session_id == subject_id:
-                return subject_id
-        matches = [record for record in records if record.spot_id == subject_id]
-        if not matches:
-            return subject_id
-        matches.sort(key=lambda record: str(record.ended_at or record.started_at))
-        return matches[-1].session_id
+        return self.archive.resolve_wrong_match_subject(subject_id)
 
     def profile_summary(self, profile_id: str, *, event: MatrixTextEvent) -> Mapping[str, Any]:
         return self.archive.profile_summary(profile_id, **self.event_metadata(event))

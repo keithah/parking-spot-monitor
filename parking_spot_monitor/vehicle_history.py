@@ -27,8 +27,6 @@ from parking_spot_monitor.vehicle_history_maintenance_utils import (
     _coerce_cutoff_datetime,
     _image_directory_stats,
     _maintenance_log_fields,
-    _missing_occupied_image_reference_count,
-    _oldest_retained_session_started_at,
     _profile_quarantine_count,
     _record_archive_image_paths,
     _record_closed_before,
@@ -36,6 +34,7 @@ from parking_spot_monitor.vehicle_history_maintenance_utils import (
     _safe_file_size,
     _safe_maintenance_metadata,
     _safe_resolve,
+    _session_health_stats,
 )
 from parking_spot_monitor.vehicle_history_models import (
     CORRECTION_ACTION_MERGE_PROFILES,

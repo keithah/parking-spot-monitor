@@ -34,7 +34,6 @@ _T = TypeVar("_T")
 class VehicleHistoryEventResult:
     errors: list[dict[str, Any]]
     occupied_alerts: list[dict[str, Any]]
-    changed: bool = False
 
 
 @dataclass(frozen=True)
@@ -127,7 +126,6 @@ def _record_vehicle_history_events(
 ) -> VehicleHistoryEventResult:
     history_errors: list[dict[str, Any]] = []
     occupied_alerts: list[dict[str, Any]] = []
-    changed = False
     if history_archive is None:
         return VehicleHistoryEventResult(errors=history_errors, occupied_alerts=occupied_alerts)
     for event in events:
@@ -151,11 +149,9 @@ def _record_vehicle_history_events(
             )
             history_errors.extend(result.errors)
             occupied_alerts.extend(result.occupied_alerts)
-            changed = changed or result.changed
             continue
         if previous_status is OccupancyStatus.OCCUPIED and new_status is OccupancyStatus.EMPTY:
             history_errors.extend(_record_vehicle_history_close(history_archive, event, logger=logger))
-            changed = True
             continue
         logger.info(
             "vehicle-session-lifecycle-ignored",
@@ -165,7 +161,7 @@ def _record_vehicle_history_events(
             new_status=None if new_status is None else new_status.value,
             reason="not-lifecycle-transition",
         )
-    return VehicleHistoryEventResult(errors=history_errors, occupied_alerts=occupied_alerts, changed=changed)
+    return VehicleHistoryEventResult(errors=history_errors, occupied_alerts=occupied_alerts)
 
 
 def _record_vehicle_history_start(
@@ -201,7 +197,7 @@ def _record_vehicle_history_start(
         )
         errors.append(context)
         logger.error("vehicle-history-record-failed", **context)
-        return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts, changed=True)
+        return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts)
 
     image_record = _attach_occupied_images(
         history_archive,
@@ -214,7 +210,7 @@ def _record_vehicle_history_start(
     )
     errors.extend(image_record.errors)
     if image_record.value is None:
-        return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts, changed=True)
+        return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts)
 
     profile_assignment = _match_vehicle_profile_for_session(
         history_archive,
@@ -235,7 +231,7 @@ def _record_vehicle_history_start(
     )
     if occupied_alert is not None:
         occupied_alerts.append(occupied_alert)
-    return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts, changed=True)
+    return VehicleHistoryEventResult(errors=errors, occupied_alerts=occupied_alerts)
 
 
 def _record_vehicle_history_close(
@@ -455,9 +451,8 @@ def _estimate_for_alert(
     spot_id: str,
 ) -> dict[str, Any]:
     try:
-        estimate_for_profile_id = getattr(history_archive, "estimate_for_profile_id", None)
-        if isinstance(profile_id, str) and profile_id.strip() and callable(estimate_for_profile_id):
-            estimate = estimate_for_profile_id(profile_id)
+        if isinstance(profile_id, str) and profile_id.strip():
+            estimate = history_archive.estimate_for_profile_id(profile_id)
         else:
             estimate = history_archive.estimate_for_session(session_id)
     except Exception as exc:

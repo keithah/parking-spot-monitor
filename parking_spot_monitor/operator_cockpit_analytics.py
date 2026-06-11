@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import heapq
 import re
 from collections.abc import Mapping
 from datetime import datetime
@@ -134,14 +135,16 @@ def _analytics_diagnostic_message(value: object, spot_labels: Mapping[str, str])
 
 
 def _load_vehicle_history_session_dicts(directory: Path, *, logger: StructuredLogger | None) -> tuple[list[Mapping[str, Any]], int]:
+    limit = MAX_LINES_PER_SECTION * 20
     try:
-        paths = sorted(path for path in directory.glob("*.json") if path.is_file())
+        candidates = (path for path in directory.glob("*.json") if path.is_file())
+        paths = heapq.nlargest(limit + 1, candidates, key=_safe_mtime_ns)
     except OSError as exc:
         log_load_problem(logger, label="vehicle_history", reason="scan_error", error_type=exc.__class__.__name__)
         return [], 1
     records: list[Mapping[str, Any]] = []
     invalid_count = 0
-    for path in paths[: MAX_LINES_PER_SECTION * 20]:
+    for path in paths[:limit]:
         try:
             if path.stat().st_size > MAX_FILE_BYTES:
                 invalid_count += 1
@@ -155,9 +158,16 @@ def _load_vehicle_history_session_dicts(directory: Path, *, logger: StructuredLo
             records.append(dict(payload))
         else:
             invalid_count += 1
-    if len(paths) > MAX_LINES_PER_SECTION * 20:
-        invalid_count += len(paths) - (MAX_LINES_PER_SECTION * 20)
+    if len(paths) > limit:
+        invalid_count += 1
     return records, invalid_count
+
+
+def _safe_mtime_ns(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return -1
 
 
 def _duration_label(seconds: int | None) -> str:

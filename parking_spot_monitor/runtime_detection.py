@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from parking_spot_monitor.capture import FrameGeometry
 from parking_spot_monitor.config import RuntimeSettings, SpotConfig
 from parking_spot_monitor.detection import (
     DetectionError,
@@ -28,12 +29,14 @@ def _process_detection_for_capture(
     logger: StructuredLogger,
     mode: str,
     iteration: int | None = None,
-    decision_memory_path: Path | None = None,
+    frame_geometry: FrameGeometry,
 ) -> DetectionFilterResult:
     actual_frame_size = _image_size(latest_path)
+    expected_size = frame_geometry.expected_size
+    effective_frame_size = actual_frame_size or expected_size
     configured_frame_size = (settings.stream.frame_width, settings.stream.frame_height)
-    frame_size_mismatch = actual_frame_size is not None and actual_frame_size != configured_frame_size
-    scale = _frame_scale(configured_frame_size=configured_frame_size, actual_frame_size=actual_frame_size)
+    frame_size_mismatch = effective_frame_size is not None and effective_frame_size != configured_frame_size
+    scale = _frame_scale(configured_frame_size=configured_frame_size, actual_frame_size=effective_frame_size)
     spot_polygons = _configured_spot_polygons(settings, scale=scale)
     full_frame_detections = _detect_vehicles_for_frame(settings, detector, latest_path)
     spot_crop_detections = _detect_spot_crop_vehicles_for_frame(
@@ -72,6 +75,9 @@ def _process_detection_for_capture(
             "min_polygon_overlap_ratio": settings.detection.min_polygon_overlap_ratio,
         },
         "actual_frame_size": _frame_size_dict(actual_frame_size),
+        "stream_profile": frame_geometry.stream_profile,
+        "expected_frame_size": _frame_size_dict(expected_size),
+        "effective_frame_size": _frame_size_dict(effective_frame_size),
         "configured_frame_size": _frame_size_dict(configured_frame_size),
         "frame_size_mismatch": frame_size_mismatch,
         "candidate_summaries": _candidate_summaries(result),
@@ -79,15 +85,26 @@ def _process_detection_for_capture(
     if iteration is not None:
         fields["iteration"] = iteration
     logger.info("detection-frame-processed", **fields)
+    return result
+
+
+def record_detection_memory_records(
+    decision_memory_path: Path | None,
+    detection_result: DetectionFilterResult,
+    *,
+    observed_at: Any | None,
+    logger: StructuredLogger,
+    mode: str,
+    iteration: int | None,
+) -> None:
     _append_detection_memory_records(
         decision_memory_path,
-        result,
-        observed_at=frame_timestamp,
+        detection_result,
+        observed_at=observed_at,
         logger=logger,
         mode=mode,
         iteration=iteration,
     )
-    return result
 
 def _detect_spot_crop_vehicles_for_frame(
     settings: RuntimeSettings,

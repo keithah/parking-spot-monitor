@@ -21,6 +21,8 @@ class HealthStatus:
     iteration: int
     last_frame_at: str | None = None
     selected_decode_mode: str | None = None
+    capture_last_success_at: str | None = None
+    capture_selected_decode_mode: str | None = None
     consecutive_capture_failures: int = 0
     consecutive_detection_failures: int = 0
     last_matrix_error: Mapping[str, Any] | None = None
@@ -43,8 +45,8 @@ class HealthStatus:
                 "last_frame_at": self.last_frame_at,
                 "selected_decode_mode": self.selected_decode_mode,
                 "capture": {
-                    "last_success_at": self.last_frame_at,
-                    "selected_decode_mode": self.selected_decode_mode,
+                    "last_success_at": self.capture_last_success_at,
+                    "selected_decode_mode": self.capture_selected_decode_mode,
                 },
                 "consecutive_capture_failures": self.consecutive_capture_failures,
                 "consecutive_detection_failures": self.consecutive_detection_failures,

@@ -3,6 +3,13 @@ stream:
   frame_width: 1458
   frame_height: 806
   reconnect_seconds: 5
+  escalation_profile: high_resolution
+  escalation_min_confidence: 0.75
+  profiles:
+    high_resolution:
+      rtsp_url_env: RTSP_URL_4K
+      frame_width: 3840
+      frame_height: 2160
 
 spots:
   left_spot:

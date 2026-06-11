@@ -1,0 +1,257 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+from PIL import Image
+
+from parking_spot_monitor.__main__ import _main
+from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult, FrameGeometry
+from parking_spot_monitor.detection import DetectionError, VehicleDetection
+from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
+from parking_spot_monitor.state import RuntimeState, save_runtime_state
+
+SECRET_MARKER = "startup-secret-should-not-leak"
+FAKE_RTSP_VALUE = f"camera-value-{SECRET_MARKER}"
+FAKE_MATRIX_VALUE = f"matrix-value-{SECRET_MARKER}"
+
+
+def fake_environ(**overrides: str) -> dict[str, str]:
+    environ = {
+        "RTSP_URL": FAKE_RTSP_VALUE,
+        "RTSP_URL_4K": f"{FAKE_RTSP_VALUE}-4k",
+        "RTSP_URL_360P": f"{FAKE_RTSP_VALUE}-360p",
+        "MATRIX_ACCESS_TOKEN": FAKE_MATRIX_VALUE,
+    }
+    environ.update(overrides)
+    return environ
+
+
+def combined_output(capsys: pytest.CaptureFixture[str]) -> str:
+    captured = capsys.readouterr()
+    return captured.out + captured.err
+
+
+def assert_no_secret_leak(output: str) -> None:
+    assert FAKE_RTSP_VALUE not in output
+    assert FAKE_MATRIX_VALUE not in output
+    assert SECRET_MARKER not in output
+
+
+def health_payload(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def runtime_state_payload(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def noop_overlay(_settings: object, _source_path: Path, _output_path: Path, *, logger: Any) -> object:
+    return object()
+
+
+def test_runtime_loop_escalates_weak_primary_detection_to_high_resolution_profile(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example").read_text(encoding="utf-8").replace(
+            "  reconnect_seconds: 5\n",
+            "  reconnect_seconds: 5\n"
+            "  profiles:\n"
+            "    high_resolution:\n"
+            "      rtsp_url_env: RTSP_URL_4K\n"
+            "      frame_width: 3840\n"
+            "      frame_height: 2160\n",
+        ),
+        encoding="utf-8",
+    )
+    sleeps: list[float] = []
+    capture_profiles: list[str | None] = []
+    primary_path = tmp_path / "latest-primary.jpg"
+    high_path = tmp_path / "latest-high.jpg"
+    save_runtime_state(
+        tmp_path / "state.json",
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY, open_event_emitted=True),
+                "right_spot": SpotOccupancyState(status=OccupancyStatus.OCCUPIED),
+            }
+        ),
+    )
+
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
+        capture_profiles.append(stream_profile)
+        profile = stream_profile or "primary"
+        size = (3840, 2160) if profile == "high_resolution" else (1458, 806)
+        latest_path = high_path if profile == "high_resolution" else primary_path
+        Image.new("RGB", size, (20, 30, 40)).save(latest_path, format="JPEG")
+        return FrameCaptureResult(
+            timestamp="2026-05-18T18:00:01Z" if profile == "high_resolution" else "2026-05-18T18:00:00Z",
+            latest_path=latest_path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=0.01,
+            byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile=profile, expected_size=size),
+        )
+
+    class ProfileAwareDetector:
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            path = Path(frame_path)
+            if path == primary_path:
+                return [VehicleDetection(class_name="car", confidence=0.50, bbox=(1010, 215, 1395, 355))]
+            if path == high_path:
+                return [
+                    VehicleDetection(
+                        class_name="car",
+                        confidence=0.92,
+                        bbox=(1010 * 3840 / 1458, 215 * 2160 / 806, 1395 * 3840 / 1458, 355 * 2160 / 806),
+                    )
+                ]
+            return []
+
+    exit_code = _main(
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+        environ=fake_environ(RTSP_URL_4K=f"high-camera-{SECRET_MARKER}"),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: ProfileAwareDetector(),
+        sleep=sleeps.append,
+        max_iterations=1,
+    )
+
+    output = combined_output(capsys)
+    health = health_payload(tmp_path / "health.json")
+    assert exit_code == 0
+    assert capture_profiles == [None, "high_resolution"]
+    assert health["capture"] == {
+        "last_success_at": "2026-05-18T18:00:01Z",
+        "selected_decode_mode": "software",
+    }
+    assert '"event":"stream-profile-escalated"' in output
+    assert '"from_profile":"primary"' in output
+    assert '"to_profile":"high_resolution"' in output
+    assert '"stream_profile":"high_resolution"' in output
+    assert runtime_state_payload(tmp_path / "state.json")["spots"]["right_spot"]["last_bbox"][0] == pytest.approx(1010 * 3840 / 1458)
+    assert sleeps == [30]
+    assert_no_secret_leak(output)
+
+
+def test_runtime_loop_failed_escalation_records_capture_success_without_processed_frame(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(Path("config.yaml.example").read_text(encoding="utf-8"), encoding="utf-8")
+    latest_path = tmp_path / "latest.jpg"
+    capture_profiles: list[str | None] = []
+
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
+        capture_profiles.append(stream_profile)
+        if stream_profile == "high_resolution":
+            raise CaptureError(
+                reason="ffmpeg-timeout",
+                mode=DecodeMode.SOFTWARE,
+                output_path=Path(data_dir) / "latest.jpg",
+                message=f"timeout rtsp://camera access_token={SECRET_MARKER}",
+                stderr_tail=f"Traceback raw_image_bytes {SECRET_MARKER}",
+                timeout_seconds=15.0,
+            )
+        Image.new("RGB", (1458, 806), (20, 30, 40)).save(latest_path, format="JPEG")
+        return FrameCaptureResult(
+            timestamp="2026-05-18T18:00:00Z",
+            latest_path=latest_path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=0.01,
+            byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
+        )
+
+    class WeakDetector:
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            return [VehicleDetection(class_name="car", confidence=0.50, bbox=(1010, 215, 1395, 355))]
+
+    exit_code = _main(
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+        environ=fake_environ(RTSP_URL_4K=f"high-camera-{SECRET_MARKER}", RTSP_URL_360P=f"low-camera-{SECRET_MARKER}"),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: WeakDetector(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+    )
+
+    output = combined_output(capsys)
+    health = health_payload(tmp_path / "health.json")
+    assert exit_code == 0
+    assert capture_profiles == [None, "high_resolution"]
+    assert health["status"] == "down"
+    assert health["last_frame_at"] is None
+    assert health["capture"] == {
+        "last_success_at": "2026-05-18T18:00:00Z",
+        "selected_decode_mode": "software",
+    }
+    assert health["last_error"]["phase"] == "capture"
+    assert_no_secret_leak(output + json.dumps(health))
+
+
+def test_runtime_loop_failed_high_resolution_detection_records_high_resolution_capture(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(Path("config.yaml.example").read_text(encoding="utf-8"), encoding="utf-8")
+    capture_profiles: list[str | None] = []
+    primary_path = tmp_path / "latest-primary.jpg"
+    high_path = tmp_path / "latest-high.jpg"
+
+    def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
+        capture_profiles.append(stream_profile)
+        profile = stream_profile or "primary"
+        size = (3840, 2160) if profile == "high_resolution" else (1458, 806)
+        latest_path = high_path if profile == "high_resolution" else primary_path
+        Image.new("RGB", size, (20, 30, 40)).save(latest_path, format="JPEG")
+        return FrameCaptureResult(
+            timestamp="2026-05-18T18:00:01Z" if profile == "high_resolution" else "2026-05-18T18:00:00Z",
+            latest_path=latest_path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=0.01,
+            byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile=profile, expected_size=size),
+        )
+
+    class HighResolutionFailingDetector:
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            if Path(frame_path) == high_path:
+                raise DetectionError(
+                    f"predict failed raw token={SECRET_MARKER}",
+                    model_path="yolov8n.pt",
+                    frame_path=str(frame_path),
+                    phase="predict",
+                    error_type="RuntimeError",
+                )
+            return [VehicleDetection(class_name="car", confidence=0.50, bbox=(1010, 215, 1395, 355))]
+
+    exit_code = _main(
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+        environ=fake_environ(RTSP_URL_4K=f"high-camera-{SECRET_MARKER}", RTSP_URL_360P=f"low-camera-{SECRET_MARKER}"),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: HighResolutionFailingDetector(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+    )
+
+    output = combined_output(capsys)
+    health = health_payload(tmp_path / "health.json")
+    assert exit_code == 0
+    assert capture_profiles == [None, "high_resolution"]
+    assert health["status"] == "degraded"
+    assert health["last_frame_at"] is None
+    assert health["capture"] == {
+        "last_success_at": "2026-05-18T18:00:01Z",
+        "selected_decode_mode": "software",
+    }
+    assert health["last_error"]["phase"] == "detection"
+    assert '"event":"detection-frame-failed"' in output
+    assert_no_secret_leak(output + json.dumps(health))

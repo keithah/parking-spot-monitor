@@ -15,8 +15,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
-from typing import Any, Literal
+from collections.abc import Callable
+from typing import Any, BinaryIO, Literal
 
 OutboxState = Literal["pending", "retrying", "delivered", "failed", "dead_lettered"]
 PhaseState = Literal["pending", "delivered", "failed"]
@@ -29,6 +31,7 @@ _RETRYABLE_STATES: set[str] = {"pending", "retrying"}
 _VALID_PHASES: set[str] = {"text", "upload", "image"}
 _VALID_PHASE_STATES: set[str] = {"pending", "delivered", "failed"}
 _MAX_QUARANTINE_FILES = 20
+_MAX_OUTBOX_FILE_BYTES = 5_000_000
 _SECRET_KEY_RE = re.compile(
     r"(access[_-]?token|authorization|auth[_-]?header|bearer|password|secret|cookie|rtsp|image[_-]?bytes|raw[_-]?image|exception|traceback|error[_-]?message)",
     re.IGNORECASE,
@@ -551,6 +554,15 @@ class LocalOutbox:
         if not self.path.exists():
             return [], RecoveryResult()
 
+        try:
+            if self.path.stat().st_size > _MAX_OUTBOX_FILE_BYTES:
+                recovery = RecoveryResult().with_event(
+                    self._quarantine_file(self.path, reason="oversized_file", suffix="json")
+                )
+                return [], recovery
+        except OSError as exc:
+            raise OutboxPersistenceError("failed to inspect local outbox payload") from exc
+
         raw = self.path.read_bytes()
         try:
             payload = json.loads(raw.decode("utf-8"))
@@ -628,17 +640,30 @@ class LocalOutbox:
     def _quarantine_bytes(self, payload: bytes, *, reason: str, suffix: str = "bin") -> RecoveryEvent:
         digest = hashlib.sha256(payload).hexdigest()[:16]
         quarantine_path = self._quarantine_dir() / f"{reason}-{digest}.{suffix}.bad"
-        self._write_quarantine_payload(quarantine_path, payload)
+        self._atomic_quarantine_write(quarantine_path, lambda handle: handle.write(payload))
         return RecoveryEvent(reason=reason, quarantine_path=str(quarantine_path))
 
     def _quarantine_json(self, payload: Any, *, reason: str) -> RecoveryEvent:
         serialized = json.dumps(payload, indent=2, sort_keys=True, default=str).encode("utf-8") + b"\n"
         return self._quarantine_bytes(serialized, reason=reason, suffix="json")
 
+    def _quarantine_file(self, source: Path, *, reason: str, suffix: str) -> RecoveryEvent:
+        stat = source.stat()
+        digest_source = f"{source.name}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")
+        digest = hashlib.sha256(digest_source).hexdigest()[:16]
+        quarantine_path = self._quarantine_dir() / f"{reason}-{digest}.{suffix}.bad"
+
+        def copy_source(handle: BinaryIO) -> None:
+            with source.open("rb") as reader:
+                shutil.copyfileobj(reader, handle, length=1024 * 1024)
+
+        self._atomic_quarantine_write(quarantine_path, copy_source)
+        return RecoveryEvent(reason=reason, quarantine_path=str(quarantine_path))
+
     def _quarantine_dir(self) -> Path:
         return self.path.parent / f".{self.path.stem}-quarantine"
 
-    def _write_quarantine_payload(self, path: Path, payload: bytes) -> None:
+    def _atomic_quarantine_write(self, path: Path, writer: Callable[[BinaryIO], None]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path: str | None = None
         try:
@@ -650,7 +675,7 @@ class LocalOutbox:
                 delete=False,
             ) as handle:
                 tmp_path = handle.name
-                handle.write(payload)
+                writer(handle)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp_path, path)
@@ -662,7 +687,7 @@ class LocalOutbox:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-            raise OutboxPersistenceError("failed to quarantine invalid local outbox payload") from exc
+            raise OutboxPersistenceError("failed to quarantine local outbox payload") from exc
 
 
 def derive_outbox_item_id(intent: AlertIntent) -> str:

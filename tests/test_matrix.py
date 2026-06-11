@@ -34,6 +34,17 @@ from parking_spot_monitor.matrix import (
 
 
 ACCESS_TOKEN = "secret-token-value"
+
+
+def stream_env(rtsp_url: str = "rtsp://operator:secret@camera/live") -> dict[str, str]:
+    return {
+        "RTSP_URL": rtsp_url,
+        "RTSP_URL_4K": f"{rtsp_url}/4k",
+        "RTSP_URL_360P": f"{rtsp_url}/360p",
+        "MATRIX_ACCESS_TOKEN": ACCESS_TOKEN,
+    }
+
+
 HOMESERVER = "https://matrix.example.org/"
 ROOM_ID = "!parking-room:example.org"
 TXN_ID = "txn/with space?"
@@ -342,7 +353,7 @@ def test_matrix_config_summary_includes_timeout_retry_and_backoff() -> None:
 
     settings = load_settings(
         "config.yaml.example",
-        environ={"RTSP_URL": "rtsp://camera", "MATRIX_ACCESS_TOKEN": ACCESS_TOKEN},
+        environ=stream_env("rtsp://camera"),
     )
 
     summary = settings.sanitized_summary()["matrix"]
@@ -1350,6 +1361,13 @@ class FakeCommandArchive:
     def list_closed_sessions(self) -> list[FakeSession]:
         return []
 
+    def resolve_wrong_match_subject(self, subject_id: str) -> str:
+        for record in self.sessions:
+            if record.session_id == subject_id:
+                return subject_id
+        matches = [record for record in self.sessions if record.spot_id == subject_id]
+        return subject_id if not matches else matches[-1].session_id
+
 
 def test_active_spot_assignments_reply_includes_occupied_and_open_durations() -> None:
     from parking_spot_monitor.matrix_cockpit import _format_active_spot_assignments_reply
@@ -1506,6 +1524,35 @@ def test_command_service_authorizes_applies_and_replies_safely() -> None:
     assert "!parking owner <spot_id>" in rendered_replies
     assert "Profile prof_b: Blue hatchback" in rendered_replies
     assert ACCESS_TOKEN not in rendered_replies
+
+
+def test_command_service_reports_processed_read_only_commands() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    replies: list[dict[str, Any]] = []
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return MatrixSyncResult(
+                next_batch="s3",
+                events=(MatrixTextEvent(event_id="$help", sender="@op:example", room_id=ROOM_ID, body="!parking help"),),
+            )
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(dict(kwargs))
+            return "$reply"
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
+        room_id=ROOM_ID,
+        authorized_senders=["@op:example"],
+    )
+
+    result = service.poll_once()
+
+    assert result.processed_count == 1
+    assert len(replies) == 1
 
 
 def test_command_service_fails_corrections_when_duplicate_check_is_unavailable() -> None:
@@ -2580,7 +2627,7 @@ def test_command_service_incident_review_real_context_replays_detector_sends_saf
 
     config_path = tmp_path / "config.yaml"
     config_path.write_text(Path("config.yaml.example").read_text(encoding="utf-8"), encoding="utf-8")
-    settings = load_settings(config_path, environ={"RTSP_URL": "rtsp://operator:secret@camera/live", "MATRIX_ACCESS_TOKEN": ACCESS_TOKEN})
+    settings = load_settings(config_path, environ=stream_env())
     frames_dir = tmp_path / "timeline" / "frames"
     frames_dir.mkdir(parents=True)
     frame = frames_dir / "20260518T023900Z.jpg"
@@ -2714,7 +2761,7 @@ def test_command_service_confidence_context_reads_local_artifacts_text_only(tmp_
 
     config_path = tmp_path / "config.yaml"
     config_path.write_text(Path("config.yaml.example").read_text(encoding="utf-8"), encoding="utf-8")
-    settings = load_settings(config_path, environ={"RTSP_URL": "rtsp://operator:secret@camera/live", "MATRIX_ACCESS_TOKEN": ACCESS_TOKEN})
+    settings = load_settings(config_path, environ=stream_env())
     state_path = tmp_path / "state.json"
     save_runtime_state(
         state_path,
@@ -3506,7 +3553,7 @@ def test_default_matrix_command_service_factory_wires_resolved_outbox_path(tmp_p
         "command_authorized_senders: ['@op:example']",
     )
     config_path.write_text(config_text, encoding="utf-8")
-    settings = load_settings(config_path, environ={"RTSP_URL": "rtsp://operator:secret@camera/live", "MATRIX_ACCESS_TOKEN": ACCESS_TOKEN})
+    settings = load_settings(config_path, environ=stream_env())
     paths = resolve_runtime_paths(settings, tmp_path)
 
     service = _default_matrix_command_service_factory(settings, tmp_path, logger=None, archive=FakeCommandArchive())  # type: ignore[arg-type]

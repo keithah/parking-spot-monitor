@@ -28,7 +28,6 @@ class FrameUpdateResult:
     matrix_errors: list[dict[str, Any]]
     state_save_error: dict[str, Any] | None = None
     history_errors: list[dict[str, Any]] | None = None
-    history_changed: bool = False
 
 
 def _update_runtime_state_for_frame(
@@ -140,5 +139,4 @@ def _update_runtime_state_for_frame(
         matrix_errors=matrix_errors,
         state_save_error=state_save_error,
         history_errors=history_errors,
-        history_changed=history_result.changed,
     )

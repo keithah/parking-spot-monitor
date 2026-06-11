@@ -33,6 +33,10 @@ def format_health_timestamp(value: Any | None) -> str | None:
     return str(value)
 
 
+def _decode_mode_text(selected_mode: Any) -> str:
+    return str(selected_mode.value if hasattr(selected_mode, "value") else selected_mode)
+
+
 def observed_at(frame_timestamp: Any | None, now: Callable[[], datetime]) -> datetime:
     parsed = parse_frame_timestamp(frame_timestamp)
     value = parsed if parsed is not None else now()
@@ -80,6 +84,8 @@ class RuntimeLoopHealthState:
     consecutive_detection_failures: int = 0
     last_frame_at: str | None = None
     selected_decode_mode: str | None = None
+    capture_last_success_at: str | None = None
+    capture_selected_decode_mode: str | None = None
     last_matrix_error: dict[str, Any] | None = None
     last_error: dict[str, Any] | None = None
     state_save_error: dict[str, Any] | None = None
@@ -91,8 +97,12 @@ class RuntimeLoopHealthState:
 
     def record_capture_success(self, *, timestamp: Any, selected_mode: Any) -> None:
         self.consecutive_capture_failures = 0
+        self.capture_last_success_at = format_health_timestamp(timestamp)
+        self.capture_selected_decode_mode = _decode_mode_text(selected_mode)
+
+    def record_processed_frame(self, *, timestamp: Any, selected_mode: Any) -> None:
         self.last_frame_at = format_health_timestamp(timestamp)
-        self.selected_decode_mode = str(selected_mode.value if hasattr(selected_mode, "value") else selected_mode)
+        self.selected_decode_mode = _decode_mode_text(selected_mode)
 
     def record_capture_failure(self, error: BaseException, *, iteration: int) -> None:
         self.consecutive_capture_failures += 1
@@ -204,6 +214,8 @@ def write_loop_health(
     iteration: int,
     last_frame_at: str | None,
     selected_decode_mode: str | None,
+    capture_last_success_at: str | None,
+    capture_selected_decode_mode: str | None,
     consecutive_capture_failures: int,
     consecutive_detection_failures: int,
     last_matrix_error: Mapping[str, Any] | None,
@@ -226,6 +238,8 @@ def write_loop_health(
                 iteration=iteration,
                 last_frame_at=last_frame_at,
                 selected_decode_mode=selected_decode_mode,
+                capture_last_success_at=capture_last_success_at,
+                capture_selected_decode_mode=capture_selected_decode_mode,
                 consecutive_capture_failures=consecutive_capture_failures,
                 consecutive_detection_failures=consecutive_detection_failures,
                 last_matrix_error=last_matrix_error,

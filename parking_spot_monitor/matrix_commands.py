@@ -93,8 +93,21 @@ class MatrixCommandService:
             else:
                 ignored_count += 1
         self.archive.write_matrix_cursor({"next_batch": result.next_batch})
-        self._log("info", "matrix-command-sync", phase="apply", next_batch_present=True, processed_count=processed_count, ignored_count=ignored_count, error_count=error_count)
-        return MatrixCommandPollResult(next_batch=result.next_batch, processed_count=processed_count, ignored_count=ignored_count, error_count=error_count)
+        self._log(
+            "info",
+            "matrix-command-sync",
+            phase="apply",
+            next_batch_present=True,
+            processed_count=processed_count,
+            ignored_count=ignored_count,
+            error_count=error_count,
+        )
+        return MatrixCommandPollResult(
+            next_batch=result.next_batch,
+            processed_count=processed_count,
+            ignored_count=ignored_count,
+            error_count=error_count,
+        )
 
     def _handle_event(self, event: MatrixTextEvent) -> str:
         context = {"phase": "command", "sender": event.sender, "event_id": event.event_id, "room_id": event.room_id}
