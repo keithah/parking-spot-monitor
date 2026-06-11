@@ -209,7 +209,6 @@ class VehicleHistoryStorageMixin:
         except OSError as exc:
             self._record_failure(phase="quarantine", path_name=path.name, error=exc)
             raise ArchiveWriteError(_safe_error_message(exc)) from exc
-        self._bump_revision()
         self._record_failure(phase=phase, path_name=path.name, error=error)
         self._log(
             "warning",
@@ -234,7 +233,6 @@ class VehicleHistoryStorageMixin:
         except OSError as exc:
             self._record_failure(phase="profile-quarantine", path_name=path.name, error=exc)
             raise ArchiveWriteError(_safe_error_message(exc)) from exc
-        self._bump_revision()
         self._record_failure(phase=phase, path_name=path.name, error=error)
         self._log(
             "warning",

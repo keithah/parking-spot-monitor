@@ -320,6 +320,13 @@ def test_mutation_revision_advances_on_writes_and_is_stable_on_reads(tmp_path: P
     archive.load_active_sessions()
     assert archive.mutation_revision() == after_start
 
+    # Even a read that quarantines a corrupt file must not bump the revision,
+    # or health_snapshot() could invalidate its own cache entry mid-read.
+    (tmp_path / "vehicle-history" / "sessions" / "active" / "bad.json").write_text("{bad json")
+    quiet = archive.mutation_revision()
+    archive.load_active_sessions()
+    assert archive.mutation_revision() == quiet
+
     archive.close_session(open_event(spot_id="left", observed_at="2026-05-18T13:30:00Z"))
     assert archive.mutation_revision() > after_start
     assert record.session_id
