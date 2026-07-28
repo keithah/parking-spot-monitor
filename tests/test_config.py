@@ -185,6 +185,57 @@ def test_escalation_profile_must_reference_configured_stream_profile(tmp_path: P
     assert "stream.escalation_profile" in str(exc_info.value)
 
 
+def test_stream_profile_name_without_filename_safe_characters_is_rejected(tmp_path: Path) -> None:
+    profile_name = "!@#$%"
+    config = (
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("  escalation_profile: high_resolution\n", f'  escalation_profile: "{profile_name}"\n')
+        .replace("    high_resolution:\n", f'    "{profile_name}":\n')
+    )
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    message = str(exc_info.value)
+    assert "stream" in message
+    assert "filename-safe" in message
+
+
+def test_stream_profile_names_with_same_sanitized_destination_are_rejected(tmp_path: Path) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "  escalation_profile: high_resolution\n"
+        "  escalation_min_confidence: 0.75\n"
+        "  profiles:\n"
+        "    high_resolution:\n"
+        "      rtsp_url_env: RTSP_URL_4K\n"
+        "      frame_width: 3840\n"
+        "      frame_height: 2160\n",
+        '  escalation_profile: "high resolution"\n'
+        "  escalation_min_confidence: 0.75\n"
+        "  profiles:\n"
+        '    "high resolution":\n'
+        "      rtsp_url_env: RTSP_URL_4K\n"
+        "      frame_width: 3840\n"
+        "      frame_height: 2160\n"
+        '    "high/resolution":\n'
+        "      rtsp_url_env: RTSP_URL_360P\n"
+        "      frame_width: 640\n"
+        "      frame_height: 360\n",
+    )
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    message = str(exc_info.value)
+    assert "stream" in message
+    assert "high resolution" in message
+    assert "high/resolution" in message
+    assert "same capture filename" in message
+
+
 @pytest.mark.parametrize("model_value", ["yolov8n.pt", "models/custom-detector.pt"])
 def test_detection_model_accepts_local_model_names_and_relative_paths(tmp_path: Path, model_value: str) -> None:
     config = Path("config.yaml.example").read_text(encoding="utf-8").replace("model: yolov8n.pt", f"model: {model_value}")

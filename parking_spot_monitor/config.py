@@ -18,6 +18,10 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def sanitize_stream_profile_name(profile_name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", profile_name).strip("-._")
+
+
 class ResolvedSecret(StrictModel):
     """Secret resolved from an environment variable with redacted serialization."""
 
@@ -90,6 +94,21 @@ class StreamConfig(StrictModel):
     profiles: dict[str, StreamProfileConfig] = Field(default_factory=dict)
     escalation_profile: str | None = None
     escalation_min_confidence: float = Field(default=0.75, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def profile_capture_filenames_must_be_unique(self) -> Self:
+        profile_by_filename: dict[str, str] = {}
+        for profile_name in self.profiles:
+            sanitized_name = sanitize_stream_profile_name(profile_name)
+            if not sanitized_name:
+                raise ValueError(f"stream profile name {profile_name!r} must contain a filename-safe character")
+            existing_profile = profile_by_filename.get(sanitized_name)
+            if existing_profile is not None:
+                raise ValueError(
+                    f"stream profile names {existing_profile!r} and {profile_name!r} resolve to the same capture filename"
+                )
+            profile_by_filename[sanitized_name] = profile_name
+        return self
 
     @model_validator(mode="after")
     def escalation_profile_must_resolve(self) -> Self:

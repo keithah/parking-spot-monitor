@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
-from parking_spot_monitor.config import RuntimeSettings
+from parking_spot_monitor.config import RuntimeSettings, sanitize_stream_profile_name
 from parking_spot_monitor.logging import StructuredLogger
 
 DEFAULT_CAPTURE_TIMEOUT_SECONDS = 15.0
@@ -171,7 +171,7 @@ def build_ffmpeg_argv(
 def _capture_output_path(output_dir: Path, profile_name: str) -> Path:
     if profile_name == "primary":
         return output_dir / "latest.jpg"
-    sanitized_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", profile_name).strip("-._")
+    sanitized_name = sanitize_stream_profile_name(profile_name)
     if not sanitized_name:
         raise ValueError("stream profile name must contain a filename-safe character")
     return output_dir / f"latest-{sanitized_name}.jpg"
