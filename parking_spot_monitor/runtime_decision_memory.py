@@ -6,24 +6,25 @@ from typing import Any
 
 from parking_spot_monitor.detection import DetectionFilterResult
 from parking_spot_monitor.logging import StructuredLogger
-from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, make_decision_memory_record
+from parking_spot_monitor.operator_decision_memory import (
+    DecisionMemoryRecord,
+    append_decision_memory_record,
+    make_decision_memory_record,
+)
 from parking_spot_monitor.state import RuntimeState
 
 
-def _append_detection_memory_records(
-    path: Path | None,
+def build_detection_memory_records(
     result: DetectionFilterResult,
     *,
     observed_at: Any | None,
-    logger: StructuredLogger,
     mode: str,
     iteration: int | None,
-) -> None:
-    if path is None:
-        return
+) -> list[DecisionMemoryRecord]:
     from parking_spot_monitor.runtime_detection import _candidate_summary
     from parking_spot_monitor.runtime_presence import _best_rejected_detection
 
+    records: list[DecisionMemoryRecord] = []
     for spot_id, spot_result in result.by_spot.items():
         accepted = spot_result.accepted
         rejected = list(spot_result.rejected)
@@ -35,40 +36,35 @@ def _append_detection_memory_records(
             "rejection_reasons": _rejection_reason_counts(rejected),
         }
         if accepted is not None:
-            _append_decision_memory(
-                path,
+            record = make_decision_memory_record(
                 "accepted_evidence",
                 spot_id=spot_id,
                 observed_at=observed_at,
                 summary=f"accepted {accepted.class_name} evidence confidence={accepted.confidence:.2f}",
                 details=common_details | {"candidate": _candidate_summary(accepted)},
-                logger=logger,
             )
         elif rejected:
             best = _best_rejected_detection(rejected)
-            _append_decision_memory(
-                path,
+            record = make_decision_memory_record(
                 "rejected_evidence",
                 spot_id=spot_id,
                 observed_at=observed_at,
                 summary="no accepted candidate; rejected vehicle-like evidence present",
                 details=common_details | {"best_rejected": _rejected_summary(best) if best is not None else None},
-                logger=logger,
             )
         else:
-            _append_decision_memory(
-                path,
+            record = make_decision_memory_record(
                 "miss",
                 spot_id=spot_id,
                 observed_at=observed_at,
                 summary="no vehicle evidence for configured spot",
                 details=common_details,
-            logger=logger,
-        )
+            )
+        records.append(record)
+    return records
 
 
-def _append_runtime_state_memory_records(
-    path: Path | None,
+def build_runtime_state_memory_records(
     *,
     previous_state: RuntimeState,
     next_state: Mapping[str, Any],
@@ -77,10 +73,8 @@ def _append_runtime_state_memory_records(
     observed_at: Any,
     configured_spot_ids: Sequence[str],
     presence_by_spot: Mapping[str, bool],
-    logger: StructuredLogger,
-) -> None:
-    if path is None:
-        return
+) -> list[DecisionMemoryRecord]:
+    records: list[DecisionMemoryRecord] = []
     for spot_id in configured_spot_ids:
         prior = previous_state.state_by_spot.get(spot_id)
         current = next_state.get(spot_id)
@@ -93,8 +87,7 @@ def _append_runtime_state_memory_records(
         hit_streak = getattr(current, "hit_streak", None)
         miss_streak = getattr(current, "miss_streak", None)
         reason = "accepted-candidate" if accepted is not None else "weak-open-suppression" if has_presence else "no-presence-evidence"
-        _append_decision_memory(
-            path,
+        records.append(make_decision_memory_record(
             kind,
             spot_id=spot_id,
             observed_at=observed_at,
@@ -108,8 +101,8 @@ def _append_runtime_state_memory_records(
                 "quiet_window_active": bool(getattr(quiet_status, "active", False)),
                 "suppressed_reason": getattr(quiet_status, "suppressed_reason", None),
             },
-            logger=logger,
-        )
+        ))
+    return records
 
 def _append_lab_outcome_memory(
     path: Path,

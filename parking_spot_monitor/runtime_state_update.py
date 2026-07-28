@@ -14,7 +14,8 @@ from parking_spot_monitor.matrix_alerts import (
     OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
 )
 from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
-from parking_spot_monitor.runtime_decision_memory import _append_runtime_state_memory_records
+from parking_spot_monitor.operator_decision_memory import DecisionMemoryRecord, append_decision_memory_records
+from parking_spot_monitor.runtime_decision_memory import build_runtime_state_memory_records
 from parking_spot_monitor.runtime_frame_plan import build_runtime_frame_plan
 from parking_spot_monitor.runtime_health import safe_error_context as _safe_error_context
 from parking_spot_monitor.runtime_vehicle_events import _record_vehicle_history_events
@@ -43,6 +44,7 @@ def _update_runtime_state_for_frame(
     configured_spot_ids: Sequence[str],
     history_archive: VehicleHistoryArchive | None = None,
     decision_memory_path: Path | None = None,
+    pending_decision_records: Sequence[DecisionMemoryRecord] = (),
 ) -> FrameUpdateResult:
     matrix_errors: list[dict[str, Any]] = []
     frame_plan = build_runtime_frame_plan(
@@ -71,17 +73,20 @@ def _update_runtime_state_for_frame(
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
 
-    _append_runtime_state_memory_records(
-        decision_memory_path,
-        previous_state=runtime_state,
-        next_state=frame_plan.occupancy_update.state_by_spot,
-        detection_result=detection_result,
-        quiet_status=frame_plan.quiet_status,
-        observed_at=observed_at,
-        configured_spot_ids=configured_spot_ids,
-        presence_by_spot=frame_plan.presence_by_spot,
-        logger=logger,
-    )
+    if decision_memory_path is not None:
+        frame_records = [
+            *pending_decision_records,
+            *build_runtime_state_memory_records(
+                previous_state=runtime_state,
+                next_state=frame_plan.occupancy_update.state_by_spot,
+                detection_result=detection_result,
+                quiet_status=frame_plan.quiet_status,
+                observed_at=observed_at,
+                configured_spot_ids=configured_spot_ids,
+                presence_by_spot=frame_plan.presence_by_spot,
+            ),
+        ]
+        append_decision_memory_records(decision_memory_path, frame_records, logger=logger)
     history_result = _record_vehicle_history_events(
         history_archive,
         frame_plan.occupancy_update.events,

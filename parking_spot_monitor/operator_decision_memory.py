@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -110,6 +111,7 @@ _SAFE_LAB_DETAIL_KEYS = (
 _MAX_FORMAT_DEPTH = 3
 _MAX_FORMAT_ITEMS = 6
 _MAX_FORMAT_TEXT_CHARS = 160
+_MEMORY_WRITE_LOCK = threading.RLock()
 
 
 class DecisionMemorySchemaError(ValueError):
@@ -187,19 +189,46 @@ def append_decision_memory_record(
 ) -> bool:
     """Append one sanitized record with bounded retention; failures are logged and non-fatal."""
 
+    return append_decision_memory_records(
+        path,
+        (record,),
+        max_records=max_records,
+        max_file_bytes=max_file_bytes,
+        logger=logger,
+    )
+
+
+def append_decision_memory_records(
+    path: str | Path,
+    records: Sequence[DecisionMemoryRecord | Mapping[str, Any]],
+    *,
+    max_records: int = MAX_RECORDS,
+    max_file_bytes: int = MAX_MEMORY_FILE_BYTES,
+    logger: StructuredLogger | None = None,
+) -> bool:
+    """Append sanitized records atomically with bounded retention; failures are non-fatal."""
+
     memory_path = Path(path)
     try:
-        new_record = _record_from_any(record)
-        loaded = load_decision_memory(memory_path, max_file_bytes=max_file_bytes, logger=logger)
-        retained = list(loaded.records)
-        retained.append(new_record)
-        retained = retained[-_positive_limit(max_records, MAX_RECORDS) :]
-        _write_memory(memory_path, retained)
+        sanitized = [_record_from_any(record) for record in records]
+        if not sanitized:
+            return True
+        with _MEMORY_WRITE_LOCK:
+            loaded = load_decision_memory(memory_path, max_file_bytes=max_file_bytes, logger=logger)
+            retained = [*loaded.records, *sanitized][-_positive_limit(max_records, MAX_RECORDS) :]
+            _write_memory(memory_path, retained)
     except Exception as exc:
         _log(logger, "warning", "operator-decision-memory-append-failed", path=memory_path, error_type=type(exc).__name__, error=str(exc))
         return False
 
-    _log(logger, "debug", "operator-decision-memory-appended", path=memory_path, record_count=len(retained), kind=new_record.kind)
+    _log(
+        logger,
+        "debug",
+        "operator-decision-memory-appended",
+        path=memory_path,
+        record_count=len(retained),
+        kind=sanitized[-1].kind,
+    )
     return True
 
 

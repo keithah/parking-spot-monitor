@@ -16,7 +16,7 @@ from parking_spot_monitor.runtime_frame_outcome import prepare_runtime_frame_loo
 from parking_spot_monitor.runtime_health import RuntimeLoopHealthState, observed_at, safe_error_context, write_loop_health
 from parking_spot_monitor.runtime_health_cache import VehicleHistoryHealthSnapshotCache
 from parking_spot_monitor.runtime_commands import _poll_matrix_commands_once
-from parking_spot_monitor.runtime_detection import _configured_spot_polygons, record_detection_memory_records
+from parking_spot_monitor.runtime_detection import _configured_spot_polygons, build_detection_memory_records
 from parking_spot_monitor.runtime_overlay import _write_overlay_for_capture
 from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
 from parking_spot_monitor.runtime_lifecycle import ShutdownState, monitor_signal_handlers, return_if_shutdown_requested
@@ -206,11 +206,9 @@ def run_capture_loop(
                 detection_result = frame_result.detection
                 if detection_result is not None:
                     health_state.record_processed_frame(timestamp=result.timestamp, selected_mode=result.selected_mode)
-                    record_detection_memory_records(
-                        decision_memory_path,
+                    pending_decision_records = build_detection_memory_records(
                         detection_result,
                         observed_at=result.timestamp,
-                        logger=logger,
                         mode="runtime-loop",
                         iteration=iteration,
                     )
@@ -231,6 +229,7 @@ def run_capture_loop(
                         configured_spot_ids=spot_ids,
                         history_archive=effective_history_archive,
                         decision_memory_path=decision_memory_path,
+                        pending_decision_records=pending_decision_records,
                     )
                     runtime_state = frame_update.runtime_state
                     health_state.record_frame_update(

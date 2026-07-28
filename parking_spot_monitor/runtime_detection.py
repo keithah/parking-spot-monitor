@@ -17,7 +17,8 @@ from parking_spot_monitor.detection import (
     translate_crop_detection,
 )
 from parking_spot_monitor.logging import StructuredLogger
-from parking_spot_monitor.runtime_decision_memory import _append_detection_memory_records
+from parking_spot_monitor.operator_decision_memory import append_decision_memory_records
+from parking_spot_monitor.runtime_decision_memory import build_detection_memory_records
 
 
 def _process_detection_for_capture(
@@ -97,13 +98,17 @@ def record_detection_memory_records(
     mode: str,
     iteration: int | None,
 ) -> None:
-    _append_detection_memory_records(
+    if decision_memory_path is None:
+        return
+    append_decision_memory_records(
         decision_memory_path,
-        detection_result,
-        observed_at=observed_at,
+        build_detection_memory_records(
+            detection_result,
+            observed_at=observed_at,
+            mode=mode,
+            iteration=iteration,
+        ),
         logger=logger,
-        mode=mode,
-        iteration=iteration,
     )
 
 def _detect_spot_crop_vehicles_for_frame(

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
+from threading import Barrier
+from unittest.mock import patch
 
+import parking_spot_monitor.operator_decision_memory as decision_memory
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import (
     SCHEMA_VERSION,
@@ -44,6 +48,43 @@ def _assert_no_sensitive_text(rendered: str) -> None:
     assert NESTED_SECRET_MARKER not in rendered
     assert "Traceback" not in rendered
     assert "super-secret" not in rendered
+
+
+def test_batch_append_persists_multiple_records_once(tmp_path: Path) -> None:
+    path = decision_memory_path(tmp_path)
+    records = [
+        _record("command_outcome", None, "first"),
+        _record("command_outcome", None, "second"),
+    ]
+
+    with patch(
+        "parking_spot_monitor.operator_decision_memory._write_memory",
+        wraps=decision_memory._write_memory,
+    ) as write:
+        assert decision_memory.append_decision_memory_records(path, records)
+
+    assert write.call_count == 1
+    assert [record.summary for record in load_decision_memory(path).records] == ["first", "second"]
+
+
+def test_concurrent_batch_append_preserves_both_writers(tmp_path: Path) -> None:
+    for iteration in range(20):
+        path = decision_memory_path(tmp_path / str(iteration))
+        barrier = Barrier(2)
+
+        def append(summary: str) -> bool:
+            barrier.wait()
+            return decision_memory.append_decision_memory_records(
+                path,
+                [_record("command_outcome", None, summary)],
+            )
+
+        summaries = [f"first-{iteration}", f"second-{iteration}"]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(append, summaries))
+
+        assert results == [True, True]
+        assert {record.summary for record in load_decision_memory(path).records} == set(summaries)
 
 
 def test_append_load_and_format_why_for_spot_decision_contract(tmp_path: Path) -> None:
@@ -352,4 +393,3 @@ def test_why_reply_recursively_formats_only_whitelisted_safe_details(tmp_path: P
     assert "debug_dump" not in reply
     assert "Authorization" not in reply
     _assert_no_sensitive_text(reply + path.read_text(encoding="utf-8"))
-

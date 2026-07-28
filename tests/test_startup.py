@@ -14,7 +14,12 @@ from parking_monitor.outbox import AlertIntent, LocalOutbox
 from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult, FrameGeometry
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.logging import StructuredLogger
-from parking_spot_monitor.operator_decision_memory import load_decision_memory
+from parking_spot_monitor.operator_decision_memory import (
+    MAX_TEXT_FIELD_CHARS,
+    DecisionMemoryRecord,
+    append_decision_memory_records,
+    load_decision_memory,
+)
 from parking_spot_monitor.matrix import MatrixDelivery, MatrixSnapshot
 from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _main, main
 from parking_spot_monitor.runtime_presence import _presence_by_spot
@@ -3620,9 +3625,27 @@ def test_presence_by_spot_does_not_count_centroid_outside_vehicle() -> None:
 
     assert _presence_by_spot(result) == {"left_spot": False}
 
-def test_runtime_loop_appends_sanitized_decision_memory_records(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_runtime_loop_appends_sanitized_decision_memory_records(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     detections = [[left_spot_vehicle()]]
     delivery = FakeMatrixDelivery()
+    batch_calls: list[tuple[DecisionMemoryRecord, ...]] = []
+
+    def track_batch_append(
+        path: str | Path,
+        records: list[DecisionMemoryRecord],
+        **kwargs: Any,
+    ) -> bool:
+        batch_calls.append(tuple(records))
+        return append_decision_memory_records(path, records, **kwargs)
+
+    monkeypatch.setattr(
+        "parking_spot_monitor.runtime_state_update.append_decision_memory_records",
+        track_batch_append,
+    )
 
     def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
@@ -3653,7 +3676,14 @@ def test_runtime_loop_appends_sanitized_decision_memory_records(tmp_path: Path, 
     assert any(record.kind == "accepted_evidence" and record.spot_id == "left_spot" for record in loaded.records)
     assert any(record.kind == "miss" and record.spot_id == "right_spot" for record in loaded.records)
     assert any(record.details and record.details.get("hit_streak") == 1 for record in loaded.records)
-    assert_no_secret_leak(output + rendered)
+    assert len(batch_calls) == 1
+    frame_records = batch_calls[0]
+    assert len(frame_records) == 4
+    assert [record.spot_id for record in frame_records].count("left_spot") == 2
+    assert [record.spot_id for record in frame_records].count("right_spot") == 2
+    assert all(len(record.summary.encode("utf-8")) <= MAX_TEXT_FIELD_CHARS for record in frame_records)
+    batch_rendered = json.dumps([record.to_json_dict() for record in frame_records])
+    assert_no_secret_leak(output + rendered + batch_rendered)
 
 
 def test_runtime_loop_decision_memory_append_failure_is_non_fatal(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
