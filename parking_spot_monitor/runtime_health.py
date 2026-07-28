@@ -81,6 +81,7 @@ def matrix_outbox_health_payload(
                 "error_message": "matrix outbox status unavailable",
             },
         }
+    payload.pop("items", None)
     payload["available"] = True
     return payload
 

@@ -3866,7 +3866,7 @@ def test_matrix_outbox_health_payload_degrades_on_read_error_without_secret(
     assert "matrix-secret" not in rendered
 
 
-def test_matrix_outbox_health_payload_uses_compact_live_provider(
+def test_matrix_outbox_health_payload_strips_record_items_from_live_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class ExplodingOutbox:
@@ -3881,6 +3881,7 @@ def test_matrix_outbox_health_payload_uses_compact_live_provider(
             "path": str(tmp_path / "matrix-outbox.json"),
             "total": 1,
             "counts_by_state": {"delivered": 1},
+            "items": [{"id": "event-1", "body": "record-level data"}],
         },
     )
 
