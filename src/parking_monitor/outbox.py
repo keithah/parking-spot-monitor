@@ -391,39 +391,27 @@ class LocalOutbox:
         return self.mark_dead_lettered(record.id, reason=reason)
 
     def status_summary(self) -> dict[str, JsonValue]:
+        return self._status_summary(include_items=True)
+
+    def compact_status_summary(self) -> dict[str, JsonValue]:
+        return self._status_summary(include_items=False)
+
+    def _status_summary(self, *, include_items: bool) -> dict[str, JsonValue]:
         counts: dict[str, int] = {}
         retry_reason_counts: dict[str, int] = {}
         dead_letter_reason_counts: dict[str, int] = {}
         items: list[dict[str, JsonValue]] = []
-        timestamps = [record.created_at for record in self._records] + [record.updated_at for record in self._records]
+        timestamps: list[str] = []
         for record in self._records:
             counts[record.state] = counts.get(record.state, 0) + 1
+            timestamps.extend((record.created_at, record.updated_at))
             if record.retry_reason is not None:
                 retry_reason_counts[record.retry_reason] = retry_reason_counts.get(record.retry_reason, 0) + 1
             if record.dead_letter_reason is not None:
                 dead_letter_reason_counts[record.dead_letter_reason] = dead_letter_reason_counts.get(record.dead_letter_reason, 0) + 1
-            items.append(
-                {
-                    "id": record.id,
-                    "matrix_transaction_id": record.transaction_id,
-                    "state": record.state,
-                    "phase": record.intent.phase,
-                    "phases": [
-                        {
-                            "phase": phase,
-                            "state": record.phase_states[phase],
-                            "updated_at": record.phase_updated_at.get(phase, record.updated_at),
-                            **({"result": record.phase_results[phase]} if phase in record.phase_results else {}),
-                        }
-                        for phase in sorted(record.phase_states)
-                    ],
-                    "retry_reason": record.retry_reason,
-                    "dead_letter_reason": record.dead_letter_reason,
-                    "created_at": record.created_at,
-                    "updated_at": record.updated_at,
-                }
-            )
-        return {
+            if include_items:
+                items.append(self._status_item(record))
+        summary: dict[str, JsonValue] = {
             "path": str(self.path),
             "schema_version": _SCHEMA_VERSION,
             "total": len(self._records),
@@ -432,8 +420,31 @@ class LocalOutbox:
             "newest_timestamp": max(timestamps) if timestamps else None,
             "retry_reason_counts": retry_reason_counts,
             "dead_letter_reason_counts": dead_letter_reason_counts,
-            "items": items,
             "recovery": self.recovery.to_json(),
+        }
+        if include_items:
+            summary["items"] = items
+        return summary
+
+    def _status_item(self, record: OutboxRecord) -> dict[str, JsonValue]:
+        return {
+            "id": record.id,
+            "matrix_transaction_id": record.transaction_id,
+            "state": record.state,
+            "phase": record.intent.phase,
+            "phases": [
+                {
+                    "phase": phase,
+                    "state": record.phase_states[phase],
+                    "updated_at": record.phase_updated_at.get(phase, record.updated_at),
+                    **({"result": record.phase_results[phase]} if phase in record.phase_results else {}),
+                }
+                for phase in sorted(record.phase_states)
+            ],
+            "retry_reason": record.retry_reason,
+            "dead_letter_reason": record.dead_letter_reason,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
         }
 
     def _transition_record(

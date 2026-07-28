@@ -57,11 +57,19 @@ def parse_frame_timestamp(value: Any | None) -> datetime | None:
         return None
 
 
-def matrix_outbox_health_payload(matrix_outbox_file: Path | None) -> dict[str, Any] | None:
+def matrix_outbox_health_payload(
+    matrix_outbox_file: Path | None,
+    *,
+    summary_provider: Callable[[], Mapping[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     if matrix_outbox_file is None:
         return None
     try:
-        summary = LocalOutbox(matrix_outbox_file).status_summary()
+        payload = dict(
+            summary_provider()
+            if summary_provider is not None
+            else LocalOutbox(matrix_outbox_file).compact_status_summary()
+        )
     except Exception as exc:
         return {
             "available": False,
@@ -73,7 +81,6 @@ def matrix_outbox_health_payload(matrix_outbox_file: Path | None) -> dict[str, A
                 "error_message": "matrix outbox status unavailable",
             },
         }
-    payload = dict(summary)
     payload["available"] = True
     return payload
 
@@ -228,6 +235,7 @@ def write_loop_health(
     last_vehicle_history_error: Mapping[str, Any] | None = None,
     vehicle_history: Mapping[str, Any] | None = None,
     matrix_outbox_file: Path | None = None,
+    matrix_outbox_summary_provider: Callable[[], Mapping[str, Any]] | None = None,
 ) -> None:
     try:
         write_health_status(
@@ -251,7 +259,10 @@ def write_loop_health(
                 vehicle_history_failure_count=vehicle_history_failure_count,
                 last_vehicle_history_error=last_vehicle_history_error,
                 vehicle_history=vehicle_history,
-                matrix_outbox=matrix_outbox_health_payload(matrix_outbox_file),
+                matrix_outbox=matrix_outbox_health_payload(
+                    matrix_outbox_file,
+                    summary_provider=matrix_outbox_summary_provider,
+                ),
             ),
             logger=logger,
         )

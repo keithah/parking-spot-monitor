@@ -3866,6 +3866,33 @@ def test_matrix_outbox_health_payload_degrades_on_read_error_without_secret(
     assert "matrix-secret" not in rendered
 
 
+def test_matrix_outbox_health_payload_uses_compact_live_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ExplodingOutbox:
+        def __init__(self, _path: Path) -> None:
+            raise AssertionError("live provider must avoid reopening the outbox")
+
+    monkeypatch.setattr("parking_spot_monitor.runtime_health.LocalOutbox", ExplodingOutbox)
+
+    payload = _matrix_outbox_health_payload(
+        tmp_path / "matrix-outbox.json",
+        summary_provider=lambda: {
+            "path": str(tmp_path / "matrix-outbox.json"),
+            "total": 1,
+            "counts_by_state": {"delivered": 1},
+        },
+    )
+
+    assert payload == {
+        "path": str(tmp_path / "matrix-outbox.json"),
+        "total": 1,
+        "counts_by_state": {"delivered": 1},
+        "available": True,
+    }
+    assert "items" not in payload
+
+
 def test_runtime_health_json_includes_resolved_matrix_outbox_summary(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
     pending = outbox.enqueue(AlertIntent(event_id="evt-pending", phase="text", body="ok"))
@@ -3906,13 +3933,7 @@ def test_runtime_health_json_includes_resolved_matrix_outbox_summary(tmp_path: P
     }
     assert matrix_outbox["retry_reason_counts"] == {"timeout": 1}
     assert matrix_outbox["dead_letter_reason_counts"] == {"matrix_forbidden": 1, "redacted": 1}
-    assert {item["state"] for item in matrix_outbox["items"]} == {
-        "pending",
-        "retrying",
-        "delivered",
-        "failed",
-        "dead_lettered",
-    }
+    assert "items" not in matrix_outbox
     rendered = json.dumps(health).lower()
     assert "authorization" not in rendered
     assert "bearer" not in rendered

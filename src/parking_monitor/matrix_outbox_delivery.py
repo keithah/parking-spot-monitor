@@ -79,6 +79,9 @@ class MatrixOutboxDelivery:
         if callable(close):
             close()
 
+    def outbox_health_summary(self) -> Mapping[str, Any]:
+        return self.outbox.compact_status_summary()
+
     def send_occupied_spot_alert(self, event: Mapping[str, Any]) -> OutboxRecord:
         """Persist an occupied alert without performing Matrix network I/O."""
 

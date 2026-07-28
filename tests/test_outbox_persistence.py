@@ -71,6 +71,20 @@ def test_enqueue_is_idempotent_for_duplicate_logical_alerts(tmp_path):
     assert item["dead_letter_reason"] is None
 
 
+def test_compact_status_summary_omits_record_items(tmp_path: Path) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    record = outbox.enqueue(AlertIntent(event_id="event-1", phase="text", body="Parking status"))
+    outbox.mark_delivered(record.id)
+
+    detailed = outbox.status_summary()
+    compact = outbox.compact_status_summary()
+
+    assert len(detailed["items"]) == 1
+    assert "items" not in compact
+    assert compact["total"] == 1
+    assert compact["counts_by_state"] == {"delivered": 1}
+
+
 @pytest.mark.parametrize(
     "bad_intent",
     [

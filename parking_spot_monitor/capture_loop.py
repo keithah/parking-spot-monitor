@@ -114,6 +114,9 @@ def run_capture_loop(
         now=now_fn,
         ttl_seconds=VEHICLE_HISTORY_HEALTH_CACHE_SECONDS,
     )
+    outbox_health_provider = getattr(matrix_delivery, "outbox_health_summary", None)
+    if not callable(outbox_health_provider):
+        outbox_health_provider = None
 
     def write_current_health(*, status: str, iteration: int) -> None:
         write_loop_health(
@@ -140,6 +143,7 @@ def run_capture_loop(
                 or health_state.vehicle_history_failure_count > 0
             ),
             matrix_outbox_file=runtime_paths.matrix_outbox_file,
+            matrix_outbox_summary_provider=outbox_health_provider,
         )
 
     with monitor_signal_handlers(shutdown_state, logger=logger):
