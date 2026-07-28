@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -166,6 +168,26 @@ def build_ffmpeg_argv(
     return argv
 
 
+def _capture_output_path(output_dir: Path, profile_name: str) -> Path:
+    if profile_name == "primary":
+        return output_dir / "latest.jpg"
+    sanitized_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", profile_name).strip("-._")
+    if not sanitized_name:
+        raise ValueError("stream profile name must contain a filename-safe character")
+    return output_dir / f"latest-{sanitized_name}.jpg"
+
+
+def _capture_temp_path(output_path: Path) -> Path:
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        delete=False,
+        dir=output_path.parent,
+        prefix=f".{output_path.stem}.",
+        suffix=".jpg",
+    ) as handle:
+        return Path(handle.name)
+
+
 def capture_latest(
     settings: RuntimeSettings,
     data_dir: str | Path,
@@ -178,9 +200,9 @@ def capture_latest(
     stream_profile: str | None = None,
 ) -> FrameCaptureResult:
     output_dir = Path(data_dir)
-    output_path = output_dir / "latest.jpg"
     selected_profile = settings.stream.profile(stream_profile)
     profile_name = selected_profile.name
+    output_path = _capture_output_path(output_dir, profile_name)
     rtsp_url = selected_profile.rtsp_url.value
     secrets = [rtsp_url, settings.matrix.access_token.value]
     selected_modes = list(modes if modes is not None else DEFAULT_DECODE_MODES)
@@ -205,8 +227,8 @@ def capture_latest(
 
     for mode in selected_modes:
         attempted_modes.append(mode)
-        argv = build_ffmpeg_argv(rtsp_url, output_path, mode, network_timeout_seconds=timeout_seconds)
         start = time.perf_counter()
+        temp_path: Path | None = None
         _log(
             logger,
             "info",
@@ -217,6 +239,19 @@ def capture_latest(
             stream_profile=profile_name,
         )
         try:
+            try:
+                temp_path = _capture_temp_path(output_path)
+            except OSError as exc:
+                raise _failure(
+                    "output-temporary-unavailable",
+                    mode,
+                    output_path,
+                    f"capture temporary output is unavailable: {exc.strerror or type(exc).__name__}",
+                    secrets=secrets,
+                    duration_seconds=time.perf_counter() - start,
+                    timeout_seconds=timeout_seconds,
+                ) from exc
+            argv = build_ffmpeg_argv(rtsp_url, temp_path, mode, network_timeout_seconds=timeout_seconds)
             completed = run(argv, timeout=timeout_seconds)
             duration = time.perf_counter() - start
             if completed.returncode != 0:
@@ -231,7 +266,26 @@ def capture_latest(
                     timeout_seconds=timeout_seconds,
                     returncode=completed.returncode,
                 )
-            byte_size = _validate_jpeg_output(output_path, mode=mode, secrets=secrets, duration_seconds=duration)
+            byte_size = _validate_jpeg_output(
+                temp_path,
+                failure_output_path=output_path,
+                mode=mode,
+                secrets=secrets,
+                duration_seconds=duration,
+            )
+            try:
+                temp_path.chmod(0o644)
+                os.replace(temp_path, output_path)
+            except OSError as exc:
+                raise _failure(
+                    "output-publish-failed",
+                    mode,
+                    output_path,
+                    f"capture output could not be published: {exc.strerror or type(exc).__name__}",
+                    secrets=secrets,
+                    duration_seconds=duration,
+                    timeout_seconds=timeout_seconds,
+                ) from exc
         except CaptureError as exc:
             exc.attempted_modes = list(attempted_modes)
             failures.append(exc)
@@ -275,6 +329,12 @@ def capture_latest(
                 continue
             _log(logger, "error", "capture-all-modes-failed", **failure.diagnostics())
             raise failure from exc
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         timestamp = now() if now is not None else datetime.now(UTC).isoformat()
         result = FrameCaptureResult(
@@ -304,18 +364,20 @@ def _run_ffmpeg(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedP
 def _validate_jpeg_output(
     output_path: Path,
     *,
+    failure_output_path: Path | None = None,
     mode: DecodeMode,
     secrets: Iterable[str],
     duration_seconds: float,
 ) -> int:
+    reported_output_path = output_path if failure_output_path is None else failure_output_path
     try:
         byte_size = output_path.stat().st_size
     except OSError as exc:
         raise _failure(
             "output-missing",
             mode,
-            output_path,
-            f"ffmpeg did not produce readable output: {exc}",
+            reported_output_path,
+            f"ffmpeg did not produce readable output: {exc.strerror or type(exc).__name__}",
             secrets=secrets,
             duration_seconds=duration_seconds,
         ) from exc
@@ -323,7 +385,7 @@ def _validate_jpeg_output(
         raise _failure(
             "output-empty",
             mode,
-            output_path,
+            reported_output_path,
             "ffmpeg produced an empty output file",
             secrets=secrets,
             duration_seconds=duration_seconds,
@@ -339,8 +401,8 @@ def _validate_jpeg_output(
         raise _failure(
             "output-missing",
             mode,
-            output_path,
-            f"ffmpeg did not produce readable output: {exc}",
+            reported_output_path,
+            f"ffmpeg did not produce readable output: {exc.strerror or type(exc).__name__}",
             secrets=secrets,
             duration_seconds=duration_seconds,
         ) from exc
@@ -348,7 +410,7 @@ def _validate_jpeg_output(
         raise _failure(
             "output-invalid-jpeg",
             mode,
-            output_path,
+            reported_output_path,
             "ffmpeg output is not a valid JPEG frame",
             secrets=secrets,
             duration_seconds=duration_seconds,

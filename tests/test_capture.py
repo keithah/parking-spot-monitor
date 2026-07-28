@@ -119,9 +119,12 @@ def test_capture_latest_returns_result_shape_after_valid_jpeg_write(tmp_path: Pa
     assert result.duration_seconds >= 0
     assert result.byte_size == len(jpeg_bytes())
     assert calls and isinstance(calls[0], list)
+    assert Path(calls[0][-1]).parent == tmp_path
+    assert Path(calls[0][-1]) != result.latest_path
+    assert not Path(calls[0][-1]).exists()
 
 
-def test_capture_latest_uses_selected_stream_profile(tmp_path: Path) -> None:
+def test_named_profile_publishes_separate_latest_path(tmp_path: Path) -> None:
     config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
         "  reconnect_seconds: 5\n",
         "  reconnect_seconds: 5\n  profiles:\n    high_resolution:\n      rtsp_url_env: RTSP_URL_4K\n      frame_width: 3840\n      frame_height: 2160\n",
@@ -147,10 +150,60 @@ def test_capture_latest_uses_selected_stream_profile(tmp_path: Path) -> None:
 
     result = capture_latest(settings, tmp_path, stream_profile="high_resolution", modes=[DecodeMode.SOFTWARE], runner=runner)
 
+    assert result.latest_path == tmp_path / "latest-high_resolution.jpg"
+    assert result.latest_path.read_bytes() == jpeg_bytes()
+    assert not (tmp_path / "latest.jpg").exists()
     assert result.frame_geometry == FrameGeometry(stream_profile="high_resolution", expected_size=(3840, 2160))
     assert high_url in calls[0]
     assert FAKE_RTSP_VALUE not in calls[0]
     assert result.diagnostics()["stream_profile"] == "high_resolution"
+
+
+def test_named_profile_sanitizes_published_filename(tmp_path: Path) -> None:
+    profile_name = "High Resolution / 4K"
+    config = (
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("  escalation_profile: high_resolution\n", f'  escalation_profile: "{profile_name}"\n')
+        .replace("    high_resolution:\n", f'    "{profile_name}":\n')
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(config, encoding="utf-8")
+    settings = load_settings(
+        config_path,
+        environ={
+            "RTSP_URL": FAKE_RTSP_VALUE,
+            "RTSP_URL_4K": f"{FAKE_RTSP_VALUE}/4k",
+            "RTSP_URL_360P": f"{FAKE_RTSP_VALUE}/360p",
+            "MATRIX_ACCESS_TOKEN": FAKE_MATRIX_VALUE,
+        },
+    )
+
+    def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        Path(argv[-1]).write_bytes(jpeg_bytes())
+        return subprocess.CompletedProcess(argv, 0, stderr="captured sanitized profile")
+
+    result = capture_latest(settings, tmp_path, stream_profile=profile_name, modes=[DecodeMode.SOFTWARE], runner=runner)
+
+    assert result.latest_path == tmp_path / "latest-High-Resolution-4K.jpg"
+    assert result.latest_path.read_bytes() == jpeg_bytes()
+    assert not (tmp_path / "latest.jpg").exists()
+
+
+def test_invalid_capture_preserves_previous_published_frame(tmp_path: Path) -> None:
+    settings = fake_settings()
+    published = tmp_path / "latest.jpg"
+    published.write_bytes(jpeg_bytes())
+
+    def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        Path(argv[-1]).write_bytes(b"not-a-jpeg")
+        return subprocess.CompletedProcess(argv, 0, stderr="invalid frame")
+
+    with pytest.raises(CaptureError):
+        capture_latest(settings, tmp_path, modes=[DecodeMode.SOFTWARE], runner=runner)
+
+    assert published.read_bytes() == jpeg_bytes()
+    assert not list(tmp_path.glob(".latest.*.jpg"))
 
 
 def test_capture_validation_reads_only_jpeg_edges_not_full_payload(tmp_path: Path) -> None:
