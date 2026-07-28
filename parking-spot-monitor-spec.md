@@ -292,6 +292,7 @@ stream:
   sample_interval_seconds: 5
   reconnect_backoff_seconds: 10
   prefer_hw_decode: true
+  escalation_verification_seconds: 600
 
 spots:
   left_spot:
@@ -343,7 +344,24 @@ quiet_windows:
     suppress_open_spot_alerts: true
     post_start_notice: true
     post_end_notice: true
+
+runtime:
+  frame_interval_seconds: 30
+  adaptive_polling_enabled: true
+  stable_frame_interval_seconds: 60
+  stable_settle_frames: 3
+  debug_overlay_interval_seconds: 60
 ```
+
+`runtime.frame_interval_seconds` remains the active or uncertain sampling cadence. After
+`runtime.stable_settle_frames` unchanged frames, adaptive polling may use
+`runtime.stable_frame_interval_seconds`. Set `adaptive_polling_enabled: false` to keep a
+fixed cadence; setting `stable_frame_interval_seconds` equal to
+`frame_interval_seconds` is a second fixed-cadence rollback path.
+
+`debug_overlay_interval_seconds: 0` disables periodic debug overlays.
+`escalation_verification_seconds: 0` disables periodic high-resolution verification;
+transition-driven escalation remains enabled when an escalation profile is configured.
 
 ---
 

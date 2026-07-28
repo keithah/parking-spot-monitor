@@ -90,6 +90,11 @@ def test_example_config_loads_with_fake_env_values() -> None:
     assert settings.detection.spot_crop_margin_px == 48
     assert settings.detection.open_suppression_min_confidence == 0.1
     assert settings.detection.open_suppression_classes == ["car", "truck", "bus", "suitcase", "umbrella"]
+    assert settings.runtime.adaptive_polling_enabled is True
+    assert settings.runtime.stable_frame_interval_seconds == 60
+    assert settings.runtime.stable_settle_frames == 3
+    assert settings.runtime.debug_overlay_interval_seconds == 60
+    assert settings.stream.escalation_verification_seconds == 600
 
 
 def test_stream_profiles_resolve_secret_env_values_and_sanitize_names_only(tmp_path: Path) -> None:
@@ -207,6 +212,7 @@ def test_stream_profile_names_with_same_sanitized_destination_are_rejected(tmp_p
     config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
         "  escalation_profile: high_resolution\n"
         "  escalation_min_confidence: 0.75\n"
+        "  escalation_verification_seconds: 600\n"
         "  profiles:\n"
         "    high_resolution:\n"
         "      rtsp_url_env: RTSP_URL_4K\n"
@@ -214,6 +220,7 @@ def test_stream_profile_names_with_same_sanitized_destination_are_rejected(tmp_p
         "      frame_height: 2160\n",
         '  escalation_profile: "high resolution"\n'
         "  escalation_min_confidence: 0.75\n"
+        "  escalation_verification_seconds: 600\n"
         "  profiles:\n"
         '    "high resolution":\n'
         "      rtsp_url_env: RTSP_URL_4K\n"
@@ -347,6 +354,57 @@ def test_runtime_frame_interval_seconds_is_configurable_and_summarized(tmp_path:
 
     assert settings.runtime.frame_interval_seconds == 7
     assert settings.sanitized_summary()["runtime"]["frame_interval_seconds"] == 7
+
+
+def test_adaptive_runtime_settings_are_configurable_and_summarized(tmp_path: Path) -> None:
+    config = (
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("  adaptive_polling_enabled: true", "  adaptive_polling_enabled: false")
+        .replace("  stable_frame_interval_seconds: 60", "  stable_frame_interval_seconds: 30")
+        .replace("  stable_settle_frames: 3", "  stable_settle_frames: 5")
+        .replace("  debug_overlay_interval_seconds: 60", "  debug_overlay_interval_seconds: 0")
+        .replace("  escalation_verification_seconds: 600", "  escalation_verification_seconds: 0")
+    )
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(path, environ=fake_environ())
+
+    assert settings.runtime.adaptive_polling_enabled is False
+    assert settings.runtime.stable_frame_interval_seconds == settings.runtime.frame_interval_seconds == 30
+    assert settings.runtime.stable_settle_frames == 5
+    assert settings.runtime.debug_overlay_interval_seconds == 0
+    assert settings.stream.escalation_verification_seconds == 0
+    summary = settings.sanitized_summary()
+    assert summary["runtime"]["adaptive_polling_enabled"] is False
+    assert summary["runtime"]["stable_frame_interval_seconds"] == 30
+    assert summary["runtime"]["stable_settle_frames"] == 5
+    assert summary["runtime"]["debug_overlay_interval_seconds"] == 0
+    assert summary["stream"]["escalation_verification_seconds"] == 0
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement", "field"),
+    [
+        ("  debug_overlay_interval_seconds: 60", "  debug_overlay_interval_seconds: -1", "debug_overlay_interval_seconds"),
+        ("  escalation_verification_seconds: 600", "  escalation_verification_seconds: -1", "escalation_verification_seconds"),
+        ("  stable_settle_frames: 3", "  stable_settle_frames: 0", "stable_settle_frames"),
+        ("  stable_frame_interval_seconds: 60", "  stable_frame_interval_seconds: 29", "stable_frame_interval_seconds"),
+    ],
+)
+def test_adaptive_runtime_settings_reject_invalid_values(
+    tmp_path: Path,
+    original: str,
+    replacement: str,
+    field: str,
+) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(original, replacement)
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert field in str(exc_info.value)
 
 
 @pytest.mark.parametrize("bad_value", ["0", "-1"])

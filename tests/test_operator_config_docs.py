@@ -69,6 +69,7 @@ def test_example_config_exposes_operator_calibration_and_runtime_fields() -> Non
         ("stream", "reconnect_seconds"),
         ("stream", "escalation_profile"),
         ("stream", "escalation_min_confidence"),
+        ("stream", "escalation_verification_seconds"),
         ("stream", "profiles"),
         ("spots", "left_spot", "polygon"),
         ("spots", "right_spot", "polygon"),
@@ -92,6 +93,10 @@ def test_example_config_exposes_operator_calibration_and_runtime_fields() -> Non
         ("storage", "snapshot_retention_count"),
         ("runtime", "health_file"),
         ("runtime", "frame_interval_seconds"),
+        ("runtime", "adaptive_polling_enabled"),
+        ("runtime", "stable_frame_interval_seconds"),
+        ("runtime", "stable_settle_frames"),
+        ("runtime", "debug_overlay_interval_seconds"),
     ]
     for path in required_fields:
         value = config
@@ -102,7 +107,32 @@ def test_example_config_exposes_operator_calibration_and_runtime_fields() -> Non
 
     assert config["stream"]["rtsp_url_env"] == "RTSP_URL"
     assert config["stream"]["profiles"]["high_resolution"]["rtsp_url_env"] == "RTSP_URL_4K"
+    assert config["stream"]["escalation_verification_seconds"] == 600
     assert config["matrix"]["access_token_env"] == "MATRIX_ACCESS_TOKEN"
+    assert config["runtime"]["frame_interval_seconds"] == 30
+    assert config["runtime"]["adaptive_polling_enabled"] is True
+    assert config["runtime"]["stable_frame_interval_seconds"] == 60
+    assert config["runtime"]["stable_settle_frames"] == 3
+    assert config["runtime"]["debug_overlay_interval_seconds"] == 60
+
+
+def test_spec_documents_adaptive_runtime_rollbacks_and_disabled_periodic_work() -> None:
+    spec = read_tracked("parking-spot-monitor-spec.md")
+
+    assert_contains_all(
+        spec,
+        [
+            "adaptive_polling_enabled: false",
+            "stable_frame_interval_seconds",
+            "frame_interval_seconds",
+            "fixed cadence",
+            "debug_overlay_interval_seconds: 0",
+            "disables periodic debug overlays",
+            "escalation_verification_seconds: 0",
+            "disables periodic high-resolution verification",
+            "transition-driven escalation remains enabled",
+        ],
+    )
 
 def test_example_spot_polygons_are_in_frame_and_have_minimum_shape() -> None:
     config = read_yaml("config.yaml.example")

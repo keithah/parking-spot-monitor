@@ -94,6 +94,7 @@ class StreamConfig(StrictModel):
     profiles: dict[str, StreamProfileConfig] = Field(default_factory=dict)
     escalation_profile: str | None = None
     escalation_min_confidence: float = Field(default=0.75, ge=0, le=1)
+    escalation_verification_seconds: float = Field(default=600, ge=0)
 
     @model_validator(mode="after")
     def profile_capture_filenames_must_be_unique(self) -> Self:
@@ -251,6 +252,16 @@ class RuntimeConfig(StrictModel):
     log_level: str = "INFO"
     startup_timeout_seconds: int = Field(default=30, gt=0)
     frame_interval_seconds: float = Field(default=30, gt=0)
+    adaptive_polling_enabled: bool = True
+    stable_frame_interval_seconds: float = Field(default=60, gt=0)
+    stable_settle_frames: int = Field(default=3, gt=0)
+    debug_overlay_interval_seconds: float = Field(default=60, ge=0)
+
+    @model_validator(mode="after")
+    def stable_interval_not_faster_than_active(self) -> Self:
+        if self.stable_frame_interval_seconds < self.frame_interval_seconds:
+            raise ValueError("stable_frame_interval_seconds must be greater than or equal to frame_interval_seconds")
+        return self
 
 
 class RuntimeSettings(StrictModel):
@@ -288,6 +299,7 @@ class RuntimeSettings(StrictModel):
                 "reconnect_seconds": self.stream.reconnect_seconds,
                 "escalation_profile": self.stream.escalation_profile,
                 "escalation_min_confidence": self.stream.escalation_min_confidence,
+                "escalation_verification_seconds": self.stream.escalation_verification_seconds,
                 "profiles": {
                     name: {
                         "rtsp_url": profile.rtsp_url.sanitized_summary(),
@@ -344,6 +356,10 @@ class RuntimeSettings(StrictModel):
                 "log_level": self.runtime.log_level,
                 "startup_timeout_seconds": self.runtime.startup_timeout_seconds,
                 "frame_interval_seconds": self.runtime.frame_interval_seconds,
+                "adaptive_polling_enabled": self.runtime.adaptive_polling_enabled,
+                "stable_frame_interval_seconds": self.runtime.stable_frame_interval_seconds,
+                "stable_settle_frames": self.runtime.stable_settle_frames,
+                "debug_overlay_interval_seconds": self.runtime.debug_overlay_interval_seconds,
             },
         }
 

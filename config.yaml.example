@@ -5,6 +5,7 @@ stream:
   reconnect_seconds: 5
   escalation_profile: high_resolution
   escalation_min_confidence: 0.75
+  escalation_verification_seconds: 600
   profiles:
     high_resolution:
       rtsp_url_env: RTSP_URL_4K
@@ -86,3 +87,7 @@ runtime:
   log_level: INFO
   startup_timeout_seconds: 30
   frame_interval_seconds: 30
+  adaptive_polling_enabled: true
+  stable_frame_interval_seconds: 60
+  stable_settle_frames: 3
+  debug_overlay_interval_seconds: 60
