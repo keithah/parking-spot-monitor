@@ -33,6 +33,7 @@ def capture_and_detect_runtime_frame(
     logger: StructuredLogger,
     mode: str,
     iteration: int,
+    periodic_verification_due: bool = False,
 ) -> RuntimeFrameAttempt:
     try:
         primary_result = capture(settings, data_dir)
@@ -51,9 +52,10 @@ def capture_and_detect_runtime_frame(
             logger=logger,
             mode=mode,
             iteration=iteration,
+            periodic_verification_due=periodic_verification_due,
         )
     except DetectionError as exc:
-        return RuntimeFrameDetectionFailed(capture=primary_result, detector=detector, error=exc)
+        return RuntimeFrameDetectionFailed(primary_capture=primary_result, capture=primary_result, detector=detector, error=exc)
 
     if isinstance(outcome, StreamEscalationCaptureFailed):
         return RuntimeFrameCaptureEscalationFailed(
@@ -62,10 +64,17 @@ def capture_and_detect_runtime_frame(
             error=outcome.error,
         )
     if isinstance(outcome, StreamEscalationDetectionFailed):
-        return RuntimeFrameDetectionFailed(capture=outcome.last_successful_capture, detector=detector, error=outcome.error)
+        return RuntimeFrameDetectionFailed(
+            primary_capture=primary_result,
+            capture=outcome.last_successful_capture,
+            detector=detector,
+            error=outcome.error,
+        )
 
     return RuntimeFrameDetected(
+        primary_capture=outcome.primary_capture,
         capture=outcome.final_capture,
         detector=detector,
         detection=outcome.detection,
+        escalated=outcome.escalated,
     )

@@ -15,6 +15,7 @@ class RuntimeFrameCaptureFailed:
 
 @dataclass(frozen=True)
 class RuntimeFrameDetectionFailed:
+    primary_capture: FrameCaptureResult
     capture: FrameCaptureResult
     detector: object | None
     error: DetectionError
@@ -29,24 +30,22 @@ class RuntimeFrameCaptureEscalationFailed:
 
 @dataclass(frozen=True)
 class RuntimeFrameDetected:
+    primary_capture: FrameCaptureResult
     capture: FrameCaptureResult
     detector: object
     detection: DetectionFilterResult
+    escalated: bool
 
 
-RuntimeFrameAttempt = (
-    RuntimeFrameCaptureFailed
-    | RuntimeFrameDetectionFailed
-    | RuntimeFrameCaptureEscalationFailed
-    | RuntimeFrameDetected
-)
-
+RuntimeFrameAttempt = RuntimeFrameCaptureFailed | RuntimeFrameDetectionFailed | RuntimeFrameCaptureEscalationFailed | RuntimeFrameDetected
 
 @dataclass(frozen=True)
 class RuntimeFrameLoopResult:
+    primary_capture: FrameCaptureResult
     capture: FrameCaptureResult
     detector: object | None
     detection: DetectionFilterResult | None = None
+    escalated: bool = False
 
 
 def prepare_runtime_frame_loop_result(
@@ -75,13 +74,15 @@ def prepare_runtime_frame_loop_result(
             iteration=iteration,
             **frame_attempt.error.diagnostics(),
         )
-        return RuntimeFrameLoopResult(capture=frame_attempt.capture, detector=frame_attempt.detector)
+        return RuntimeFrameLoopResult(primary_capture=frame_attempt.primary_capture, capture=frame_attempt.capture, detector=frame_attempt.detector)
 
     _record_capture_success(health_state, frame_attempt.capture)
     return RuntimeFrameLoopResult(
+        primary_capture=frame_attempt.primary_capture,
         capture=frame_attempt.capture,
         detector=frame_attempt.detector,
         detection=frame_attempt.detection,
+        escalated=frame_attempt.escalated,
     )
 
 

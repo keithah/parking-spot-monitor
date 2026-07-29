@@ -9,8 +9,17 @@ from PIL import Image
 
 from parking_spot_monitor.__main__ import _main
 from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult, FrameGeometry
+from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.detection import DetectionError, VehicleDetection
+from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
+from parking_spot_monitor.runtime_frame import capture_and_detect_runtime_frame
+from parking_spot_monitor.runtime_frame_outcome import (
+    RuntimeFrameDetected,
+    RuntimeFrameDetectionFailed,
+    prepare_runtime_frame_loop_result,
+)
+from parking_spot_monitor.runtime_health import RuntimeLoopHealthState
 from parking_spot_monitor.state import RuntimeState, save_runtime_state
 
 SECRET_MARKER = "startup-secret-should-not-leak"
@@ -77,7 +86,7 @@ def test_runtime_loop_escalates_weak_primary_detection_to_high_resolution_profil
         RuntimeState(
             state_by_spot={
                 "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY, open_event_emitted=True),
-                "right_spot": SpotOccupancyState(status=OccupancyStatus.OCCUPIED),
+                "right_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
             }
         ),
     )
@@ -139,12 +148,173 @@ def test_runtime_loop_escalates_weak_primary_detection_to_high_resolution_profil
     assert_no_secret_leak(output)
 
 
+def test_runtime_frame_periodic_outcome_preserves_primary_and_final_capture_identities(tmp_path: Path) -> None:
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    capture_profiles: list[str | None] = []
+    primary_path = tmp_path / "latest-primary.jpg"
+    high_path = tmp_path / "latest-high-resolution.jpg"
+
+    def fake_capture(
+        _settings: object,
+        data_dir: str | Path,
+        *,
+        stream_profile: str | None = None,
+    ) -> FrameCaptureResult:
+        capture_profiles.append(stream_profile)
+        profile = stream_profile or "primary"
+        size = (3840, 2160) if profile == "high_resolution" else (1458, 806)
+        latest_path = high_path if profile == "high_resolution" else primary_path
+        Image.new("RGB", size, (20, 30, 40)).save(latest_path, format="JPEG")
+        return FrameCaptureResult(
+            timestamp="2026-05-18T18:00:01Z" if profile == "high_resolution" else "2026-05-18T18:00:00Z",
+            latest_path=latest_path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=0.01,
+            byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile=profile, expected_size=size),
+        )
+
+    class ProfileAwareDetector:
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            path = Path(frame_path)
+            confidence = 0.92
+            width_scale = 3840 / 1458 if path == high_path else 1
+            height_scale = 2160 / 806 if path == high_path else 1
+            return [
+                VehicleDetection(
+                    class_name="car",
+                    confidence=confidence,
+                    bbox=(
+                        1010 * width_scale,
+                        215 * height_scale,
+                        1395 * width_scale,
+                        355 * height_scale,
+                    ),
+                )
+            ]
+
+    frame_attempt = capture_and_detect_runtime_frame(
+        settings,
+        tmp_path,
+        capture=fake_capture,
+        detector=None,
+        detector_factory=lambda _settings: ProfileAwareDetector(),
+        runtime_state=RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+                "right_spot": SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=12),
+            }
+        ),
+        logger=StructuredLogger(),
+        mode="runtime-loop",
+        iteration=1,
+        periodic_verification_due=True,
+    )
+
+    assert isinstance(frame_attempt, RuntimeFrameDetected)
+    assert capture_profiles == [None, "high_resolution"]
+    assert frame_attempt.primary_capture.latest_path == primary_path
+    assert frame_attempt.capture.latest_path == high_path
+    assert frame_attempt.escalated is True
+
+    health_state = RuntimeLoopHealthState()
+    frame_result = prepare_runtime_frame_loop_result(
+        frame_attempt,
+        health_state=health_state,
+        logger=StructuredLogger(),
+        iteration=1,
+    )
+    assert frame_result.primary_capture.latest_path == primary_path
+    assert frame_result.capture.latest_path == high_path
+    assert frame_result.escalated is True
+
+
+def test_failed_high_resolution_detection_preserves_primary_capture_identity(tmp_path: Path) -> None:
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    primary_path = tmp_path / "latest-primary.jpg"
+    high_path = tmp_path / "latest-high-resolution.jpg"
+
+    def fake_capture(
+        _settings: object,
+        data_dir: str | Path,
+        *,
+        stream_profile: str | None = None,
+    ) -> FrameCaptureResult:
+        profile = stream_profile or "primary"
+        size = (3840, 2160) if profile == "high_resolution" else (1458, 806)
+        latest_path = high_path if profile == "high_resolution" else primary_path
+        Image.new("RGB", size, (20, 30, 40)).save(latest_path, format="JPEG")
+        return FrameCaptureResult(
+            timestamp="2026-05-18T18:00:01Z" if profile == "high_resolution" else "2026-05-18T18:00:00Z",
+            latest_path=latest_path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=0.01,
+            byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile=profile, expected_size=size),
+        )
+
+    class FailingHighDetector:
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            if Path(frame_path) == high_path:
+                raise DetectionError(
+                    "high-resolution detection failed",
+                    model_path="yolov8n.pt",
+                    frame_path=str(frame_path),
+                    phase="predict",
+                    error_type="RuntimeError",
+                )
+            return [VehicleDetection(class_name="car", confidence=0.92, bbox=(1010, 215, 1395, 355))]
+
+    frame_attempt = capture_and_detect_runtime_frame(
+        settings,
+        tmp_path,
+        capture=fake_capture,
+        detector=FailingHighDetector(),
+        detector_factory=lambda _settings: FailingHighDetector(),
+        runtime_state=RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+                "right_spot": SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=12),
+            }
+        ),
+        logger=StructuredLogger(),
+        mode="runtime-loop",
+        iteration=1,
+        periodic_verification_due=True,
+    )
+
+    assert isinstance(frame_attempt, RuntimeFrameDetectionFailed)
+    assert frame_attempt.primary_capture.latest_path == primary_path
+    assert frame_attempt.capture.latest_path == high_path
+
+    health_state = RuntimeLoopHealthState()
+    frame_result = prepare_runtime_frame_loop_result(
+        frame_attempt,
+        health_state=health_state,
+        logger=StructuredLogger(),
+        iteration=1,
+    )
+    assert frame_result.primary_capture.latest_path == primary_path
+    assert frame_result.capture.latest_path == high_path
+    assert health_state.capture_last_success_at == "2026-05-18T18:00:01Z"
+
+
 def test_runtime_loop_failed_escalation_records_capture_success_without_processed_frame(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(Path("config.yaml.example").read_text(encoding="utf-8"), encoding="utf-8")
-    latest_path = tmp_path / "latest.jpg"
+    primary_path = tmp_path / "latest-primary.jpg"
     capture_profiles: list[str | None] = []
 
     def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
@@ -158,13 +328,13 @@ def test_runtime_loop_failed_escalation_records_capture_success_without_processe
                 stderr_tail=f"Traceback raw_image_bytes {SECRET_MARKER}",
                 timeout_seconds=15.0,
             )
-        Image.new("RGB", (1458, 806), (20, 30, 40)).save(latest_path, format="JPEG")
+        Image.new("RGB", (1458, 806), (20, 30, 40)).save(primary_path, format="JPEG")
         return FrameCaptureResult(
             timestamp="2026-05-18T18:00:00Z",
-            latest_path=latest_path,
+            latest_path=primary_path,
             selected_mode=DecodeMode.SOFTWARE,
             duration_seconds=0.01,
-            byte_size=latest_path.stat().st_size,
+            byte_size=primary_path.stat().st_size,
             frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
         )
 
@@ -193,6 +363,7 @@ def test_runtime_loop_failed_escalation_records_capture_success_without_processe
         "selected_decode_mode": "software",
     }
     assert health["last_error"]["phase"] == "capture"
+    assert primary_path.exists()
     assert_no_secret_leak(output + json.dumps(health))
 
 
@@ -254,4 +425,5 @@ def test_runtime_loop_failed_high_resolution_detection_records_high_resolution_c
     }
     assert health["last_error"]["phase"] == "detection"
     assert '"event":"detection-frame-failed"' in output
+    assert primary_path.exists()
     assert_no_secret_leak(output + json.dumps(health))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import StringIO
 from pathlib import Path
 
 import yaml
@@ -44,6 +45,185 @@ def _settings_without_escalation(tmp_path: Path) -> object:
     assert settings.stream.escalation_profile is None
     assert settings.stream.profiles == {}
     return settings
+
+
+def _capture_profiles(
+    tmp_path: Path,
+) -> tuple[list[str | None], object, FrameCaptureResult]:
+    captured_profiles: list[str | None] = []
+
+    def capture(
+        _settings: object,
+        data_dir: str | Path,
+        *,
+        stream_profile: str | None = None,
+    ) -> FrameCaptureResult:
+        captured_profiles.append(stream_profile)
+        profile = stream_profile or "primary"
+        size = (3840, 2160) if profile == "high_resolution" else (1458, 806)
+        latest_path = tmp_path / f"latest-{profile}.jpg"
+        Image.new("RGB", size, (20, 30, 40)).save(latest_path, format="JPEG")
+        return FrameCaptureResult(
+            timestamp="2026-05-18T18:00:01Z" if profile == "high_resolution" else "2026-05-18T18:00:00Z",
+            latest_path=latest_path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=0.01,
+            byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile=profile, expected_size=size),
+        )
+
+    primary = capture(_settings(), tmp_path)
+    return captured_profiles, capture, primary
+
+
+class _RightSpotDetector:
+    def __init__(self, confidence: float) -> None:
+        self.confidence = confidence
+
+    def detect(
+        self,
+        frame_path: str | Path,
+        *,
+        confidence_threshold: float | None = None,
+    ) -> list[VehicleDetection]:
+        with Image.open(frame_path) as image:
+            width_scale = image.width / 1458
+            height_scale = image.height / 806
+        return [
+            VehicleDetection(
+                class_name="car",
+                confidence=self.confidence,
+                bbox=(
+                    1010 * width_scale,
+                    215 * height_scale,
+                    1395 * width_scale,
+                    355 * height_scale,
+                ),
+            )
+        ]
+
+
+def test_weak_candidate_for_stable_occupied_spot_does_not_escalate(tmp_path: Path) -> None:
+    settings = _settings()
+    captured_profiles, capture, primary = _capture_profiles(tmp_path)
+
+    result = detect_with_stream_escalation(
+        settings,
+        tmp_path,
+        capture=capture,
+        detector=_RightSpotDetector(0.50),
+        runtime_state=RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+                "right_spot": SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=12),
+            }
+        ),
+        primary_result=primary,
+        logger=StructuredLogger(),
+        mode="runtime-loop",
+        iteration=1,
+        periodic_verification_due=False,
+    )
+
+    assert captured_profiles == [None]
+    assert result.primary_capture is primary
+    assert result.final_capture is primary
+    assert result.escalated is False
+
+
+def test_weak_candidate_for_empty_spot_escalates_before_confirmation(tmp_path: Path) -> None:
+    settings = _settings()
+    captured_profiles, capture, primary = _capture_profiles(tmp_path)
+
+    result = detect_with_stream_escalation(
+        settings,
+        tmp_path,
+        capture=capture,
+        detector=_RightSpotDetector(0.50),
+        runtime_state=RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+                "right_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+            }
+        ),
+        primary_result=primary,
+        logger=StructuredLogger(),
+        mode="runtime-loop",
+        iteration=1,
+        periodic_verification_due=False,
+    )
+
+    assert captured_profiles == [None, "high_resolution"]
+    assert result.primary_capture is primary
+    assert result.final_capture is not primary
+    assert result.escalated is True
+
+
+def test_periodic_verification_escalates_stable_strong_primary_evidence(tmp_path: Path) -> None:
+    settings = _settings()
+    captured_profiles, capture, primary = _capture_profiles(tmp_path)
+    log_stream = StringIO()
+
+    result = detect_with_stream_escalation(
+        settings,
+        tmp_path,
+        capture=capture,
+        detector=_RightSpotDetector(0.92),
+        runtime_state=RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+                "right_spot": SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=12),
+            }
+        ),
+        primary_result=primary,
+        logger=StructuredLogger(stream=log_stream),
+        mode="runtime-loop",
+        iteration=1,
+        periodic_verification_due=True,
+    )
+
+    assert captured_profiles == [None, "high_resolution"]
+    assert result.primary_capture is primary
+    assert result.escalated is True
+    assert '"reason":"periodic-verification"' in log_stream.getvalue()
+
+
+def test_occupied_spot_near_release_escalates_on_missing_candidate(tmp_path: Path) -> None:
+    settings = _settings()
+    captured_profiles, capture, primary = _capture_profiles(tmp_path)
+
+    class NoDetection:
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    result = detect_with_stream_escalation(
+        settings,
+        tmp_path,
+        capture=capture,
+        detector=NoDetection(),
+        runtime_state=RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+                "right_spot": SpotOccupancyState(
+                    status=OccupancyStatus.OCCUPIED,
+                    miss_streak=settings.occupancy.release_frames - 1,
+                ),
+            }
+        ),
+        primary_result=primary,
+        logger=StructuredLogger(),
+        mode="runtime-loop",
+        iteration=1,
+        periodic_verification_due=False,
+    )
+
+    assert captured_profiles == [None, "high_resolution"]
+    assert result.escalated is True
 
 
 def test_missing_escalation_profile_does_not_recapture_primary_stream(tmp_path: Path) -> None:
@@ -92,7 +272,8 @@ def test_missing_escalation_profile_does_not_recapture_primary_stream(tmp_path: 
 
 def test_escalation_returns_final_frame_for_caller_owned_memory_recording(tmp_path: Path) -> None:
     settings = _settings()
-    latest_path = tmp_path / "latest.jpg"
+    primary_path = tmp_path / "latest-primary.jpg"
+    high_path = tmp_path / "latest-high-resolution.jpg"
     memory_path = tmp_path / "operator-decision-memory.json"
     captured_profiles: list[str | None] = []
 
@@ -100,6 +281,7 @@ def test_escalation_returns_final_frame_for_caller_owned_memory_recording(tmp_pa
         captured_profiles.append(stream_profile)
         profile = stream_profile or "primary"
         size = (3840, 2160) if profile == "high_resolution" else (1458, 806)
+        latest_path = high_path if profile == "high_resolution" else primary_path
         Image.new("RGB", size, (20, 30, 40)).save(latest_path, format="JPEG")
         return FrameCaptureResult(
             timestamp="2026-05-18T18:00:01Z" if profile == "high_resolution" else "2026-05-18T18:00:00Z",
@@ -133,7 +315,7 @@ def test_escalation_returns_final_frame_for_caller_owned_memory_recording(tmp_pa
         runtime_state=RuntimeState(
             state_by_spot={
                 "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
-                "right_spot": SpotOccupancyState(status=OccupancyStatus.OCCUPIED),
+                "right_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
             }
         ),
         primary_result=primary,
@@ -144,7 +326,11 @@ def test_escalation_returns_final_frame_for_caller_owned_memory_recording(tmp_pa
     result = frame_result.final_capture
 
     assert captured_profiles == [None, "high_resolution"]
+    assert frame_result.primary_capture is primary
+    assert frame_result.primary_capture.latest_path == primary_path
     assert result.frame_geometry.stream_profile == "high_resolution"
+    assert result.latest_path == high_path
+    assert frame_result.escalated is True
     assert not memory_path.exists()
 
     record_detection_memory_records(
