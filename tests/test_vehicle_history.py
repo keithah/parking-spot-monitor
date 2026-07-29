@@ -16,6 +16,7 @@ from PIL import Image
 from parking_spot_monitor import vehicle_history_corrections, vehicle_history_storage
 from parking_spot_monitor.logging import setup_logging
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
+from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache
 from parking_spot_monitor.vehicle_history import (
     ArchiveSchemaError,
     ArchiveWriteError,
@@ -132,6 +133,57 @@ def test_start_and_close_session_round_trip_writes_inspectable_json(tmp_path: Pa
     rendered = json.dumps(raw_closed)
     assert "NaN" not in rendered
     assert "Infinity" not in rendered
+
+
+def test_close_session_revision_invalidates_snapshot_taken_before_active_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    active = archive.start_session(occupied_event())
+    cache = OwnerVehicleRuntimeCache(archive.root / "owner-vehicles.json")
+    active_path = archive.active_dir / f"{active.session_id}.json"
+    real_unlink = Path.unlink
+    overlap_snapshots = []
+
+    def snapshot_before_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        if path == active_path:
+            overlap_snapshots.append(cache.snapshot(archive))
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", snapshot_before_unlink)
+
+    archive.close_session(open_event())
+    final_snapshot = cache.snapshot(archive)
+
+    assert [record.session_id for record in overlap_snapshots[0].active_sessions] == [active.session_id]
+    assert final_snapshot.active_sessions == ()
+    assert final_snapshot is not overlap_snapshots[0]
+
+
+def test_close_session_unlink_failure_keeps_active_record_and_does_not_claim_final_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    active = archive.start_session(occupied_event())
+    revision_before_close = archive.mutation_revision()
+    active_path = archive.active_dir / f"{active.session_id}.json"
+    real_unlink = Path.unlink
+
+    def fail_active_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        if path == active_path:
+            raise PermissionError("active unlink denied")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_active_unlink)
+
+    with pytest.raises(ArchiveWriteError):
+        archive.close_session(open_event())
+
+    assert active_path.exists()
+    assert (archive.closed_dir / f"{active.session_id}.json").exists()
+    assert archive.mutation_revision() == revision_before_close + 1
 
 
 def test_resolve_wrong_match_subject_prefers_exact_session_then_latest_spot_session(tmp_path: Path) -> None:

@@ -136,9 +136,7 @@ def test_registry_replacement_during_rebuild_does_not_claim_a_stable_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry_path = tmp_path / "owner-vehicles.json"
-    original_payload = '{"schema_version":1,"owner_vehicles":[]}'
-    registry_path.write_text(original_payload, encoding="utf-8")
-    original_stat = registry_path.stat()
+    write_registry(registry_path)
     archive = FakeArchive()
     cache = OwnerVehicleRuntimeCache(registry_path)
     real_load = runtime_owner_vehicle_cache.load_owner_vehicle_registry
@@ -157,29 +155,34 @@ def test_registry_replacement_during_rebuild_does_not_claim_a_stable_snapshot(
 
     monkeypatch.setattr(runtime_owner_vehicle_cache, "load_owner_vehicle_registry", replace_after_load)
 
-    first = cache.snapshot(archive)
-    registry_path.write_text(original_payload, encoding="utf-8")
-    os.utime(registry_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-    second = cache.snapshot(archive)
+    snapshot = cache.snapshot(archive)
 
-    assert second is not first
+    assert snapshot.registry.owner_for_profile("profile-b") is not None
     assert registry_loads == 2
+    assert archive.active_loads == 2
+    assert cache.snapshot(archive) is snapshot
 
 
 def test_archive_mutation_during_rebuild_is_cached_only_after_a_stable_retry(tmp_path: Path) -> None:
+    stale_session = object()
+    current_session = object()
+
     class MutatingArchive(FakeArchive):
         def __init__(self) -> None:
             super().__init__()
             self.revision_reads = 0
+            self.sessions = [stale_session]
 
         def mutation_revision(self) -> int:
             self.revision_reads += 1
             return self.revision
 
         def load_active_sessions(self) -> list[object]:
-            sessions = super().load_active_sessions()
+            self.active_loads += 1
+            sessions = list(self.sessions)
             if self.active_loads == 1:
                 self.revision += 1
+                self.sessions = [current_session]
             return sessions
 
     registry_path = tmp_path / "owner-vehicles.json"
@@ -187,12 +190,11 @@ def test_archive_mutation_during_rebuild_is_cached_only_after_a_stable_retry(tmp
     archive = MutatingArchive()
     cache = OwnerVehicleRuntimeCache(registry_path)
 
-    first = cache.snapshot(archive)
-    second = cache.snapshot(archive)
-    third = cache.snapshot(archive)
+    snapshot = cache.snapshot(archive)
+    cached = cache.snapshot(archive)
 
-    assert second is not first
-    assert third is second
+    assert snapshot.active_sessions == (current_session,)
+    assert cached is snapshot
     assert archive.active_loads == 2
     assert archive.revision_reads == 5
 
@@ -300,3 +302,37 @@ def test_owner_snapshot_failure_preserves_the_alert_scan_warning(
     assert '"event":"owner-vehicle-alert-scan-failed"' in output
     assert '"action":"load-owner-registry"' in output
     assert "private-value" not in output
+
+
+def test_repeated_snapshot_instability_is_bounded_and_warns_without_alerting(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class AlwaysMutatingArchive(FakeArchive):
+        def load_active_sessions(self) -> list[object]:
+            self.active_loads += 1
+            self.revision += 1
+            return []
+
+    registry_path = tmp_path / "owner-vehicles.json"
+    write_registry(registry_path, "profile-a")
+    archive = AlwaysMutatingArchive()
+    cache = OwnerVehicleRuntimeCache(registry_path)
+
+    alerts = _owner_vehicle_quiet_window_alerts(
+        archive,  # type: ignore[arg-type]
+        quiet_status=QuietWindowStatus(active=True, active_window_id="window-a"),
+        observed_at=datetime(2026, 5, 18, 20, 5, 6, tzinfo=timezone.utc),
+        emitted_alert_ids=set(),
+        configured_spot_ids=("left_spot",),
+        logger=StructuredLogger(),
+        owner_vehicle_cache=cache,
+    )
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert alerts == []
+    assert archive.active_loads == 2
+    assert '"event":"owner-vehicle-alert-scan-failed"' in output
+    assert '"error_type":"OwnerVehicleSnapshotUnstableError"' in output
+    assert '"error_message":"owner vehicle inputs changed during snapshot"' in output

@@ -96,6 +96,7 @@ class VehicleHistorySessionMixin:
         except OSError as exc:
             self._record_failure(phase="active-unlink", path_name=f"{record.session_id}.json", error=exc)
             raise ArchiveWriteError(_safe_error_message(exc)) from exc
+        self._bump_revision()
         self._log("info", "vehicle-session-closed", spot_id=closed.spot_id, session_id=closed.session_id)
         return closed
 
