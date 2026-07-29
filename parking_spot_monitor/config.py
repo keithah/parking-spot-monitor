@@ -94,7 +94,7 @@ class StreamConfig(StrictModel):
     profiles: dict[str, StreamProfileConfig] = Field(default_factory=dict)
     escalation_profile: str | None = None
     escalation_min_confidence: float = Field(default=0.75, ge=0, le=1)
-    escalation_verification_seconds: float = Field(default=600, ge=0)
+    escalation_verification_seconds: float = Field(default=600, ge=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def profile_capture_filenames_must_be_unique(self) -> Self:
@@ -179,9 +179,9 @@ class MatrixConfig(StrictModel):
     user_id: str | None = None
     command_prefix: str = Field(default="!parking", min_length=1, max_length=32)
     command_authorized_senders: list[str] = Field(default_factory=list)
-    timeout_seconds: float = Field(default=10, gt=0)
+    timeout_seconds: float = Field(default=10, gt=0, allow_inf_nan=False)
     retry_attempts: int = Field(default=3, gt=0)
-    retry_backoff_seconds: float = Field(default=1, ge=0)
+    retry_backoff_seconds: float = Field(default=1, ge=0, allow_inf_nan=False)
 
 
 WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
@@ -251,11 +251,24 @@ class RuntimeConfig(StrictModel):
     health_file: Path
     log_level: str = "INFO"
     startup_timeout_seconds: int = Field(default=30, gt=0)
-    frame_interval_seconds: float = Field(default=30, gt=0)
+    frame_interval_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
     adaptive_polling_enabled: bool = True
-    stable_frame_interval_seconds: float = Field(default=60, gt=0)
+    stable_frame_interval_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
     stable_settle_frames: int = Field(default=3, gt=0)
-    debug_overlay_interval_seconds: float = Field(default=60, ge=0)
+    debug_overlay_interval_seconds: float = Field(default=60, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_omitted_stable_interval(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping) or "stable_frame_interval_seconds" in value:
+            return value
+        resolved = dict(value)
+        try:
+            active_interval = float(resolved.get("frame_interval_seconds", 30))
+        except (TypeError, ValueError):
+            return value
+        resolved["stable_frame_interval_seconds"] = max(60.0, active_interval)
+        return resolved
 
     @model_validator(mode="after")
     def stable_interval_not_faster_than_active(self) -> Self:

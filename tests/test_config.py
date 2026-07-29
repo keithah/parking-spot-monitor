@@ -384,6 +384,37 @@ def test_adaptive_runtime_settings_are_configurable_and_summarized(tmp_path: Pat
 
 
 @pytest.mark.parametrize(
+    ("adaptive_polling_line", "expected_adaptive_polling"),
+    [("", True), ("  adaptive_polling_enabled: false\n", False)],
+)
+def test_legacy_runtime_config_omitting_adaptive_intervals_preserves_slower_fixed_cadence(
+    tmp_path: Path,
+    adaptive_polling_line: str,
+    expected_adaptive_polling: bool,
+) -> None:
+    config = (
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("  frame_interval_seconds: 30", "  frame_interval_seconds: 120")
+        .replace("  adaptive_polling_enabled: true\n", adaptive_polling_line)
+        .replace("  stable_frame_interval_seconds: 60\n", "")
+        .replace("  stable_settle_frames: 3\n", "")
+        .replace("  debug_overlay_interval_seconds: 60\n", "")
+        .replace("  escalation_verification_seconds: 600\n", "")
+    )
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(path, environ=fake_environ())
+
+    assert settings.runtime.frame_interval_seconds == 120
+    assert settings.runtime.stable_frame_interval_seconds == 120
+    assert settings.runtime.adaptive_polling_enabled is expected_adaptive_polling
+    assert settings.runtime.stable_settle_frames == 3
+    assert settings.runtime.debug_overlay_interval_seconds == 60
+    assert settings.stream.escalation_verification_seconds == 600
+
+
+@pytest.mark.parametrize(
     ("original", "replacement", "field"),
     [
         ("  debug_overlay_interval_seconds: 60", "  debug_overlay_interval_seconds: -1", "debug_overlay_interval_seconds"),
@@ -416,6 +447,42 @@ def test_runtime_frame_interval_seconds_must_be_positive(tmp_path: Path, bad_val
         load_settings(path, environ=fake_environ())
 
     assert "frame_interval_seconds" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("bad_value", [".nan", ".inf", "-.inf"])
+@pytest.mark.parametrize(
+    ("original", "field"),
+    [
+        ("  frame_interval_seconds: 30", "frame_interval_seconds"),
+        ("  stable_frame_interval_seconds: 60", "stable_frame_interval_seconds"),
+        ("  debug_overlay_interval_seconds: 60", "debug_overlay_interval_seconds"),
+        ("  escalation_verification_seconds: 600", "escalation_verification_seconds"),
+        ("  timeout_seconds: 10", "timeout_seconds"),
+        ("  retry_backoff_seconds: 1", "retry_backoff_seconds"),
+    ],
+)
+def test_configured_timing_intervals_must_be_finite(
+    tmp_path: Path,
+    original: str,
+    field: str,
+    bad_value: str,
+) -> None:
+    indentation = original[: len(original) - len(original.lstrip())]
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        original,
+        f"{indentation}{field}: {bad_value}",
+    )
+    if field == "frame_interval_seconds":
+        config = config.replace(
+            "  stable_frame_interval_seconds: 60",
+            f"  stable_frame_interval_seconds: {bad_value}",
+        )
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert field in str(exc_info.value)
 
 
 def test_missing_env_vars_report_names_only() -> None:

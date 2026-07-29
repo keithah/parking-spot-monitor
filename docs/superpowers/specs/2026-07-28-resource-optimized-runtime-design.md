@@ -43,7 +43,9 @@ stream:
 
 Setting `adaptive_polling_enabled` to `false` restores a fixed interval. Setting `stable_frame_interval_seconds` equal to `frame_interval_seconds` also removes the cadence difference. Setting `debug_overlay_interval_seconds` to `0` disables periodic overlays while retaining event evidence. Setting `escalation_verification_seconds` to `0` disables periodic stable-state verification, but transition-driven escalation remains enabled.
 
-All intervals are positive finite numbers except the two explicitly disableable intervals, which may be zero. `stable_frame_interval_seconds` must be greater than or equal to `frame_interval_seconds`, and `stable_settle_frames` must be a positive integer.
+For backward compatibility, an omitted `stable_frame_interval_seconds` resolves to `max(60, frame_interval_seconds)`; this keeps legacy cadences above 60 seconds valid, including when adaptive polling is disabled. An explicitly configured stable interval must still be greater than or equal to `frame_interval_seconds`.
+
+All intervals are positive finite numbers except the two explicitly disableable intervals, which may be zero. `stable_settle_frames` must be a positive integer.
 
 ## Runtime Resource Policy
 
