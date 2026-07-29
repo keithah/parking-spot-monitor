@@ -97,6 +97,31 @@ def test_example_config_loads_with_fake_env_values() -> None:
     assert settings.stream.escalation_verification_seconds == 600
 
 
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(7681, 100), (100, 7681), (7680, 4321)],
+)
+def test_stream_geometry_rejects_more_than_8k_resource_budget(
+    tmp_path: Path, width: int, height: int
+) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8")
+    config = config.replace("frame_width: 1458", f"frame_width: {width}")
+    config = config.replace("frame_height: 806", f"frame_height: {height}")
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError, match="stream.*resource ceiling"):
+        load_settings(path, environ=fake_environ())
+
+
+def test_named_stream_profile_geometry_rejects_more_than_8k_resource_budget(tmp_path: Path) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8")
+    config = config.replace("frame_width: 3840", "frame_width: 7681")
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError, match="stream.*high_resolution.*resource ceiling"):
+        load_settings(path, environ=fake_environ())
+
+
 def test_stream_profiles_resolve_secret_env_values_and_sanitize_names_only(tmp_path: Path) -> None:
     high_url = f"high-res-camera-{SECRET_MARKER}"
     low_url = f"low-res-camera-{SECRET_MARKER}"

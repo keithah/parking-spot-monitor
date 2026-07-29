@@ -13,6 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, Valid
 
 from parking_spot_monitor.errors import ConfigError
 
+MAX_CAPTURE_DIMENSION = 7_680
+MAX_CAPTURE_PIXELS = 33_177_600
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -72,10 +75,27 @@ class SpotsConfig(StrictModel):
     right_spot: SpotConfig
 
 
-class StreamProfileConfig(StrictModel):
-    rtsp_url: ResolvedSecret
+def _validate_stream_geometry(width: int, height: int) -> None:
+    if (
+        width > MAX_CAPTURE_DIMENSION
+        or height > MAX_CAPTURE_DIMENSION
+        or width * height > MAX_CAPTURE_PIXELS
+    ):
+        raise ValueError("stream geometry exceeds the 8K resource ceiling")
+
+
+class CaptureGeometryConfig(StrictModel):
     frame_width: int = Field(gt=0)
     frame_height: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def capture_geometry_must_fit_resource_budget(self) -> Self:
+        _validate_stream_geometry(self.frame_width, self.frame_height)
+        return self
+
+
+class StreamProfileConfig(CaptureGeometryConfig):
+    rtsp_url: ResolvedSecret
 
 
 @dataclass(frozen=True)
@@ -86,10 +106,8 @@ class ResolvedStreamProfile:
     frame_height: int
 
 
-class StreamConfig(StrictModel):
+class StreamConfig(CaptureGeometryConfig):
     rtsp_url: ResolvedSecret
-    frame_width: int = Field(gt=0)
-    frame_height: int = Field(gt=0)
     reconnect_seconds: int = Field(default=5, gt=0)
     profiles: dict[str, StreamProfileConfig] = Field(default_factory=dict)
     escalation_profile: str | None = None

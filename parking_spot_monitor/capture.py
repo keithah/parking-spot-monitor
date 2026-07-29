@@ -5,6 +5,7 @@ import re
 import subprocess
 import tempfile
 import time
+import warnings
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -12,10 +13,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from PIL import Image
+
 from parking_spot_monitor.config import RuntimeSettings, sanitize_stream_profile_name
 from parking_spot_monitor.logging import StructuredLogger
 
 DEFAULT_CAPTURE_TIMEOUT_SECONDS = 15.0
+MAX_CAPTURE_JPEG_BYTES = 32 * 1024 * 1024
 STDERR_TAIL_CHARS = 2000
 _SECRET_PATTERNS = (
     re.compile(r"(rtsp://)[^\s/@]+:[^\s/@]+@", re.IGNORECASE),
@@ -272,6 +276,7 @@ def capture_latest(
                 mode=mode,
                 secrets=secrets,
                 duration_seconds=duration,
+                expected_size=(selected_profile.frame_width, selected_profile.frame_height),
             )
             try:
                 temp_path.chmod(0o644)
@@ -368,6 +373,7 @@ def _validate_jpeg_output(
     mode: DecodeMode,
     secrets: Iterable[str],
     duration_seconds: float,
+    expected_size: tuple[int, int],
 ) -> int:
     reported_output_path = output_path if failure_output_path is None else failure_output_path
     try:
@@ -390,23 +396,41 @@ def _validate_jpeg_output(
             secrets=secrets,
             duration_seconds=duration_seconds,
         )
-    try:
-        with output_path.open("rb") as handle:
-            prefix = handle.read(2)
-            suffix = b""
-            if byte_size >= 2:
-                handle.seek(-2, 2)
-                suffix = handle.read(2)
-    except OSError as exc:
+    if byte_size > MAX_CAPTURE_JPEG_BYTES:
         raise _failure(
-            "output-missing",
+            "output-too-large",
             mode,
             reported_output_path,
-            f"ffmpeg did not produce readable output: {exc.strerror or type(exc).__name__}",
+            "ffmpeg output exceeds the encoded JPEG resource ceiling",
             secrets=secrets,
             duration_seconds=duration_seconds,
-        ) from exc
-    if not (prefix == b"\xff\xd8" and suffix == b"\xff\xd9"):
+        )
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(output_path) as image:
+                if image.format != "JPEG":
+                    raise _failure(
+                        "output-invalid-jpeg",
+                        mode,
+                        reported_output_path,
+                        "ffmpeg output is not a valid JPEG frame",
+                        secrets=secrets,
+                        duration_seconds=duration_seconds,
+                    )
+                if image.size != expected_size:
+                    raise _failure(
+                        "output-dimensions-mismatch",
+                        mode,
+                        reported_output_path,
+                        "ffmpeg output dimensions do not match the selected stream profile",
+                        secrets=secrets,
+                        duration_seconds=duration_seconds,
+                    )
+                image.verify()
+    except CaptureError:
+        raise
+    except (OSError, SyntaxError, Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
         raise _failure(
             "output-invalid-jpeg",
             mode,
@@ -414,7 +438,7 @@ def _validate_jpeg_output(
             "ffmpeg output is not a valid JPEG frame",
             secrets=secrets,
             duration_seconds=duration_seconds,
-        )
+        ) from exc
     return byte_size
 
 

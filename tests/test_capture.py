@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import subprocess
+import warnings
+from io import BytesIO
 from pathlib import Path
 from typing import Sequence
-from unittest.mock import patch
 
 import pytest
+from PIL import Image
 
+import parking_spot_monitor.capture as capture
 from parking_spot_monitor.capture import (
     DEFAULT_DECODE_MODES,
     CaptureError,
@@ -37,8 +40,10 @@ def fake_settings():
     )
 
 
-def jpeg_bytes() -> bytes:
-    return b"\xff\xd8fake-jpeg-frame\xff\xd9"
+def jpeg_bytes(size: tuple[int, int] = (1458, 806)) -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", size, (20, 30, 40)).save(buffer, "JPEG")
+    return buffer.getvalue()
 
 
 def combined_failure_text(exc: CaptureError) -> str:
@@ -145,13 +150,13 @@ def test_named_profile_publishes_separate_latest_path(tmp_path: Path) -> None:
 
     def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
-        Path(argv[-1]).write_bytes(jpeg_bytes())
+        Path(argv[-1]).write_bytes(jpeg_bytes(size=(3840, 2160)))
         return subprocess.CompletedProcess(argv, 0, stderr="captured high-res frame")
 
     result = capture_latest(settings, tmp_path, stream_profile="high_resolution", modes=[DecodeMode.SOFTWARE], runner=runner)
 
     assert result.latest_path == tmp_path / "latest-high_resolution.jpg"
-    assert result.latest_path.read_bytes() == jpeg_bytes()
+    assert result.latest_path.read_bytes() == jpeg_bytes(size=(3840, 2160))
     assert not (tmp_path / "latest.jpg").exists()
     assert result.frame_geometry == FrameGeometry(stream_profile="high_resolution", expected_size=(3840, 2160))
     assert high_url in calls[0]
@@ -180,13 +185,13 @@ def test_named_profile_sanitizes_published_filename(tmp_path: Path) -> None:
     )
 
     def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
-        Path(argv[-1]).write_bytes(jpeg_bytes())
+        Path(argv[-1]).write_bytes(jpeg_bytes(size=(3840, 2160)))
         return subprocess.CompletedProcess(argv, 0, stderr="captured sanitized profile")
 
     result = capture_latest(settings, tmp_path, stream_profile=profile_name, modes=[DecodeMode.SOFTWARE], runner=runner)
 
     assert result.latest_path == tmp_path / "latest-High-Resolution-4K.jpg"
-    assert result.latest_path.read_bytes() == jpeg_bytes()
+    assert result.latest_path.read_bytes() == jpeg_bytes(size=(3840, 2160))
     assert not (tmp_path / "latest.jpg").exists()
 
 
@@ -206,18 +211,92 @@ def test_invalid_capture_preserves_previous_published_frame(tmp_path: Path) -> N
     assert not list(tmp_path.glob(".latest.*.jpg"))
 
 
-def test_capture_validation_reads_only_jpeg_edges_not_full_payload(tmp_path: Path) -> None:
+def test_capture_rejects_wrong_dimensions_and_preserves_previous_frame(tmp_path: Path) -> None:
     settings = fake_settings()
+    published = tmp_path / "latest.jpg"
+    previous_frame = jpeg_bytes()
+    published.write_bytes(previous_frame)
+
+    def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        Path(argv[-1]).write_bytes(jpeg_bytes(size=(32, 32)))
+        return subprocess.CompletedProcess(argv, 0, stderr="ok")
+
+    with pytest.raises(CaptureError) as raised:
+        capture_latest(settings, tmp_path, modes=[DecodeMode.SOFTWARE], runner=runner)
+
+    assert raised.value.reason == "output-dimensions-mismatch"
+    assert published.read_bytes() == previous_frame
+
+
+def test_capture_rejects_encoded_file_over_32_mib_and_preserves_previous_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(capture, "MAX_CAPTURE_JPEG_BYTES", 64, raising=False)
+    published = tmp_path / "latest.jpg"
+    previous_frame = jpeg_bytes()
+    published.write_bytes(previous_frame)
+
+    def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        Path(argv[-1]).write_bytes(jpeg_bytes())
+        return subprocess.CompletedProcess(argv, 0, stderr="ok")
+
+    with pytest.raises(CaptureError) as raised:
+        capture_latest(fake_settings(), tmp_path, modes=[DecodeMode.SOFTWARE], runner=runner)
+
+    assert raised.value.reason == "output-too-large"
+    assert published.read_bytes() == previous_frame
+
+
+def test_capture_rejects_marker_wrapped_non_image_and_preserves_previous_frame(tmp_path: Path) -> None:
     payload = b"\xff\xd8" + (b"x" * 1024) + b"\xff\xd9"
+    published = tmp_path / "latest.jpg"
+    previous_frame = jpeg_bytes()
+    published.write_bytes(previous_frame)
 
     def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
         Path(argv[-1]).write_bytes(payload)
         return subprocess.CompletedProcess(argv, 0, stderr="captured frame")
 
-    with patch.object(Path, "read_bytes", side_effect=AssertionError("capture validation should not read entire JPEG")):
-        result = capture_latest(settings, tmp_path, modes=[DecodeMode.SOFTWARE], runner=runner)
+    with pytest.raises(CaptureError) as raised:
+        capture_latest(fake_settings(), tmp_path, modes=[DecodeMode.SOFTWARE], runner=runner)
 
-    assert result.byte_size == len(payload)
+    assert raised.value.reason == "output-invalid-jpeg"
+    assert published.read_bytes() == previous_frame
+
+
+def test_capture_rejects_decompression_bomb_warning_and_preserves_previous_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1_000_000)
+    published = tmp_path / "latest.jpg"
+    previous_frame = jpeg_bytes()
+    published.write_bytes(previous_frame)
+
+    def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        Path(argv[-1]).write_bytes(jpeg_bytes())
+        return subprocess.CompletedProcess(argv, 0, stderr="captured frame")
+
+    with pytest.raises(CaptureError) as raised:
+        capture_latest(fake_settings(), tmp_path, modes=[DecodeMode.SOFTWARE], runner=runner)
+
+    assert raised.value.reason == "output-invalid-jpeg"
+    assert published.read_bytes() == previous_frame
+
+
+def test_capture_decompression_bomb_handling_does_not_change_global_warning_filters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1_000_000)
+    filters_before = list(warnings.filters)
+
+    def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        Path(argv[-1]).write_bytes(jpeg_bytes())
+        return subprocess.CompletedProcess(argv, 0, stderr="captured frame")
+
+    with pytest.raises(CaptureError):
+        capture_latest(fake_settings(), tmp_path, modes=[DecodeMode.SOFTWARE], runner=runner)
+
+    assert warnings.filters == filters_before
 
 
 def test_capture_latest_falls_back_from_hardware_failures_to_software_success(tmp_path: Path) -> None:
