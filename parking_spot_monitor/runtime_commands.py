@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -8,6 +7,7 @@ from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_dispatch import append_matrix_event_memory
 from parking_spot_monitor.runtime_decision_memory import _append_decision_memory
 from parking_spot_monitor.runtime_health import safe_error_context as _safe_error_context
+from parking_spot_monitor.runtime_matrix_commands import RuntimeMatrixCommandPollOutcome
 
 
 class RuntimeMatrixCommandPollResult(Protocol):
@@ -19,12 +19,6 @@ class RuntimeMatrixCommandPollResult(Protocol):
 
 class RuntimeMatrixCommandService(Protocol):
     def poll_once(self) -> RuntimeMatrixCommandPollResult: ...
-
-
-@dataclass(frozen=True, slots=True)
-class RuntimeMatrixCommandPollOutcome:
-    transport_failed: bool = False
-    health_error: dict[str, Any] | None = None
 
 
 def _poll_matrix_commands_once(
@@ -46,12 +40,7 @@ def _poll_matrix_commands_once(
         result = matrix_command_service.poll_once()
     except Exception as exc:
         context = _safe_error_context(
-            "matrix-command",
-            exc,
-            extra={
-                "action": "matrix-command",
-                "iteration": iteration,
-            },
+            "matrix-command", exc, extra={"action": "matrix-command", "iteration": iteration}
         )
         logger.warning("matrix-command-poll-failed", **context)
         append_matrix_event_memory(
@@ -62,10 +51,7 @@ def _poll_matrix_commands_once(
             error_type=context.get("error_type"),
             logger=logger,
         )
-        return RuntimeMatrixCommandPollOutcome(
-            transport_failed=True,
-            health_error=context,
-        )
+        return RuntimeMatrixCommandPollOutcome(transport_failed=True, health_error=context)
     processed_count = getattr(result, "processed_count", None)
     ignored_count = getattr(result, "ignored_count", None)
     error_count = getattr(result, "error_count", None)

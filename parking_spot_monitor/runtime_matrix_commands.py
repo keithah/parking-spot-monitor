@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import isfinite
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,12 @@ class MatrixCommandPollState:
     last_attempt_at: float | None = None
     failure_count: int = 0
     retry_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeMatrixCommandPollOutcome:
+    transport_failed: bool = False
+    health_error: dict[str, Any] | None = None
 
 
 def command_poll_due(

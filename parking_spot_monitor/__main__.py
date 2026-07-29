@@ -33,6 +33,7 @@ from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as 
 from parking_spot_monitor.runtime_decision_memory import _append_lab_outcome_memory
 from parking_spot_monitor.runtime_detection import _process_detection_for_capture
 from parking_spot_monitor.runtime_overlay import _write_debug_overlay, write_overlay_for_capture
+from parking_spot_monitor.runtime_snapshot_retention import startup_retryable_retained_snapshots
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
 DEFAULT_CONFIG_PATH = "/config/config.yaml"
@@ -140,7 +141,7 @@ def _main(
         logger.info("startup-ready", config_path=config_path, data_dir=str(paths.data_dir), mode="validate-config")
         return 0
 
-    protected_snapshots = _startup_retryable_retained_snapshots(
+    protected_snapshots = startup_retryable_retained_snapshots(
         paths.matrix_outbox_file,
         logger=logger,
     )
@@ -254,31 +255,6 @@ def _close_if_available(resource: Any | None) -> None:
     close = getattr(resource, "close", None)
     if callable(close):
         close()
-
-
-def _startup_retryable_retained_snapshots(
-    outbox_path: Path,
-    *,
-    logger: StructuredLogger,
-) -> tuple[Path, ...] | None:
-    try:
-        records = LocalOutbox(outbox_path).list_records()
-    except Exception as exc:
-        logger.warning(
-            "startup-outbox-snapshot-protection-failed",
-            phase="startup-retention",
-            action="load-outbox",
-            error_type=type(exc).__name__,
-        )
-        return None
-    protected: list[Path] = []
-    for record in records:
-        if record.state not in {"pending", "retrying"}:
-            continue
-        retained = record.intent.metadata.get("retained_snapshot_path")
-        if isinstance(retained, str) and retained.strip():
-            protected.append(Path(retained))
-    return tuple(protected)
 
 
 def _default_detector_factory(settings: RuntimeSettings) -> UltralyticsVehicleDetector:
