@@ -714,10 +714,13 @@ The publication boundary matches `.gitignore`: raw snapshots, logs, health/state
 
 Honest limitation: the committed example labels and proposed config prove the workflow and report contract only. They do not prove real-world detector accuracy, live Matrix behavior, or production tuning quality. Private operator-labeled calibration cases from real captures are required before S08 or later work can claim tuned live alert behavior. Keep those private labels, bundle manifests, frames, overlays, and raw logs local unless they have been explicitly reviewed and redacted.
 
-A successful capture writes two files in the data directory:
+Every successful primary capture publishes `latest.jpg` in the data directory.
+`--capture-once` also refreshes `debug_latest.jpg`. In the runtime loop,
+`debug_latest.jpg` is cadence-limited: it is refreshed only when
+`runtime.debug_overlay_interval_seconds` is due or a state transition forces an overlay.
 
 - `latest.jpg` is the raw full-frame camera evidence. Keep it unannotated; later Matrix alert slices must send raw snapshots rather than polygon overlays (D008).
-- `debug_latest.jpg` is a local-only tuning artifact with the configured `left_spot` and `right_spot` street polygons drawn over the latest frame. Use it to verify the monitored street regions exclude the driveway car, but do not treat it as alert evidence.
+- `debug_latest.jpg` is a local-only tuning artifact with the configured `left_spot` and `right_spot` street polygons drawn over the primary frame. Use it to verify the monitored street regions exclude the driveway car, but do not treat it as alert evidence or assume its modification time matches every successful capture.
 
 After a successful primary capture, the service runs local vehicle detection against the raw primary `latest.jpg` frame. The runtime loop may then replace that iteration's detection result with a separately published high-resolution verification result when transition evidence or the periodic deadline requires escalation; routine timeline and overlay artifacts still use the primary frame. Each processed result emits one aggregate `detection-frame-processed` JSON-line event. The event includes the configured thresholds, spot IDs, total detections, accepted candidate summaries, and rejection reason counts; it does not overwrite raw frame artifacts or log image bytes. In `--capture-once`, detector/model failures emit `detection-frame-failed` and return non-zero. In the runtime loop, per-frame detector failures emit `detection-frame-failed` and the loop continues so inference failures are not misrepresented as empty candidate sets.
 

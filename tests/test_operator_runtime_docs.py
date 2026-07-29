@@ -26,19 +26,51 @@ def test_first_check_artifact_guidance_and_structured_events_are_documented() ->
     assert "startup-ready" in readme or "capture-frame-written" in readme
 
 
-def test_readme_documents_adaptive_resource_controls_and_primary_artifacts() -> None:
-    readme = read_tracked("README.md")
+def test_readme_local_configuration_documents_adaptive_resource_semantics() -> None:
+    section = read_readme_section("Local configuration")
+    normalized = " ".join(section.split())
 
-    for key in (
-        "adaptive_polling_enabled",
-        "stable_frame_interval_seconds",
-        "stable_settle_frames",
-        "debug_overlay_interval_seconds",
-        "escalation_verification_seconds",
-    ):
-        assert key in readme
-    assert "fixed cadence" in readme.lower()
-    assert "primary" in readme.lower()
+    assert_contains_all(
+        normalized,
+        [
+            "frame_interval_seconds: 30",
+            "adaptive_polling_enabled: true",
+            "stable_frame_interval_seconds: 60",
+            "stable_settle_frames: 3",
+            "debug_overlay_interval_seconds: 60",
+            "escalation_verification_seconds: 600",
+            "consecutive successful stable frames (default `3`)",
+            "`adaptive_polling_enabled: false`",
+            "`stable_frame_interval_seconds` equal to `frame_interval_seconds`",
+            "second fixed-cadence rollback",
+            "`debug_overlay_interval_seconds: 0` to disable periodic debug overlays",
+            "transition-driven overlays remain enabled",
+            "`escalation_verification_seconds: 0` to disable periodic high-resolution verification",
+            "transition-driven escalation remains enabled",
+            "`latest-high_resolution.jpg`",
+            "authoritative frame for that iteration's detection, state transition, and event snapshot",
+            "Escalation is transition-driven for weak evidence that could change occupancy and is also "
+            "periodic after state has settled",
+            "A successful transition-driven verification resets that periodic deadline",
+            "primary frames own routine timeline retention and debug overlays",
+        ],
+    )
+
+
+def test_readme_distinguishes_primary_publication_from_cadence_limited_runtime_overlays() -> None:
+    readme = read_tracked("README.md")
+    normalized = " ".join(readme.split())
+
+    assert_contains_all(
+        normalized,
+        [
+            "Every successful primary capture publishes `latest.jpg` in the data directory.",
+            "`--capture-once` also refreshes `debug_latest.jpg`.",
+            "In the runtime loop, `debug_latest.jpg` is cadence-limited: it is refreshed only when "
+            "`runtime.debug_overlay_interval_seconds` is due or a state transition forces an overlay.",
+        ],
+    )
+    assert "A successful capture writes two files in the data directory" not in readme
 
 def test_readme_troubleshooting_covers_s04_failure_classes_with_evidence_surfaces() -> None:
     section = read_readme_section("Troubleshooting and cleanup runbook")
