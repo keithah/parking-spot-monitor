@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from parking_spot_monitor import tuning
 from parking_spot_monitor.config import OccupancyConfig
 from parking_spot_monitor.replay import (
     ExpectedPresence,
@@ -78,6 +81,91 @@ def test_improved_proposed_config_applies_shared_tuning_and_serializes_report() 
     assert "# Tuning Comparison Report" in markdown
     assert "Decision: **apply_shared_tuning**" in markdown
     assert "False negatives: -1" in markdown
+
+
+def test_rendering_tuning_report_preserves_nested_input_and_exact_markdown() -> None:
+    report = build_tuning_comparison_report(
+        manifest(
+            ReplayFrame(
+                frame_id="low-confidence-occupied",
+                expected={"left_spot": ExpectedPresence.OCCUPIED, "right_spot": ExpectedPresence.EMPTY},
+                detections=[detection((10, 10, 90, 90), confidence=0.42)],
+            ),
+            ReplayFrame(
+                frame_id="empty-frame",
+                expected={"left_spot": ExpectedPresence.EMPTY, "right_spot": ExpectedPresence.EMPTY},
+                detections=[],
+            ),
+        ),
+        baseline_config=replay_config(confidence_threshold=0.55),
+        proposed_config=replay_config(confidence_threshold=0.35),
+        created_at="2026-05-10T00:00:00Z",
+    )
+    before = copy.deepcopy(report)
+
+    markdown = render_tuning_report_markdown(report)
+
+    assert report == before
+    assert json.loads(json.dumps(report)) == before
+    assert markdown == (
+        "# Tuning Comparison Report\n"
+        "\n"
+        "## Decision\n"
+        "- Decision: **apply_shared_tuning**\n"
+        "- Rationale: proposed shared thresholds reduce false-positive/false-negative evidence without new safety regressions\n"
+        "- Schema version: `parking-spot-monitor.tuning-report.v1`\n"
+        "- Case IDs: `case-1`\n"
+        "\n"
+        "## Thresholds Compared\n"
+        '- Baseline: `{"allowed_classes":["car","truck"],"confidence_threshold":0.55,"min_bbox_area_px":100.0,"min_polygon_overlap_ratio":0.5,"occupancy":{"confirm_frames":2,"iou_threshold":0.7,"release_frames":2}}`\n'
+        '- Proposed: `{"allowed_classes":["car","truck"],"confidence_threshold":0.35,"min_bbox_area_px":100.0,"min_polygon_overlap_ratio":0.5,"occupancy":{"confirm_frames":2,"iou_threshold":0.7,"release_frames":2}}`\n'
+        "\n"
+        "## Metric Deltas\n"
+        "Deltas are proposed minus baseline; negative FP/FN values are improvements.\n"
+        "- True positives: 1\n"
+        "- True negatives: 0\n"
+        "- False positives: 0\n"
+        "- False negatives: -1\n"
+        "\n"
+        "| Spot | TP | TN | FP | FN | Blocked | Not covered |\n"
+        "|---|---:|---:|---:|---:|---:|---:|\n"
+        "| `left_spot` | 1 | 0 | 0 | -1 | 0 | 0 |\n"
+        "| `right_spot` | 0 | 0 | 0 | 0 | 0 | 0 |\n"
+        "\n"
+        "## Event Deltas\n"
+        "- Baseline findings: 0\n"
+        "- Proposed findings: 0\n"
+        "- Added findings: 0\n"
+        "- Removed findings: 0\n"
+        "\n"
+        "## Coverage and Safety\n"
+        '- Status counts: `{"baseline":{"blocked":0,"failed":1,"not_covered":0,"passed":0},"proposed":{"blocked":0,"failed":0,"not_covered":0,"passed":1}}`\n'
+        "- Blocked reasons: None\n"
+        "- Not-covered reasons: None\n"
+        "- Redaction passed: True\n"
+        "- Redaction findings: None\n"
+    )
+
+
+def test_tuning_builder_and_renderer_do_not_decode_reports_from_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbid_json_decode(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("tuning reports must not be copied through JSON decoding")
+
+    monkeypatch.setattr(tuning, "json", SimpleNamespace(dumps=json.dumps, loads=forbid_json_decode))
+
+    report = build_tuning_comparison_report(
+        manifest(
+            ReplayFrame(
+                frame_id="empty-frame",
+                expected={"left_spot": ExpectedPresence.EMPTY, "right_spot": ExpectedPresence.EMPTY},
+                detections=[],
+            )
+        ),
+        baseline_config=replay_config(),
+        proposed_config=replay_config(),
+    )
+
+    assert render_tuning_report_markdown(report).startswith("# Tuning Comparison Report\n")
 
 
 def test_regressing_proposed_config_keeps_shared_thresholds_with_visible_deltas() -> None:

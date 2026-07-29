@@ -83,31 +83,30 @@ def build_tuning_comparison_report(
     if report["redaction_scan"]["passed"] is False:
         report["decision"] = TuningDecision.BLOCKED.value
         report["decision_rationale"] = "redaction findings prevent safe publication of tuning evidence"
-    return _json_round_trip(report)
+    return report
 
 
 def render_tuning_report_markdown(report: Mapping[str, Any]) -> str:
     """Render a publication-safe Markdown tuning report from report data."""
 
-    jsonable = _json_round_trip(report)
-    redaction = jsonable.get("redaction_scan", {}) or {}
+    redaction = report.get("redaction_scan", {}) or {}
     if redaction.get("passed") is False:
         raise ReplayReportError("rendered Markdown contains unsafe content", path=",".join(redaction.get("findings", [])))
 
-    metric_totals = jsonable.get("metric_deltas", {}).get("totals", {})
-    event_deltas = jsonable.get("event_deltas", {}) or {}
+    metric_totals = report.get("metric_deltas", {}).get("totals", {})
+    event_deltas = report.get("event_deltas", {}) or {}
     lines = [
         "# Tuning Comparison Report",
         "",
         "## Decision",
-        f"- Decision: **{jsonable.get('decision', 'unknown')}**",
-        f"- Rationale: {jsonable.get('decision_rationale', 'no rationale')}",
-        f"- Schema version: `{jsonable.get('schema_version', 'unknown')}`",
-        f"- Case IDs: {_comma_list(jsonable.get('case_ids', []))}",
+        f"- Decision: **{report.get('decision', 'unknown')}**",
+        f"- Rationale: {report.get('decision_rationale', 'no rationale')}",
+        f"- Schema version: `{report.get('schema_version', 'unknown')}`",
+        f"- Case IDs: {_comma_list(report.get('case_ids', []))}",
         "",
         "## Thresholds Compared",
-        f"- Baseline: `{_inline_json(jsonable.get('baseline_thresholds', {}))}`",
-        f"- Proposed: `{_inline_json(jsonable.get('proposed_thresholds', {}))}`",
+        f"- Baseline: `{_inline_json(report.get('baseline_thresholds', {}))}`",
+        f"- Proposed: `{_inline_json(report.get('proposed_thresholds', {}))}`",
         "",
         "## Metric Deltas",
         "Deltas are proposed minus baseline; negative FP/FN values are improvements.",
@@ -119,7 +118,7 @@ def render_tuning_report_markdown(report: Mapping[str, Any]) -> str:
         "| Spot | TP | TN | FP | FN | Blocked | Not covered |",
         "|---|---:|---:|---:|---:|---:|---:|",
     ]
-    for spot_id, metric in sorted((jsonable.get("metric_deltas", {}).get("by_spot", {}) or {}).items()):
+    for spot_id, metric in sorted((report.get("metric_deltas", {}).get("by_spot", {}) or {}).items()):
         lines.append(
             f"| `{spot_id}` | {metric.get('tp', 0)} | {metric.get('tn', 0)} | {metric.get('fp', 0)} | {metric.get('fn', 0)} | {metric.get('blocked', 0)} | {metric.get('not_assessed', 0)} |"
         )
@@ -134,9 +133,9 @@ def render_tuning_report_markdown(report: Mapping[str, Any]) -> str:
             f"- Removed findings: {len(event_deltas.get('removed', []))}",
             "",
             "## Coverage and Safety",
-            f"- Status counts: `{_inline_json(jsonable.get('status_counts', {}))}`",
-            f"- Blocked reasons: {_comma_list(jsonable.get('blocked_reasons', []))}",
-            f"- Not-covered reasons: {_comma_list(jsonable.get('not_covered_reasons', []))}",
+            f"- Status counts: `{_inline_json(report.get('status_counts', {}))}`",
+            f"- Blocked reasons: {_comma_list(report.get('blocked_reasons', []))}",
+            f"- Not-covered reasons: {_comma_list(report.get('not_covered_reasons', []))}",
             f"- Redaction passed: {redaction.get('passed', False)}",
             f"- Redaction findings: {_comma_list(redaction.get('findings', []))}",
         ]
@@ -288,10 +287,6 @@ def _has_spot_divergent_errors(metrics: Any) -> bool:
         if errors:
             error_spots.append(spot_id)
     return bool(error_spots) and len(error_spots) < len(covered_spots)
-
-
-def _json_round_trip(value: Any) -> dict[str, Any]:
-    return json.loads(json.dumps(value, sort_keys=True))
 
 
 def _inline_json(value: Any) -> str:
