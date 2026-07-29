@@ -941,6 +941,29 @@ def test_matrix_snapshot_resize_translates_pillow_open_failure_safely(
     assert "pillow-secret" not in str(exc_info.value) + repr(exc_info.value.diagnostics)
 
 
+def test_matrix_snapshot_resize_translates_decompression_bomb_warning_safely(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "decompression-bomb.jpg"
+
+    def raise_filtered_warning(_path: Path) -> Image.Image:
+        raise Image.DecompressionBombWarning("access_token=warning-secret")
+
+    monkeypatch.setattr(matrix_snapshots.Image, "open", raise_filtered_warning)
+
+    with pytest.raises(MatrixError) as exc_info:
+        matrix_snapshots._resize_jpeg_for_matrix_upload(source)
+
+    assert str(exc_info.value) == "Matrix snapshot could not be resized under upload budget"
+    assert exc_info.value.diagnostics == {
+        "error_type": "snapshot_resize_failed",
+        "snapshot_path": str(source),
+    }
+    assert exc_info.value.__cause__ is None
+    assert "warning-secret" not in str(exc_info.value) + repr(exc_info.value.diagnostics)
+
+
 def test_matrix_snapshot_upload_under_budget_returns_raw_bytes_without_encoding(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

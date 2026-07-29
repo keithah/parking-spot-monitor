@@ -122,7 +122,7 @@ def _resize_jpeg_for_matrix_upload_result(path: Path) -> _MatrixSnapshotResize:
             )
         finally:
             image.close()
-    except (ImageBudgetError, OSError, UnidentifiedImageError, Image.DecompressionBombError):
+    except (ImageBudgetError, OSError, UnidentifiedImageError, Image.DecompressionBombError, Image.DecompressionBombWarning):
         raise MatrixError(
             "Matrix snapshot could not be resized under upload budget",
             error_type="snapshot_resize_failed",
