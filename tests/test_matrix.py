@@ -816,6 +816,52 @@ def test_matrix_snapshot_resize_translates_shared_encoder_failure_without_leakin
         opened[0].getpixel((0, 0))
 
 
+def test_matrix_snapshot_resize_does_not_translate_unexpected_encoder_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "large.jpg"
+    Image.new("RGB", (1280, 720)).save(source, "JPEG")
+    unexpected = AssertionError("encoder invariant failed")
+
+    def fail_unexpectedly(image: Image.Image, **kwargs: object) -> JpegBudgetResult:
+        raise unexpected
+
+    monkeypatch.setattr(matrix_snapshots, "encode_jpeg_under_budget", fail_unexpectedly)
+
+    with pytest.raises(AssertionError) as exc_info:
+        matrix_snapshots._resize_jpeg_for_matrix_upload(source)
+
+    assert exc_info.value is unexpected
+    assert exc_info.traceback[-1].name == "fail_unexpectedly"
+
+
+def test_matrix_snapshot_resize_rejects_invalid_dimensions_with_safe_matrix_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class InvalidImage:
+        size = (0, 720)
+
+        def close(self) -> None:
+            events.append("source-close")
+
+    source = tmp_path / "invalid-dimensions.jpg"
+    monkeypatch.setattr(matrix_snapshots.Image, "open", lambda _path: InvalidImage())
+
+    with pytest.raises(MatrixError) as exc_info:
+        matrix_snapshots._resize_jpeg_for_matrix_upload(source)
+
+    assert str(exc_info.value) == "Matrix snapshot dimensions are invalid"
+    assert exc_info.value.diagnostics == {
+        "error_type": "snapshot_resize_failed",
+        "snapshot_path": str(source),
+    }
+    assert events == ["source-close"]
+
+
 def test_matrix_snapshot_resize_converts_non_rgb_once_and_closes_both_images(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

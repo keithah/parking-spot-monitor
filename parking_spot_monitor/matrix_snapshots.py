@@ -12,7 +12,7 @@ from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
-from parking_spot_monitor.image_budget import JpegBudgetResult, encode_jpeg_under_budget
+from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult, encode_jpeg_under_budget
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
 from parking_spot_monitor.matrix_support import MatrixError, _require_non_empty, _sanitize_diagnostics
 from parking_spot_monitor.matrix_time import format_observed_at
@@ -87,7 +87,7 @@ def _resize_jpeg_for_matrix_upload_result(path: Path) -> _MatrixSnapshotResize:
         try:
             width, height = image.size
             if width <= 0 or height <= 0:
-                raise ValueError("invalid image dimensions")
+                raise MatrixError("Matrix snapshot dimensions are invalid", error_type="snapshot_resize_failed", snapshot_path=str(path))
 
             bounded_dimension = min(max(width, height), MATRIX_UPLOAD_INITIAL_MAX_DIMENSION)
             if width >= height:
@@ -122,7 +122,7 @@ def _resize_jpeg_for_matrix_upload_result(path: Path) -> _MatrixSnapshotResize:
             )
         finally:
             image.close()
-    except Exception:
+    except (ImageBudgetError, OSError, UnidentifiedImageError, Image.DecompressionBombError):
         raise MatrixError(
             "Matrix snapshot could not be resized under upload budget",
             error_type="snapshot_resize_failed",
