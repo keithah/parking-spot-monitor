@@ -264,6 +264,23 @@ def test_capture_rejects_marker_wrapped_non_image_and_preserves_previous_frame(t
     assert published.read_bytes() == previous_frame
 
 
+def test_capture_rejects_truncated_jpeg_and_preserves_previous_frame(tmp_path: Path) -> None:
+    published = tmp_path / "latest.jpg"
+    previous_frame = jpeg_bytes()
+    published.write_bytes(previous_frame)
+
+    def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        Path(argv[-1]).write_bytes(jpeg_bytes()[:-2])
+        return subprocess.CompletedProcess(argv, 0, stderr="captured truncated frame")
+
+    with pytest.raises(CaptureError) as raised:
+        capture_latest(fake_settings(), tmp_path, modes=[DecodeMode.SOFTWARE], runner=runner)
+
+    assert raised.value.reason == "output-invalid-jpeg"
+    assert published.read_bytes() == previous_frame
+    assert not list(tmp_path.glob(".latest.*.jpg"))
+
+
 def test_capture_rejects_decompression_bomb_warning_and_preserves_previous_frame(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

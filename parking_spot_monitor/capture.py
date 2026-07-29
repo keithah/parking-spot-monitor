@@ -428,6 +428,8 @@ def _validate_jpeg_output(
                         duration_seconds=duration_seconds,
                     )
                 image.verify()
+            with Image.open(output_path) as decoded_image:
+                decoded_image.load()
     except CaptureError:
         raise
     except (OSError, SyntaxError, Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
