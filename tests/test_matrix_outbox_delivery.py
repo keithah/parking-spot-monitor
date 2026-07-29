@@ -11,8 +11,10 @@ from typing import Any
 import pytest
 from PIL import Image
 
+import parking_spot_monitor.matrix_snapshots as matrix_snapshots
 from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery, MatrixOutboxDrainResult
 from parking_monitor.outbox import LocalOutbox
+from parking_spot_monitor.image_budget import JpegBudgetResult
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix import MatrixError
 
@@ -158,6 +160,42 @@ def test_occupied_alert_drains_as_single_image_message_with_alert_body(tmp_path:
     assert image_call["body"].startswith("Raw full-frame snapshot for left_spot")
     [persisted] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
     assert persisted.phase_states == {"text": "delivered", "upload": "delivered", "image": "delivered"}
+
+
+def test_oversized_outbox_snapshot_preserves_upload_and_persisted_info_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "latest.jpg"
+    Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
+    assert source.stat().st_size > matrix_snapshots.MAX_MATRIX_UPLOAD_IMAGE_BYTES
+    monkeypatch.setattr(
+        matrix_snapshots,
+        "encode_jpeg_under_budget",
+        lambda image, **kwargs: JpegBudgetResult(b"jpeg", 640, 360, 65, 6),
+    )
+    client = FakeMatrixClient()
+
+    result = make_delivery(tmp_path, client).send_open_spot_alert(open_event(source))
+
+    assert result.delivered_count == 1
+    assert [call["kind"] for call in client.calls] == ["text", "upload", "image"]
+    assert client.calls[0]["body"] == "Parking spot open: left_spot at 2026-05-18 1:01:02 PM PDT"
+    assert client.calls[1] == {
+        "kind": "upload",
+        "filename": "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg",
+        "data": b"jpeg",
+        "content_type": "image/jpeg",
+    }
+    assert client.calls[2]["body"] == "Raw full-frame snapshot for left_spot at 2026-05-18T20:01:02+00:00"
+    assert client.calls[2]["info"] == {"mimetype": "image/jpeg", "size": 4, "w": 640, "h": 360}
+    [persisted] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
+    assert persisted.phase_results["upload"] == {
+        "content_uri": "mxc://example.org/open",
+        "filename": "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg",
+        "body": "Raw full-frame snapshot for left_spot at 2026-05-18T20:01:02+00:00",
+        "info": {"mimetype": "image/jpeg", "size": 4, "w": 640, "h": 360},
+    }
 
 
 def test_matrix_outbox_delivery_close_closes_owned_client(tmp_path: Path) -> None:

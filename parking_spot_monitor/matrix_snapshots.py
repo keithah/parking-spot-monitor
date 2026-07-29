@@ -7,12 +7,12 @@ import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
+from parking_spot_monitor.image_budget import JpegBudgetResult, encode_jpeg_under_budget
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
 from parking_spot_monitor.matrix_support import MatrixError, _require_non_empty, _sanitize_diagnostics
 from parking_spot_monitor.matrix_time import format_observed_at
@@ -44,6 +44,13 @@ class SnapshotRetentionResult:
     retained_count: int = 0
     failed_count: int = 0
 
+
+@dataclass(frozen=True, slots=True)
+class _MatrixSnapshotResize:
+    result: JpegBudgetResult
+    info: dict[str, int | str]
+
+
 def _matrix_snapshot_upload(
     snapshot: MatrixSnapshot,
     *,
@@ -54,47 +61,73 @@ def _matrix_snapshot_upload(
         raw = snapshot.path.read_bytes()
         return {"data": raw, "info": dict(snapshot.info)}
 
-    data, info = _resize_jpeg_for_matrix_upload(snapshot.path)
+    resized = _resize_jpeg_for_matrix_upload_result(snapshot.path)
     if logger is not None:
         logger.info(
             "matrix-snapshot-upload-resized",
             snapshot_path=str(snapshot.path),
             source_size=source_size,
-            upload_size=info["size"],
-            width=info["w"],
-            height=info["h"],
+            upload_size=resized.info["size"],
+            width=resized.info["w"],
+            height=resized.info["h"],
+            quality=resized.result.quality,
+            attempts=resized.result.attempts,
         )
-    return {"data": data, "info": info}
+    return {"data": resized.result.data, "info": resized.info}
 
 
 def _resize_jpeg_for_matrix_upload(path: Path) -> tuple[bytes, dict[str, int | str]]:
-    with Image.open(path) as image:
-        width, height = image.size
-        if width <= 0 or height <= 0:
-            raise MatrixError("Matrix snapshot dimensions are invalid", error_type="snapshot_resize_failed", snapshot_path=str(path))
-
-        max_dimension = min(max(width, height), MATRIX_UPLOAD_INITIAL_MAX_DIMENSION)
-        resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
-        working = image.convert("RGB") if image.mode != "RGB" else image.copy()
-        first_attempt = True
-        while first_attempt or max_dimension >= MATRIX_UPLOAD_MIN_DIMENSION:
-            first_attempt = False
-            target_width, target_height = _bounded_dimensions(width, height, max_dimension)
-            resized = working.resize((target_width, target_height), resampling)
-            for quality in MATRIX_UPLOAD_JPEG_QUALITIES:
-                buffer = BytesIO()
-                resized.save(buffer, format="JPEG", quality=quality, optimize=True)
-                if buffer.tell() <= MAX_MATRIX_UPLOAD_IMAGE_BYTES:
-                    data = bytes(buffer.getbuffer())
-                    output_width, output_height = resized.size
-                    return data, {"mimetype": JPEG_MIMETYPE, "size": len(data), "w": output_width, "h": output_height}
-            max_dimension = int(max_dimension * 0.85)
-    raise MatrixError("Matrix snapshot could not be resized under upload budget", error_type="snapshot_resize_failed", snapshot_path=str(path))
+    resized = _resize_jpeg_for_matrix_upload_result(path)
+    return resized.result.data, resized.info
 
 
-def _bounded_dimensions(width: int, height: int, max_dimension: int) -> tuple[int, int]:
-    scale = min(1.0, max_dimension / max(width, height))
-    return max(1, int(width * scale)), max(1, int(height * scale))
+def _resize_jpeg_for_matrix_upload_result(path: Path) -> _MatrixSnapshotResize:
+    try:
+        image = Image.open(path)
+        try:
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                raise ValueError("invalid image dimensions")
+
+            bounded_dimension = min(max(width, height), MATRIX_UPLOAD_INITIAL_MAX_DIMENSION)
+            if width >= height:
+                bounded_size = (bounded_dimension, max(1, height * bounded_dimension // width))
+            else:
+                bounded_size = (max(1, width * bounded_dimension // height), bounded_dimension)
+            image.draft("RGB", bounded_size)
+            image.load()
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            working = image.convert("RGB") if image.mode != "RGB" else image
+            try:
+                result = encode_jpeg_under_budget(
+                    working,
+                    max_bytes=MAX_MATRIX_UPLOAD_IMAGE_BYTES,
+                    initial_max_dimension=MATRIX_UPLOAD_INITIAL_MAX_DIMENSION,
+                    min_dimension=MATRIX_UPLOAD_MIN_DIMENSION,
+                    dimension_scale=0.85,
+                    qualities=MATRIX_UPLOAD_JPEG_QUALITIES,
+                    resampling=resampling,
+                )
+            finally:
+                if working is not image:
+                    working.close()
+            return _MatrixSnapshotResize(
+                result=result,
+                info={
+                    "mimetype": JPEG_MIMETYPE,
+                    "size": len(result.data),
+                    "w": result.width,
+                    "h": result.height,
+                },
+            )
+        finally:
+            image.close()
+    except Exception:
+        raise MatrixError(
+            "Matrix snapshot could not be resized under upload budget",
+            error_type="snapshot_resize_failed",
+            snapshot_path=str(path),
+        ) from None
 
 
 def prepare_event_snapshot(

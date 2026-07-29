@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,8 @@ import httpx
 import pytest
 from PIL import Image
 
+import parking_spot_monitor.matrix_snapshots as matrix_snapshots
+from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix import (
     MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
@@ -666,6 +669,271 @@ def test_matrix_delivery_open_alert_uploads_resized_image_without_mutating_retai
     assert images[0]["info"]["w"] < 1280
     assert images[0]["info"]["h"] < 720
     assert images[0]["body"] == "Parking spot open: left_spot at 2026-05-18 1:01:02 PM PDT"
+
+
+def test_matrix_snapshot_resize_uses_shared_encoder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source = tmp_path / "large.jpg"
+    Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
+    seen: dict[str, object] = {}
+
+    def fake_encoder(image: Image.Image, **kwargs: object) -> JpegBudgetResult:
+        seen["image_mode"] = image.mode
+        seen.update(kwargs)
+        return JpegBudgetResult(b"jpeg", 640, 360, 65, 6)
+
+    monkeypatch.setattr(matrix_snapshots, "encode_jpeg_under_budget", fake_encoder)
+
+    data, info = matrix_snapshots._resize_jpeg_for_matrix_upload(source)
+
+    assert data == b"jpeg"
+    assert info == {"mimetype": "image/jpeg", "size": 4, "w": 640, "h": 360}
+    assert seen == {
+        "image_mode": "RGB",
+        "max_bytes": matrix_snapshots.MAX_MATRIX_UPLOAD_IMAGE_BYTES,
+        "initial_max_dimension": matrix_snapshots.MATRIX_UPLOAD_INITIAL_MAX_DIMENSION,
+        "min_dimension": matrix_snapshots.MATRIX_UPLOAD_MIN_DIMENSION,
+        "dimension_scale": 0.85,
+        "qualities": matrix_snapshots.MATRIX_UPLOAD_JPEG_QUALITIES,
+        "resampling": Image.Resampling.LANCZOS,
+    }
+
+
+def test_matrix_snapshot_resize_drafts_before_load_and_reuses_rgb_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[object] = []
+
+    class TrackingImage:
+        size = (1280, 720)
+        mode = "RGB"
+
+        def draft(self, mode: str, size: tuple[int, int]) -> None:
+            events.append(("draft", mode, size))
+
+        def load(self) -> None:
+            events.append("load")
+
+        def copy(self) -> Image.Image:
+            raise AssertionError("RGB Matrix source must not be copied")
+
+        def convert(self, mode: str) -> Image.Image:
+            raise AssertionError(f"RGB Matrix source must not be converted to {mode}")
+
+        def close(self) -> None:
+            events.append("source-close")
+
+    source_image = TrackingImage()
+    monkeypatch.setattr(matrix_snapshots.Image, "open", lambda _path: source_image)
+
+    def fake_encoder(image: object, **_kwargs: object) -> JpegBudgetResult:
+        assert image is source_image
+        events.append("encode")
+        return JpegBudgetResult(b"jpeg", 640, 360, 65, 3)
+
+    monkeypatch.setattr(matrix_snapshots, "encode_jpeg_under_budget", fake_encoder)
+
+    matrix_snapshots._resize_jpeg_for_matrix_upload(tmp_path / "oversized.jpg")
+
+    assert events == [("draft", "RGB", (960, 540)), "load", "encode", "source-close"]
+
+
+def test_matrix_snapshot_resize_log_has_diagnostics_without_expanding_media_info(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "large.jpg"
+    Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
+    source_size = source.stat().st_size
+    assert source_size > matrix_snapshots.MAX_MATRIX_UPLOAD_IMAGE_BYTES
+    monkeypatch.setattr(
+        matrix_snapshots,
+        "encode_jpeg_under_budget",
+        lambda image, **kwargs: JpegBudgetResult(b"jpeg", 640, 360, 65, 6),
+    )
+    snapshot = matrix_snapshots.MatrixSnapshot(
+        path=source,
+        filename=source.name,
+        txn_id="snapshot-large",
+        body="Raw full-frame snapshot",
+        info={"mimetype": "image/jpeg", "size": source_size, "w": 1280, "h": 720},
+        log_context={},
+    )
+    stream = StringIO()
+
+    upload = matrix_snapshots._matrix_snapshot_upload(snapshot, logger=StructuredLogger(stream=stream))
+
+    assert upload == {
+        "data": b"jpeg",
+        "info": {"mimetype": "image/jpeg", "size": 4, "w": 640, "h": 360},
+    }
+    assert json.loads(stream.getvalue()) == {
+        "event": "matrix-snapshot-upload-resized",
+        "level": "INFO",
+        "snapshot_path": str(source),
+        "source_size": source_size,
+        "upload_size": 4,
+        "width": 640,
+        "height": 360,
+        "quality": 65,
+        "attempts": 6,
+    }
+
+
+def test_matrix_snapshot_resize_translates_shared_encoder_failure_without_leaking_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "large.jpg"
+    Image.new("RGB", (1280, 720)).save(source, "JPEG")
+    opened: list[Image.Image] = []
+    real_open = Image.open
+
+    def tracking_open(path: Path) -> Image.Image:
+        image = real_open(path)
+        opened.append(image)
+        return image
+
+    monkeypatch.setattr(matrix_snapshots.Image, "open", tracking_open)
+    monkeypatch.setattr(
+        matrix_snapshots,
+        "encode_jpeg_under_budget",
+        lambda image, **kwargs: (_ for _ in ()).throw(ImageBudgetError("access_token=encoder-secret")),
+    )
+
+    with pytest.raises(MatrixError) as exc_info:
+        matrix_snapshots._resize_jpeg_for_matrix_upload(source)
+
+    assert str(exc_info.value) == "Matrix snapshot could not be resized under upload budget"
+    assert exc_info.value.diagnostics == {
+        "error_type": "snapshot_resize_failed",
+        "snapshot_path": str(source),
+    }
+    assert exc_info.value.__cause__ is None
+    assert "encoder-secret" not in str(exc_info.value) + repr(exc_info.value.diagnostics)
+    assert len(opened) == 1
+    with pytest.raises(ValueError, match="closed image"):
+        opened[0].getpixel((0, 0))
+
+
+def test_matrix_snapshot_resize_converts_non_rgb_once_and_closes_both_images(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[object] = []
+
+    class ConvertedImage:
+        size = (1280, 720)
+        mode = "RGB"
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+            events.append("converted-close")
+
+    converted = ConvertedImage()
+
+    class SourceImage:
+        size = (1280, 720)
+        mode = "CMYK"
+
+        def close(self) -> None:
+            events.append("source-close")
+
+        def draft(self, mode: str, size: tuple[int, int]) -> None:
+            events.append(("draft", mode, size))
+
+        def load(self) -> None:
+            events.append("load")
+
+        def convert(self, mode: str) -> ConvertedImage:
+            events.append(("convert", mode))
+            return converted
+
+    monkeypatch.setattr(matrix_snapshots.Image, "open", lambda _path: SourceImage())
+
+    def fake_encoder(image: object, **_kwargs: object) -> JpegBudgetResult:
+        assert image is converted
+        assert converted.closed is False
+        events.append("encode")
+        return JpegBudgetResult(b"jpeg", 640, 360, 65, 3)
+
+    monkeypatch.setattr(matrix_snapshots, "encode_jpeg_under_budget", fake_encoder)
+
+    matrix_snapshots._resize_jpeg_for_matrix_upload(tmp_path / "oversized-cmyk.jpg")
+
+    assert events == [
+        ("draft", "RGB", (960, 540)),
+        "load",
+        ("convert", "RGB"),
+        "encode",
+        "converted-close",
+        "source-close",
+    ]
+
+
+def test_matrix_snapshot_resize_translates_pillow_open_failure_safely(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "broken.jpg"
+    monkeypatch.setattr(
+        matrix_snapshots.Image,
+        "open",
+        lambda _path: (_ for _ in ()).throw(OSError("Authorization: Bearer pillow-secret")),
+    )
+
+    with pytest.raises(MatrixError) as exc_info:
+        matrix_snapshots._resize_jpeg_for_matrix_upload(source)
+
+    assert str(exc_info.value) == "Matrix snapshot could not be resized under upload budget"
+    assert exc_info.value.diagnostics == {
+        "error_type": "snapshot_resize_failed",
+        "snapshot_path": str(source),
+    }
+    assert exc_info.value.__cause__ is None
+    assert "pillow-secret" not in str(exc_info.value) + repr(exc_info.value.diagnostics)
+
+
+def test_matrix_snapshot_upload_under_budget_returns_raw_bytes_without_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "small.jpg"
+    raw = write_jpeg(source, size=(8, 6))
+    info = {"mimetype": "image/jpeg", "size": len(raw), "w": 8, "h": 6}
+    snapshot = matrix_snapshots.MatrixSnapshot(
+        path=source,
+        filename=source.name,
+        txn_id="snapshot-small",
+        body="Raw full-frame snapshot",
+        info=info,
+        log_context={},
+    )
+    monkeypatch.setattr(
+        matrix_snapshots,
+        "encode_jpeg_under_budget",
+        lambda image, **kwargs: (_ for _ in ()).throw(AssertionError("raw upload called encoder")),
+    )
+
+    upload = matrix_snapshots._matrix_snapshot_upload(snapshot, logger=None)
+
+    assert upload == {"data": raw, "info": info}
+    assert upload["info"] is not info
+
+
+def test_matrix_snapshot_real_resize_honors_budget_dimensions_and_payload_metadata(tmp_path: Path) -> None:
+    source = tmp_path / "large-real.jpg"
+    Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
+    assert source.stat().st_size > matrix_snapshots.MAX_MATRIX_UPLOAD_IMAGE_BYTES
+
+    data, info = matrix_snapshots._resize_jpeg_for_matrix_upload(source)
+
+    assert len(data) <= matrix_snapshots.MAX_MATRIX_UPLOAD_IMAGE_BYTES
+    assert info == {"mimetype": "image/jpeg", "size": len(data), "w": 960, "h": 540}
+    with Image.open(BytesIO(data)) as encoded:
+        assert encoded.format == "JPEG"
+        assert encoded.size == (960, 540)
 
 def test_matrix_delivery_occupied_alert_sends_upload_and_image_with_alert_body(tmp_path: Path) -> None:
     source = tmp_path / "occupied.jpg"
