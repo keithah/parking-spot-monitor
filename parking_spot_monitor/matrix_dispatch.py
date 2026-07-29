@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_alerts import (
@@ -19,6 +19,20 @@ from parking_spot_monitor.matrix_support import MatrixError
 from parking_spot_monitor.occupancy import OccupancyEventType
 from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, make_decision_memory_record
 from parking_spot_monitor.scheduler import QuietWindowEventType
+
+
+class RuntimeMatrixDelivery(Protocol):
+    """Matrix operations consumed by runtime event dispatch."""
+
+    def send_lifecycle_notice(self, event: Mapping[str, Any]) -> object: ...
+
+    def enqueue_text_notice(self, event_name: str, event: Mapping[str, Any]) -> object: ...
+
+    def enqueue_open_spot_alert(self, event: Mapping[str, Any]) -> object: ...
+
+    def enqueue_occupied_spot_alert(self, event: Mapping[str, Any]) -> object: ...
+
+    def outbox_health_summary(self) -> Mapping[str, Any]: ...
 
 
 def append_matrix_event_memory(
@@ -57,7 +71,7 @@ def append_matrix_event_memory(
 
 
 def dispatch_matrix_event(
-    matrix_delivery: Any | None,
+    matrix_delivery: RuntimeMatrixDelivery | None,
     event_name: str,
     event: Mapping[str, Any],
     *,
@@ -79,8 +93,7 @@ def dispatch_matrix_event(
     if event_name in LIFECYCLE_EVENT_TYPES:
         txn_id = str(event.get("event_id", ""))
         logger.info(event_name, **{key: value for key, value in event.items() if key != "event_type"})
-        return _attempt_immediate_matrix_send(
-            matrix_delivery,
+        return _attempt_matrix_operation(
             event_name=event_name,
             event=event,
             txn_id=txn_id,
@@ -91,95 +104,66 @@ def dispatch_matrix_event(
 
     if event_name == OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE:
         txn_id = str(event.get("event_id") or owner_vehicle_quiet_window_event_id(event))
-        return _attempt_immediate_matrix_send(
-            matrix_delivery,
+        return _attempt_matrix_operation(
             event_name=event_name,
             event=event,
             txn_id=txn_id,
-            send=lambda: matrix_delivery.send_owner_vehicle_quiet_window_alert(event),
+            send=lambda: matrix_delivery.enqueue_text_notice(event_name, event),
             logger=logger,
             decision_memory_path=decision_memory_path,
+            attempt_log_fields={"delivery_mode": "outbox_enqueue"},
+            success_log_fields={"delivery_mode": "outbox_enqueue"},
+            success_memory_outcome="queued",
+            success_memory_reason="outbox_enqueue",
         )
 
     if event_name in {QuietWindowEventType.UPCOMING.value, QuietWindowEventType.STARTED.value, QuietWindowEventType.ENDED.value}:
         txn_id = str(event.get("event_id", ""))
-        return _attempt_immediate_matrix_send(
-            matrix_delivery,
+        return _attempt_matrix_operation(
             event_name=event_name,
             event=event,
             txn_id=txn_id,
-            send=lambda: matrix_delivery.send_quiet_window_notice(event),
+            send=lambda: matrix_delivery.enqueue_text_notice(event_name, event),
             logger=logger,
             decision_memory_path=decision_memory_path,
+            attempt_log_fields={"delivery_mode": "outbox_enqueue"},
+            success_log_fields={"delivery_mode": "outbox_enqueue"},
+            success_memory_outcome="queued",
+            success_memory_reason="outbox_enqueue",
         )
 
     if event_name == OCCUPIED_SPOT_EVENT_TYPE:
         txn_id = occupied_spot_event_id(event)
         alert_fields = _occupied_alert_log_fields(event, txn_id=txn_id)
-        enqueue_occupied_alert = getattr(matrix_delivery, "enqueue_occupied_spot_alert", None)
-        if callable(enqueue_occupied_alert):
-            return _attempt_immediate_matrix_send(
-                matrix_delivery,
-                event_name=event_name,
-                event=event,
-                txn_id=txn_id,
-                send=lambda: enqueue_occupied_alert(event),
-                logger=logger,
-                decision_memory_path=decision_memory_path,
-                attempt_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
-                success_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
-                success_memory_outcome="queued",
-                success_memory_reason="outbox_enqueue",
-                process_send_result=lambda result: (event, None, "error"),
-            )
-        return _attempt_immediate_matrix_send(
-            matrix_delivery,
+        return _attempt_matrix_operation(
             event_name=event_name,
             event=event,
             txn_id=txn_id,
-            send=lambda: matrix_delivery.send_occupied_spot_alert(event),
+            send=lambda: matrix_delivery.enqueue_occupied_spot_alert(event),
             logger=logger,
             decision_memory_path=decision_memory_path,
-            attempt_log_fields=alert_fields,
-            success_log_fields=alert_fields,
-            process_send_result=lambda result: _process_occupied_send_result(event, result),
+            attempt_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
+            success_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
+            success_memory_outcome="queued",
+            success_memory_reason="outbox_enqueue",
+            process_send_result=lambda result: (_event_with_retained_snapshot_path(event, result), None, "error"),
         )
 
     if event_name == OccupancyEventType.OPEN_EVENT.value:
         txn_id = open_spot_event_id(event)
         alert_fields = _open_alert_log_fields(event, txn_id=txn_id)
-        enqueue_open_alert = getattr(matrix_delivery, "enqueue_open_spot_alert", None)
-        if callable(enqueue_open_alert):
-            return _attempt_immediate_matrix_send(
-                matrix_delivery,
-                event_name=event_name,
-                event=event,
-                txn_id=txn_id,
-                send=lambda: enqueue_open_alert(event),
-                logger=logger,
-                decision_memory_path=decision_memory_path,
-                attempt_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
-                success_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
-                success_memory_outcome="queued",
-                success_memory_reason="outbox_enqueue",
-                process_send_result=lambda result: (event, None, "error"),
-            )
-        return _attempt_immediate_matrix_send(
-            matrix_delivery,
+        return _attempt_matrix_operation(
             event_name=event_name,
             event=event,
             txn_id=txn_id,
-            send=lambda: matrix_delivery.send_open_spot_alert(event),
+            send=lambda: matrix_delivery.enqueue_open_spot_alert(event),
             logger=logger,
             decision_memory_path=decision_memory_path,
-            attempt_log_fields=alert_fields,
-            success_log_fields=alert_fields,
-            process_send_result=lambda result: _process_open_send_result(
-                event,
-                event_name=event_name,
-                txn_id=txn_id,
-                result=result,
-            ),
+            attempt_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
+            success_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
+            success_memory_outcome="queued",
+            success_memory_reason="outbox_enqueue",
+            process_send_result=lambda result: (_event_with_retained_snapshot_path(event, result), None, "error"),
         )
 
     reason = "suppressed" if event_name == OccupancyEventType.OPEN_SUPPRESSED.value else "unsupported-event-type"
@@ -234,37 +218,7 @@ def _open_alert_log_fields(event: Mapping[str, Any], *, txn_id: str) -> dict[str
     }
 
 
-def _process_occupied_send_result(event: Mapping[str, Any], result: Any) -> tuple[Mapping[str, Any], dict[str, Any] | None, str]:
-    return _event_with_retained_snapshot_path(event, result), None, "error"
-
-
-def _process_open_send_result(
-    event: Mapping[str, Any],
-    *,
-    event_name: str,
-    txn_id: str,
-    result: Any,
-) -> tuple[Mapping[str, Any], dict[str, Any] | None, str]:
-    retrying_count = getattr(result, "retrying_count", None)
-    if isinstance(retrying_count, int) and retrying_count > 0:
-        return (
-            event,
-            {
-                "phase": "matrix",
-                "event_type": event_name,
-                "spot_id": event.get("spot_id"),
-                "txn_id": txn_id,
-                "error_type": "retrying_records",
-                "message": "matrix outbox delivery is retrying",
-                "retrying_count": retrying_count,
-            },
-            "warning",
-        )
-    return _event_with_retained_snapshot_path(event, result), None, "error"
-
-
-def _attempt_immediate_matrix_send(
-    matrix_delivery: Any,
+def _attempt_matrix_operation(
     *,
     event_name: str,
     event: Mapping[str, Any],
@@ -378,6 +332,11 @@ def _event_with_retained_snapshot_path(event: Mapping[str, Any], snapshot: Any |
 
 def _safe_retained_snapshot_memory_path(snapshot: Any | None) -> str | None:
     snapshot_path = getattr(snapshot, "path", None)
+    if snapshot_path is None:
+        intent = getattr(snapshot, "intent", None)
+        metadata = getattr(intent, "metadata", None)
+        if isinstance(metadata, Mapping):
+            snapshot_path = metadata.get("retained_snapshot_path")
     if snapshot_path is None:
         return None
     path = Path(snapshot_path)

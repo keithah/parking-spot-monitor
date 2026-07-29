@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_dispatch import append_matrix_event_memory
@@ -9,8 +9,19 @@ from parking_spot_monitor.runtime_decision_memory import _append_decision_memory
 from parking_spot_monitor.runtime_health import safe_error_context as _safe_error_context
 
 
+class RuntimeMatrixCommandPollResult(Protocol):
+    processed_count: int
+    ignored_count: int
+    error_count: int
+    bootstrapped: bool
+
+
+class RuntimeMatrixCommandService(Protocol):
+    def poll_once(self) -> RuntimeMatrixCommandPollResult: ...
+
+
 def _poll_matrix_commands_once(
-    matrix_command_service: Any | None,
+    matrix_command_service: RuntimeMatrixCommandService | None,
     *,
     logger: StructuredLogger,
     iteration: int,

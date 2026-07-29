@@ -82,6 +82,19 @@ def matrix_outbox_health_payload(
             },
         }
     payload.pop("items", None)
+    safe_worker_fields = {
+        "worker_running",
+        "worker_last_attempt_at",
+        "worker_last_error_type",
+    }
+    for key in tuple(payload):
+        if key.startswith("worker_") and key not in safe_worker_fields:
+            payload.pop(key, None)
+    for key in ("worker_last_attempt_at", "worker_last_error_type"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            redacted = redact_diagnostic_text(value)
+            payload[key] = redacted if redacted == value else "redacted"
     payload["available"] = True
     return payload
 

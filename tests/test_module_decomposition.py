@@ -337,6 +337,60 @@ def test_runtime_modules_stay_decomposed() -> None:
         assert _line_count(path) <= max_lines
 
 
+def test_runtime_matrix_boundaries_use_narrow_protocols() -> None:
+    dispatch_classes = _class_names("parking_spot_monitor/matrix_dispatch.py")
+    command_classes = _class_names("parking_spot_monitor/runtime_commands.py")
+
+    assert "RuntimeMatrixDelivery" in dispatch_classes
+    assert "RuntimeMatrixCommandService" in command_classes
+    assert _function_arg_annotation_mentions(
+        "parking_spot_monitor/matrix_dispatch.py",
+        "dispatch_matrix_event",
+        "matrix_delivery",
+        "RuntimeMatrixDelivery",
+    )
+    assert _function_arg_annotation_mentions(
+        "parking_spot_monitor/runtime_state_update.py",
+        "_update_runtime_state_for_frame",
+        "matrix_delivery",
+        "RuntimeMatrixDelivery",
+    )
+    assert _function_arg_annotation_mentions(
+        "parking_spot_monitor/runtime_commands.py",
+        "_poll_matrix_commands_once",
+        "matrix_command_service",
+        "RuntimeMatrixCommandService",
+    )
+
+
+def test_promoted_runtime_helpers_are_imported_publicly() -> None:
+    loop_resource_overlay_imports = _imported_names(
+        "parking_spot_monitor/runtime_loop_resources.py",
+        "parking_spot_monitor.runtime_overlay",
+    )
+    loop_resource_presence_imports = _imported_names(
+        "parking_spot_monitor/runtime_loop_resources.py",
+        "parking_spot_monitor.runtime_presence",
+    )
+    frame_plan_presence_imports = _imported_names(
+        "parking_spot_monitor/runtime_frame_plan.py",
+        "parking_spot_monitor.runtime_presence",
+    )
+    main_overlay_imports = _imported_names(
+        "parking_spot_monitor/__main__.py",
+        "parking_spot_monitor.runtime_overlay",
+    )
+
+    assert "write_overlay_for_capture" in loop_resource_overlay_imports
+    assert "_write_overlay_for_capture" not in loop_resource_overlay_imports
+    assert "presence_by_spot" in loop_resource_presence_imports
+    assert "_presence_by_spot" not in loop_resource_presence_imports
+    assert "presence_by_spot" in frame_plan_presence_imports
+    assert "_presence_by_spot" not in frame_plan_presence_imports
+    assert "write_overlay_for_capture" in main_overlay_imports
+    assert "_write_overlay_for_capture" not in main_overlay_imports
+
+
 def test_runtime_stream_escalation_stays_pure_orchestration() -> None:
     source = (ROOT / "parking_spot_monitor/runtime_stream_escalation.py").read_text(encoding="utf-8")
     loop_source = (ROOT / "parking_spot_monitor/capture_loop.py").read_text(encoding="utf-8")
@@ -567,8 +621,8 @@ def test_operator_confidence_groups_memory_records_once() -> None:
 def test_matrix_dispatch_send_paths_do_not_copy_event_mappings() -> None:
     lambda_targets = _lambda_call_targets("parking_spot_monitor/matrix_dispatch.py")
 
-    assert {"send_lifecycle_notice", "send_owner_vehicle_quiet_window_alert", "send_quiet_window_notice"} <= lambda_targets
-    assert {"send_occupied_spot_alert", "send_open_spot_alert"} <= lambda_targets
+    assert {"send_lifecycle_notice", "enqueue_text_notice"} <= lambda_targets
+    assert {"enqueue_occupied_spot_alert", "enqueue_open_spot_alert"} <= lambda_targets
     assert not _lambda_calls_function("parking_spot_monitor/matrix_dispatch.py", "dict")
 
 

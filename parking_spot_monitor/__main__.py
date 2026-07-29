@@ -32,7 +32,7 @@ from parking_spot_monitor.paths import RuntimePaths, resolve_runtime_paths
 from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as _matrix_outbox_health_payload
 from parking_spot_monitor.runtime_decision_memory import _append_lab_outcome_memory
 from parking_spot_monitor.runtime_detection import _process_detection_for_capture
-from parking_spot_monitor.runtime_overlay import _write_debug_overlay, _write_overlay_for_capture
+from parking_spot_monitor.runtime_overlay import _write_debug_overlay, write_overlay_for_capture
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
 DEFAULT_CONFIG_PATH = "/config/config.yaml"
@@ -221,7 +221,7 @@ def _capture_once(
     except CaptureError as exc:
         logger.error("capture-failed", **exc.diagnostics())
         return 1
-    if not _write_overlay_for_capture(settings, result.latest_path, data_dir, logger=logger, overlay=overlay):
+    if not write_overlay_for_capture(settings, result.latest_path, data_dir, logger=logger, overlay=overlay):
         return 1
     try:
         detector = detector_factory(settings)
@@ -276,7 +276,7 @@ def _default_matrix_delivery_factory(settings: RuntimeSettings, data_dir: Path, 
         logger=logger,
     )
     outbox = LocalOutbox(paths.matrix_outbox_file)
-    return MatrixOutboxDelivery(
+    delivery = MatrixOutboxDelivery(
         client=client,
         room_id=settings.matrix.room_id,
         data_dir=paths.data_dir,
@@ -285,6 +285,10 @@ def _default_matrix_delivery_factory(settings: RuntimeSettings, data_dir: Path, 
         logger=logger,
         snapshot_retention_count=settings.storage.snapshot_retention_count,
     )
+    delivery.start_worker(
+        retry_interval_seconds=settings.matrix.outbox_retry_interval_seconds
+    )
+    return delivery
 
 
 def _default_matrix_command_service_factory(

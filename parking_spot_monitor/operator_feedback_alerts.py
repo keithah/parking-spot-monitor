@@ -18,7 +18,7 @@ def resolve_latest_alert_candidate(path: str | Path, spot_id: str, *, logger: St
         if record.kind != "alert" or record.spot_id != spot_id:
             continue
         details = record.details if isinstance(record.details, Mapping) else {}
-        if details.get("outcome") != "sent":
+        if details.get("outcome") not in {"sent", "queued"}:
             continue
         event_type = details.get("event_type")
         reported_state = reported_state_from_event_type(event_type)

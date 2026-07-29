@@ -86,6 +86,7 @@ def test_example_config_loads_with_fake_env_values() -> None:
     assert settings.matrix.command_poll_interval_seconds == 60
     assert settings.matrix.command_failure_cooldown_seconds == 60
     assert settings.matrix.command_failure_max_cooldown_seconds == 900
+    assert settings.matrix.outbox_retry_interval_seconds == 60
     assert settings.matrix.unauthorized_reply_cooldown_seconds == 300
     assert settings.matrix.retry_jitter_ratio == 0.2
     assert settings.spots.left_spot.name == "Left spot"
@@ -753,6 +754,7 @@ def test_legacy_matrix_config_omitting_command_schedule_uses_compatible_defaults
         base.replace("  command_poll_interval_seconds: 60\n", "")
         .replace("  command_failure_cooldown_seconds: 60\n", "")
         .replace("  command_failure_max_cooldown_seconds: 900\n", "")
+        .replace("  outbox_retry_interval_seconds: 60\n", "")
         .replace("  retry_jitter_ratio: 0.2\n", "")
         .replace("  unauthorized_reply_cooldown_seconds: 300\n", "")
     )
@@ -763,6 +765,7 @@ def test_legacy_matrix_config_omitting_command_schedule_uses_compatible_defaults
     assert settings.matrix.command_poll_interval_seconds == 60
     assert settings.matrix.command_failure_cooldown_seconds == 60
     assert settings.matrix.command_failure_max_cooldown_seconds == 900
+    assert settings.matrix.outbox_retry_interval_seconds == 60
     assert settings.matrix.retry_jitter_ratio == 0.2
     assert settings.matrix.unauthorized_reply_cooldown_seconds == 300
 
@@ -792,6 +795,36 @@ def test_matrix_command_schedule_is_configurable_and_summarized(tmp_path: Path) 
     assert summary["command_poll_interval_seconds"] == 0
     assert summary["command_failure_cooldown_seconds"] == 30
     assert summary["command_failure_max_cooldown_seconds"] == 120
+
+
+def test_matrix_outbox_retry_interval_is_configurable_and_summarized(tmp_path: Path) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "  outbox_retry_interval_seconds: 60",
+        "  outbox_retry_interval_seconds: 30",
+    )
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(path, environ=fake_environ())
+
+    assert settings.matrix.outbox_retry_interval_seconds == 30
+    assert settings.sanitized_summary()["matrix"]["outbox_retry_interval_seconds"] == 30
+
+
+@pytest.mark.parametrize("bad_value", ["0", "-1", ".nan", ".inf"])
+def test_matrix_outbox_retry_interval_rejects_nonpositive_or_nonfinite_values(
+    tmp_path: Path,
+    bad_value: str,
+) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "  outbox_retry_interval_seconds: 60",
+        f"  outbox_retry_interval_seconds: {bad_value}",
+    )
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert "outbox_retry_interval_seconds" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

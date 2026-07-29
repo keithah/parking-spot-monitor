@@ -11,12 +11,11 @@ from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.paths import RuntimePaths
 from parking_spot_monitor.runtime_health import (
     RuntimeLoopHealthState,
-    safe_error_context,
     write_loop_health,
 )
 from parking_spot_monitor.runtime_health_cache import VehicleHistoryHealthSnapshotCache
-from parking_spot_monitor.runtime_overlay import _write_overlay_for_capture
-from parking_spot_monitor.runtime_presence import _presence_by_spot
+from parking_spot_monitor.runtime_overlay import write_overlay_for_capture
+from parking_spot_monitor.runtime_presence import presence_by_spot
 from parking_spot_monitor.runtime_resource_policy import (
     RuntimeResourceDecision,
     RuntimeResourcePolicyState,
@@ -27,57 +26,6 @@ from parking_spot_monitor.runtime_resource_policy import (
 )
 from parking_spot_monitor.state import RuntimeState
 from parking_spot_monitor.timeline_buffer import record_timeline_frame
-
-MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION = 1
-
-
-def drain_matrix_outbox_if_available(
-    matrix_delivery: Any | None,
-    *,
-    logger: StructuredLogger,
-    iteration: int,
-    trigger: str,
-    max_records: int | None = None,
-) -> dict[str, Any] | None:
-    drain = getattr(matrix_delivery, "drain_outbox", None)
-    if drain is None or not callable(drain):
-        return None
-    logger.info("matrix-outbox-runtime-drain-attempt", trigger=trigger, iteration=iteration)
-    try:
-        try:
-            result = drain(max_records=max_records) if max_records is not None else drain()
-        except TypeError:
-            if max_records is None:
-                raise
-            result = drain()
-    except Exception as exc:
-        context = safe_error_context(
-            "matrix-outbox",
-            exc,
-            extra={"trigger": trigger, "iteration": iteration},
-        )
-        logger.warning("matrix-outbox-runtime-drain-failed", **context)
-        return context
-    logger.info(
-        "matrix-outbox-runtime-drain-succeeded",
-        trigger=trigger,
-        iteration=iteration,
-        attempted_count=getattr(result, "attempted_count", None),
-        delivered_count=getattr(result, "delivered_count", None),
-        retrying_count=getattr(result, "retrying_count", None),
-    )
-    retrying_count = getattr(result, "retrying_count", None)
-    if isinstance(retrying_count, int) and retrying_count > 0:
-        return {
-            "phase": "matrix-outbox",
-            "error_type": "retrying_records",
-            "message": "matrix outbox has retrying records",
-            "trigger": trigger,
-            "iteration": iteration,
-            "retrying_count": retrying_count,
-        }
-    return None
-
 
 @dataclass(frozen=True)
 class ResourcePolicyUpdate:
@@ -144,13 +92,13 @@ def frame_has_weak_presence(
     settings: RuntimeSettings,
     detection_result: DetectionFilterResult,
 ) -> bool:
-    presence_by_spot = _presence_by_spot(
+    spot_presence = presence_by_spot(
         detection_result,
         open_suppression_classes=settings.detection.open_suppression_classes,
         min_polygon_overlap_ratio=settings.detection.min_polygon_overlap_ratio,
     )
     return any(
-        presence_by_spot.get(spot_id, False) and spot_result.accepted is None
+        spot_presence.get(spot_id, False) and spot_result.accepted is None
         for spot_id, spot_result in detection_result.by_spot.items()
     )
 
@@ -180,7 +128,7 @@ def record_primary_frame_artifacts(
         transition=transition_occurred,
     ):
         return False
-    return _write_overlay_for_capture(
+    return write_overlay_for_capture(
         settings,
         primary_capture.latest_path,
         data_dir,

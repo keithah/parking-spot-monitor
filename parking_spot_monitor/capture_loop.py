@@ -11,13 +11,13 @@ from parking_spot_monitor.capture import CaptureError, StreamProfileCapture
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_alerts import MONITOR_STARTED_EVENT_TYPE, monitor_lifecycle_event
-from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
+from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery, dispatch_matrix_event
 from parking_spot_monitor.paths import resolve_runtime_paths
 from parking_spot_monitor.runtime_frame import capture_and_detect_runtime_frame
 from parking_spot_monitor.runtime_frame_outcome import prepare_runtime_frame_loop_result
 from parking_spot_monitor.runtime_health import RuntimeLoopHealthState, observed_at
 from parking_spot_monitor.runtime_health_cache import VehicleHistoryHealthSnapshotCache
-from parking_spot_monitor.runtime_commands import _poll_matrix_commands_once
+from parking_spot_monitor.runtime_commands import RuntimeMatrixCommandService, _poll_matrix_commands_once
 from parking_spot_monitor.runtime_detection import _configured_spot_polygons, build_detection_memory_records
 from parking_spot_monitor.runtime_resource_policy import RuntimeResourcePolicyState
 from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
@@ -26,10 +26,6 @@ from parking_spot_monitor.state import load_runtime_state
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
 VEHICLE_HISTORY_HEALTH_CACHE_SECONDS = 300
-MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION = runtime_loop_resources.MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION
-drain_matrix_outbox_if_available = runtime_loop_resources.drain_matrix_outbox_if_available
-
-
 def run_capture_loop(
     settings: RuntimeSettings,
     data_dir: Path,
@@ -38,9 +34,9 @@ def run_capture_loop(
     capture: StreamProfileCapture,
     overlay: Callable[..., Any],
     detector_factory: Callable[[RuntimeSettings], Any],
-    matrix_delivery: Any | None,
+    matrix_delivery: RuntimeMatrixDelivery | None,
     history_archive: VehicleHistoryArchive | None = None,
-    matrix_command_service: Any | None = None,
+    matrix_command_service: RuntimeMatrixCommandService | None = None,
     sleep: Callable[[float], None],
     max_iterations: int | None = None,
     now: Callable[[], datetime] | None = None,
@@ -62,10 +58,6 @@ def run_capture_loop(
     health_state = RuntimeLoopHealthState(retention_failure_count=startup_retention_failure_count)
     resource_policy_state = RuntimeResourcePolicyState()
     matrix_command_poll_state = runtime_matrix_commands.MatrixCommandPollState()
-    startup_outbox_error = runtime_loop_resources.drain_matrix_outbox_if_available(
-        matrix_delivery, logger=logger, iteration=iteration, trigger="startup"
-    )
-    health_state.record_matrix_result(startup_outbox_error)
     decision_memory_path = data_dir / "operator-decision-memory.json"
     shutdown_state = ShutdownState()
     vehicle_history_health = VehicleHistoryHealthSnapshotCache(
@@ -103,7 +95,7 @@ def run_capture_loop(
                 event_type=MONITOR_STARTED_EVENT_TYPE,
                 error_type=startup_lifecycle_error.get("error_type"),
             )
-        startup_status = "degraded" if health_state.retention_failure_count or startup_outbox_error is not None else "starting"
+        startup_status = "degraded" if health_state.retention_failure_count else "starting"
         write_current_health(status=startup_status, iteration=iteration)
         while max_iterations is None or iteration < max_iterations:
             shutdown_exit = return_if_shutdown_requested(
@@ -120,14 +112,6 @@ def run_capture_loop(
             iteration_started_at = monotonic()
             logger.debug("capture-loop-iteration", iteration=iteration, data_dir=str(data_dir))
             try:
-                outbox_error = runtime_loop_resources.drain_matrix_outbox_if_available(
-                    matrix_delivery,
-                    logger=logger,
-                    iteration=iteration,
-                    trigger="iteration",
-                    max_records=runtime_loop_resources.MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION,
-                )
-                health_state.record_matrix_result(outbox_error)
                 frame_attempt = capture_and_detect_runtime_frame(
                     settings,
                     data_dir,

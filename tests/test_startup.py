@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import signal
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,7 @@ from parking_spot_monitor.operator_decision_memory import (
 )
 from parking_spot_monitor.matrix import MatrixDelivery, MatrixSnapshot
 from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _main, main
-from parking_spot_monitor.runtime_presence import _presence_by_spot
+from parking_spot_monitor.runtime_presence import presence_by_spot
 from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as _matrix_outbox_health_payload
 from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 from parking_spot_monitor.detection import DetectionError, DetectionFilterResult, RejectedDetection, RejectionReason, SpotDetectionResult, VehicleDetection
@@ -148,20 +149,40 @@ class FakeMatrixClient:
         self.texts: list[dict[str, Any]] = []
         self.uploads: list[dict[str, Any]] = []
         self.images: list[dict[str, Any]] = []
+        self.text_sent = threading.Event()
+        self.upload_sent = threading.Event()
+        self.image_sent = threading.Event()
+        self.call_condition = threading.Condition()
 
     def send_text(self, *, room_id: str, txn_id: str, body: str) -> str:
-        self.texts.append({"room_id": room_id, "txn_id": txn_id, "body": body})
+        with self.call_condition:
+            self.texts.append({"room_id": room_id, "txn_id": txn_id, "body": body})
+            self.call_condition.notify_all()
+        self.text_sent.set()
         return f"${txn_id}:example.org"
 
     def upload_image(self, *, filename: str, data: bytes, content_type: str) -> str:
-        self.uploads.append({"filename": filename, "data": data, "content_type": content_type})
+        with self.call_condition:
+            self.uploads.append({"filename": filename, "data": data, "content_type": content_type})
+            self.call_condition.notify_all()
+        self.upload_sent.set()
         return f"mxc://example.org/{filename}"
 
     def send_image(self, *, room_id: str, txn_id: str, body: str, content_uri: str, info: dict[str, Any]) -> str:
-        self.images.append(
-            {"room_id": room_id, "txn_id": txn_id, "body": body, "content_uri": content_uri, "info": dict(info)}
-        )
+        with self.call_condition:
+            self.images.append(
+                {"room_id": room_id, "txn_id": txn_id, "body": body, "content_uri": content_uri, "info": dict(info)}
+            )
+            self.call_condition.notify_all()
+        self.image_sent.set()
         return f"${txn_id}:example.org"
+
+    def wait_for_image_transaction(self, prefix: str, *, timeout: float = 2) -> bool:
+        with self.call_condition:
+            return self.call_condition.wait_for(
+                lambda: any(image["txn_id"].startswith(prefix) for image in self.images),
+                timeout=timeout,
+            )
 
 class FakeMatrixDelivery:
     def __init__(self, *, fail: bool = False) -> None:
@@ -172,6 +193,31 @@ class FakeMatrixDelivery:
         self.live_proofs: list[dict[str, Any]] = []
         self.owner_alerts: list[dict[str, Any]] = []
         self.lifecycle_notices: list[dict[str, Any]] = []
+        self.enqueue_threads: list[str] = []
+
+    def enqueue_text_notice(self, event_name: str, event: dict[str, Any]) -> object:
+        self.enqueue_threads.append(threading.current_thread().name)
+        if event_name == "owner-vehicle-quiet-window-alert":
+            self.owner_alerts.append(dict(event))
+        else:
+            self.quiet_notices.append(dict(event))
+        if self.fail:
+            raise RuntimeError(f"matrix enqueue failure {SECRET_MARKER}")
+        return object()
+
+    def enqueue_open_spot_alert(self, event: dict[str, Any]) -> object:
+        self.enqueue_threads.append(threading.current_thread().name)
+        self.open_alerts.append(dict(event))
+        if self.fail:
+            raise RuntimeError(f"matrix enqueue failure {SECRET_MARKER}")
+        return object()
+
+    def enqueue_occupied_spot_alert(self, event: dict[str, Any]) -> object:
+        self.enqueue_threads.append(threading.current_thread().name)
+        self.occupied_alerts.append(dict(event))
+        if self.fail:
+            raise RuntimeError(f"matrix enqueue failure {SECRET_MARKER}")
+        return object()
 
     def send_quiet_window_notice(self, event: dict[str, Any]) -> None:
         self.quiet_notices.append(dict(event))
@@ -223,7 +269,7 @@ def test_dispatch_matrix_open_alert_feedback_uses_retained_snapshot_not_latest(t
         def __init__(self) -> None:
             self.open_alerts: list[dict[str, Any]] = []
 
-        def send_open_spot_alert(self, event: dict[str, Any]) -> MatrixSnapshot:
+        def enqueue_open_spot_alert(self, event: dict[str, Any]) -> MatrixSnapshot:
             self.open_alerts.append(dict(event))
             return MatrixSnapshot(
                 path=retained_path,
@@ -344,6 +390,143 @@ def test_dispatch_matrix_open_alert_enqueue_records_queued_memory(tmp_path: Path
     assert records[0]["summary"] == "occupancy-open-event queued"
     assert records[0]["details"]["outcome"] == "queued"
     assert records[0]["details"]["reason"] == "outbox_enqueue"
+
+
+def test_dispatch_matrix_occupied_alert_uses_durable_snapshot_enqueue(tmp_path: Path) -> None:
+    class EnqueueOnlyDelivery:
+        def __init__(self) -> None:
+            self.enqueued: list[dict[str, Any]] = []
+
+        def enqueue_occupied_spot_alert(self, event: dict[str, Any]) -> object:
+            self.enqueued.append(dict(event))
+            return object()
+
+        def send_occupied_spot_alert(self, event: dict[str, Any]) -> None:
+            raise AssertionError("frame dispatch must not send an occupied alert immediately")
+
+    source = tmp_path / "occupied.jpg"
+    Image.new("RGB", (10, 8), (12, 34, 56)).save(source, format="JPEG")
+    event = {
+        "event_type": "occupancy-occupied-event",
+        "event_id": "occupancy-state-changed:left_spot:2026-05-18T20:01:02Z",
+        "spot_id": "left_spot",
+        "observed_at": "2026-05-18T20:01:02Z",
+        "occupied_snapshot_path": str(source),
+    }
+    delivery = EnqueueOnlyDelivery()
+
+    error = dispatch_matrix_event(delivery, event["event_type"], event, logger=StructuredLogger())
+
+    assert error is None
+    assert delivery.enqueued == [event]
+
+
+@pytest.mark.parametrize(
+    ("event_name", "event"),
+    [
+        (
+            "quiet-window-started",
+            {
+                "event_type": "quiet-window-started",
+                "event_id": "quiet-window-started:street_sweeping:2026-05-18:13:00-15:00",
+                "window_id": "street_sweeping:2026-05-18:13:00-15:00",
+            },
+        ),
+        (
+            "owner-vehicle-quiet-window-alert",
+            {
+                "event_type": "owner-vehicle-quiet-window-alert",
+                "event_id": "owner-vehicle-quiet-window-alert:left_spot:prof-owner:window-1",
+                "spot_id": "left_spot",
+                "profile_id": "prof-owner",
+                "window_id": "window-1",
+                "observed_at": "2026-05-18T20:01:02Z",
+                "owner_vehicle": {"label": "owner car"},
+            },
+        ),
+    ],
+)
+def test_dispatch_matrix_frame_text_notices_use_durable_enqueue(
+    event_name: str,
+    event: dict[str, Any],
+) -> None:
+    class EnqueueOnlyDelivery:
+        def __init__(self) -> None:
+            self.enqueued: list[tuple[str, dict[str, Any]]] = []
+
+        def enqueue_text_notice(self, queued_name: str, queued_event: dict[str, Any]) -> object:
+            self.enqueued.append((queued_name, dict(queued_event)))
+            return object()
+
+        def send_quiet_window_notice(self, event: dict[str, Any]) -> None:
+            raise AssertionError("frame dispatch must not send a quiet-window notice immediately")
+
+        def send_owner_vehicle_quiet_window_alert(self, event: dict[str, Any]) -> None:
+            raise AssertionError("frame dispatch must not send an owner notice immediately")
+
+    delivery = EnqueueOnlyDelivery()
+
+    error = dispatch_matrix_event(delivery, event_name, event, logger=StructuredLogger())
+
+    assert error is None
+    assert delivery.enqueued == [(event_name, event)]
+
+
+def test_frame_update_network_delivery_runs_only_on_the_outbox_worker(tmp_path: Path) -> None:
+    from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
+
+    sent = threading.Event()
+
+    class ThreadTrackingClient(FakeMatrixClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.send_threads: list[str] = []
+
+        def send_text(self, *, room_id: str, txn_id: str, body: str) -> str:
+            self.send_threads.append(threading.current_thread().name)
+            result = super().send_text(room_id=room_id, txn_id=txn_id, body=body)
+            sent.set()
+            return result
+
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    detection_result = DetectionFilterResult(
+        by_spot={
+            "left_spot": SpotDetectionResult(spot_id="left_spot", accepted=None, rejected=[]),
+            "right_spot": SpotDetectionResult(spot_id="right_spot", accepted=None, rejected=[]),
+        },
+        rejection_counts={},
+    )
+    client = ThreadTrackingClient()
+    delivery = MatrixOutboxDelivery(
+        client=client,
+        room_id="!room:example.org",
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(tmp_path / "matrix-outbox.json"),
+    )
+    delivery.start_worker(retry_interval_seconds=60)
+    try:
+        update = _update_runtime_state_for_frame(
+            settings=settings,
+            runtime_state=RuntimeState.default(["left_spot", "right_spot"]),
+            detection_result=detection_result,
+            observed_at=datetime(2026, 5, 18, 20, 30, tzinfo=timezone.utc),
+            snapshot_path=str(tmp_path / "latest.jpg"),
+            logger=StructuredLogger(),
+            matrix_delivery=delivery,
+            state_path=tmp_path / "state.json",
+            configured_spot_ids=["left_spot", "right_spot"],
+        )
+
+        assert update.matrix_errors == []
+        assert sent.wait(2), "worker did not deliver the durable frame notice"
+        assert client.send_threads == ["matrix-outbox-delivery"]
+    finally:
+        delivery.close()
+
+    [record] = delivery.outbox.list_records()
+    assert record.intent.event_id == "quiet-window-started:street_sweeping:2026-05-18:13:00-15:00"
+    assert record.phase_states == {"text": "delivered"}
 
 
 class FakeCommandPollResult:
@@ -878,14 +1061,16 @@ def test_runtime_loop_matrix_open_event_sends_text_and_raw_snapshot(
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
             return next_detection(detections, allow_exhausted=True)
 
-    def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixDelivery:
-        return MatrixDelivery(
-            client=matrix_client,  # type: ignore[arg-type]
-            room_id="!room:example.org",
-            data_dir=data_dir,
-            snapshots_dir=tmp_path / "snapshots",
-            logger=logger,
-        )
+    def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixOutboxDelivery:
+        return outbox_delivery(matrix_client, data_dir, logger)
+
+    sleep_calls = 0
+
+    def wait_for_open_delivery(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 6:
+            assert matrix_client.wait_for_image_transaction("occupancy-open-event:")
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -894,7 +1079,7 @@ def test_runtime_loop_matrix_open_event_sends_text_and_raw_snapshot(
         overlay=noop_overlay,
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=matrix_factory,
-        sleep=lambda _seconds: None,
+        sleep=wait_for_open_delivery,
         max_iterations=6,
         now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
     )
@@ -917,7 +1102,7 @@ def test_runtime_loop_matrix_open_event_sends_text_and_raw_snapshot(
     active_files = list((tmp_path / "vehicle-history" / "sessions" / "active").glob("*.json"))
     assert len(open_images) == 1
     assert open_images[0]["txn_id"].endswith(":image")
-    assert open_images[0]["body"] == "Parking spot open: left_spot at 2026-05-18 12:00:00 PM PDT"
+    assert open_images[0]["body"].startswith("Raw full-frame snapshot for left_spot")
     assert open_images[0]["info"]["mimetype"] == "image/jpeg"
     assert active_files == []
     assert len(closed_files) == 1
@@ -929,7 +1114,7 @@ def test_runtime_loop_matrix_open_event_sends_text_and_raw_snapshot(
     assert closed_payload["occupied_crop_path"] is not None
     assert Path(closed_payload["occupied_snapshot_path"]).exists()
     assert Path(closed_payload["occupied_crop_path"]).exists()
-    assert '"event":"matrix-snapshot-copied"' in output
+    assert '"event":"matrix-outbox-snapshot-prepared"' in output
     assert '"event":"matrix-delivery-succeeded"' in output
     assert '"event":"vehicle-session-lifecycle-recorded"' in output
     assert '"action":"close"' in output
@@ -1009,14 +1194,16 @@ def test_runtime_loop_occupied_alert_sends_text_image_with_seeded_vehicle_estima
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
             return next_detection(detections, allow_exhausted=True)
 
-    def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixDelivery:
-        return MatrixDelivery(
-            client=matrix_client,  # type: ignore[arg-type]
-            room_id="!room:example.org",
-            data_dir=data_dir,
-            snapshots_dir=tmp_path / "snapshots",
-            logger=logger,
-        )
+    def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixOutboxDelivery:
+        return outbox_delivery(matrix_client, data_dir, logger)
+
+    sleep_calls = 0
+
+    def wait_for_occupied_delivery(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 4:
+            assert matrix_client.wait_for_image_transaction("occupancy-occupied-event:")
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -1025,7 +1212,7 @@ def test_runtime_loop_occupied_alert_sends_text_image_with_seeded_vehicle_estima
         overlay=noop_overlay,
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=matrix_factory,
-        sleep=lambda _seconds: None,
+        sleep=wait_for_occupied_delivery,
         max_iterations=4,
         now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
     )
@@ -1042,13 +1229,15 @@ def test_runtime_loop_occupied_alert_sends_text_image_with_seeded_vehicle_estima
     assert snapshot_files[0].read_bytes() == Path(active_payload["occupied_snapshot_path"]).read_bytes()
     assert matrix_client.uploads[0]["data"] == Path(active_payload["occupied_snapshot_path"]).read_bytes()
     reminder_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("quiet-window-upcoming:")]
+    occupied_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("occupancy-occupied-event:")]
     occupied_images = [image for image in matrix_client.images if image["txn_id"].startswith("occupancy-occupied-event:")]
     lifecycle_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("parking-monitor-started:")]
     assert len(lifecycle_texts) == 1
     assert len(reminder_texts) == 1
     assert reminder_texts[0]["body"] == "Street sweeping starts in 1 hour: street_sweeping:2026-05-18:13:00-15:00"
     assert len(occupied_images) == 1
-    text_body = occupied_images[0]["body"]
+    assert len(occupied_texts) == 1
+    text_body = occupied_texts[0]["body"]
     assert "Likely vehicle: Blue Civic (profile prof_civic)" in text_body
     assert "Estimated dwell: 1 hr–1 hr 10 min (typical 1 hr 5 min)" in text_body
     assert "Usual leave window: 8:00 PM–8:15 PM" in text_body
@@ -1181,14 +1370,16 @@ def test_runtime_loop_vehicle_history_final_integrated_regression_includes_reten
     def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
 
-    def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixDelivery:
-        return MatrixDelivery(
-            client=matrix_client,  # type: ignore[arg-type]
-            room_id="!room:example.org",
-            data_dir=data_dir,
-            snapshots_dir=tmp_path / "snapshots",
-            logger=logger,
-        )
+    def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixOutboxDelivery:
+        return outbox_delivery(matrix_client, data_dir, logger)
+
+    sleep_calls = 0
+
+    def wait_for_integrated_delivery(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 7:
+            assert matrix_client.wait_for_image_transaction("occupancy-open-event:")
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -1198,7 +1389,7 @@ def test_runtime_loop_vehicle_history_final_integrated_regression_includes_reten
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=matrix_factory,
         matrix_command_service_factory=lambda _settings, _data_dir, _logger, runtime_archive: MergeRenameCommandService(runtime_archive),
-        sleep=lambda _seconds: None,
+        sleep=wait_for_integrated_delivery,
         max_iterations=7,
         now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
     )
@@ -1210,6 +1401,7 @@ def test_runtime_loop_vehicle_history_final_integrated_regression_includes_reten
     health = health_payload(tmp_path / "health.json")
     vehicle_health = health["vehicle_history"]
     open_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("occupancy-open-event:")]
+    occupied_texts = [text for text in matrix_client.texts if text["txn_id"].startswith("occupancy-occupied-event:")]
     occupied_uploads = [upload for upload in matrix_client.uploads if upload["filename"].startswith("occupancy-occupied-event-")]
     open_uploads = [upload for upload in matrix_client.uploads if upload["filename"].startswith("occupancy-open-event-")]
     occupied_images = [image for image in matrix_client.images if image["txn_id"].startswith("occupancy-occupied-event:")]
@@ -1234,7 +1426,8 @@ def test_runtime_loop_vehicle_history_final_integrated_regression_includes_reten
     assert len(open_uploads) == 1
     assert len(occupied_images) == 1
     assert len(open_images) == 1
-    occupied_body = occupied_images[0]["body"]
+    assert len(occupied_texts) == 1
+    occupied_body = occupied_texts[0]["body"]
     assert "Likely vehicle: Corrected Fleet (profile prof_source)" in occupied_body
     assert "Estimated dwell: 1 hr–1 hr 10 min (typical 1 hr 5 min)" in occupied_body
     assert "History: 2 samples, estimate confidence low" in occupied_body
@@ -2101,15 +2294,9 @@ def test_runtime_loop_passes_effective_paths_to_capture_state_and_matrix(
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
             return []
 
-    def matrix_factory(settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixDelivery:
+    def matrix_factory(settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixOutboxDelivery:
         matrix_paths.append((data_dir, settings.storage.snapshots_dir))  # type: ignore[attr-defined]
-        return MatrixDelivery(
-            client=FakeMatrixClient(),  # type: ignore[arg-type]
-            room_id="!room:example.org",
-            data_dir=data_dir,
-            snapshots_dir=settings.storage.snapshots_dir,  # type: ignore[attr-defined]
-            logger=logger,
-        )
+        return outbox_delivery(FakeMatrixClient(), data_dir, logger)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -3223,21 +3410,19 @@ def test_runtime_loop_read_only_matrix_commands_keep_vehicle_history_health_snap
     assert_no_secret_leak(combined_output(capsys))
 
 
-def test_runtime_loop_clears_transient_matrix_outbox_error_after_clean_iteration(
+def test_startup_drains_are_not_owned_by_the_capture_loop(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    class FlakyOutboxDelivery(FakeMatrixDelivery):
+    class WorkerOwnedOutboxDelivery(FakeMatrixDelivery):
         def __init__(self) -> None:
             super().__init__()
             self.drain_calls = 0
 
-        def drain_outbox(self) -> FakeOutboxDrainResult:
+        def drain_outbox(self, *, max_records: int | None = None) -> FakeOutboxDrainResult:
             self.drain_calls += 1
-            if self.drain_calls == 2:
-                raise RuntimeError(f"outbox transient token={SECRET_MARKER}")
-            return FakeOutboxDrainResult()
+            raise AssertionError("capture loop must not drain the worker-owned outbox")
 
-    delivery = FlakyOutboxDelivery()
+    delivery = WorkerOwnedOutboxDelivery()
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -3253,7 +3438,7 @@ def test_runtime_loop_clears_transient_matrix_outbox_error_after_clean_iteration
 
     health = health_payload(tmp_path / "health.json")
     assert exit_code == 0
-    assert delivery.drain_calls == 3
+    assert delivery.drain_calls == 0
     assert health["status"] == "ok"
     assert health["last_matrix_error"] is None
     assert health["last_error"] is None
@@ -3846,8 +4031,13 @@ def test_runtime_loop_matrix_upload_failure_logs_safe_context_and_retains_copied
     detections = [[left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()], [], [], []]
 
     class UploadFailingMatrixClient(FakeMatrixClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed_upload = threading.Event()
+
         def upload_image(self, *, filename: str, data: bytes, content_type: str) -> str:
             self.uploads.append({"filename": filename, "data": data, "content_type": content_type})
+            self.failed_upload.set()
             raise MatrixError(
                 f"Matrix upload failed Authorization: Bearer {FAKE_MATRIX_VALUE}",
                 error_type="http_status",
@@ -3866,14 +4056,16 @@ def test_runtime_loop_matrix_upload_failure_logs_safe_context_and_retains_copied
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
             return next_detection(detections, allow_exhausted=True)
 
-    def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixDelivery:
-        return MatrixDelivery(
-            client=matrix_client,  # type: ignore[arg-type]
-            room_id="!room:example.org",
-            data_dir=data_dir,
-            snapshots_dir=tmp_path / "snapshots",
-            logger=logger,
-        )
+    def matrix_factory(_settings: object, data_dir: Path, logger: StructuredLogger) -> MatrixOutboxDelivery:
+        return outbox_delivery(matrix_client, data_dir, logger)
+
+    sleep_calls = 0
+
+    def wait_for_failed_upload(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 6:
+            assert matrix_client.failed_upload.wait(2)
 
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
@@ -3882,7 +4074,7 @@ def test_runtime_loop_matrix_upload_failure_logs_safe_context_and_retains_copied
         overlay=noop_overlay,
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=matrix_factory,
-        sleep=lambda _seconds: None,
+        sleep=wait_for_failed_upload,
         max_iterations=6,
         now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
     )
@@ -3893,20 +4085,16 @@ def test_runtime_loop_matrix_upload_failure_logs_safe_context_and_retains_copied
     failed = next(
         record
         for record in records
-        if record["event"] == "matrix-delivery-failed" and record.get("event_type") == "occupancy-open-event"
+        if record["event"] == "matrix-outbox-phase-retryable-failure" and record.get("phase") == "upload"
     )
 
     assert exit_code == 0
     assert len(snapshot_files) == 1
     assert snapshot_files[0].read_bytes() == (tmp_path / "latest.jpg").read_bytes()
     assert state_status(tmp_path / "state.json", "left_spot") == "empty"
-    assert failed["event_type"] == "occupancy-open-event"
-    assert failed["spot_id"] == "left_spot"
-    assert failed["snapshot_path"] == str(tmp_path / "latest.jpg")
-    assert failed["attempt"] == 3
-    assert failed["status_code"] == 500
-    assert failed["final"] is True
-    assert '"event":"matrix-snapshot-copied"' in output
+    assert failed["reason"] == "matrix_upload_http_500"
+    assert failed["error_type"] == "MatrixError"
+    assert '"event":"matrix-outbox-phase-retryable-failure"' in output
     assert '"event":"state-saved"' in output
     assert "Authorization" not in output
     assert "raw response body" not in output
@@ -3989,7 +4177,7 @@ def test_presence_by_spot_treats_small_in_spot_vehicle_as_release_suppression() 
         rejection_counts={RejectionReason.AREA_TOO_SMALL: 1},
     )
 
-    assert _presence_by_spot(result) == {"left_spot": True, "right_spot": False}
+    assert presence_by_spot(result) == {"left_spot": True, "right_spot": False}
 
 
 def test_presence_by_spot_does_not_count_centroid_outside_vehicle() -> None:
@@ -4011,7 +4199,7 @@ def test_presence_by_spot_does_not_count_centroid_outside_vehicle() -> None:
         rejection_counts={RejectionReason.CENTROID_OUTSIDE: 1},
     )
 
-    assert _presence_by_spot(result) == {"left_spot": False}
+    assert presence_by_spot(result) == {"left_spot": False}
 
 def test_runtime_loop_appends_sanitized_decision_memory_records(
     tmp_path: Path,
@@ -4312,6 +4500,30 @@ def test_matrix_outbox_health_payload_strips_record_items_from_live_provider(
     assert "items" not in payload
 
 
+def test_matrix_outbox_health_payload_exposes_only_safe_worker_fields(tmp_path: Path) -> None:
+    payload = _matrix_outbox_health_payload(
+        tmp_path / "matrix-outbox.json",
+        summary_provider=lambda: {
+            "total": 0,
+            "counts_by_state": {},
+            "worker_running": True,
+            "worker_last_attempt_at": "2026-07-29T17:00:00Z",
+            "worker_last_error_type": "RuntimeError",
+            "worker_error_message": "Authorization: Bearer matrix-secret",
+        },
+    )
+
+    assert payload is not None
+    assert payload["worker_running"] is True
+    assert payload["worker_last_attempt_at"] == "2026-07-29T17:00:00Z"
+    assert payload["worker_last_error_type"] == "RuntimeError"
+    assert "worker_error_message" not in payload
+    rendered = json.dumps(payload)
+    assert "Authorization" not in rendered
+    assert "Bearer" not in rendered
+    assert "matrix-secret" not in rendered
+
+
 def test_runtime_health_json_includes_resolved_matrix_outbox_summary(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
     pending = outbox.enqueue(AlertIntent(event_id="evt-pending", phase="text", body="ok"))
@@ -4391,20 +4603,49 @@ def test_runtime_loop_closes_matrix_services_on_exit(tmp_path: Path) -> None:
     assert closed == ["commands", "delivery"]
 
 
+def test_default_matrix_delivery_factory_starts_one_outbox_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from parking_spot_monitor import __main__ as cli
+
+    class FactoryClient(FakeMatrixClient):
+        def __init__(self, **_kwargs: Any) -> None:
+            super().__init__()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli, "MatrixClient", FactoryClient)
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+
+    delivery = cli._default_matrix_delivery_factory(settings, tmp_path, StructuredLogger())
+    worker = delivery.worker_thread
+    try:
+        assert worker is not None
+        assert worker.is_alive() is True
+        delivery.start_worker(retry_interval_seconds=settings.matrix.outbox_retry_interval_seconds)
+        assert delivery.worker_thread is worker
+    finally:
+        delivery.close()
+
+
 class UploadFailsOnceMatrixClient(FakeMatrixClient):
     def __init__(self) -> None:
         super().__init__()
         self.fail_upload = True
+        self.failed_upload = threading.Event()
 
     def upload_image(self, *, filename: str, data: bytes, content_type: str) -> str:
         if self.fail_upload and filename.startswith("occupancy-open-event-"):
             self.fail_upload = False
+            self.failed_upload.set()
             raise RuntimeError(f"matrix upload failed {SECRET_MARKER}")
         return super().upload_image(filename=filename, data=data, content_type=content_type)
 
 
 def outbox_delivery(client: object, data_dir: Path, logger: StructuredLogger) -> MatrixOutboxDelivery:
-    return MatrixOutboxDelivery(
+    delivery = MatrixOutboxDelivery(
         client=client,
         room_id="!room:example.org",
         data_dir=data_dir,
@@ -4412,6 +4653,8 @@ def outbox_delivery(client: object, data_dir: Path, logger: StructuredLogger) ->
         outbox=LocalOutbox(data_dir / "matrix-outbox.json"),
         logger=logger,
     )
+    delivery.start_worker(retry_interval_seconds=60)
+    return delivery
 
 
 def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -4422,6 +4665,15 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
             return next_detection(detections, allow_exhausted=True)
 
+    sleep_calls = 0
+
+    def wait_for_worker_on_last_iteration(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 7:
+            assert matrix_client.image_sent.wait(2)
+            assert matrix_client.failed_upload.wait(2)
+
     exit_code = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
@@ -4429,7 +4681,7 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
         overlay=noop_overlay,
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=lambda _settings, data_dir, logger: outbox_delivery(matrix_client, data_dir, logger),
-        sleep=lambda _seconds: None,
+        sleep=wait_for_worker_on_last_iteration,
         max_iterations=7,
         now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
     )
@@ -4441,7 +4693,7 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
     phases = {phase["phase"]: phase for phase in item["phases"]}
 
     assert exit_code == 0
-    assert summary["counts_by_state"] == {"delivered": 1, "retrying": 1}
+    assert summary["counts_by_state"] == {"delivered": 2, "retrying": 1}
     assert phases["upload"]["state"] == "pending"
     assert phases["image"]["state"] == "pending"
     occupancy_text_kinds = [text["txn_id"].split(":", 1)[0] for text in matrix_client.texts if text["txn_id"].startswith("occupancy-")]
@@ -4454,7 +4706,7 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
     assert_no_secret_leak(output)
 
 
-def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_event(
+def test_runtime_worker_restarts_existing_matrix_outbox_without_new_occupancy_event(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # First invocation leaves a retryable record before Matrix media upload.
@@ -4465,6 +4717,15 @@ def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_eve
         def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
             return next_detection(detections, allow_exhausted=True)
 
+    sleep_calls = 0
+
+    def wait_for_failed_worker_pass(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 7:
+            assert failing_client.image_sent.wait(2)
+            assert failing_client.failed_upload.wait(2)
+
     first_exit = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
@@ -4472,7 +4733,7 @@ def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_eve
         overlay=noop_overlay,
         detector_factory=lambda _settings: SequencedDetector(),
         matrix_delivery_factory=lambda _settings, data_dir, logger: outbox_delivery(failing_client, data_dir, logger),
-        sleep=lambda _seconds: None,
+        sleep=wait_for_failed_worker_pass,
         max_iterations=7,
         now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
     )
@@ -4484,13 +4745,26 @@ def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_eve
     def forbidden_capture(_settings: object, _data_dir: str | Path) -> FrameCaptureResult:
         raise AssertionError("startup drain with max_iterations=0 must not capture a new frame")
 
+    def _started_delivery_after_restart(
+        client: FakeMatrixClient,
+        data_dir: Path,
+        logger: StructuredLogger,
+    ) -> MatrixOutboxDelivery:
+        delivery = outbox_delivery(client, data_dir, logger)
+        assert client.image_sent.wait(2), "restarted worker did not finish durable delivery"
+        return delivery
+
     second_exit = _main(
         ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
         environ=fake_environ(),
         capture=forbidden_capture,
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
-        matrix_delivery_factory=lambda _settings, data_dir, logger: outbox_delivery(successful_client, data_dir, logger),
+        matrix_delivery_factory=lambda _settings, data_dir, logger: _started_delivery_after_restart(
+            successful_client,
+            data_dir,
+            logger,
+        ),
         sleep=lambda _seconds: None,
         max_iterations=0,
         now=lambda: datetime(2026, 5, 18, 19, 5, tzinfo=timezone.utc),
@@ -4503,13 +4777,13 @@ def test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_eve
     phases = {phase: {"state": state} for phase, state in record.phase_states.items()}
 
     assert second_exit == 0
-    assert summary["counts_by_state"] == {"delivered": 2}
+    assert summary["counts_by_state"] == {"delivered": 3}
     assert phases["upload"]["state"] == "delivered"
     assert phases["image"]["state"] == "delivered"
     assert [text for text in successful_client.texts if text["txn_id"].startswith("occupancy-open-event:")] == []
     assert len([text for text in successful_client.texts if text["txn_id"].startswith("parking-monitor-started:")]) == 1
     assert len(successful_client.uploads) == 1
     assert len(successful_client.images) == 1
-    assert '"event":"matrix-outbox-runtime-drain-succeeded"' in output
+    assert '"event":"matrix-outbox-record-delivered"' in output
     assert '"attempted_count":1' in output
     assert_no_secret_leak(output)

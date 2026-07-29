@@ -12,7 +12,7 @@ from typing import Any
 
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_alerts import MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, monitor_lifecycle_event
-from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
+from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery, dispatch_matrix_event
 
 
 @dataclass
@@ -87,7 +87,7 @@ def _signal_name(signum: int) -> str:
 def return_if_shutdown_requested(
     *,
     shutdown_state: ShutdownState,
-    matrix_delivery: Any | None,
+    matrix_delivery: RuntimeMatrixDelivery | None,
     now_fn: Callable[[], datetime],
     logger: StructuredLogger,
     decision_memory_path: Path,

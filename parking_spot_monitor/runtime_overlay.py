@@ -20,7 +20,7 @@ def _write_debug_overlay(
     return write_debug_overlay(settings, source_path, output_path, logger=logger)
 
 
-def _write_overlay_for_capture(
+def write_overlay_for_capture(
     settings: RuntimeSettings,
     latest_path: Path,
     data_dir: Path,

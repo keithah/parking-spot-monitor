@@ -11,7 +11,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import isfinite
 from pathlib import Path
+import threading
+import time
 from typing import Any
 
 from parking_monitor.outbox import AlertIntent, LocalOutbox, OutboxRecord
@@ -20,18 +23,24 @@ from parking_spot_monitor.matrix import (
     JPEG_MIMETYPE,
     OCCUPIED_SPOT_EVENT_TYPE,
     OPEN_SPOT_EVENT_TYPE,
+    OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
     MatrixDelivery,
     MatrixError,
     MatrixSnapshot,
     format_occupied_spot_alert,
     format_open_spot_alert,
+    format_owner_vehicle_quiet_window_alert,
+    format_quiet_window_notice,
     occupied_spot_event_id,
     open_spot_event_id,
+    owner_vehicle_quiet_window_event_id,
     prepare_event_snapshot,
 )
 from parking_spot_monitor.matrix_snapshots import _matrix_snapshot_upload
 
 _SNAPSHOT_ALERT_PHASES = ("text", "upload", "image")
+_QUIET_WINDOW_EVENT_TYPES = frozenset({"quiet-window-upcoming", "quiet-window-started", "quiet-window-ended"})
+_WORKER_JOIN_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -64,6 +73,15 @@ class MatrixOutboxDelivery:
         self.outbox = outbox
         self.logger = logger
         self.snapshot_retention_count = snapshot_retention_count
+        self._worker_lock = threading.Lock()
+        self._drain_lock = threading.Lock()
+        self._wake_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._worker: threading.Thread | None = None
+        self._retry_interval_seconds = 60.0
+        self._worker_last_attempt_at: str | None = None
+        self._worker_last_error_type: str | None = None
+        self._client_closed = False
         self._immediate_delivery = MatrixDelivery(
             client=client,
             room_id=room_id,
@@ -75,12 +93,117 @@ class MatrixOutboxDelivery:
         )
 
     def close(self) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+        with self._worker_lock:
+            worker = self._worker
+        if worker is not None and worker is not threading.current_thread() and worker.is_alive():
+            worker.join(timeout=_WORKER_JOIN_TIMEOUT_SECONDS)
+        with self._worker_lock:
+            if self._client_closed:
+                return
+            self._client_closed = True
         close = getattr(self.client, "close", None)
         if callable(close):
             close()
 
+    @property
+    def worker_thread(self) -> threading.Thread | None:
+        with self._worker_lock:
+            return self._worker
+
+    def start_worker(self, *, retry_interval_seconds: float) -> None:
+        retry_interval = float(retry_interval_seconds)
+        if not isfinite(retry_interval) or retry_interval <= 0:
+            raise ValueError("retry_interval_seconds must be finite and positive")
+        with self._worker_lock:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            if self._client_closed:
+                raise RuntimeError("cannot start Matrix outbox worker after close")
+            self._retry_interval_seconds = retry_interval
+            self._stop_event.clear()
+            self._worker = threading.Thread(
+                target=self._worker_main,
+                name="matrix-outbox-delivery",
+                daemon=True,
+            )
+            self._worker.start()
+        self._wake_event.set()
+
+    def _worker_main(self) -> None:
+        retry_deadline: float | None = None
+        while not self._stop_event.is_set():
+            timeout = None if retry_deadline is None else max(0.0, retry_deadline - time.monotonic())
+            signaled = self._wake_event.wait(timeout)
+            self._wake_event.clear()
+            if self._stop_event.is_set():
+                break
+            retry_due = retry_deadline is None or time.monotonic() >= retry_deadline
+            record_id: str | None = None
+            if signaled and retry_deadline is not None and not retry_due:
+                record_id = next(
+                    (record.id for record in self.outbox.list_records() if record.state == "pending"),
+                    None,
+                )
+                if record_id is None:
+                    continue
+            self._record_worker_attempt()
+            try:
+                result = self.drain_outbox(record_id=record_id, max_records=1)
+            except Exception as exc:
+                self._record_worker_error(exc)
+                self._log(
+                    "warning",
+                    "matrix-outbox-worker-pass-failed",
+                    error_type=redact_diagnostic_text(exc.__class__.__name__) or "Exception",
+                )
+                retry_deadline = time.monotonic() + self._retry_interval_seconds
+                continue
+            if self._stop_event.is_set():
+                break
+            counts = self.outbox.compact_status_summary().get("counts_by_state", {})
+            pending_count = counts.get("pending", 0) if isinstance(counts, Mapping) else 0
+            retrying_count = counts.get("retrying", 0) if isinstance(counts, Mapping) else 0
+            if result.retrying_count > 0:
+                retry_deadline = time.monotonic() + self._retry_interval_seconds
+            if isinstance(pending_count, int) and pending_count > 0:
+                self._wake_event.set()
+            elif isinstance(retrying_count, int) and retrying_count > 0:
+                if retry_deadline is None:
+                    self._wake_event.set()
+                elif retry_deadline <= time.monotonic():
+                    self._wake_event.set()
+            else:
+                retry_deadline = None
+
+    def _record_worker_attempt(self) -> None:
+        attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        with self._worker_lock:
+            self._worker_last_attempt_at = attempted_at
+
+    def _record_worker_error(self, exc: BaseException) -> None:
+        error_type = redact_diagnostic_text(exc.__class__.__name__) or "Exception"
+        with self._worker_lock:
+            self._worker_last_error_type = error_type
+
+    def _worker_stop_requested(self) -> bool:
+        with self._worker_lock:
+            worker = self._worker
+        return threading.current_thread() is worker and self._stop_event.is_set()
+
     def outbox_health_summary(self) -> Mapping[str, Any]:
-        return self.outbox.compact_status_summary()
+        summary = dict(self.outbox.compact_status_summary())
+        with self._worker_lock:
+            worker = self._worker
+            summary.update(
+                {
+                    "worker_running": worker is not None and worker.is_alive(),
+                    "worker_last_attempt_at": self._worker_last_attempt_at,
+                    "worker_last_error_type": self._worker_last_error_type,
+                }
+            )
+        return summary
 
     def send_occupied_spot_alert(self, event: Mapping[str, Any]) -> OutboxRecord:
         """Persist an occupied alert without performing Matrix network I/O."""
@@ -137,6 +260,33 @@ class MatrixOutboxDelivery:
             snapshot_event_type=OCCUPIED_SPOT_EVENT_TYPE,
         )
 
+    def enqueue_text_notice(self, event_name: str, event: Mapping[str, Any]) -> OutboxRecord:
+        """Persist a text-only frame notice without performing Matrix network I/O."""
+
+        if event_name == OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE:
+            event_id = str(event.get("event_id") or owner_vehicle_quiet_window_event_id(event))
+            body = format_owner_vehicle_quiet_window_alert(event)
+        elif event_name in _QUIET_WINDOW_EVENT_TYPES:
+            event_id = str(event.get("event_id", ""))
+            body = format_quiet_window_notice(event)
+        else:
+            raise MatrixError(
+                "Matrix text-only outbox event type is unsupported",
+                error_type="unsupported_outbox_text_event",
+                event_type=event_name,
+            )
+        intent = AlertIntent(
+            event_id=event_id,
+            phase="text",
+            room_id=self.room_id,
+            body=body,
+            metadata={"event_type": event_name},
+        )
+        record = self.outbox.enqueue_with_phases(intent, ("text",))
+        self._log("info", "matrix-outbox-enqueued", item_id=record.id, event_id=event_id, phase="text")
+        self._wake_event.set()
+        return record
+
     def _enqueue_snapshot_alert(
         self,
         *,
@@ -160,7 +310,7 @@ class MatrixOutboxDelivery:
                 "retained_snapshot_filename": snapshot.filename,
             }
         )
-        initial_phase, *followup_phases = _SNAPSHOT_ALERT_PHASES
+        initial_phase = _SNAPSHOT_ALERT_PHASES[0]
         intent = AlertIntent(
             event_id=event_id,
             phase=initial_phase,
@@ -168,16 +318,23 @@ class MatrixOutboxDelivery:
             body=body,
             metadata=metadata,
         )
-        record = self.outbox.enqueue(intent)
+        record = self.outbox.enqueue_with_phases(intent, _SNAPSHOT_ALERT_PHASES)
         self._log("info", "matrix-outbox-enqueued", item_id=record.id, event_id=event_id, phase=initial_phase)
-        # Predeclare all phases before delivery so one phase alone cannot make
-        # the record terminal-delivered.
-        for phase in followup_phases:
-            record = self.outbox.ensure_phase_pending(record.id, phase)
+        self._wake_event.set()
         return record
 
     def drain_outbox(self, *, record_id: str | None = None, max_records: int | None = None) -> MatrixOutboxDrainResult:
         """Drain pending/retrying outbox records, skipping already delivered phases."""
+
+        with self._drain_lock:
+            return self._drain_outbox_locked(record_id=record_id, max_records=max_records)
+
+    def _drain_outbox_locked(
+        self,
+        *,
+        record_id: str | None,
+        max_records: int | None,
+    ) -> MatrixOutboxDrainResult:
 
         records = [
             record
@@ -210,6 +367,8 @@ class MatrixOutboxDelivery:
     def _drain_record(self, record: OutboxRecord) -> OutboxRecord:
         current = record
         for phase in _record_delivery_phases(current):
+            if self._worker_stop_requested():
+                return current
             if current.phase_states.get(phase) == "delivered":
                 self._log("info", "matrix-outbox-phase-skip", item_id=current.id, phase=phase, reason="already_delivered")
                 continue
@@ -235,6 +394,8 @@ class MatrixOutboxDelivery:
                     transaction_id=_transaction_id(current, phase),
                 )
             except Exception as exc:
+                if threading.current_thread() is self.worker_thread:
+                    self._record_worker_error(exc)
                 classification = _classify_delivery_failure(exc, phase=phase)
                 if classification.retryable:
                     current = self.outbox.mark_retrying(current.id, reason=classification.reason)
@@ -355,7 +516,12 @@ class MatrixOutboxDelivery:
     def _log(self, level: str, event: str, **fields: Any) -> None:
         if self.logger is None:
             return
-        getattr(self.logger, level)(event, **fields)
+        try:
+            getattr(self.logger, level)(event, **fields)
+        except (OSError, ValueError):
+            # Shutdown may close an injected stream while a bounded worker join
+            # is still unwinding a network call. Logging must not kill delivery.
+            return
 
 
 
@@ -405,6 +571,8 @@ def _delivery_failure_reason(exc: Exception, *, phase: str) -> str:
 
 
 def _transaction_id(record: OutboxRecord, phase: str) -> str:
+    if phase == "text" and tuple(record.phase_states) == ("text",):
+        return record.intent.event_id
     return f"{record.intent.event_id}:{phase}"
 
 

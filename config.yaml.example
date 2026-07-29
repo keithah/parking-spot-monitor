@@ -70,6 +70,7 @@ matrix:
   retry_attempts: 3
   retry_backoff_seconds: 1
   retry_jitter_ratio: 0.2
+  outbox_retry_interval_seconds: 60
   unauthorized_reply_cooldown_seconds: 300
 
 quiet_windows:

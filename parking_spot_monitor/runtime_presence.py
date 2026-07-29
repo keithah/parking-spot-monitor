@@ -9,7 +9,7 @@ from parking_spot_monitor.occupancy import OccupancyStatus
 from parking_spot_monitor.state import RuntimeState
 
 
-def _presence_by_spot(
+def presence_by_spot(
     result: DetectionFilterResult,
     *,
     open_suppression_classes: Sequence[str] | None = None,

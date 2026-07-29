@@ -13,7 +13,7 @@ from parking_spot_monitor.matrix_alerts import (
     OCCUPIED_SPOT_EVENT_TYPE,
     OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
 )
-from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
+from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery, dispatch_matrix_event
 from parking_spot_monitor.operator_decision_memory import DecisionMemoryRecord, append_decision_memory_records
 from parking_spot_monitor.runtime_decision_memory import build_runtime_state_memory_records
 from parking_spot_monitor.runtime_frame_plan import build_runtime_frame_plan
@@ -40,7 +40,7 @@ def _update_runtime_state_for_frame(
     observed_at: datetime,
     snapshot_path: str,
     logger: StructuredLogger,
-    matrix_delivery: Any | None,
+    matrix_delivery: RuntimeMatrixDelivery | None,
     state_path: Path,
     configured_spot_ids: Sequence[str],
     history_archive: VehicleHistoryArchive | None = None,
