@@ -18,7 +18,7 @@ def _poll_matrix_commands_once(
 ) -> dict[str, Any] | None:
     if matrix_command_service is None:
         return None
-    logger.info(
+    logger.debug(
         "matrix-command-poll-attempt",
         phase="matrix-command",
         action="matrix-command",
@@ -49,7 +49,16 @@ def _poll_matrix_commands_once(
     ignored_count = getattr(result, "ignored_count", None)
     error_count = getattr(result, "error_count", None)
     bootstrapped = getattr(result, "bootstrapped", None)
-    logger.info(
+    log_success = (
+        logger.info
+        if bootstrapped is True
+        or any(
+            isinstance(count, int) and count > 0
+            for count in (processed_count, ignored_count, error_count)
+        )
+        else logger.debug
+    )
+    log_success(
         "matrix-command-poll-succeeded",
         phase="matrix-command",
         action="matrix-command",

@@ -63,6 +63,9 @@ matrix:
   command_prefix: "!parking"
   # Empty means inbound correction mutation commands are disabled/reject-all by default.
   command_authorized_senders: []
+  command_poll_interval_seconds: 60
+  command_failure_cooldown_seconds: 60
+  command_failure_max_cooldown_seconds: 900
   timeout_seconds: 10
   retry_attempts: 3
   retry_backoff_seconds: 1

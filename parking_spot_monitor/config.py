@@ -197,9 +197,30 @@ class MatrixConfig(StrictModel):
     user_id: str | None = None
     command_prefix: str = Field(default="!parking", min_length=1, max_length=32)
     command_authorized_senders: list[str] = Field(default_factory=list)
+    command_poll_interval_seconds: float = Field(
+        default=60, ge=0, allow_inf_nan=False
+    )
+    command_failure_cooldown_seconds: float = Field(
+        default=60, gt=0, allow_inf_nan=False
+    )
+    command_failure_max_cooldown_seconds: float = Field(
+        default=900, gt=0, allow_inf_nan=False
+    )
     timeout_seconds: float = Field(default=10, gt=0, allow_inf_nan=False)
     retry_attempts: int = Field(default=3, gt=0)
     retry_backoff_seconds: float = Field(default=1, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def command_failure_maximum_must_cover_initial_cooldown(self) -> Self:
+        if (
+            self.command_failure_max_cooldown_seconds
+            < self.command_failure_cooldown_seconds
+        ):
+            raise ValueError(
+                "matrix.command_failure_max_cooldown_seconds must be greater than "
+                "or equal to matrix.command_failure_cooldown_seconds"
+            )
+        return self
 
 
 WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
@@ -372,6 +393,9 @@ class RuntimeSettings(StrictModel):
                 "user_id": self.matrix.user_id,
                 "command_prefix": self.matrix.command_prefix,
                 "command_authorized_senders_count": len(self.matrix.command_authorized_senders),
+                "command_poll_interval_seconds": self.matrix.command_poll_interval_seconds,
+                "command_failure_cooldown_seconds": self.matrix.command_failure_cooldown_seconds,
+                "command_failure_max_cooldown_seconds": self.matrix.command_failure_max_cooldown_seconds,
                 "timeout_seconds": self.matrix.timeout_seconds,
                 "retry_attempts": self.matrix.retry_attempts,
                 "retry_backoff_seconds": self.matrix.retry_backoff_seconds,

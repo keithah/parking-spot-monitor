@@ -83,6 +83,9 @@ def test_example_config_loads_with_fake_env_values() -> None:
     assert settings.stream.primary_profile.frame_height == settings.stream.frame_height
     assert set(settings.stream.profiles) == {"high_resolution"}
     assert settings.matrix.access_token.value == FAKE_MATRIX_TOKEN
+    assert settings.matrix.command_poll_interval_seconds == 60
+    assert settings.matrix.command_failure_cooldown_seconds == 60
+    assert settings.matrix.command_failure_max_cooldown_seconds == 900
     assert settings.spots.left_spot.name == "Left spot"
     assert settings.spots.right_spot.name == "Right spot"
     assert settings.detection.inference_image_size == 1280
@@ -738,6 +741,97 @@ def test_matrix_command_config_defaults_to_prefix_and_empty_allowlist_when_omitt
     matrix_summary = settings.sanitized_summary()["matrix"]
     assert matrix_summary["command_prefix"] == "!parking"
     assert matrix_summary["command_authorized_senders_count"] == 0
+
+
+def test_legacy_matrix_config_omitting_command_schedule_uses_compatible_defaults(
+    tmp_path: Path,
+) -> None:
+    base = Path("config.yaml.example").read_text(encoding="utf-8")
+    config = (
+        base.replace("  command_poll_interval_seconds: 60\n", "")
+        .replace("  command_failure_cooldown_seconds: 60\n", "")
+        .replace("  command_failure_max_cooldown_seconds: 900\n", "")
+    )
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(path, environ=fake_environ())
+
+    assert settings.matrix.command_poll_interval_seconds == 60
+    assert settings.matrix.command_failure_cooldown_seconds == 60
+    assert settings.matrix.command_failure_max_cooldown_seconds == 900
+
+
+def test_matrix_command_schedule_is_configurable_and_summarized(tmp_path: Path) -> None:
+    config = (
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("  command_poll_interval_seconds: 60", "  command_poll_interval_seconds: 0")
+        .replace(
+            "  command_failure_cooldown_seconds: 60",
+            "  command_failure_cooldown_seconds: 30",
+        )
+        .replace(
+            "  command_failure_max_cooldown_seconds: 900",
+            "  command_failure_max_cooldown_seconds: 120",
+        )
+    )
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(path, environ=fake_environ())
+
+    assert settings.matrix.command_poll_interval_seconds == 0
+    assert settings.matrix.command_failure_cooldown_seconds == 30
+    assert settings.matrix.command_failure_max_cooldown_seconds == 120
+    summary = settings.sanitized_summary()["matrix"]
+    assert summary["command_poll_interval_seconds"] == 0
+    assert summary["command_failure_cooldown_seconds"] == 30
+    assert summary["command_failure_max_cooldown_seconds"] == 120
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("command_poll_interval_seconds", "-1"),
+        ("command_poll_interval_seconds", ".nan"),
+        ("command_poll_interval_seconds", ".inf"),
+        ("command_failure_cooldown_seconds", "0"),
+        ("command_failure_cooldown_seconds", ".nan"),
+        ("command_failure_cooldown_seconds", ".inf"),
+        ("command_failure_max_cooldown_seconds", "0"),
+        ("command_failure_max_cooldown_seconds", ".nan"),
+        ("command_failure_max_cooldown_seconds", ".inf"),
+    ],
+)
+def test_matrix_command_schedule_rejects_invalid_or_nonfinite_timings(
+    tmp_path: Path,
+    field: str,
+    bad_value: str,
+) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        f"  {field}: " + ("900" if field.endswith("max_cooldown_seconds") else "60"),
+        f"  {field}: {bad_value}",
+    )
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert field in str(exc_info.value)
+
+
+def test_matrix_command_failure_maximum_cannot_be_below_initial_cooldown(
+    tmp_path: Path,
+) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "  command_failure_max_cooldown_seconds: 900",
+        "  command_failure_max_cooldown_seconds: 59",
+    )
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert "command_failure_max_cooldown_seconds" in str(exc_info.value)
 
 
 def test_matrix_command_authorized_senders_are_configurable_without_secret_leaks(tmp_path: Path) -> None:

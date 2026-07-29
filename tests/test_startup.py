@@ -1436,7 +1436,7 @@ def test_runtime_loop_matrix_command_failure_is_non_blocking_and_redacted(
     assert health["status"] == "degraded"
     assert health["vehicle_history_failure_count"] == 0
     assert health["last_vehicle_history_error"] is None
-    assert health["matrix_command_failure_count"] == 4
+    assert health["matrix_command_failure_count"] == 1
     assert health["last_matrix_command_error"]["phase"] == "matrix-command"
     assert health["last_matrix_command_error"]["action"] == "matrix-command"
     assert '"event":"matrix-command-poll-failed"' in output
@@ -2765,6 +2765,160 @@ def test_runtime_loop_equal_active_and_stable_intervals_preserve_fixed_cadence(
 
     assert exit_code == 0
     assert sleeps == [2, 2]
+
+
+def test_runtime_loop_paces_successful_noop_matrix_command_polls_with_monotonic_clock(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    capture_calls = 0
+    poll_calls = 0
+    sleeps: list[float] = []
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "matrix": settings.matrix.model_copy(
+                update={"command_poll_interval_seconds": 60}
+            ),
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "adaptive_polling_enabled": False,
+                    "debug_overlay_interval_seconds": 0,
+                }
+            ),
+            "stream": settings.stream.model_copy(
+                update={"escalation_verification_seconds": 0}
+            ),
+        }
+    )
+
+    def capture_frame(
+        _settings: object,
+        data_dir: str | Path,
+        **_kwargs: object,
+    ) -> FrameCaptureResult:
+        nonlocal capture_calls
+        capture_calls += 1
+        return captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z")
+
+    class NoopCommandService:
+        def poll_once(self) -> FakeCommandPollResult:
+            nonlocal poll_calls
+            poll_calls += 1
+            return FakeCommandPollResult()
+
+    monotonic_values = iter([0.0, 1.0, 30.0, 31.0, 60.0, 61.0])
+
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(level="DEBUG"),
+        capture=capture_frame,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        matrix_command_service=NoopCommandService(),
+        sleep=sleeps.append,
+        max_iterations=3,
+        monotonic=lambda: next(monotonic_values),
+    )
+
+    output = combined_output(capsys)
+    success_logs = [
+        record
+        for record in json_records(output)
+        if record.get("event") == "matrix-command-poll-succeeded"
+    ]
+    command_records = [
+        record
+        for record in load_decision_memory(
+            tmp_path / "operator-decision-memory.json"
+        ).records
+        if record.kind == "command_outcome"
+    ]
+    assert exit_code == 0
+    assert capture_calls == 3
+    assert poll_calls == 2
+    assert len(sleeps) == 3
+    assert len(command_records) == 2
+    assert [record["level"] for record in success_logs] == ["DEBUG", "DEBUG"]
+
+
+def test_runtime_loop_open_matrix_command_circuit_skips_polls_without_sleeping_or_recounting(
+    tmp_path: Path,
+) -> None:
+    capture_calls = 0
+    poll_calls = 0
+    sleeps: list[float] = []
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "matrix": settings.matrix.model_copy(
+                update={
+                    "command_poll_interval_seconds": 60,
+                    "command_failure_cooldown_seconds": 60,
+                    "command_failure_max_cooldown_seconds": 900,
+                }
+            ),
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "adaptive_polling_enabled": False,
+                    "debug_overlay_interval_seconds": 0,
+                }
+            ),
+            "stream": settings.stream.model_copy(
+                update={"escalation_verification_seconds": 0}
+            ),
+        }
+    )
+
+    def capture_frame(
+        _settings: object,
+        data_dir: str | Path,
+        **_kwargs: object,
+    ) -> FrameCaptureResult:
+        nonlocal capture_calls
+        capture_calls += 1
+        return captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z")
+
+    class FailingCommandService:
+        def poll_once(self) -> FakeCommandPollResult:
+            nonlocal poll_calls
+            poll_calls += 1
+            raise RuntimeError("Matrix unavailable")
+
+    monotonic_values = iter([0.0, 1.0, 30.0, 31.0, 60.0, 61.0, 120.0, 121.0])
+
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=capture_frame,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        matrix_command_service=FailingCommandService(),
+        sleep=sleeps.append,
+        max_iterations=4,
+        monotonic=lambda: next(monotonic_values),
+    )
+
+    health = health_payload(tmp_path / "health.json")
+    command_records = [
+        record
+        for record in load_decision_memory(
+            tmp_path / "operator-decision-memory.json"
+        ).records
+        if record.kind == "command_outcome"
+    ]
+    assert exit_code == 0
+    assert capture_calls == 4
+    assert poll_calls == 2
+    assert len(sleeps) == 4
+    assert health["matrix_command_failure_count"] == 2
+    assert len(command_records) == 2
 
 
 def test_runtime_loop_stable_cadence_starts_after_settle_threshold(
