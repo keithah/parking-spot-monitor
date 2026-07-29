@@ -179,7 +179,7 @@ def run_capture_loop(
                         matrix_command_poll_state,
                         iteration_started_at,
                     ):
-                        command_error = _poll_matrix_commands_once(
+                        command_outcome = _poll_matrix_commands_once(
                             matrix_command_service,
                             logger=logger,
                             iteration=iteration,
@@ -189,9 +189,9 @@ def run_capture_loop(
                             settings.matrix,
                             matrix_command_poll_state,
                             iteration_started_at,
-                            failed=command_error is not None,
+                            failed=command_outcome.transport_failed,
                         )
-                        health_state.record_command_result(command_error)
+                        health_state.record_command_result(command_outcome.health_error)
                     overlay_written = runtime_loop_resources.record_primary_frame_artifacts(
                         settings,
                         frame_result.primary_capture,

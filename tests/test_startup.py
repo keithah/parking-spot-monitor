@@ -1676,6 +1676,103 @@ def test_runtime_loop_matrix_command_result_errors_degrade_health(
     assert_no_secret_leak(output)
 
 
+@pytest.mark.parametrize(
+    ("sender", "body"),
+    [
+        ("@intruder:example.org", "!parking status"),
+        ("@operator:example.org", "!parking status extra"),
+    ],
+    ids=["unauthorized", "malformed"],
+)
+def test_runtime_loop_command_event_errors_do_not_suppress_next_healthy_poll(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    sender: str,
+    body: str,
+) -> None:
+    from parking_spot_monitor.matrix import (
+        MatrixCommandService,
+        MatrixSyncResult,
+        MatrixTextEvent,
+    )
+
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "matrix": settings.matrix.model_copy(
+                update={"command_poll_interval_seconds": 0}
+            ),
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "adaptive_polling_enabled": False,
+                    "debug_overlay_interval_seconds": 0,
+                }
+            ),
+            "stream": settings.stream.model_copy(
+                update={"escalation_verification_seconds": 0}
+            ),
+        }
+    )
+    sync_calls = 0
+
+    class Client:
+        def sync(self, **_kwargs: Any) -> MatrixSyncResult:
+            nonlocal sync_calls
+            sync_calls += 1
+            events = (
+                MatrixTextEvent(
+                    event_id="$rejected",
+                    sender=sender,
+                    room_id=settings.matrix.room_id,
+                    body=body,
+                ),
+            ) if sync_calls == 1 else ()
+            return MatrixSyncResult(next_batch=f"s{sync_calls + 1}", events=events)
+
+        def send_text(self, **_kwargs: Any) -> str:
+            return "$rejection"
+
+    class CursorArchive:
+        def __init__(self) -> None:
+            self.cursor = {"next_batch": "s1"}
+
+        def read_matrix_cursor(self) -> dict[str, str]:
+            return dict(self.cursor)
+
+        def write_matrix_cursor(self, state: dict[str, str]) -> None:
+            self.cursor = dict(state)
+
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=CursorArchive(),  # type: ignore[arg-type]
+        room_id=settings.matrix.room_id,
+        authorized_senders=["@operator:example.org"],
+        unauthorized_reply_cooldown_seconds=0,
+    )
+
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(
+            Path(data_dir), timestamp="2026-05-18T18:00:00Z"
+        ),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        matrix_command_service=service,
+        sleep=lambda _seconds: None,
+        max_iterations=2,
+        monotonic=lambda: 0.0,
+    )
+
+    output = combined_output(capsys)
+    assert exit_code == 0
+    assert sync_calls == 2
+    assert output.count('"event":"matrix-command-poll-degraded"') == 1
+
+
 
 def test_runtime_loop_vehicle_history_close_failure_degrades_health_without_blocking_open_alert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

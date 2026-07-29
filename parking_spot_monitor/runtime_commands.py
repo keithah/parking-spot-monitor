@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -20,15 +21,21 @@ class RuntimeMatrixCommandService(Protocol):
     def poll_once(self) -> RuntimeMatrixCommandPollResult: ...
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeMatrixCommandPollOutcome:
+    transport_failed: bool = False
+    health_error: dict[str, Any] | None = None
+
+
 def _poll_matrix_commands_once(
     matrix_command_service: RuntimeMatrixCommandService | None,
     *,
     logger: StructuredLogger,
     iteration: int,
     decision_memory_path: Path | None = None,
-) -> dict[str, Any] | None:
+) -> RuntimeMatrixCommandPollOutcome:
     if matrix_command_service is None:
-        return None
+        return RuntimeMatrixCommandPollOutcome()
     logger.debug(
         "matrix-command-poll-attempt",
         phase="matrix-command",
@@ -55,7 +62,10 @@ def _poll_matrix_commands_once(
             error_type=context.get("error_type"),
             logger=logger,
         )
-        return context
+        return RuntimeMatrixCommandPollOutcome(
+            transport_failed=True,
+            health_error=context,
+        )
     processed_count = getattr(result, "processed_count", None)
     ignored_count = getattr(result, "ignored_count", None)
     error_count = getattr(result, "error_count", None)
@@ -116,5 +126,5 @@ def _poll_matrix_commands_once(
             error_type=context["error_type"],
             logger=logger,
         )
-        return context
-    return None
+        return RuntimeMatrixCommandPollOutcome(health_error=context)
+    return RuntimeMatrixCommandPollOutcome()
