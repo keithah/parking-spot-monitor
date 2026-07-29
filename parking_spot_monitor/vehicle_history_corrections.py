@@ -362,10 +362,14 @@ class VehicleHistoryCorrectionMixin:
             reason=safe_reason,
             quarantined_at=_utc_now(),
             record_failure=self._record_failure,
-            bump_revision=self._bump_correction_revision,
+            bump_revision=self._bump_correction_quarantine_revisions,
         )
         self._log("warning", "vehicle-profile-correction-quarantined", phase="correction-load", line_number=line_number, reason=reason)
         return outcome
+
+    def _bump_correction_quarantine_revisions(self) -> None:
+        self._bump_revision()
+        self._bump_correction_revision()
 
 
 def _required_correction_field(value: str | None, field_name: str) -> str:

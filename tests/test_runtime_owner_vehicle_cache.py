@@ -9,10 +9,12 @@ import pytest
 
 from parking_spot_monitor import runtime_owner_vehicle_cache
 from parking_spot_monitor.logging import StructuredLogger
+from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
 from parking_spot_monitor.owner_vehicles import OwnerVehicle, OwnerVehicleRegistry
 from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache, OwnerVehicleSnapshot
 from parking_spot_monitor.runtime_vehicle_events import _owner_vehicle_quiet_window_alerts
 from parking_spot_monitor.scheduler import QuietWindowStatus
+from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
 
 class FakeArchive:
@@ -31,6 +33,37 @@ class FakeArchive:
 def write_registry(path: Path, profile_id: str | None = None) -> None:
     vehicles = [] if profile_id is None else [{"profile_id": profile_id, "label": "Owner car"}]
     path.write_text(json.dumps({"schema_version": 1, "owner_vehicles": vehicles}), encoding="utf-8")
+
+
+def occupied_event(*, spot_id: str = "left", observed_at: str = "2026-05-18T13:00:00Z") -> OccupancyEvent:
+    return OccupancyEvent(
+        event_type=OccupancyEventType.STATE_CHANGED,
+        spot_id=spot_id,
+        previous_status=OccupancyStatus.EMPTY,
+        new_status=OccupancyStatus.OCCUPIED,
+        observed_at=observed_at,
+        source_timestamp=None,
+        snapshot_path="/data/snapshots/start.jpg",
+        candidate_summary={"score": 0.97, "bbox": [1, 2, 3, 4]},
+    )
+
+
+def replace_active_profile(
+    archive: VehicleHistoryArchive,
+    *,
+    session_id: str,
+    profile_id: str,
+    mtime_ns: int | None = None,
+) -> None:
+    active_path = archive.active_dir / f"{session_id}.json"
+    payload = json.loads(active_path.read_text(encoding="utf-8"))
+    payload["profile_id"] = profile_id
+    payload["profile_confidence"] = 0.99
+    replacement = archive.active_dir / f".{session_id}.replacement"
+    replacement.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    if mtime_ns is not None:
+        os.utime(replacement, ns=(mtime_ns, mtime_ns))
+    os.replace(replacement, active_path)
 
 
 def test_owner_snapshot_reuses_registry_and_active_sessions(tmp_path: Path) -> None:
@@ -118,6 +151,113 @@ def test_owner_snapshot_invalidates_on_archive_mutation(tmp_path: Path) -> None:
 
     assert second is not first
     assert archive.active_loads == 2
+
+
+def test_owner_snapshot_invalidates_after_external_active_record_replacement(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    active = archive.start_session(occupied_event())
+    cache = OwnerVehicleRuntimeCache(archive.root / "owner-vehicles.json")
+    first = cache.snapshot(archive)
+    revision = archive.mutation_revision()
+    old_stat = (archive.active_dir / f"{active.session_id}.json").stat()
+
+    replace_active_profile(
+        archive,
+        session_id=active.session_id,
+        profile_id="profile-external",
+        mtime_ns=old_stat.st_mtime_ns + 1_000_000,
+    )
+    second = cache.snapshot(archive)
+
+    assert archive.mutation_revision() == revision
+    assert second is not first
+    assert first.active_sessions[0].profile_id is None
+    assert second.active_sessions[0].profile_id == "profile-external"
+
+
+def test_external_active_record_replacement_during_rebuild_retries_to_a_stable_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    active = archive.start_session(occupied_event())
+    cache = OwnerVehicleRuntimeCache(archive.root / "owner-vehicles.json")
+    real_load = archive.load_active_sessions
+    active_loads = 0
+
+    def replace_after_first_load() -> list[object]:
+        nonlocal active_loads
+        active_loads += 1
+        sessions = real_load()
+        if active_loads == 1:
+            old_stat = (archive.active_dir / f"{active.session_id}.json").stat()
+            replace_active_profile(
+                archive,
+                session_id=active.session_id,
+                profile_id="profile-current",
+                mtime_ns=old_stat.st_mtime_ns + 1_000_000,
+            )
+        return sessions  # type: ignore[return-value]
+
+    monkeypatch.setattr(archive, "load_active_sessions", replace_after_first_load)
+
+    snapshot = cache.snapshot(archive)
+
+    assert snapshot.active_sessions[0].profile_id == "profile-current"
+    assert active_loads == 2
+    assert cache.snapshot(archive) is snapshot
+
+
+def test_active_session_signature_stat_failure_warns_and_does_not_admit_a_cache_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    active = archive.start_session(occupied_event())
+    active_path = archive.active_dir / f"{active.session_id}.json"
+    cache = OwnerVehicleRuntimeCache(archive.root / "owner-vehicles.json")
+    real_stat = Path.stat
+    real_load = archive.load_active_sessions
+    active_stat_calls = 0
+    active_loads = 0
+
+    def fail_active_stat_once(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal active_stat_calls
+        if path == active_path:
+            active_stat_calls += 1
+        if path == active_path and active_stat_calls == 3:
+            raise PermissionError("active session signature denied")
+        return real_stat(path, *args, **kwargs)
+
+    def counted_load_active_sessions():
+        nonlocal active_loads
+        active_loads += 1
+        return real_load()
+
+    monkeypatch.setattr(Path, "stat", fail_active_stat_once)
+    monkeypatch.setattr(archive, "load_active_sessions", counted_load_active_sessions)
+
+    alerts = _owner_vehicle_quiet_window_alerts(
+        archive,
+        quiet_status=QuietWindowStatus(active=True, active_window_id="window-a"),
+        observed_at=datetime(2026, 5, 18, 20, 5, 6, tzinfo=timezone.utc),
+        emitted_alert_ids=set(),
+        configured_spot_ids=("left",),
+        logger=StructuredLogger(),
+        owner_vehicle_cache=cache,
+    )
+    recovered = cache.snapshot(archive)
+    cached = cache.snapshot(archive)
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert alerts == []
+    assert '"event":"owner-vehicle-alert-scan-failed"' in output
+    assert '"error_type":"PermissionError"' in output
+    assert recovered.active_sessions[0].session_id == active.session_id
+    assert cached is recovered
+    assert active_loads == 2
 
 
 def test_missing_owner_registry_has_a_stable_cache_signature(tmp_path: Path) -> None:

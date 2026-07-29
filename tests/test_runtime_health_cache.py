@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from parking_spot_monitor.runtime_health_cache import VehicleHistoryHealthSnapshotCache
+from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
 
 class FakeArchive:
@@ -81,3 +83,21 @@ def test_force_bypasses_the_cache() -> None:
     cache.snapshot(force=True)
 
     assert archive.snapshot_calls == 2
+
+
+def test_successful_correction_quarantine_invalidates_a_primed_health_snapshot(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    clock = FakeClock(datetime(2026, 6, 10, tzinfo=timezone.utc))
+    cache = VehicleHistoryHealthSnapshotCache(archive, now=clock, ttl_seconds=300)
+    first = cache.snapshot()
+    revision = archive.mutation_revision()
+    archive.corrections_dir.mkdir(parents=True, exist_ok=True)
+    archive.corrections_path.write_text("{not-json\n", encoding="utf-8")
+
+    replay = archive.correction_replay_state()
+    second = cache.snapshot()
+
+    assert first["correction_quarantine_count"] == 0
+    assert replay.quarantine_count == 1
+    assert archive.mutation_revision() == revision + 1
+    assert second["correction_quarantine_count"] == 1

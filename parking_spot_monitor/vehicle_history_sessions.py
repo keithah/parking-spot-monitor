@@ -22,9 +22,13 @@ from parking_spot_monitor.vehicle_history_models import (
     _validate_close_event,
     _validate_start_event,
 )
+from parking_spot_monitor.vehicle_history_storage_utils import _session_file_signature
 
 
 class VehicleHistorySessionMixin:
+    def active_session_signature(self) -> tuple[tuple[str, int, int], ...]:
+        return _session_file_signature(self.active_dir)
+
     def start_session(self, event: OccupancyEvent) -> SessionRecord:
         _validate_start_event(event)
         for record in self.load_active_sessions():

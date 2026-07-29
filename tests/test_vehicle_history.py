@@ -135,6 +135,34 @@ def test_start_and_close_session_round_trip_writes_inspectable_json(tmp_path: Pa
     assert "Infinity" not in rendered
 
 
+def test_list_closed_sessions_preserves_sorted_path_order_when_creation_order_is_reversed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    created_first = archive.start_session(
+        occupied_event(spot_id="z-spot", observed_at="2026-05-18T13:00:00Z")
+    )
+    archive.close_session(open_event(spot_id="z-spot", observed_at="2026-05-18T13:30:00Z"))
+    created_second = archive.start_session(
+        occupied_event(spot_id="a-spot", observed_at="2026-05-18T14:00:00Z")
+    )
+    archive.close_session(open_event(spot_id="a-spot", observed_at="2026-05-18T14:30:00Z"))
+    original_glob = Path.glob
+    reversed_closed_paths = sorted(original_glob(archive.closed_dir, "*.json"), reverse=True)
+
+    def reverse_closed_paths(path: Path, pattern: str):
+        if path == archive.closed_dir and pattern == "*.json":
+            return iter(reversed_closed_paths)
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", reverse_closed_paths)
+
+    closed = archive.list_closed_sessions()
+
+    assert [record.session_id for record in closed] == [created_second.session_id, created_first.session_id]
+
+
 def test_close_session_revision_invalidates_snapshot_taken_before_active_unlink(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -552,7 +580,11 @@ def test_health_snapshot_streams_closed_sessions_without_list_materialization(
     def forbidden_list_closed_sessions() -> None:
         raise AssertionError("health must stream the closed archive")
 
+    def forbidden_load_records(_directory: Path) -> None:
+        raise AssertionError("health must not materialize session records")
+
     monkeypatch.setattr(archive, "list_closed_sessions", forbidden_list_closed_sessions)
+    monkeypatch.setattr(archive, "_load_records", forbidden_load_records)
 
     health = archive.health_snapshot()
 
@@ -1706,6 +1738,70 @@ def test_malformed_correction_quarantine_signature_is_stable_after_replay(
     assert correction_reads == 1
     assert archive.correction_revision() == 1
     assert archive.corrections_quarantine_path.read_text(encoding="utf-8").count("\n") == 1
+
+
+def test_successful_new_correction_quarantine_bumps_both_revisions_exactly_once(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    archive.corrections_path.write_text("{not-json\n", encoding="utf-8")
+    mutation_before = archive.mutation_revision()
+    correction_before = archive.correction_revision()
+
+    replay = archive.correction_replay_state()
+
+    assert replay.quarantine_count == 1
+    assert archive.mutation_revision() == mutation_before + 1
+    assert archive.correction_revision() == correction_before + 1
+
+
+def test_failed_correction_quarantine_write_bumps_neither_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    archive.corrections_path.write_text("{not-json\n", encoding="utf-8")
+    original_open = Path.open
+
+    def fail_quarantine_write(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == archive.corrections_quarantine_path and args and args[0] == "a":
+            raise PermissionError("quarantine denied")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_quarantine_write)
+    mutation_before = archive.mutation_revision()
+    correction_before = archive.correction_revision()
+
+    replay = archive.correction_replay_state()
+
+    assert replay.quarantine_count == 0
+    assert archive.mutation_revision() == mutation_before
+    assert archive.correction_revision() == correction_before
+
+
+def test_deduplicated_correction_quarantine_bumps_neither_revision(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    archive.corrections_path.write_text("{not-json\n", encoding="utf-8")
+    archive.corrections_quarantine_path.write_text(
+        json.dumps(
+            {
+                "line_number": 1,
+                "quarantined_at": "2026-05-18T14:45:00Z",
+                "reason": "JSONDecodeError",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    mutation_before = archive.mutation_revision()
+    correction_before = archive.correction_revision()
+
+    replay = archive.correction_replay_state()
+
+    assert replay.quarantine_count == 1
+    assert archive.mutation_revision() == mutation_before
+    assert archive.correction_revision() == correction_before
 
 
 def test_correction_replay_retries_after_quarantine_write_failure(
