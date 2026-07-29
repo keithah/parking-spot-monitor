@@ -135,9 +135,13 @@ class DetectionLabManager:
                 error={"code": "lab_busy", "message": "Another detection lab job is already active"},
             )
             return job
-        self._write_status(job, status="queued", phase="queued", summary={"inputs": sorted(inputs)})
-        thread = threading.Thread(target=self._run_job, args=(job, runner), name=f"detection-lab-{job.job_id}", daemon=True)
-        thread.start()
+        try:
+            self._write_status(job, status="queued", phase="queued", summary={"inputs": sorted(inputs)})
+            thread = threading.Thread(target=self._run_job, args=(job, runner), name=f"detection-lab-{job.job_id}", daemon=True)
+            thread.start()
+        except Exception:
+            self._release(job)
+            raise
         self._log("info", "detection-lab-job-started", job_id=job.job_id, kind=safe_kind)
         return job
 
@@ -169,26 +173,27 @@ class DetectionLabManager:
             return removed
 
     def _run_job(self, job: DetectionLabJob, runner: LabRunner) -> None:
-        self._write_status(job, status="running", phase="running")
-        inputs = self._fixed_inputs(job.kind)
-        inputs = {**inputs, "job_dir": job.job_dir}
         try:
-            result = runner(inputs)
-            report_path = self._report_path(job, result)
-            summary = self._summarize_report(job.kind, report_path)
-            self._write_status(job, status="succeeded", phase="complete", report_path=report_path, summary=summary)
-            self._log("info", "detection-lab-job-succeeded", job_id=job.job_id, kind=job.kind)
-        except DetectionLabError as exc:
-            self._write_status(job, status="blocked", phase="run", error={"code": exc.code, "message": exc.message})
-            self._log("warning", "detection-lab-job-blocked", job_id=job.job_id, kind=job.kind, error_code=exc.code)
-        except Exception as exc:  # pragma: no cover - exact exception type is runner-controlled
-            self._write_status(
-                job,
-                status="failed",
-                phase="run",
-                error={"code": "runner_exception", "message": f"Runner failed: {type(exc).__name__}: {redact_diagnostic_text(exc)}"},
-            )
-            self._log("warning", "detection-lab-job-failed", job_id=job.job_id, kind=job.kind, error_type=type(exc).__name__)
+            self._write_status(job, status="running", phase="running")
+            inputs = self._fixed_inputs(job.kind)
+            inputs = {**inputs, "job_dir": job.job_dir}
+            try:
+                result = runner(inputs)
+                report_path = self._report_path(job, result)
+                summary = self._summarize_report(job.kind, report_path)
+                self._write_status(job, status="succeeded", phase="complete", report_path=report_path, summary=summary)
+                self._log("info", "detection-lab-job-succeeded", job_id=job.job_id, kind=job.kind)
+            except DetectionLabError as exc:
+                self._write_status(job, status="blocked", phase="run", error={"code": exc.code, "message": exc.message})
+                self._log("warning", "detection-lab-job-blocked", job_id=job.job_id, kind=job.kind, error_code=exc.code)
+            except Exception as exc:  # pragma: no cover - exact exception type is runner-controlled
+                self._write_status(
+                    job,
+                    status="failed",
+                    phase="run",
+                    error={"code": "runner_exception", "message": f"Runner failed: {type(exc).__name__}: {redact_diagnostic_text(exc)}"},
+                )
+                self._log("warning", "detection-lab-job-failed", job_id=job.job_id, kind=job.kind, error_type=type(exc).__name__)
         finally:
             self._release(job)
             self.retain_recent_jobs()

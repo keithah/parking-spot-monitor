@@ -219,6 +219,102 @@ def test_second_job_is_blocked_while_first_job_is_active(tmp_path: Path) -> None
     assert _wait_for_terminal(manager, first.job_id)["status"] == "succeeded"
 
 
+@pytest.mark.parametrize("failure_point", ["queued_status", "thread_start"])
+def test_startup_failure_releases_slot_and_allows_later_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    _write_fixed_inputs(tmp_path)
+
+    def runner(inputs):
+        report = inputs["job_dir"] / "replay-report.json"
+        report.write_text('{"status_counts": {}, "coverage": {}}', encoding="utf-8")
+        return report
+
+    manager = DetectionLabManager(tmp_path, replay_runner=runner)
+    if failure_point == "queued_status":
+        original_write_status = manager._write_status
+        failed = False
+
+        def fail_first_queued_status(job, **kwargs):
+            nonlocal failed
+            if kwargs["status"] == "queued" and not failed:
+                failed = True
+                raise OSError("injected queued status write failure")
+            return original_write_status(job, **kwargs)
+
+        monkeypatch.setattr(manager, "_write_status", fail_first_queued_status)
+    else:
+        original_start = threading.Thread.start
+        failed = False
+
+        def fail_first_thread_start(thread):
+            nonlocal failed
+            if thread.name.startswith("detection-lab-") and not failed:
+                failed = True
+                raise RuntimeError("injected thread start failure")
+            return original_start(thread)
+
+        monkeypatch.setattr(threading.Thread, "start", fail_first_thread_start)
+
+    with pytest.raises((OSError, RuntimeError)):
+        manager.start_replay()
+
+    assert manager.active_job_id is None
+    later = manager.start_replay()
+    assert _wait_for_terminal(manager, later.job_id)["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("failure_point", ["running_status", "fixed_inputs"])
+def test_worker_setup_failure_releases_slot_and_allows_later_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    _write_fixed_inputs(tmp_path)
+
+    def runner(inputs):
+        report = inputs["job_dir"] / "replay-report.json"
+        report.write_text('{"status_counts": {}, "coverage": {}}', encoding="utf-8")
+        return report
+
+    manager = DetectionLabManager(tmp_path, replay_runner=runner)
+    if failure_point == "running_status":
+        original_write_status = manager._write_status
+        failed = False
+
+        def fail_first_running_status(job, **kwargs):
+            nonlocal failed
+            if kwargs["status"] == "running" and not failed:
+                failed = True
+                raise OSError("injected running status write failure")
+            return original_write_status(job, **kwargs)
+
+        monkeypatch.setattr(manager, "_write_status", fail_first_running_status)
+    else:
+        original_fixed_inputs = manager._fixed_inputs
+        call_count = 0
+
+        def fail_first_worker_input_setup(kind):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise OSError("injected worker input setup failure")
+            return original_fixed_inputs(kind)
+
+        monkeypatch.setattr(manager, "_fixed_inputs", fail_first_worker_input_setup)
+
+    worker_failed = threading.Event()
+    monkeypatch.setattr(threading, "excepthook", lambda args: worker_failed.set())
+    manager.start_replay()
+    assert worker_failed.wait(1)
+
+    assert manager.active_job_id is None
+    later = manager.start_replay()
+    assert _wait_for_terminal(manager, later.job_id)["status"] == "succeeded"
+
+
 def test_retention_never_removes_active_job(tmp_path: Path) -> None:
     _write_fixed_inputs(tmp_path)
     started = threading.Event()
