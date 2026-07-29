@@ -3,15 +3,51 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
 
+import parking_spot_monitor.detection_lab as detection_lab
 from parking_spot_monitor.detection_lab import (
     DetectionLabError,
     DetectionLabManager,
     detection_lab_root,
 )
+
+
+class CountingSequence(Sequence[object]):
+    def __init__(self, values: Iterable[object]) -> None:
+        self._values = tuple(values)
+        self.consumed = 0
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __iter__(self):
+        for item in self._values:
+            self.consumed += 1
+            yield item
+
+
+class CountingMapping(Mapping[str, object]):
+    def __init__(self, values: Iterable[tuple[str, object]]) -> None:
+        self._values = dict(values)
+        self.consumed = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self._values[key]
+
+    def __iter__(self):
+        for key in self._values:
+            self.consumed += 1
+            yield key
+
+    def __len__(self) -> int:
+        return len(self._values)
 
 
 def _write_fixed_inputs(data_dir: Path, *, tuning: bool = False) -> Path:
@@ -34,6 +70,55 @@ def _wait_for_terminal(manager: DetectionLabManager, job_id: str) -> dict:
             return last
         time.sleep(0.01)
     pytest.fail(f"job did not finish: {last}")
+
+
+def test_detection_lab_status_sanitizer_consumes_only_limit_plus_one_per_collection() -> None:
+    sequence = CountingSequence(range(100))
+    nested_mapping = CountingMapping(
+        [("sequence", sequence), ("token", "must-not-leak")]
+        + [(f"nested-{index}", index) for index in range(30)]
+    )
+    status = CountingMapping(
+        [("summary", nested_mapping)]
+        + [(f"detail-{index}", index) for index in range(30)]
+    )
+
+    sanitized = detection_lab._sanitize_status(status)
+
+    assert status.consumed == detection_lab.MAX_DETAIL_ITEMS + 1
+    assert nested_mapping.consumed == detection_lab.MAX_DETAIL_ITEMS + 1
+    assert sequence.consumed == detection_lab.MAX_DETAIL_ITEMS + 1
+    assert sanitized["summary"]["token"] == "<redacted>"
+    assert sanitized["summary"]["sequence"] == list(range(detection_lab.MAX_DETAIL_ITEMS))
+    assert sanitized["summary"]["truncated"] is True
+    assert sanitized["truncated"] is True
+
+
+def test_detection_lab_report_bounds_findings_and_detail_mappings_before_sanitizing() -> None:
+    findings = CountingSequence(
+        ["token=must-not-leak"] + [f"finding-{index}" for index in range(30)]
+    )
+    status_counts = CountingMapping(
+        (f"status-{index}", index) for index in range(100)
+    )
+
+    summary = detection_lab.summarize_lab_report(
+        "replay",
+        {
+            "status_counts": status_counts,
+            "coverage": {},
+            "redaction_scan": {"passed": False, "findings": findings},
+        },
+    )
+
+    assert findings.consumed == 9
+    assert status_counts.consumed == detection_lab.MAX_DETAIL_ITEMS + 1
+    assert summary["redaction"]["findings"] == ["token=<redacted>"] + [
+        f"finding-{index}" for index in range(7)
+    ]
+    assert list(summary["status_counts"]) == [
+        f"status-{index}" for index in range(detection_lab.MAX_DETAIL_ITEMS)
+    ]
 
 
 def test_replay_job_uses_fixed_inputs_and_persists_bounded_summary(tmp_path: Path) -> None:

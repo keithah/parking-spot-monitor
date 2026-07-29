@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
@@ -14,6 +15,40 @@ FAKE_RTSP_URL = "rtsp://user:pass@example.local/live"
 FAKE_MATRIX_TOKEN = "syt_secret_matrix_token"
 RAW_IMAGE_MARKER = "\xff\xd8\xff\xe0 raw image bytes"
 TRACEBACK_TEXT = "Traceback (most recent call last): secret stack"
+
+
+class CountingSequence(Sequence[object]):
+    def __init__(self, values: Iterable[object]) -> None:
+        self._values = tuple(values)
+        self.consumed = 0
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __iter__(self):
+        for item in self._values:
+            self.consumed += 1
+            yield item
+
+
+class CountingMapping(Mapping[str, object]):
+    def __init__(self, values: Iterable[tuple[str, object]]) -> None:
+        self._values = dict(values)
+        self.consumed = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self._values[key]
+
+    def __iter__(self):
+        for key in self._values:
+            self.consumed += 1
+            yield key
+
+    def __len__(self) -> int:
+        return len(self._values)
 
 
 def _assert_no_sensitive_text(rendered: str) -> None:
@@ -105,6 +140,30 @@ def test_feedback_label_category_metadata_is_optional_backward_compatible_and_va
 
     with pytest.raises(FeedbackLabelSchemaError):
         _sample_feedback_label(feedback_category="generic_feedback").to_json_dict()
+
+
+def test_feedback_serialization_consumes_only_limit_plus_one_for_sequences_and_metadata() -> None:
+    from parking_spot_monitor import operator_feedback_models
+
+    replay_context = CountingSequence(f"line {index}" for index in range(100))
+    source_metadata = CountingMapping(
+        [("sender", "@operator:example")]
+        + [(f"metadata-{index}", index) for index in range(30)]
+    )
+
+    payload = _sample_feedback_label(
+        label_type="learn",
+        target_state="open",
+        learned_at="2026-05-16T18:00:00Z",
+        replay_context=replay_context,
+        source_metadata=source_metadata,
+    ).to_json_dict()
+
+    assert replay_context.consumed == operator_feedback_models.MAX_REPLAY_CONTEXT_LINES + 1
+    assert source_metadata.consumed == operator_feedback_models.MAX_METADATA_ITEMS + 1
+    assert payload["replay_context"] == [f"line {index}" for index in range(12)]
+    assert list(payload["source_metadata"]) == ["sender"] + [f"metadata-{index}" for index in range(15)]
+    assert payload["source_metadata"]["sender"].startswith("sha256:")
 
 
 def test_feedback_label_load_quarantines_invalid_state(tmp_path: Path) -> None:

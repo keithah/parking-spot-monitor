@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from io import StringIO
@@ -27,6 +28,51 @@ NESTED_SECRET_MARKER = "nested-secret-marker-should-never-appear"
 TRACEBACK_TEXT = "Traceback (most recent call last): boom"
 
 
+class CountingSequence(Sequence[object]):
+    def __init__(self, values: Iterable[object]) -> None:
+        self._values = tuple(values)
+        self.consumed = 0
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __iter__(self):
+        for item in self._values:
+            self.consumed += 1
+            yield item
+
+
+class CountingList(list[object]):
+    def __init__(self, values: Iterable[object]) -> None:
+        super().__init__(values)
+        self.consumed = 0
+
+    def __iter__(self):
+        for item in super().__iter__():
+            self.consumed += 1
+            yield item
+
+
+class CountingMapping(Mapping[str, object]):
+    def __init__(self, values: Iterable[tuple[str, object]]) -> None:
+        self._values = dict(values)
+        self.consumed = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self._values[key]
+
+    def __iter__(self):
+        for key in self._values:
+            self.consumed += 1
+            yield key
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+
 def _memory_path(tmp_path: Path) -> Path:
     return decision_memory_path(tmp_path / "runtime")
 
@@ -48,6 +94,42 @@ def _assert_no_sensitive_text(rendered: str) -> None:
     assert NESTED_SECRET_MARKER not in rendered
     assert "Traceback" not in rendered
     assert "super-secret" not in rendered
+
+
+def test_decision_memory_sanitizer_consumes_only_limit_plus_one_per_collection() -> None:
+    sequence = CountingSequence(range(100))
+    nested_mapping = CountingMapping(
+        [("sequence", sequence), ("token", NESTED_SECRET_MARKER)]
+        + [(f"nested-{index}", index) for index in range(30)]
+    )
+    details = CountingMapping(
+        [("nested", nested_mapping)]
+        + [(f"detail-{index}", index) for index in range(30)]
+    )
+
+    record = make_decision_memory_record("alert", details=details)
+
+    assert details.consumed == decision_memory.MAX_MAPPING_ITEMS + 1
+    assert nested_mapping.consumed == decision_memory.MAX_MAPPING_ITEMS + 1
+    assert sequence.consumed == decision_memory.MAX_SEQUENCE_ITEMS + 1
+    assert record.details is not None
+    assert record.details["nested"]["token"] == "<redacted>"
+    assert record.details["nested"]["sequence"][-1] == "<truncated>"
+    assert record.details["nested"]["truncated"] is True
+    assert record.details["truncated"] is True
+
+
+def test_decision_memory_formatting_consumes_only_limit_plus_one_per_collection() -> None:
+    sequence = CountingList(range(100))
+    mapping = CountingMapping((f"key-{index}", index) for index in range(100))
+
+    rendered_sequence = decision_memory._format_detail_value(sequence)
+    rendered_mapping = decision_memory._format_detail_value(mapping)
+
+    assert sequence.consumed == decision_memory._MAX_FORMAT_ITEMS + 1
+    assert mapping.consumed == decision_memory._MAX_FORMAT_ITEMS + 1
+    assert rendered_sequence == "0, 1, 2, 3, 4, 5, ..."
+    assert rendered_mapping == "key-0=0; key-1=1; key-2=2; key-3=3; key-4=4; key-5=5; ..."
 
 
 def test_batch_append_persists_multiple_records_once(tmp_path: Path) -> None:

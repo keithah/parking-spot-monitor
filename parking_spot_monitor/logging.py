@@ -82,11 +82,15 @@ def redact_diagnostic_value(value: Any) -> Any:
 
 
 def _redact_mapping_item(key: object, item: Any) -> Any:
-    if not _is_secret_value_key(key):
-        return redact_diagnostic_value(item)
-    if isinstance(item, Mapping) and "env_var" in item:
+    if not is_secret_diagnostic_value(key, item):
         return redact_diagnostic_value(item)
     return "<redacted>"
+
+
+def is_secret_diagnostic_value(key: object, item: Any) -> bool:
+    """Return whether a mapping value must be replaced without inspecting it."""
+
+    return _is_secret_value_key(key) and not (isinstance(item, Mapping) and "env_var" in item)
 
 
 def _is_secret_value_key(key: object) -> bool:

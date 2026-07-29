@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from parking_spot_monitor.diagnostic_bounding import _take_bounded
 from parking_spot_monitor.logging import redact_diagnostic_text
 
 SCHEMA_VERSION = 1
@@ -279,7 +280,8 @@ def safe_feedback_text_list(value: object, *, max_items: int, item_limit: int) -
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise FeedbackLabelSchemaError("feedback label replay fields must be lists")
     bounded: list[str] = []
-    for item in list(value)[:positive_feedback_limit(max_items, max_items)]:
+    items, _ = _take_bounded(value, positive_feedback_limit(max_items, max_items))
+    for item in items:
         text = optional_feedback_text(item, limit=item_limit)
         if text:
             bounded.append(text)
@@ -292,7 +294,8 @@ def _safe_metadata(value: object) -> dict[str, str]:
     if not isinstance(value, Mapping):
         raise FeedbackLabelSchemaError("feedback label source_metadata must be an object")
     sanitized: dict[str, str] = {}
-    for raw_key, raw_value in list(value.items())[:MAX_METADATA_ITEMS]:
+    entries, _ = _take_bounded(value.items(), MAX_METADATA_ITEMS)
+    for raw_key, raw_value in entries:
         key = optional_feedback_text(raw_key, limit=80)
         if not key:
             continue

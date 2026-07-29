@@ -5,13 +5,19 @@ import re
 import secrets
 import tempfile
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
+from parking_spot_monitor.diagnostic_bounding import _take_bounded
+from parking_spot_monitor.logging import (
+    StructuredLogger,
+    is_secret_diagnostic_value,
+    redact_diagnostic_text,
+    redact_diagnostic_value,
+)
 
 LabJobKind = Literal["replay", "tuning"]
 LabJobStatus = Literal["queued", "running", "succeeded", "failed", "blocked"]
@@ -359,9 +365,10 @@ def summarize_lab_report(kind: str, report: Mapping[str, Any]) -> dict[str, Any]
             summary["metric_delta_totals"] = _int_mapping(metric_deltas.get("totals", {}))
     redaction = report.get("redaction_scan", {})
     if isinstance(redaction, Mapping):
+        findings, _ = _take_bounded(redaction.get("findings", []), 8)
         summary["redaction"] = {
             "passed": bool(redaction.get("passed", False)),
-            "findings": [_clip_text(item, 80) for item in list(redaction.get("findings", []))[:8]],
+            "findings": [_clip_text(item, 80) for item in findings],
         }
     return _sanitize_value(summary)  # type: ignore[return-value]
 
@@ -422,17 +429,22 @@ def _sanitize_status(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _sanitize_value(value: Any) -> Any:
-    redacted = redact_diagnostic_value(value)
-    if isinstance(redacted, Mapping):
+    if isinstance(value, Mapping):
         result: dict[str, Any] = {}
-        for index, (key, item) in enumerate(redacted.items()):
-            if index >= MAX_DETAIL_ITEMS:
-                result["truncated"] = True
-                break
-            result[_clip_text(key, 80)] = _sanitize_value(item)
+        entries, truncated = _take_bounded(value.items(), MAX_DETAIL_ITEMS)
+        for key, item in entries:
+            result[_clip_text(key, 80)] = (
+                "<redacted>"
+                if is_secret_diagnostic_value(key, item)
+                else _sanitize_value(item)
+            )
+        if truncated:
+            result["truncated"] = True
         return result
-    if isinstance(redacted, (list, tuple)):
-        return [_sanitize_value(item) for item in list(redacted)[:MAX_DETAIL_ITEMS]]
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        items, _ = _take_bounded(value, MAX_DETAIL_ITEMS)
+        return [_sanitize_value(item) for item in items]
+    redacted = redact_diagnostic_value(value)
     if isinstance(redacted, str):
         return _clip_text(redacted)
     if isinstance(redacted, bool) or redacted is None:
@@ -452,7 +464,8 @@ def _clip_text(value: object, limit: int = MAX_TEXT_CHARS) -> str:
 def _int_mapping(value: Any) -> dict[str, int]:
     if not isinstance(value, Mapping):
         return {}
-    return {_clip_text(key, 80): _safe_int(item) for key, item in list(value.items())[:MAX_DETAIL_ITEMS]}
+    entries, _ = _take_bounded(value.items(), MAX_DETAIL_ITEMS)
+    return {_clip_text(key, 80): _safe_int(item) for key, item in entries}
 
 
 def _safe_int(value: Any) -> int:

@@ -10,7 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
+from parking_spot_monitor.diagnostic_bounding import _take_bounded
+from parking_spot_monitor.logging import (
+    StructuredLogger,
+    is_secret_diagnostic_value,
+    redact_diagnostic_text,
+)
 
 SCHEMA_VERSION = 1
 DECISION_MEMORY_FILENAME = "operator-decision-memory.json"
@@ -379,8 +384,7 @@ def _record_from_any(value: DecisionMemoryRecord | Mapping[str, Any]) -> Decisio
 
 
 def _sanitize_details(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    redacted = redact_diagnostic_value(value)
-    sanitized = _bound_value(redacted, depth=0)
+    sanitized = _bound_value(value, depth=0)
     return sanitized if isinstance(sanitized, Mapping) else {}
 
 
@@ -389,16 +393,20 @@ def _bound_value(value: Any, *, depth: int) -> Any:
         return "<truncated>"
     if isinstance(value, Mapping):
         bounded: dict[str, Any] = {}
-        for index, (key, item) in enumerate(value.items()):
-            if index >= MAX_MAPPING_ITEMS:
-                bounded["truncated"] = True
-                break
-            bounded[_clip_text(key, 80)] = _bound_value(item, depth=depth + 1)
+        entries, truncated = _take_bounded(value.items(), MAX_MAPPING_ITEMS)
+        for key, item in entries:
+            bounded[_clip_text(key, 80)] = (
+                "<redacted>"
+                if is_secret_diagnostic_value(key, item)
+                else _bound_value(item, depth=depth + 1)
+            )
+        if truncated:
+            bounded["truncated"] = True
         return bounded
-    if isinstance(value, list | tuple | set | frozenset):
-        items = list(value)
-        bounded_items = [_bound_value(item, depth=depth + 1) for item in items[:MAX_SEQUENCE_ITEMS]]
-        if len(items) > len(bounded_items):
+    if (isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray)) or isinstance(value, set | frozenset):
+        items, truncated = _take_bounded(value, MAX_SEQUENCE_ITEMS)
+        bounded_items = [_bound_value(item, depth=depth + 1) for item in items]
+        if truncated:
             bounded_items.append("<truncated>")
         return bounded_items
     if isinstance(value, bytes | bytearray):
@@ -433,17 +441,17 @@ def _format_detail_value(value: Any, *, depth: int = 0) -> str:
         return "<truncated>"
     if isinstance(value, Mapping):
         parts: list[str] = []
-        for index, (key, item) in enumerate(value.items()):
-            if index >= _MAX_FORMAT_ITEMS:
-                parts.append("...")
-                break
+        entries, truncated = _take_bounded(value.items(), _MAX_FORMAT_ITEMS)
+        for key, item in entries:
             safe_key = _clip_text(key, 48)
             parts.append(f"{safe_key}={_format_detail_value(item, depth=depth + 1)}")
+        if truncated:
+            parts.append("...")
         return _clip_text("; ".join(parts), _MAX_FORMAT_TEXT_CHARS)
     if isinstance(value, list | tuple | set | frozenset):
-        items = list(value)
-        rendered = [_format_detail_value(item, depth=depth + 1) for item in items[:_MAX_FORMAT_ITEMS]]
-        if len(items) > len(rendered):
+        items, truncated = _take_bounded(value, _MAX_FORMAT_ITEMS)
+        rendered = [_format_detail_value(item, depth=depth + 1) for item in items]
+        if truncated:
             rendered.append("...")
         return _clip_text(", ".join(rendered), _MAX_FORMAT_TEXT_CHARS)
     if isinstance(value, bytes | bytearray):
