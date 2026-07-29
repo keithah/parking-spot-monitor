@@ -2241,6 +2241,49 @@ def test_runtime_loop_startup_prunes_existing_event_snapshots_without_touching_r
     assert_no_secret_leak(output)
 
 
+def test_runtime_loop_startup_retention_protects_pending_outbox_snapshot(
+    tmp_path: Path,
+) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+    pending = snapshots / "occupancy-open-event-left-spot-2026-05-18t19-00-00z.jpg"
+    unprotected = snapshots / "occupancy-open-event-left-spot-2026-05-18t20-00-00z.jpg"
+    pending.write_bytes(b"pending-snapshot")
+    unprotected.write_bytes(b"newer-snapshot")
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    outbox.enqueue(
+        AlertIntent(
+            event_id="pending-open-alert",
+            phase="upload",
+            body="Parking spot is open.",
+            metadata={"retained_snapshot_path": str(pending)},
+        )
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("snapshot_retention_count: 50", "snapshot_retention_count: 1"),
+        encoding="utf-8",
+    )
+
+    exit_code = _main(
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(
+            Path(data_dir), timestamp="2026-05-18T19:00:00Z"
+        ),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: FakeMatrixDelivery(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+    )
+
+    assert exit_code == 0
+    assert pending.exists()
+
+
 def test_runtime_loop_startup_retention_failure_logs_and_continues(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

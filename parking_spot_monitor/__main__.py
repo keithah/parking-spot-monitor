@@ -23,7 +23,7 @@ from parking_spot_monitor.logging import StructuredLogger, setup_logging
 from parking_spot_monitor.matrix_client import MatrixClient
 from parking_spot_monitor.matrix_cockpit import MatrixOperatorCockpitContext
 from parking_spot_monitor.matrix_commands import MatrixCommandService
-from parking_spot_monitor.matrix_snapshots import prune_event_snapshots
+from parking_spot_monitor.matrix_snapshots import SnapshotRetentionResult, prune_event_snapshots
 from parking_spot_monitor.capture_loop import run_capture_loop
 from parking_spot_monitor.config import RuntimeSettings, load_settings
 from parking_spot_monitor.operator_cockpit import build_who_snapshot_response
@@ -140,11 +140,20 @@ def _main(
         logger.info("startup-ready", config_path=config_path, data_dir=str(paths.data_dir), mode="validate-config")
         return 0
 
-    retention_result = prune_event_snapshots(
-        paths.snapshots_dir,
-        retention_count=settings.storage.snapshot_retention_count,
+    protected_snapshots = _startup_retryable_retained_snapshots(
+        paths.matrix_outbox_file,
         logger=logger,
-        trigger="startup",
+    )
+    retention_result = (
+        SnapshotRetentionResult(failed_count=1)
+        if protected_snapshots is None
+        else prune_event_snapshots(
+            paths.snapshots_dir,
+            retention_count=settings.storage.snapshot_retention_count,
+            logger=logger,
+            trigger="startup",
+            protected_snapshots=protected_snapshots,
+        )
     )
 
     logger.info("startup-ready", config_path=config_path, data_dir=str(paths.data_dir), mode=mode)
@@ -245,6 +254,31 @@ def _close_if_available(resource: Any | None) -> None:
     close = getattr(resource, "close", None)
     if callable(close):
         close()
+
+
+def _startup_retryable_retained_snapshots(
+    outbox_path: Path,
+    *,
+    logger: StructuredLogger,
+) -> tuple[Path, ...] | None:
+    try:
+        records = LocalOutbox(outbox_path).list_records()
+    except Exception as exc:
+        logger.warning(
+            "startup-outbox-snapshot-protection-failed",
+            phase="startup-retention",
+            action="load-outbox",
+            error_type=type(exc).__name__,
+        )
+        return None
+    protected: list[Path] = []
+    for record in records:
+        if record.state not in {"pending", "retrying"}:
+            continue
+        retained = record.intent.metadata.get("retained_snapshot_path")
+        if isinstance(retained, str) and retained.strip():
+            protected.append(Path(retained))
+    return tuple(protected)
 
 
 def _default_detector_factory(settings: RuntimeSettings) -> UltralyticsVehicleDetector:
