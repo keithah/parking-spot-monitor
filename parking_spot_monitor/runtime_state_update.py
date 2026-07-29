@@ -27,6 +27,7 @@ from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 class FrameUpdateResult:
     runtime_state: RuntimeState
     matrix_errors: list[dict[str, Any]]
+    transition_occurred: bool
     state_save_error: dict[str, Any] | None = None
     history_errors: list[dict[str, Any]] | None = None
 
@@ -142,6 +143,7 @@ def _update_runtime_state_for_frame(
     return FrameUpdateResult(
         runtime_state=frame_plan.runtime_state,
         matrix_errors=matrix_errors,
+        transition_occurred=bool(frame_plan.occupancy_update.events),
         state_save_error=state_save_error,
         history_errors=history_errors,
     )

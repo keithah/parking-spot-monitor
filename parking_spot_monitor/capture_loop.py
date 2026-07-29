@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from parking_spot_monitor import runtime_loop_resources
 from parking_spot_monitor.capture import CaptureError, StreamProfileCapture
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.logging import StructuredLogger
@@ -13,67 +15,19 @@ from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 from parking_spot_monitor.paths import resolve_runtime_paths
 from parking_spot_monitor.runtime_frame import capture_and_detect_runtime_frame
 from parking_spot_monitor.runtime_frame_outcome import prepare_runtime_frame_loop_result
-from parking_spot_monitor.runtime_health import RuntimeLoopHealthState, observed_at, safe_error_context, write_loop_health
+from parking_spot_monitor.runtime_health import RuntimeLoopHealthState, observed_at
 from parking_spot_monitor.runtime_health_cache import VehicleHistoryHealthSnapshotCache
 from parking_spot_monitor.runtime_commands import _poll_matrix_commands_once
 from parking_spot_monitor.runtime_detection import _configured_spot_polygons, build_detection_memory_records
-from parking_spot_monitor.runtime_overlay import _write_overlay_for_capture
+from parking_spot_monitor.runtime_resource_policy import RuntimeResourcePolicyState
 from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
 from parking_spot_monitor.runtime_lifecycle import ShutdownState, monitor_signal_handlers, return_if_shutdown_requested
 from parking_spot_monitor.state import load_runtime_state
-from parking_spot_monitor.timeline_buffer import record_timeline_frame
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
-MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION = 1
 VEHICLE_HISTORY_HEALTH_CACHE_SECONDS = 300
-
-
-def drain_matrix_outbox_if_available(
-    matrix_delivery: Any | None,
-    *,
-    logger: StructuredLogger,
-    iteration: int,
-    trigger: str,
-    max_records: int | None = None,
-) -> dict[str, Any] | None:
-    drain = getattr(matrix_delivery, "drain_outbox", None)
-    if drain is None or not callable(drain):
-        return None
-    logger.info("matrix-outbox-runtime-drain-attempt", trigger=trigger, iteration=iteration)
-    try:
-        try:
-            result = drain(max_records=max_records) if max_records is not None else drain()
-        except TypeError:
-            if max_records is None:
-                raise
-            result = drain()
-    except Exception as exc:
-        context = safe_error_context(
-            "matrix-outbox",
-            exc,
-            extra={"trigger": trigger, "iteration": iteration},
-        )
-        logger.warning("matrix-outbox-runtime-drain-failed", **context)
-        return context
-    logger.info(
-        "matrix-outbox-runtime-drain-succeeded",
-        trigger=trigger,
-        iteration=iteration,
-        attempted_count=getattr(result, "attempted_count", None),
-        delivered_count=getattr(result, "delivered_count", None),
-        retrying_count=getattr(result, "retrying_count", None),
-    )
-    retrying_count = getattr(result, "retrying_count", None)
-    if isinstance(retrying_count, int) and retrying_count > 0:
-        return {
-            "phase": "matrix-outbox",
-            "error_type": "retrying_records",
-            "message": "matrix outbox has retrying records",
-            "trigger": trigger,
-            "iteration": iteration,
-            "retrying_count": retrying_count,
-        }
-    return None
+MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION = runtime_loop_resources.MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION
+drain_matrix_outbox_if_available = runtime_loop_resources.drain_matrix_outbox_if_available
 
 
 def run_capture_loop(
@@ -90,6 +44,7 @@ def run_capture_loop(
     sleep: Callable[[float], None],
     max_iterations: int | None = None,
     now: Callable[[], datetime] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
     startup_retention_failure_count: int = 0,
 ) -> int:
     iteration = 0
@@ -105,7 +60,10 @@ def run_capture_loop(
     )
     now_fn = now if now is not None else lambda: datetime.now(timezone.utc)
     health_state = RuntimeLoopHealthState(retention_failure_count=startup_retention_failure_count)
-    startup_outbox_error = drain_matrix_outbox_if_available(matrix_delivery, logger=logger, iteration=iteration, trigger="startup")
+    resource_policy_state = RuntimeResourcePolicyState()
+    startup_outbox_error = runtime_loop_resources.drain_matrix_outbox_if_available(
+        matrix_delivery, logger=logger, iteration=iteration, trigger="startup"
+    )
     health_state.record_matrix_result(startup_outbox_error)
     decision_memory_path = data_dir / "operator-decision-memory.json"
     shutdown_state = ShutdownState()
@@ -119,31 +77,15 @@ def run_capture_loop(
         outbox_health_provider = None
 
     def write_current_health(*, status: str, iteration: int) -> None:
-        write_loop_health(
+        runtime_loop_resources.write_current_loop_health(
             settings,
             logger=logger,
+            health_state=health_state,
             status=status,
             iteration=iteration,
-            last_frame_at=health_state.last_frame_at,
-            selected_decode_mode=health_state.selected_decode_mode,
-            capture_last_success_at=health_state.capture_last_success_at,
-            capture_selected_decode_mode=health_state.capture_selected_decode_mode,
-            consecutive_capture_failures=health_state.consecutive_capture_failures,
-            consecutive_detection_failures=health_state.consecutive_detection_failures,
-            last_matrix_error=health_state.last_matrix_error,
-            last_error=health_state.last_error,
-            retention_failure_count=health_state.retention_failure_count,
-            state_save_error=health_state.state_save_error,
-            matrix_command_failure_count=health_state.matrix_command_failure_count,
-            last_matrix_command_error=health_state.last_matrix_command_error,
-            vehicle_history_failure_count=health_state.vehicle_history_failure_count,
-            last_vehicle_history_error=health_state.last_vehicle_history_error,
-            vehicle_history=vehicle_history_health.snapshot(
-                force=health_state.last_vehicle_history_error is not None
-                or health_state.vehicle_history_failure_count > 0
-            ),
-            matrix_outbox_file=runtime_paths.matrix_outbox_file,
-            matrix_outbox_summary_provider=outbox_health_provider,
+            vehicle_history_health=vehicle_history_health,
+            runtime_paths=runtime_paths,
+            outbox_health_provider=outbox_health_provider,
         )
 
     with monitor_signal_handlers(shutdown_state, logger=logger):
@@ -174,14 +116,15 @@ def run_capture_loop(
             if shutdown_exit is not None:
                 return shutdown_exit
             iteration += 1
+            iteration_started_at = monotonic()
             logger.debug("capture-loop-iteration", iteration=iteration, data_dir=str(data_dir))
             try:
-                outbox_error = drain_matrix_outbox_if_available(
+                outbox_error = runtime_loop_resources.drain_matrix_outbox_if_available(
                     matrix_delivery,
                     logger=logger,
                     iteration=iteration,
                     trigger="iteration",
-                    max_records=MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION,
+                    max_records=runtime_loop_resources.MATRIX_OUTBOX_MAX_RECORDS_PER_ITERATION,
                 )
                 health_state.record_matrix_result(outbox_error)
                 frame_attempt = capture_and_detect_runtime_frame(
@@ -194,6 +137,11 @@ def run_capture_loop(
                     logger=logger,
                     mode="runtime-loop",
                     iteration=iteration,
+                    periodic_verification_due=runtime_loop_resources.periodic_verification_due(
+                        settings,
+                        resource_policy_state,
+                        now_monotonic=iteration_started_at,
+                    ),
                 )
                 frame_result = prepare_runtime_frame_loop_result(
                     frame_attempt,
@@ -204,6 +152,9 @@ def run_capture_loop(
                 detector = frame_result.detector
                 result = frame_result.capture
                 detection_result = frame_result.detection
+                transition_occurred = False
+                frame_has_weak_presence = False
+                overlay_written = False
                 if detection_result is not None:
                     health_state.record_processed_frame(timestamp=result.timestamp, selected_mode=result.selected_mode)
                     pending_decision_records = build_detection_memory_records(
@@ -212,9 +163,6 @@ def run_capture_loop(
                         mode="runtime-loop",
                         iteration=iteration,
                     )
-                    _write_overlay_for_capture(settings, result.latest_path, data_dir, logger=logger, overlay=overlay)
-                    timeline_result = record_timeline_frame(result.latest_path, data_dir=data_dir, observed_at=result.timestamp)
-                    logger.debug("timeline-frame-retained", iteration=iteration, **timeline_result.diagnostics())
                     health_state.record_detection_success()
                     frame_observed_at = observed_at(result.timestamp, now_fn)
                     frame_update = _update_runtime_state_for_frame(
@@ -232,6 +180,10 @@ def run_capture_loop(
                         pending_decision_records=pending_decision_records,
                     )
                     runtime_state = frame_update.runtime_state
+                    transition_occurred = frame_update.transition_occurred
+                    frame_has_weak_presence = runtime_loop_resources.frame_has_weak_presence(
+                        settings, detection_result
+                    )
                     health_state.record_frame_update(
                         matrix_errors=frame_update.matrix_errors,
                         history_errors=frame_update.history_errors,
@@ -244,10 +196,45 @@ def run_capture_loop(
                         decision_memory_path=decision_memory_path,
                     )
                     health_state.record_command_result(command_error)
+                    overlay_written = runtime_loop_resources.record_primary_frame_artifacts(
+                        settings,
+                        frame_result.primary_capture,
+                        data_dir,
+                        logger=logger,
+                        overlay=overlay,
+                        iteration=iteration,
+                        policy_state=resource_policy_state,
+                        now_monotonic=iteration_started_at,
+                        transition_occurred=transition_occurred,
+                    )
                 logger.info("capture-loop-frame-written", iteration=iteration, **result.diagnostics())
                 write_current_health(status=health_state.status(), iteration=iteration)
-                logger.debug("capture-loop-paced", iteration=iteration, sleep_seconds=settings.runtime.frame_interval_seconds)
-                sleep(settings.runtime.frame_interval_seconds)
+                iteration_finished_at = monotonic()
+                policy_update = runtime_loop_resources.advance_resource_policy(
+                    settings,
+                    runtime_state,
+                    resource_policy_state,
+                    transition_occurred=transition_occurred,
+                    weak_presence=frame_has_weak_presence,
+                    degraded=health_state.status() != "ok",
+                    verification_succeeded=detection_result is not None and frame_result.escalated,
+                    overlay_written=overlay_written,
+                    completed_at=iteration_finished_at,
+                )
+                resource_policy_state = policy_update.state
+                sleep_seconds = runtime_loop_resources.paced_sleep_seconds(
+                    settings,
+                    policy_update.decision,
+                    iteration_started_at=iteration_started_at,
+                    now_monotonic=iteration_finished_at,
+                )
+                logger.debug(
+                    "capture-loop-paced",
+                    iteration=iteration,
+                    sleep_seconds=sleep_seconds,
+                    cadence_reason=policy_update.decision.reason,
+                )
+                sleep(sleep_seconds)
                 shutdown_exit = return_if_shutdown_requested(
                     shutdown_state=shutdown_state,
                     matrix_delivery=matrix_delivery,
@@ -260,6 +247,7 @@ def run_capture_loop(
                     return shutdown_exit
             except CaptureError as exc:
                 health_state.record_capture_failure(exc, iteration=iteration)
+                resource_policy_state = runtime_loop_resources.reset_stable_successes(resource_policy_state)
                 backoff_seconds = settings.stream.reconnect_seconds
                 logger.error("capture-loop-failure", iteration=iteration, backoff_seconds=backoff_seconds, **exc.diagnostics())
                 write_current_health(status="down", iteration=iteration)

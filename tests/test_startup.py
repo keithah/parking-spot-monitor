@@ -12,6 +12,7 @@ from PIL import Image
 from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery
 from parking_monitor.outbox import AlertIntent, LocalOutbox
 from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult, FrameGeometry
+from parking_spot_monitor.capture_loop import run_capture_loop
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import (
@@ -2495,6 +2496,13 @@ def test_runtime_loop_overlay_failure_logs_and_continues(
     latest_path = tmp_path / "latest.jpg"
     sleeps: list[float] = []
     overlay_calls: list[Path] = []
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("adaptive_polling_enabled: true", "adaptive_polling_enabled: false"),
+        encoding="utf-8",
+    )
 
     def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         Image.new("RGB", (1458, 806), (20, 30, 40)).save(latest_path, format="JPEG")
@@ -2522,7 +2530,7 @@ def test_runtime_loop_overlay_failure_logs_and_continues(
         raise RuntimeError(f"overlay failure with {SECRET_MARKER}")
 
     exit_code = _main(
-        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
         environ=fake_environ(),
         capture=fake_capture,
         overlay=fake_overlay,
@@ -2546,6 +2554,13 @@ def test_runtime_loop_success_logs_detection_frame_processed_with_metadata(
 ) -> None:
     latest_path = tmp_path / "latest.jpg"
     sleeps: list[float] = []
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("adaptive_polling_enabled: true", "adaptive_polling_enabled: false"),
+        encoding="utf-8",
+    )
 
     def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         assert Path(data_dir) == tmp_path
@@ -2566,7 +2581,7 @@ def test_runtime_loop_success_logs_detection_frame_processed_with_metadata(
             return [VehicleDetection(class_name="truck", confidence=0.88, bbox=(350, 200, 550, 330))]
 
     exit_code = _main(
-        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
         environ=fake_environ(),
         capture=fake_capture,
         detector_factory=lambda _settings: FakeDetector(),
@@ -2666,7 +2681,10 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
     sleeps: list[float] = []
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        Path("config.yaml.example").read_text(encoding="utf-8").replace("frame_interval_seconds: 30", "frame_interval_seconds: 2"),
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("frame_interval_seconds: 30", "frame_interval_seconds: 2")
+        .replace("adaptive_polling_enabled: true", "adaptive_polling_enabled: false"),
         encoding="utf-8",
     )
 
@@ -2706,6 +2724,222 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
     assert '"event":"timeline-frame-retained"' not in output
     assert '"event":"capture-loop-paced"' not in output
     assert_no_secret_leak(output)
+
+
+def test_runtime_loop_equal_active_and_stable_intervals_preserve_fixed_cadence(
+    tmp_path: Path,
+) -> None:
+    sleeps: list[float] = []
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "frame_interval_seconds": 2,
+                    "stable_frame_interval_seconds": 2,
+                    "debug_overlay_interval_seconds": 0,
+                }
+            ),
+            "stream": settings.stream.model_copy(
+                update={"escalation_verification_seconds": 0}
+            ),
+        }
+    )
+    monotonic_values = iter([0.0, 1.0, 2.0, 3.0])
+
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(
+            Path(data_dir), timestamp="2026-05-18T18:00:00Z"
+        ),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        sleep=sleeps.append,
+        max_iterations=2,
+        monotonic=lambda: next(monotonic_values),
+    )
+
+    assert exit_code == 0
+    assert sleeps == [2, 2]
+
+
+def test_runtime_loop_stable_cadence_starts_after_settle_threshold(
+    tmp_path: Path,
+) -> None:
+    sleeps: list[float] = []
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "frame_interval_seconds": 15,
+                    "stable_frame_interval_seconds": 60,
+                    "stable_settle_frames": 3,
+                    "debug_overlay_interval_seconds": 0,
+                }
+            ),
+            "stream": settings.stream.model_copy(
+                update={"escalation_verification_seconds": 0}
+            ),
+        }
+    )
+    save_runtime_state(
+        tmp_path / "state.json",
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(
+                    status=OccupancyStatus.EMPTY, miss_streak=3
+                ),
+                "right_spot": SpotOccupancyState(
+                    status=OccupancyStatus.EMPTY, miss_streak=3
+                ),
+            }
+        ),
+    )
+    monotonic_values = iter([0.0, 0.0, 15.0, 15.0, 30.0, 30.0])
+
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(
+            Path(data_dir), timestamp="2026-05-18T18:00:00Z"
+        ),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        sleep=sleeps.append,
+        max_iterations=3,
+        monotonic=lambda: next(monotonic_values),
+    )
+
+    assert exit_code == 0
+    assert sleeps == [15, 15, 60]
+
+
+@pytest.mark.parametrize(
+    ("processing_finished_at", "expected_sleep"),
+    [(104.0, 11.0), (120.0, 0.0)],
+)
+def test_runtime_loop_deadline_pacing_subtracts_processing_time_and_clamps_overrun(
+    tmp_path: Path,
+    processing_finished_at: float,
+    expected_sleep: float,
+) -> None:
+    sleeps: list[float] = []
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "frame_interval_seconds": 15,
+                    "stable_frame_interval_seconds": 60,
+                    "debug_overlay_interval_seconds": 0,
+                }
+            ),
+            "stream": settings.stream.model_copy(
+                update={"escalation_verification_seconds": 0}
+            ),
+        }
+    )
+    monotonic_values = iter([100.0, processing_finished_at])
+
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(
+            Path(data_dir), timestamp="2026-05-18T18:00:00Z"
+        ),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        sleep=sleeps.append,
+        max_iterations=1,
+        monotonic=lambda: next(monotonic_values),
+    )
+
+    assert exit_code == 0
+    assert sleeps == [expected_sleep]
+
+
+def test_runtime_loop_overlay_cadence_skips_stable_frames_and_writes_on_transition(
+    tmp_path: Path,
+) -> None:
+    overlay_sources: list[Path] = []
+    sleeps: list[float] = []
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={"health_file": tmp_path / "health.json"}
+            ),
+            "stream": settings.stream.model_copy(
+                update={"escalation_verification_seconds": 0}
+            ),
+        }
+    )
+    save_runtime_state(
+        tmp_path / "state.json",
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(
+                    status=OccupancyStatus.EMPTY, miss_streak=3
+                ),
+                "right_spot": SpotOccupancyState(
+                    status=OccupancyStatus.EMPTY, miss_streak=3
+                ),
+            }
+        ),
+    )
+    detections = [[], [], [left_spot_vehicle()], [left_spot_vehicle()], [left_spot_vehicle()]]
+
+    class SequencedDetector:
+        def detect(
+            self,
+            _frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            return next_detection(detections)
+
+    def record_overlay(
+        _settings: object,
+        source_path: Path,
+        _output_path: Path,
+        *,
+        logger: Any,
+    ) -> object:
+        overlay_sources.append(Path(source_path))
+        return object()
+
+    monotonic_values = iter(
+        [0.0, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0]
+    )
+
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(
+            Path(data_dir), timestamp="2026-05-18T18:00:00Z"
+        ),
+        overlay=record_overlay,
+        detector_factory=lambda _settings: SequencedDetector(),
+        matrix_delivery=None,
+        sleep=sleeps.append,
+        max_iterations=5,
+        monotonic=lambda: next(monotonic_values),
+    )
+
+    assert exit_code == 0
+    assert overlay_sources == [tmp_path / "latest.jpg", tmp_path / "latest.jpg"]
 
 
 def test_runtime_loop_reuses_vehicle_history_health_snapshot_within_cache_window(

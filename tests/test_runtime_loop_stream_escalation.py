@@ -9,6 +9,7 @@ from PIL import Image
 
 from parking_spot_monitor.__main__ import _main
 from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult, FrameGeometry
+from parking_spot_monitor.capture_loop import run_capture_loop
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.detection import DetectionError, VehicleDetection
 from parking_spot_monitor.logging import StructuredLogger
@@ -61,7 +62,7 @@ def noop_overlay(_settings: object, _source_path: Path, _output_path: Path, *, l
     return object()
 
 
-def test_runtime_loop_escalates_weak_primary_detection_to_high_resolution_profile(
+def test_runtime_loop_escalates_weak_primary_detection_and_uses_primary_artifacts(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config_path = tmp_path / "config.yaml"
@@ -74,10 +75,13 @@ def test_runtime_loop_escalates_weak_primary_detection_to_high_resolution_profil
             "      rtsp_url_env: RTSP_URL_4K\n"
             "      frame_width: 3840\n"
             "      frame_height: 2160\n",
+        ).replace(
+            "adaptive_polling_enabled: true", "adaptive_polling_enabled: false"
         ),
         encoding="utf-8",
     )
     sleeps: list[float] = []
+    overlay_sources: list[Path] = []
     capture_profiles: list[str | None] = []
     primary_path = tmp_path / "latest-primary.jpg"
     high_path = tmp_path / "latest-high.jpg"
@@ -121,11 +125,21 @@ def test_runtime_loop_escalates_weak_primary_detection_to_high_resolution_profil
                 ]
             return []
 
+    def record_overlay(
+        _settings: object,
+        source_path: Path,
+        _output_path: Path,
+        *,
+        logger: Any,
+    ) -> object:
+        overlay_sources.append(Path(source_path))
+        return object()
+
     exit_code = _main(
         ["--config", str(config_path), "--data-dir", str(tmp_path)],
         environ=fake_environ(RTSP_URL_4K=f"high-camera-{SECRET_MARKER}"),
         capture=fake_capture,
-        overlay=noop_overlay,
+        overlay=record_overlay,
         detector_factory=lambda _settings: ProfileAwareDetector(),
         sleep=sleeps.append,
         max_iterations=1,
@@ -145,6 +159,10 @@ def test_runtime_loop_escalates_weak_primary_detection_to_high_resolution_profil
     assert '"stream_profile":"high_resolution"' in output
     assert runtime_state_payload(tmp_path / "state.json")["spots"]["right_spot"]["last_bbox"][0] == pytest.approx(1010 * 3840 / 1458)
     assert sleeps == [30]
+    timeline_frames = sorted((tmp_path / "timeline" / "frames").glob("*.jpg"))
+    assert timeline_frames[0].read_bytes() == primary_path.read_bytes()
+    assert overlay_sources == [primary_path]
+    assert high_path.read_bytes() != timeline_frames[0].read_bytes()
     assert_no_secret_leak(output)
 
 
@@ -232,6 +250,124 @@ def test_runtime_frame_periodic_outcome_preserves_primary_and_final_capture_iden
     assert frame_result.primary_capture.latest_path == primary_path
     assert frame_result.capture.latest_path == high_path
     assert frame_result.escalated is True
+
+
+def test_runtime_loop_transition_verification_resets_periodic_deadline(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "debug_overlay_interval_seconds": 0,
+                }
+            ),
+            "stream": settings.stream.model_copy(
+                update={"escalation_verification_seconds": 100}
+            ),
+        }
+    )
+    primary_path = tmp_path / "latest-primary.jpg"
+    high_path = tmp_path / "latest-high.jpg"
+    capture_profiles: list[str | None] = []
+    primary_detection_count = 0
+    save_runtime_state(
+        tmp_path / "state.json",
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(
+                    status=OccupancyStatus.EMPTY,
+                    hit_streak=2,
+                ),
+                "right_spot": SpotOccupancyState(
+                    status=OccupancyStatus.EMPTY,
+                    miss_streak=3,
+                ),
+            }
+        ),
+    )
+
+    def fake_capture(
+        _settings: object,
+        _data_dir: str | Path,
+        *,
+        stream_profile: str | None = None,
+    ) -> FrameCaptureResult:
+        capture_profiles.append(stream_profile)
+        profile = stream_profile or "primary"
+        size = (3840, 2160) if profile == "high_resolution" else (1458, 806)
+        path = high_path if profile == "high_resolution" else primary_path
+        Image.new("RGB", size, (20, 30, 40)).save(path, format="JPEG")
+        return FrameCaptureResult(
+            timestamp="2026-05-18T18:00:01Z" if stream_profile else "2026-05-18T18:00:00Z",
+            latest_path=path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=0.01,
+            byte_size=path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile=profile, expected_size=size),
+        )
+
+    class TransitionThenStableDetector:
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            nonlocal primary_detection_count
+            path = Path(frame_path)
+            if path == primary_path:
+                primary_detection_count += 1
+                confidence = 0.5 if primary_detection_count == 1 else 0.92
+                return [
+                    VehicleDetection(
+                        class_name="car",
+                        confidence=confidence,
+                        bbox=(350, 200, 550, 330),
+                    )
+                ]
+            return [
+                VehicleDetection(
+                    class_name="car",
+                    confidence=0.92,
+                    bbox=(
+                        350 * 3840 / 1458,
+                        200 * 2160 / 806,
+                        550 * 3840 / 1458,
+                        330 * 2160 / 806,
+                    ),
+                )
+            ]
+
+    timestamps = iter(
+        value
+        for iteration in range(12)
+        for value in (float(iteration * 10), float(iteration * 10 + 1))
+    )
+
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: TransitionThenStableDetector(),
+        matrix_delivery=None,
+        sleep=lambda _seconds: None,
+        max_iterations=12,
+        monotonic=lambda: next(timestamps),
+    )
+
+    assert exit_code == 0
+    assert capture_profiles == [
+        None,
+        "high_resolution",
+        *([None] * 10),
+        None,
+        "high_resolution",
+    ]
 
 
 def test_failed_high_resolution_detection_preserves_primary_capture_identity(tmp_path: Path) -> None:

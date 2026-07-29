@@ -325,6 +325,7 @@ def test_runtime_modules_stay_decomposed() -> None:
         "parking_spot_monitor/runtime_frame_plan.py": 160,
         "parking_spot_monitor/runtime_health.py": 290,
         "parking_spot_monitor/runtime_lifecycle.py": 150,
+        "parking_spot_monitor/runtime_loop_resources.py": 260,
         "parking_spot_monitor/runtime_overlay.py": 90,
         "parking_spot_monitor/runtime_presence.py": 150,
         "parking_spot_monitor/runtime_state_update.py": 180,

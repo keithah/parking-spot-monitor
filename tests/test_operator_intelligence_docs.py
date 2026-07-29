@@ -173,8 +173,11 @@ def test_operator_docs_include_timeline_frame_buffer_contract() -> None:
         ],
     )
     capture_loop_source = read_tracked("parking_spot_monitor/capture_loop.py")
+    loop_resources_source = read_tracked(
+        "parking_spot_monitor/runtime_loop_resources.py"
+    )
     assert_contains_all(
-        startup_source + capture_loop_source,
+        startup_source + capture_loop_source + loop_resources_source,
         [
             "record_timeline_frame",
             "timeline-frame-retained",

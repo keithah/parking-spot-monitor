@@ -69,6 +69,13 @@ def test_runtime_loop_detector_failure_logs_and_continues(
 ) -> None:
     latest_path = tmp_path / "latest.jpg"
     sleeps: list[float] = []
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("adaptive_polling_enabled: true", "adaptive_polling_enabled: false"),
+        encoding="utf-8",
+    )
 
     def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         Image.new("RGB", (1458, 806), (20, 30, 40)).save(latest_path, format="JPEG")
@@ -92,7 +99,7 @@ def test_runtime_loop_detector_failure_logs_and_continues(
             )
 
     exit_code = _main(
-        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
         environ=fake_environ(),
         capture=fake_capture,
         detector_factory=lambda _settings: FailingDetector(),
