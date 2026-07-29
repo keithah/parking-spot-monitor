@@ -98,3 +98,55 @@ The tests are designed to fail under the important regressions: removing singlet
 Production changes are in `config.yaml.example`, `parking_spot_monitor/{__main__,capture_loop,config,matrix_dispatch,operator_feedback_alerts,runtime_commands,runtime_frame_plan,runtime_health,runtime_lifecycle,runtime_loop_resources,runtime_overlay,runtime_presence,runtime_state_update}.py`, and `src/parking_monitor/matrix_outbox_delivery.py`.
 
 Tests are in `tests/test_config.py`, `tests/test_matrix_outbox_delivery.py`, `tests/test_module_decomposition.py`, and `tests/test_startup.py`.
+
+## Fix Round 1
+
+### Status and Root Causes
+
+The first review identified two concurrency holes, both reproduced before production changes:
+
+1. `close()` set `_stop_event` before acquiring `_worker_lock`, while a concurrent first `start_worker()` acquired the lock before clearing that event. That split lifecycle authority allowed this ordering: close sets stop, start clears stop and creates the worker, close times out its bounded join and closes the client, and the worker remains alive with stop false.
+2. The worker recovery `try` covered only `drain_outbox()`. Cooldown pending-record selection occurred before it and post-pass `compact_status_summary()` occurred after it, so an unexpected filesystem/status exception terminated the daemon without safe health metadata or retry pacing.
+
+### TDD Evidence
+
+Exact focused RED, before the fix:
+
+```text
+$ python3 -m pytest tests/test_matrix_outbox_delivery.py -k 'concurrent_first_start or unexpected_post_pass_summary or unexpected_cooldown_selection' -q
+3 failed, 30 deselected, 2 warnings in 4.51s
+```
+
+The lifecycle test deterministically gated the first stop clear while close contended for the lifecycle lock and observed the worker still alive. The other tests produced unhandled worker-thread exceptions at cooldown `list_records()` selection and post-pass `compact_status_summary()` respectively.
+
+Exact focused GREEN, after the minimal fix:
+
+```text
+$ python3 -m pytest tests/test_matrix_outbox_delivery.py -k 'concurrent_first_start or unexpected_post_pass_summary or unexpected_cooldown_selection' -q
+3 passed, 30 deselected in 0.71s
+```
+
+Amended worker/outbox/startup regression:
+
+```text
+$ python3 -m pytest tests/test_matrix_outbox_delivery.py tests/test_outbox_persistence.py tests/test_startup.py -k 'worker or outbox or enqueue or startup_drains' -q
+89 passed, 88 deselected in 9.70s
+```
+
+### Fix and Lifecycle Invariants
+
+- Added an authoritative `_closing` state. `close()` now establishes closing, stop, wake, and the worker snapshot together under `_worker_lock`, then releases the lock before the accepted bounded join and client close.
+- `start_worker()` checks closing/closed before its singleton check and before clearing stop. Because both start and close lifecycle transitions use the same lock, once close begins no start can erase its stop request or create/reuse a worker.
+- Stop remains set after close, a later start is rejected, and close remains idempotent. The accepted behavior for an uncooperative in-flight client call is unchanged.
+- Expanded the existing worker-pass recovery boundary to contain cooldown selection, the serialized one-record drain, and post-pass summary/scheduling. Any unexpected exception in those operations records only the exception class, resets the monotonic retry deadline, and leaves the daemon available to resume.
+- No lock is held across the worker join, Matrix I/O, outbox I/O, or client close. Drain serialization, one-record pass bounds, inter-phase stop checks, safe health fields, and logger-shutdown handling are unchanged.
+
+### Mutation and Self-Review
+
+The lifecycle regression fails if stop/wake move back outside the lifecycle lock, if closing is not checked before stop clear, or if close ceases to be authoritative after the race. The two pass-recovery regressions fail if either selection or summary moves outside the `try`, if failure retry pacing is removed, if safe error metadata is not recorded, or if the worker does not resume.
+
+Lock-order review found no new inversion: lifecycle/metadata locking remains independent of `_drain_lock` and the outbox's lock. Wake remains a hint only, enqueue still does not take `_drain_lock`, and the worker continues to check stop between network phases. The bounded-join limitation documented above remains the only accepted concern.
+
+Files changed in this round: `src/parking_monitor/matrix_outbox_delivery.py`, `tests/test_matrix_outbox_delivery.py`, and this report.
+
+Commit: `fix: harden Matrix worker lifecycle recovery` (the commit containing this report).

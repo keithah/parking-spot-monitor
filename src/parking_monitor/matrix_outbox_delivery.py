@@ -81,6 +81,7 @@ class MatrixOutboxDelivery:
         self._retry_interval_seconds = 60.0
         self._worker_last_attempt_at: str | None = None
         self._worker_last_error_type: str | None = None
+        self._closing = False
         self._client_closed = False
         self._immediate_delivery = MatrixDelivery(
             client=client,
@@ -93,9 +94,10 @@ class MatrixOutboxDelivery:
         )
 
     def close(self) -> None:
-        self._stop_event.set()
-        self._wake_event.set()
         with self._worker_lock:
+            self._closing = True
+            self._stop_event.set()
+            self._wake_event.set()
             worker = self._worker
         if worker is not None and worker is not threading.current_thread() and worker.is_alive():
             worker.join(timeout=_WORKER_JOIN_TIMEOUT_SECONDS)
@@ -117,10 +119,10 @@ class MatrixOutboxDelivery:
         if not isfinite(retry_interval) or retry_interval <= 0:
             raise ValueError("retry_interval_seconds must be finite and positive")
         with self._worker_lock:
+            if self._closing or self._client_closed:
+                raise RuntimeError("cannot start Matrix outbox worker after close")
             if self._worker is not None and self._worker.is_alive():
                 return
-            if self._client_closed:
-                raise RuntimeError("cannot start Matrix outbox worker after close")
             self._retry_interval_seconds = retry_interval
             self._stop_event.clear()
             self._worker = threading.Thread(
@@ -140,17 +142,33 @@ class MatrixOutboxDelivery:
             if self._stop_event.is_set():
                 break
             retry_due = retry_deadline is None or time.monotonic() >= retry_deadline
-            record_id: str | None = None
-            if signaled and retry_deadline is not None and not retry_due:
-                record_id = next(
-                    (record.id for record in self.outbox.list_records() if record.state == "pending"),
-                    None,
-                )
-                if record_id is None:
-                    continue
             self._record_worker_attempt()
             try:
+                record_id: str | None = None
+                if signaled and retry_deadline is not None and not retry_due:
+                    record_id = next(
+                        (record.id for record in self.outbox.list_records() if record.state == "pending"),
+                        None,
+                    )
+                    if record_id is None:
+                        continue
                 result = self.drain_outbox(record_id=record_id, max_records=1)
+                if self._stop_event.is_set():
+                    break
+                counts = self.outbox.compact_status_summary().get("counts_by_state", {})
+                pending_count = counts.get("pending", 0) if isinstance(counts, Mapping) else 0
+                retrying_count = counts.get("retrying", 0) if isinstance(counts, Mapping) else 0
+                if result.retrying_count > 0:
+                    retry_deadline = time.monotonic() + self._retry_interval_seconds
+                if isinstance(pending_count, int) and pending_count > 0:
+                    self._wake_event.set()
+                elif isinstance(retrying_count, int) and retrying_count > 0:
+                    if retry_deadline is None:
+                        self._wake_event.set()
+                    elif retry_deadline <= time.monotonic():
+                        self._wake_event.set()
+                else:
+                    retry_deadline = None
             except Exception as exc:
                 self._record_worker_error(exc)
                 self._log(
@@ -160,22 +178,6 @@ class MatrixOutboxDelivery:
                 )
                 retry_deadline = time.monotonic() + self._retry_interval_seconds
                 continue
-            if self._stop_event.is_set():
-                break
-            counts = self.outbox.compact_status_summary().get("counts_by_state", {})
-            pending_count = counts.get("pending", 0) if isinstance(counts, Mapping) else 0
-            retrying_count = counts.get("retrying", 0) if isinstance(counts, Mapping) else 0
-            if result.retrying_count > 0:
-                retry_deadline = time.monotonic() + self._retry_interval_seconds
-            if isinstance(pending_count, int) and pending_count > 0:
-                self._wake_event.set()
-            elif isinstance(retrying_count, int) and retrying_count > 0:
-                if retry_deadline is None:
-                    self._wake_event.set()
-                elif retry_deadline <= time.monotonic():
-                    self._wake_event.set()
-            else:
-                retry_deadline = None
 
     def _record_worker_attempt(self) -> None:
         attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")

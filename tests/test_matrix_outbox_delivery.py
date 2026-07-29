@@ -360,6 +360,129 @@ def test_worker_survives_unexpected_drain_failure_and_health_redacts_error_detai
         delivery.close()
 
 
+def test_worker_survives_unexpected_post_pass_summary_failure_and_paces_retry(tmp_path: Path) -> None:
+    summary_failed = threading.Event()
+    resumed = threading.Event()
+
+    class SummaryFailureOutbox(LocalOutbox):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.summary_calls = 0
+
+        def compact_status_summary(self) -> dict[str, Any]:
+            self.summary_calls += 1
+            if self.summary_calls == 1:
+                summary_failed.set()
+                raise RuntimeError("Authorization: Bearer summary-secret")
+            return super().compact_status_summary()
+
+    class RecordingDelivery(MatrixOutboxDelivery):
+        def __init__(self, outbox: LocalOutbox) -> None:
+            super().__init__(
+                client=FakeMatrixClient(),
+                room_id=ROOM_ID,
+                data_dir=tmp_path,
+                snapshots_dir=tmp_path / "snapshots",
+                outbox=outbox,
+            )
+            self.drain_calls = 0
+
+        def drain_outbox(
+            self,
+            *,
+            record_id: str | None = None,
+            max_records: int | None = None,
+        ) -> MatrixOutboxDrainResult:
+            self.drain_calls += 1
+            if self.drain_calls == 2:
+                resumed.set()
+            return MatrixOutboxDrainResult(0, 0, 0)
+
+    delivery = RecordingDelivery(SummaryFailureOutbox(tmp_path / "matrix-outbox.json"))
+    try:
+        delivery.start_worker(retry_interval_seconds=0.2)
+        assert summary_failed.wait(2), "worker did not reach post-pass outbox summarization"
+        assert not resumed.wait(0.05), "worker retried immediately after an unexpected summary failure"
+        assert resumed.wait(2), "worker died after an unexpected post-pass summary failure"
+        health = delivery.outbox_health_summary()
+        assert health["worker_running"] is True
+        assert health["worker_last_error_type"] == "RuntimeError"
+        assert "summary-secret" not in json.dumps(health)
+    finally:
+        delivery.close()
+
+
+def test_worker_survives_unexpected_cooldown_selection_failure_and_paces_retry(tmp_path: Path) -> None:
+    cooldown_ready = threading.Event()
+    selection_failed = threading.Event()
+    resumed = threading.Event()
+
+    class SelectionFailureOutbox(LocalOutbox):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.retrying = True
+            self.selection_calls = 0
+
+        def list_records(self, state: Any | None = None) -> list[Any]:
+            self.selection_calls += 1
+            if self.selection_calls == 1:
+                selection_failed.set()
+                raise RuntimeError("access_token=selection-secret")
+            return super().list_records(state)
+
+        def compact_status_summary(self) -> dict[str, Any]:
+            cooldown_ready.set()
+            return {"counts_by_state": {"retrying": 1 if self.retrying else 0}}
+
+    class RecordingDelivery(MatrixOutboxDelivery):
+        def __init__(self, outbox: SelectionFailureOutbox) -> None:
+            super().__init__(
+                client=FakeMatrixClient(),
+                room_id=ROOM_ID,
+                data_dir=tmp_path,
+                snapshots_dir=tmp_path / "snapshots",
+                outbox=outbox,
+            )
+            self.selection_outbox = outbox
+            self.drain_calls = 0
+
+        def drain_outbox(
+            self,
+            *,
+            record_id: str | None = None,
+            max_records: int | None = None,
+        ) -> MatrixOutboxDrainResult:
+            self.drain_calls += 1
+            if self.drain_calls == 1:
+                return MatrixOutboxDrainResult(1, 0, 1)
+            self.selection_outbox.retrying = False
+            resumed.set()
+            return MatrixOutboxDrainResult(0, 0, 0)
+
+    outbox = SelectionFailureOutbox(tmp_path / "matrix-outbox.json")
+    delivery = RecordingDelivery(outbox)
+    try:
+        delivery.start_worker(retry_interval_seconds=0.2)
+        assert cooldown_ready.wait(2), "worker did not enter retry cooldown"
+        delivery.enqueue_text_notice(
+            "quiet-window-started",
+            {
+                "event_type": "quiet-window-started",
+                "event_id": "quiet-window-started:selection-race",
+                "window_id": "selection-race",
+            },
+        )
+        assert selection_failed.wait(2), "worker did not select pending work during cooldown"
+        assert not resumed.wait(0.05), "worker retried immediately after an unexpected selection failure"
+        assert resumed.wait(2), "worker died after an unexpected cooldown selection failure"
+        health = delivery.outbox_health_summary()
+        assert health["worker_running"] is True
+        assert health["worker_last_error_type"] == "RuntimeError"
+        assert "selection-secret" not in json.dumps(health)
+    finally:
+        delivery.close()
+
+
 def test_worker_survives_logger_shutdown_during_bounded_close(tmp_path: Path) -> None:
     delivered = threading.Event()
 
@@ -426,6 +549,113 @@ def test_close_bounds_worker_join_before_closing_client(
     assert delivery.worker_thread is not None
     delivery.worker_thread.join(timeout=2)
     assert delivery.worker_thread.is_alive() is False
+
+
+def test_concurrent_first_start_cannot_clear_close_stop_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import parking_monitor.matrix_outbox_delivery as delivery_module
+
+    clear_entered = threading.Event()
+    release_clear = threading.Event()
+    lifecycle_contended = threading.Event()
+
+    class ContentionRecordingLock:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.owner: int | None = None
+
+        def acquire(self) -> bool:
+            current = threading.get_ident()
+            if self.owner is not None and self.owner != current:
+                lifecycle_contended.set()
+            acquired = self.lock.acquire()
+            if acquired:
+                self.owner = current
+            return acquired
+
+        def release(self) -> None:
+            self.owner = None
+            self.lock.release()
+
+        def __enter__(self) -> ContentionRecordingLock:
+            self.acquire()
+            return self
+
+        def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+            self.release()
+
+    class BlockingClearEvent:
+        def __init__(self) -> None:
+            self.event = threading.Event()
+
+        def clear(self) -> None:
+            clear_entered.set()
+            assert release_clear.wait(2), "test did not release worker stop clear"
+            self.event.clear()
+
+        def is_set(self) -> bool:
+            return self.event.is_set()
+
+        def set(self) -> None:
+            self.event.set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            return self.event.wait(timeout)
+
+    class WaitingDelivery(MatrixOutboxDelivery):
+        def _worker_main(self) -> None:
+            self._stop_event.wait()
+
+    monkeypatch.setattr(delivery_module, "_WORKER_JOIN_TIMEOUT_SECONDS", 0.05)
+    delivery = WaitingDelivery(
+        client=FakeMatrixClient(),
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(tmp_path / "matrix-outbox.json"),
+    )
+    delivery._worker_lock = ContentionRecordingLock()  # type: ignore[assignment]
+    delivery._stop_event = BlockingClearEvent()  # type: ignore[assignment]
+    errors: list[BaseException] = []
+
+    def start() -> None:
+        try:
+            delivery.start_worker(retry_interval_seconds=60)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def close() -> None:
+        try:
+            delivery.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    starter = threading.Thread(target=start, name="concurrent-worker-start")
+    closer = threading.Thread(target=close, name="concurrent-worker-close")
+    starter.start()
+    assert clear_entered.wait(2), "first worker start did not reach stop clear"
+    closer.start()
+    assert lifecycle_contended.wait(2), "close did not contend with first worker start"
+    release_clear.set()
+    starter.join(timeout=2)
+    closer.join(timeout=2)
+    worker = delivery.worker_thread
+    try:
+        assert starter.is_alive() is False
+        assert closer.is_alive() is False
+        assert errors == []
+        assert worker is not None
+        assert worker.is_alive() is False
+        assert delivery._stop_event.is_set() is True
+        with pytest.raises(RuntimeError, match="after close"):
+            delivery.start_worker(retry_interval_seconds=60)
+    finally:
+        delivery._stop_event.set()
+        delivery._wake_event.set()
+        if worker is not None:
+            worker.join(timeout=2)
 
 
 def test_enqueue_text_notice_is_durable_and_preserves_text_only_transaction_id(tmp_path: Path) -> None:
