@@ -65,15 +65,15 @@ def encode_jpeg_under_budget(
             target_size = _bounded_dimensions(source_width, source_height, current_dimension)
             candidate = image if target_size == (source_width, source_height) else image.resize(target_size, resampling)
             try:
-                lowest_data = _attempt(candidate, buffer, lowest_quality)
+                lowest_size = _attempt(candidate, buffer, lowest_quality)
                 attempts += 1
-                if len(lowest_data) <= max_bytes:
+                if lowest_size <= max_bytes:
                     quality, data, quality_attempts = _highest_viable_quality(
                         candidate,
                         buffer,
                         normalized_qualities,
                         max_bytes=max_bytes,
-                        lowest_data=lowest_data,
+                        lowest_data=buffer.getvalue(),
                     )
                     attempts += quality_attempts
                     width, height = candidate.size
@@ -113,23 +113,23 @@ def _highest_viable_quality(
     while low_index < high_index:
         middle_index = (low_index + high_index) // 2
         quality = qualities[middle_index]
-        data = _attempt(image, buffer, quality)
+        size = _attempt(image, buffer, quality)
         attempts += 1
-        if len(data) <= max_bytes:
+        if size <= max_bytes:
             high_index = middle_index
             best_quality = quality
-            best_data = data
+            best_data = buffer.getvalue()
         else:
             low_index = middle_index + 1
 
     return best_quality, best_data, attempts
 
 
-def _attempt(image: Image.Image, buffer: BytesIO, quality: int) -> bytes:
+def _attempt(image: Image.Image, buffer: BytesIO, quality: int) -> int:
     buffer.seek(0)
     buffer.truncate(0)
     _encode_jpeg(image, buffer, quality)
-    return buffer.getvalue()
+    return buffer.tell()
 
 
 def _encode_jpeg(image: Image.Image, buffer: BytesIO, quality: int) -> None:
@@ -167,5 +167,8 @@ def _require_positive_integer(name: str, value: int) -> None:
 
 
 def _bounded_dimensions(width: int, height: int, max_dimension: int) -> tuple[int, int]:
-    scale = min(1.0, max_dimension / max(width, height))
-    return max(1, int(width * scale)), max(1, int(height * scale))
+    if max(width, height) <= max_dimension:
+        return width, height
+    if width >= height:
+        return max_dimension, max(1, height * max_dimension // width)
+    return max(1, width * max_dimension // height), max_dimension

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from io import BytesIO
 from typing import Any
 
 import pytest
@@ -35,6 +36,12 @@ def _encode(
 
 def test_encoder_selects_largest_dimension_then_highest_quality(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts: list[tuple[tuple[int, int], int]] = []
+    materialized_sizes: list[int] = []
+
+    class RecordingBytesIO(BytesIO):
+        def getvalue(self) -> bytes:
+            materialized_sizes.append(self.tell())
+            return super().getvalue()
 
     def fake_encode(image: Image.Image, buffer: Any, quality: int) -> None:
         attempts.append((image.size, quality))
@@ -46,6 +53,7 @@ def test_encoder_selects_largest_dimension_then_highest_quality(monkeypatch: pyt
         }
         buffer.write(b"x" * sizes[(image.size, quality)])
 
+    monkeypatch.setattr(image_budget, "BytesIO", RecordingBytesIO)
     monkeypatch.setattr(image_budget, "_encode_jpeg", fake_encode)
     with Image.new("RGB", (100, 50)) as source:
         result = _encode(source)
@@ -59,6 +67,75 @@ def test_encoder_selects_largest_dimension_then_highest_quality(monkeypatch: pyt
         ((80, 40), 85),
     ]
     assert len(result.data) == 95
+    assert materialized_sizes == [80, 95]
+
+
+def test_encoder_uses_exact_initial_dominant_dimension_when_float_scaling_would_round_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted_sizes: list[tuple[int, int]] = []
+
+    def fake_encode(image: Image.Image, buffer: Any, quality: int) -> None:
+        attempted_sizes.append(image.size)
+        buffer.write(b"fits")
+
+    monkeypatch.setattr(image_budget, "_encode_jpeg", fake_encode)
+    with Image.new("RGB", (581, 337)) as source:
+        result = _encode(
+            source,
+            max_bytes=10,
+            initial_max_dimension=320,
+            min_dimension=160,
+            qualities=(40,),
+        )
+
+    assert (result.width, result.height) == (320, 185)
+    assert attempted_sizes == [(320, 185)]
+
+
+def test_encoder_uses_exact_terminal_minimum_dominant_dimension_when_float_scaling_would_round_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted_sizes: list[tuple[int, int]] = []
+
+    def fake_encode(image: Image.Image, buffer: Any, quality: int) -> None:
+        attempted_sizes.append(image.size)
+        buffer.write(b"x" * (101 if max(image.size) > 320 else 80))
+
+    monkeypatch.setattr(image_budget, "_encode_jpeg", fake_encode)
+    with Image.new("RGB", (337, 581)) as source:
+        result = _encode(
+            source,
+            initial_max_dimension=400,
+            min_dimension=320,
+            dimension_scale=0.8,
+            qualities=(40,),
+        )
+
+    assert (result.width, result.height) == (185, 320)
+    assert attempted_sizes == [(232, 400), (185, 320)]
+
+
+def test_encoder_does_not_materialize_immutable_payloads_for_oversize_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    materialized_sizes: list[int] = []
+
+    class RecordingBytesIO(BytesIO):
+        def getvalue(self) -> bytes:
+            materialized_sizes.append(self.tell())
+            return super().getvalue()
+
+    def fake_encode(image: Image.Image, buffer: Any, quality: int) -> None:
+        buffer.write(b"x" * 101)
+
+    monkeypatch.setattr(image_budget, "BytesIO", RecordingBytesIO)
+    monkeypatch.setattr(image_budget, "_encode_jpeg", fake_encode)
+    with Image.new("RGB", (100, 50)) as source:
+        with pytest.raises(ImageBudgetError):
+            _encode(source, qualities=(40,))
+
+    assert materialized_sizes == []
 
 
 def test_encoder_reuses_one_reset_buffer_for_every_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
