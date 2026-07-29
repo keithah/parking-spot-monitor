@@ -142,6 +142,24 @@ def test_mutating_second_duplicate_mapping_path_does_not_change_first(pair_name:
     assert "second-path-only" not in first
 
 
+@pytest.mark.parametrize("side", ("baseline", "proposed"))
+def test_mutating_nested_summary_threshold_does_not_change_side_detail(side: str) -> None:
+    report = empty_tuning_report()
+
+    report[f"{side}_thresholds"]["occupancy"]["confirm_frames"] = 7
+
+    assert report[side]["config_thresholds"]["occupancy"]["confirm_frames"] == 2
+
+
+@pytest.mark.parametrize("side", ("baseline", "proposed"))
+def test_mutating_nested_side_threshold_does_not_change_summary(side: str) -> None:
+    report = empty_tuning_report()
+
+    report[side]["config_thresholds"]["occupancy"]["confirm_frames"] = 7
+
+    assert report[f"{side}_thresholds"]["occupancy"]["confirm_frames"] == 2
+
+
 def test_rendering_tuning_report_preserves_nested_input_and_exact_markdown() -> None:
     report = build_tuning_comparison_report(
         manifest(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from enum import StrEnum
 from typing import Any, Mapping, Sequence
 
@@ -63,8 +64,8 @@ def build_tuning_comparison_report(
         "case_ids": [case.case_id for case in parsed_manifest.cases],
         "baseline": _comparison_side(baseline_report),
         "proposed": _comparison_side(proposed_report),
-        "baseline_thresholds": dict(baseline_report.get("config_thresholds", {})),
-        "proposed_thresholds": dict(proposed_report.get("config_thresholds", {})),
+        "baseline_thresholds": deepcopy(baseline_report.get("config_thresholds", {})),
+        "proposed_thresholds": deepcopy(proposed_report.get("config_thresholds", {})),
         "metric_deltas": metric_deltas,
         "event_deltas": event_deltas,
         "status_counts": status_counts,
