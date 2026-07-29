@@ -81,8 +81,21 @@ class MatrixOperatorCockpitContext:
             )
         )
 
-    def analytics_reply(self, window: str, *, logger: StructuredLogger | None = None) -> MatrixCommandResponse:
-        return MatrixCommandResponse(text=format_operator_analytics_reply(data_dir=self.data_dir, window=window, logger=logger))
+    def analytics_reply(
+        self,
+        window: str,
+        *,
+        now: datetime | None = None,
+        logger: StructuredLogger | None = None,
+    ) -> MatrixCommandResponse:
+        return MatrixCommandResponse(
+            text=format_operator_analytics_reply(
+                data_dir=self.data_dir,
+                window=window,
+                now=now,
+                logger=logger,
+            )
+        )
 
     def incident_review_reply(
         self,

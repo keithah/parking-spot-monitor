@@ -1355,7 +1355,10 @@ def test_matrix_operator_context_routes_parsed_analytics_command_to_cockpit(tmp_
         state_path=state_path,
     )
 
-    response = context.analytics_reply(command.subject_id or "7d")
+    response = context.analytics_reply(
+        command.subject_id or "7d",
+        now=datetime(2026, 5, 20, 12, 0, tzinfo=timezone.utc),
+    )
 
     assert response.image_path is None
     assert response.image_info is None
