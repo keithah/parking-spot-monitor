@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
+from parking_spot_monitor.vehicle_history_correction_cache import CorrectionReplayCache
+from parking_spot_monitor.vehicle_history_storage_utils import _latest_session_record
 from parking_spot_monitor.vehicle_history_models import (
     MAX_PROFILE_FILE_BYTES,
     MAX_SESSION_FILE_BYTES,
@@ -15,7 +17,6 @@ from parking_spot_monitor.vehicle_history_models import (
     ArchiveWriteError,
     SessionRecord,
     StoredVehicleProfile,
-    _parse_timestamp,
     _safe_error_message,
 )
 
@@ -38,6 +39,9 @@ class VehicleHistoryStorageMixin:
         self._failure_count = 0
         self._last_error: dict[str, Any] | None = None
         self._mutation_revision = 0
+        self._correction_revision = 0
+        self._correction_replay_cache = CorrectionReplayCache()
+        self._correction_load_succeeded = True
 
     def mutation_revision(self) -> int:
         """Monotonic counter bumped on every archive write that affects health_snapshot."""
@@ -45,6 +49,12 @@ class VehicleHistoryStorageMixin:
 
     def _bump_revision(self) -> None:
         self._mutation_revision += 1
+
+    def correction_revision(self) -> int:
+        return self._correction_revision
+
+    def _bump_correction_revision(self) -> None:
+        self._correction_revision += 1
 
     def load_active_sessions(self) -> list[SessionRecord]:
         return self._load_records(self.active_dir)
@@ -317,22 +327,3 @@ class VehicleHistoryStorageMixin:
         if self.logger is None:
             return
         getattr(self.logger, level)(event, **fields)
-
-
-def _latest_session_record(current: SessionRecord | None, candidate: SessionRecord) -> SessionRecord:
-    if current is None:
-        return candidate
-    current_text = str(current.ended_at or current.started_at)
-    candidate_text = str(candidate.ended_at or candidate.started_at)
-    current_time = _parse_timestamp(current_text)
-    candidate_time = _parse_timestamp(candidate_text)
-    if current_time is not None and candidate_time is not None:
-        if candidate_time != current_time:
-            return candidate if candidate_time > current_time else current
-    elif candidate_time is not None:
-        return candidate
-    elif current_time is not None:
-        return current
-    elif candidate_text != current_text:
-        return candidate if candidate_text > current_text else current
-    return candidate if candidate.session_id > current.session_id else current

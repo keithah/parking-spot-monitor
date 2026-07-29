@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from parking_spot_monitor.logging import redact_diagnostic_text
+from parking_spot_monitor.vehicle_history_correction_cache import _canonical_profile_map, build_correction_replay_state
 from parking_spot_monitor.vehicle_history_models import (
     CORRECTION_ACTION_MERGE_PROFILES,
     CORRECTION_ACTION_PROFILE_SUMMARY_REQUESTED,
@@ -52,6 +53,7 @@ class VehicleHistoryCorrectionMixin:
             self._record_failure(phase="correction-append", path_name=self.corrections_path.name, error=exc)
             raise ArchiveWriteError(_safe_error_message(exc)) from exc
         self._bump_revision()
+        self._bump_correction_revision()
         self._log(
             "info",
             "vehicle-profile-correction-appended",
@@ -135,8 +137,7 @@ class VehicleHistoryCorrectionMixin:
 
     def load_corrections(self) -> list[ProfileCorrectionEvent]:
         self.corrections_dir.mkdir(parents=True, exist_ok=True)
-        if not self.corrections_path.exists():
-            return []
+        self._correction_load_succeeded = True
         corrections: list[ProfileCorrectionEvent] = []
         try:
             with self.corrections_path.open("rb") as handle:
@@ -152,44 +153,40 @@ class VehicleHistoryCorrectionMixin:
                         corrections.append(ProfileCorrectionEvent.from_json_dict(payload))
                     except (UnicodeDecodeError, json.JSONDecodeError, ArchiveSchemaError, ValueError) as exc:
                         self._quarantine_correction_line(line_number=line_number, reason=type(exc).__name__)
+        except FileNotFoundError:
+            return corrections
         except OSError as exc:
+            self._correction_load_succeeded = False
             self._record_failure(phase="correction-load", path_name=self.corrections_path.name, error=exc)
             return corrections
         return corrections
 
     def correction_replay_state(self) -> CorrectionReplayState:
-        labels: dict[str, str] = {}
-        merges: dict[str, str] = {}
-        wrong_matches: set[str] = set()
-        valid_count = 0
-        last_action: str | None = None
-        last_created_at: str | None = None
-        for event in self.load_corrections():
-            valid_count += 1
-            last_action = event.action
-            last_created_at = event.created_at
-            if event.action == CORRECTION_ACTION_RENAME_PROFILE and event.profile_id is not None and event.label is not None:
-                labels[self.resolve_profile_id(event.profile_id, merges=merges)] = event.label
-            elif event.action == CORRECTION_ACTION_MERGE_PROFILES and event.source_profile_id is not None and event.target_profile_id is not None:
-                merges[event.source_profile_id] = self.resolve_profile_id(event.target_profile_id, merges=merges)
-            elif event.action == CORRECTION_ACTION_WRONG_MATCH and event.session_id is not None:
-                wrong_matches.add(event.session_id)
-        return CorrectionReplayState(
-            labels=labels,
-            merges=merges,
-            wrong_match_session_ids=frozenset(wrong_matches),
-            valid_count=valid_count,
-            invalid_count=self._correction_quarantine_count(),
-            quarantine_count=self._correction_quarantine_count(),
-            last_action=last_action,
-            last_created_at=last_created_at,
+        cached = self._correction_replay_cache.get(
+            revision=self.correction_revision(),
+            corrections_path=self.corrections_path,
+            quarantine_path=self.corrections_quarantine_path,
         )
+        if cached is not None:
+            return cached
+        events = self.load_corrections()
+        state = build_correction_replay_state(events, quarantine_count=self._correction_quarantine_count())
+        self._correction_replay_cache.store(
+            revision=self.correction_revision(),
+            corrections_path=self.corrections_path,
+            quarantine_path=self.corrections_quarantine_path,
+            value=state if self._correction_load_succeeded else None,
+        )
+        return state
 
     def resolve_profile_id(self, profile_id: str | None, *, merges: Mapping[str, str] | None = None) -> str | None:
         normalized = _optional_profile_id(profile_id, "profile_id")
         if normalized is None:
             return None
-        mapping = merges if merges is not None else self.correction_replay_state().merges
+        if merges is None:
+            state = self.correction_replay_state()
+            return state.canonical_profile_ids.get(normalized, normalized)
+        mapping = merges
         seen: set[str] = set()
         current = normalized
         while current in mapping:
@@ -299,11 +296,12 @@ class VehicleHistoryCorrectionMixin:
         exclude_wrong_matches: bool = True,
     ) -> list[SessionRecord]:
         state = state if state is not None else self.correction_replay_state()
+        canonical_profile_ids = state.canonical_profile_ids or _canonical_profile_map(state.merges)
         effective: list[SessionRecord] = []
         for record in records:
             if exclude_wrong_matches and record.session_id in state.wrong_match_session_ids:
                 continue
-            canonical = self.resolve_profile_id(record.profile_id, merges=state.merges)
+            canonical = canonical_profile_ids.get(record.profile_id, record.profile_id) if record.profile_id is not None else None
             if canonical is None or canonical == record.profile_id:
                 effective.append(record)
             else:
@@ -363,7 +361,10 @@ class VehicleHistoryCorrectionMixin:
                 json.dump(entry, handle, sort_keys=True, separators=(",", ":"), allow_nan=False)
                 handle.write("\n")
         except OSError as exc:
+            self._correction_load_succeeded = False
             self._record_failure(phase="correction-quarantine", path_name=self.corrections_quarantine_path.name, error=exc)
+        else:
+            self._bump_correction_revision()
         self._log("warning", "vehicle-profile-correction-quarantined", phase="correction-load", line_number=line_number, reason=reason)
 
     def _correction_line_already_quarantined(self, *, line_number: int, reason: str) -> bool:
@@ -379,6 +380,7 @@ class VehicleHistoryCorrectionMixin:
                     if isinstance(entry, Mapping) and entry.get("line_number") == line_number and entry.get("reason") == reason:
                         return True
         except OSError as exc:
+            self._correction_load_succeeded = False
             self._record_failure(phase="correction-quarantine-read", path_name=self.corrections_quarantine_path.name, error=exc)
         return False
 
@@ -389,6 +391,7 @@ class VehicleHistoryCorrectionMixin:
             with self.corrections_quarantine_path.open("r", encoding="utf-8") as handle:
                 return sum(1 for _ in handle)
         except OSError as exc:
+            self._correction_load_succeeded = False
             self._record_failure(phase="correction-quarantine-count", path_name=self.corrections_quarantine_path.name, error=exc)
             return 0
 
@@ -397,7 +400,6 @@ def _required_correction_field(value: str | None, field_name: str) -> str:
     if value is None:
         raise ArchiveSchemaError(f"correction missing {field_name}")
     return value
-
 
 def _profile_session_counts(records: Sequence[SessionRecord], *, profile_id: str, wrong_matches: set[str] | frozenset[str]) -> tuple[int, int]:
     kept = excluded = 0

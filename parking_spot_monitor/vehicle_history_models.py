@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -114,6 +114,12 @@ class ProfileCorrectionEvent:
             raise ArchiveSchemaError("profile_summary_requested correction requires profile_id")
 
 @dataclass(frozen=True)
+class CorrectionReplaySignature:
+    revision: int
+    corrections_stat: tuple[int, int] | None
+    quarantine_stat: tuple[int, int] | None
+
+@dataclass(frozen=True)
 class CorrectionReplayState:
     labels: Mapping[str, str]
     merges: Mapping[str, str]
@@ -123,6 +129,7 @@ class CorrectionReplayState:
     quarantine_count: int
     last_action: str | None
     last_created_at: str | None
+    canonical_profile_ids: Mapping[str, str] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class ProfileAssignment:

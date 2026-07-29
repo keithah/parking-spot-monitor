@@ -7,17 +7,19 @@ import stat
 import tarfile
 from io import StringIO
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
 from PIL import Image
 
-from parking_spot_monitor import vehicle_history_storage
+from parking_spot_monitor import vehicle_history_corrections, vehicle_history_storage
 from parking_spot_monitor.logging import setup_logging
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
 from parking_spot_monitor.vehicle_history import (
     ArchiveSchemaError,
     ArchiveWriteError,
+    CorrectionReplayState,
     VehicleHistoryArchive,
     cutoff_older_than_days,
     estimate_profile_history,
@@ -1357,6 +1359,304 @@ def test_malformed_correction_jsonl_is_quarantined_and_health_reports_metadata(t
     assert "supersecret" not in rendered_logs
     assert "rtsp://camera.local" not in rendered_logs
     assert "raw_image_bytes" not in rendered_logs
+
+
+def test_correction_replay_is_cached_until_revision_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    calls = 0
+    original = archive.load_corrections
+
+    def counted() -> Any:
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(archive, "load_corrections", counted)
+
+    first = archive.correction_replay_state()
+    second = archive.correction_replay_state()
+
+    assert second is first
+    assert calls == 1
+    assert archive.correction_revision() == 0
+
+    archive._bump_correction_revision()
+    third = archive.correction_replay_state()
+
+    assert third is not second
+    assert calls == 2
+    assert archive.correction_revision() == 1
+
+
+def test_successful_correction_append_bumps_explicit_revision(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    closed = archive.start_session(occupied_event(spot_id="revision"))
+    archive.close_session(open_event(spot_id="revision"))
+    set_session_profile(
+        tmp_path,
+        archive_state="closed",
+        session_id=closed.session_id,
+        profile_id="prof_revision",
+        profile_confidence=0.96,
+    )
+
+    archive.rename_profile("prof_revision", "Revision")
+
+    assert archive.correction_revision() == 1
+
+
+def test_external_same_process_correction_replace_invalidates_signature_cache(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    original_payload = {
+        "schema_version": 1,
+        "correction_id": "corr_external",
+        "action": "rename_profile",
+        "created_at": "2026-05-18T14:45:00Z",
+        "matrix_event_id": None,
+        "matrix_sender": None,
+        "matrix_room_id": None,
+        "profile_id": "prof_external",
+        "label": "Old",
+    }
+    archive.corrections_path.write_text(json.dumps(original_payload, sort_keys=True) + "\n", encoding="utf-8")
+    first = archive.correction_replay_state()
+    assert archive.correction_replay_state() is first
+    original_stat = archive.corrections_path.stat()
+    replacement_payload = {**original_payload, "label": "New"}
+    replacement_path = archive.corrections_dir / "replacement.jsonl"
+    replacement_path.write_text(json.dumps(replacement_payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.utime(
+        replacement_path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000),
+    )
+    os.replace(replacement_path, archive.corrections_path)
+
+    assert archive.corrections_path.stat().st_size == original_stat.st_size
+    second = archive.correction_replay_state()
+
+    assert second is not first
+    assert dict(second.labels) == {"prof_external": "New"}
+
+
+def test_correction_replay_recomputes_after_transient_signature_stat_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    archive.corrections_path.write_text("", encoding="utf-8")
+    first = archive.correction_replay_state()
+    calls = 0
+    original_load = archive.load_corrections
+    original_stat = Path.stat
+    failed = False
+
+    def counted() -> Any:
+        nonlocal calls
+        calls += 1
+        return original_load()
+
+    def fail_signature_stat_once(path: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal failed
+        if path == archive.corrections_path and not failed:
+            failed = True
+            raise PermissionError("transient signature failure")
+        return original_stat(path, *args, **kwargs)
+
+    def exists_without_signature_probe(path: Path, *args: Any, **kwargs: Any) -> bool:
+        try:
+            original_stat(path, *args, **kwargs)
+        except OSError:
+            return False
+        return True
+
+    monkeypatch.setattr(archive, "load_corrections", counted)
+    monkeypatch.setattr(Path, "exists", exists_without_signature_probe)
+    monkeypatch.setattr(Path, "stat", fail_signature_stat_once)
+
+    rebuilt = archive.correction_replay_state()
+    stable = archive.correction_replay_state()
+
+    assert rebuilt is not first
+    assert stable is rebuilt
+    assert calls == 1
+
+
+def test_correction_replay_does_not_cache_transient_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    payload = {
+        "schema_version": 1,
+        "correction_id": "corr_read_retry",
+        "action": "profile_summary_requested",
+        "created_at": "2026-05-18T14:45:00Z",
+        "matrix_event_id": None,
+        "matrix_sender": None,
+        "matrix_room_id": None,
+        "profile_id": "prof_retry",
+    }
+    archive.corrections_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    original_open = Path.open
+    read_attempts = 0
+
+    def fail_read_once(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal read_attempts
+        if path == archive.corrections_path and args and args[0] == "rb":
+            read_attempts += 1
+            if read_attempts == 1:
+                raise PermissionError("transient correction read failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_read_once)
+
+    failed = archive.correction_replay_state()
+    recovered = archive.correction_replay_state()
+    stable = archive.correction_replay_state()
+
+    assert failed.valid_count == 0
+    assert recovered.valid_count == 1
+    assert stable is recovered
+    assert read_attempts == 2
+
+
+def test_correction_replay_retries_after_combined_stat_and_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    payload = {
+        "schema_version": 1,
+        "correction_id": "corr_combined_retry",
+        "action": "profile_summary_requested",
+        "created_at": "2026-05-18T14:45:00Z",
+        "matrix_event_id": None,
+        "matrix_sender": None,
+        "matrix_room_id": None,
+        "profile_id": "prof_retry",
+    }
+    archive.corrections_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    original = archive.correction_replay_state()
+    original_open = Path.open
+    original_stat = Path.stat
+    read_attempts = 0
+    stat_failed = False
+
+    def fail_stat_once(path: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal stat_failed
+        if path == archive.corrections_path and not stat_failed:
+            stat_failed = True
+            raise PermissionError("transient signature failure")
+        return original_stat(path, *args, **kwargs)
+
+    def fail_read_once(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal read_attempts
+        if path == archive.corrections_path and args and args[0] == "rb":
+            read_attempts += 1
+            if read_attempts == 1:
+                raise PermissionError("transient correction read failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fail_stat_once)
+    monkeypatch.setattr(Path, "open", fail_read_once)
+
+    failed = archive.correction_replay_state()
+    recovered = archive.correction_replay_state()
+
+    assert failed.valid_count == 0
+    assert recovered.valid_count == 1
+    assert recovered is not original
+    assert read_attempts == 2
+
+
+def test_malformed_correction_quarantine_signature_is_stable_after_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    archive.corrections_path.write_text("{not-json\n", encoding="utf-8")
+    calls = 0
+    original = archive.load_corrections
+
+    def counted() -> Any:
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(archive, "load_corrections", counted)
+
+    first = archive.correction_replay_state()
+    second = archive.correction_replay_state()
+
+    assert first.invalid_count == 1
+    assert second is first
+    assert calls == 1
+    assert archive.correction_revision() == 1
+    assert archive.corrections_quarantine_path.read_text(encoding="utf-8").count("\n") == 1
+
+
+def test_cached_correction_replay_mappings_are_immutable(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    state = archive.correction_replay_state()
+
+    with pytest.raises(TypeError):
+        state.labels["prof_source"] = "Changed"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        state.merges["prof_source"] = "prof_target"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        state.canonical_profile_ids["prof_source"] = "prof_target"  # type: ignore[index]
+
+
+def test_canonical_profile_map_compresses_merge_chains_and_detects_cycles() -> None:
+    assert vehicle_history_corrections._canonical_profile_map(
+        {"prof_a": "prof_b", "prof_b": "prof_c", "prof_c": "prof_d"}
+    ) == {
+        "prof_a": "prof_d",
+        "prof_b": "prof_d",
+        "prof_c": "prof_d",
+        "prof_d": "prof_d",
+    }
+
+    with pytest.raises(ArchiveSchemaError, match="profile merge cycle detected"):
+        vehicle_history_corrections._canonical_profile_map({"prof_a": "prof_b", "prof_b": "prof_a"})
+
+
+def test_effective_sessions_use_precompressed_canonical_profile_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    active = archive.start_session(occupied_event(spot_id="compressed"))
+    set_session_profile(
+        tmp_path,
+        archive_state="active",
+        session_id=active.session_id,
+        profile_id="prof_a",
+        profile_confidence=0.96,
+    )
+    record = archive.load_active_sessions()[0]
+    state = CorrectionReplayState(
+        labels=MappingProxyType({}),
+        merges=MappingProxyType({"prof_a": "prof_b", "prof_b": "prof_c"}),
+        canonical_profile_ids=MappingProxyType(
+            {"prof_a": "prof_c", "prof_b": "prof_c", "prof_c": "prof_c"}
+        ),
+        wrong_match_session_ids=frozenset(),
+        valid_count=2,
+        invalid_count=0,
+        quarantine_count=0,
+        last_action="merge_profiles",
+        last_created_at="2026-05-18T14:45:00Z",
+    )
+    monkeypatch.setattr(
+        archive,
+        "resolve_profile_id",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected merge-chain walk")),
+    )
+
+    effective = archive._effective_sessions([record], state=state)
+
+    assert effective[0].profile_id == "prof_c"
 
 
 def test_export_archive_writes_tar_bundle_and_safe_maintenance_manifest(tmp_path: Path) -> None:
