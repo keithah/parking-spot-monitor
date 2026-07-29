@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from PIL import Image
 
+import parking_spot_monitor.operator_cockpit_snapshots as operator_cockpit_snapshots
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.health import HealthStatus, write_health_status
+from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.state import RuntimeState, save_runtime_state
 
@@ -399,6 +403,369 @@ def _write_test_jpeg(path: Path, *, size: tuple[int, int] = (16, 9)) -> bytes:
     image = Image.new("RGB", size, color=(12, 34, 56))
     image.save(path, format="JPEG")
     return path.read_bytes()
+
+
+def test_who_resize_uses_shared_budget_encoder_and_preserves_validation_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "latest.jpg"
+    _write_test_jpeg(source, size=(1280, 720))
+    destination = tmp_path / "who_latest.jpg"
+    seen: dict[str, object] = {}
+
+    def fake_encoder(image: Image.Image, **kwargs: object) -> JpegBudgetResult:
+        seen["image_mode"] = image.mode
+        seen.update(kwargs)
+        return JpegBudgetResult(b"jpeg", 640, 360, 65, 5)
+
+    monkeypatch.setattr(operator_cockpit_snapshots, "encode_jpeg_under_budget", fake_encoder, raising=False)
+    result = operator_cockpit_snapshots._resize_who_snapshot_for_matrix(
+        source,
+        destination=destination,
+        now=datetime.now(timezone.utc),
+        logger=None,
+    )
+
+    assert result.state == "available"
+    assert result.path == destination
+    assert result.info == {"mimetype": "image/jpeg", "size": 4, "w": 640, "h": 360}
+    assert result.freshness == "fresh"
+    assert result.age == "0s ago"
+    assert destination.read_bytes() == b"jpeg"
+    assert seen == {
+        "image_mode": "RGB",
+        "max_bytes": operator_cockpit_snapshots.MAX_WHO_MATRIX_IMAGE_BYTES,
+        "initial_max_dimension": operator_cockpit_snapshots.WHO_MATRIX_INITIAL_MAX_DIMENSION,
+        "min_dimension": operator_cockpit_snapshots.WHO_MATRIX_MIN_DIMENSION,
+        "dimension_scale": 0.85,
+        "qualities": operator_cockpit_snapshots.WHO_MATRIX_JPEG_QUALITIES,
+        "resampling": Image.Resampling.LANCZOS,
+    }
+
+
+def test_who_resize_publishes_temp_sibling_with_atomic_replace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "latest.jpg"
+    source_bytes = _write_test_jpeg(source, size=(1280, 720))
+    destination = tmp_path / "who_latest.jpg"
+    destination.write_bytes(b"previous-valid-jpeg")
+    real_replace = os.replace
+    replacements: list[tuple[Path, Path, bytes, bytes]] = []
+
+    def tracking_replace(source_path: str | os.PathLike[str], destination_path: str | os.PathLike[str]) -> None:
+        temporary = Path(source_path)
+        target = Path(destination_path)
+        replacements.append((temporary, target, temporary.read_bytes(), target.read_bytes()))
+        real_replace(temporary, target)
+
+    monkeypatch.setattr(
+        operator_cockpit_snapshots,
+        "encode_jpeg_under_budget",
+        lambda image, **kwargs: JpegBudgetResult(b"new-jpeg", 640, 360, 65, 2),
+        raising=False,
+    )
+    monkeypatch.setattr(operator_cockpit_snapshots.os, "replace", tracking_replace, raising=False)
+
+    result = operator_cockpit_snapshots._resize_who_snapshot_for_matrix(
+        source,
+        destination=destination,
+        now=datetime.now(timezone.utc),
+        logger=None,
+    )
+
+    assert result.path == destination
+    assert destination.read_bytes() == b"new-jpeg"
+    assert source.read_bytes() == source_bytes
+    assert len(replacements) == 1
+    temporary, target, staged_bytes, prior_bytes = replacements[0]
+    assert temporary.parent == destination.parent
+    assert temporary.name.startswith(f".{destination.name}.")
+    assert target == destination
+    assert staged_bytes == b"new-jpeg"
+    assert prior_bytes == b"previous-valid-jpeg"
+    assert not temporary.exists()
+
+
+@pytest.mark.parametrize("failure", ["encode", "write", "fsync", "replace", "stat"])
+def test_who_resize_publish_failure_preserves_previous_destination_and_cleans_temp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    source = tmp_path / "latest.jpg"
+    _write_test_jpeg(source, size=(1280, 720))
+    destination = tmp_path / "who_latest.jpg"
+    old_bytes = b"previous-valid-jpeg"
+    destination.write_bytes(old_bytes)
+    monkeypatch.setattr(
+        operator_cockpit_snapshots,
+        "encode_jpeg_under_budget",
+        lambda image, **kwargs: JpegBudgetResult(b"replacement-jpeg", 640, 360, 65, 2),
+        raising=False,
+    )
+
+    if failure == "encode":
+        monkeypatch.setattr(
+            operator_cockpit_snapshots,
+            "encode_jpeg_under_budget",
+            lambda image, **kwargs: (_ for _ in ()).throw(ImageBudgetError("encode failed")),
+        )
+    elif failure == "write":
+        monkeypatch.setattr(
+            operator_cockpit_snapshots.os,
+            "write",
+            lambda fd, data: (_ for _ in ()).throw(OSError("write failed")),
+            raising=False,
+        )
+    elif failure == "fsync":
+        monkeypatch.setattr(
+            operator_cockpit_snapshots.os,
+            "fsync",
+            lambda fd: (_ for _ in ()).throw(OSError("fsync failed")),
+            raising=False,
+        )
+    elif failure == "replace":
+        monkeypatch.setattr(
+            operator_cockpit_snapshots.os,
+            "replace",
+            lambda source_path, destination_path: (_ for _ in ()).throw(OSError("replace failed")),
+            raising=False,
+        )
+    else:
+        real_stat = Path.stat
+
+        def fail_temp_stat(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+            if path.name.startswith(f".{destination.name}."):
+                raise OSError("stat failed")
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", fail_temp_stat)
+
+    expected_error = ImageBudgetError if failure == "encode" else OSError
+    with pytest.raises(expected_error, match=failure):
+        operator_cockpit_snapshots._resize_who_snapshot_for_matrix(
+            source,
+            destination=destination,
+            now=datetime.now(timezone.utc),
+            logger=None,
+        )
+
+    assert destination.read_bytes() == old_bytes
+    assert list(tmp_path.glob(f".{destination.name}.*")) == []
+
+
+def test_who_resize_drafts_before_load_reuses_rgb_source_and_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[object] = []
+
+    class TrackingImage:
+        size = (1280, 720)
+        mode = "RGB"
+
+        def draft(self, mode: str, size: tuple[int, int]) -> None:
+            events.append(("draft", mode, size))
+
+        def load(self) -> None:
+            events.append("load")
+
+        def copy(self) -> Image.Image:
+            raise AssertionError("RGB operator source must not be copied")
+
+        def convert(self, mode: str) -> Image.Image:
+            raise AssertionError(f"RGB operator source must not be converted to {mode}")
+
+        def close(self) -> None:
+            events.append("source-close")
+
+    source_image = TrackingImage()
+    monkeypatch.setattr(operator_cockpit_snapshots.Image, "open", lambda path: source_image)
+
+    def fake_encoder(image: object, **kwargs: object) -> JpegBudgetResult:
+        assert image is source_image
+        events.append("encode")
+        return JpegBudgetResult(b"jpeg", 640, 360, 65, 3)
+
+    monkeypatch.setattr(operator_cockpit_snapshots, "encode_jpeg_under_budget", fake_encoder, raising=False)
+    operator_cockpit_snapshots._resize_who_snapshot_for_matrix(
+        tmp_path / "latest.jpg",
+        destination=tmp_path / "who_latest.jpg",
+        now=datetime.now(timezone.utc),
+        logger=None,
+    )
+
+    assert events == [("draft", "RGB", (960, 540)), "load", "encode", "source-close"]
+
+
+def test_who_resize_converts_non_rgb_once_and_closes_both_images(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[object] = []
+
+    class ConvertedImage:
+        size = (1280, 720)
+        mode = "RGB"
+
+        def close(self) -> None:
+            events.append("converted-close")
+
+    converted = ConvertedImage()
+
+    class SourceImage:
+        size = (1280, 720)
+        mode = "CMYK"
+
+        def draft(self, mode: str, size: tuple[int, int]) -> None:
+            events.append(("draft", mode, size))
+
+        def load(self) -> None:
+            events.append("load")
+
+        def convert(self, mode: str) -> ConvertedImage:
+            events.append(("convert", mode))
+            return converted
+
+        def close(self) -> None:
+            events.append("source-close")
+
+    monkeypatch.setattr(operator_cockpit_snapshots.Image, "open", lambda path: SourceImage())
+
+    def fake_encoder(image: object, **kwargs: object) -> JpegBudgetResult:
+        assert image is converted
+        events.append("encode")
+        return JpegBudgetResult(b"jpeg", 640, 360, 65, 3)
+
+    monkeypatch.setattr(operator_cockpit_snapshots, "encode_jpeg_under_budget", fake_encoder, raising=False)
+    operator_cockpit_snapshots._resize_who_snapshot_for_matrix(
+        tmp_path / "latest.jpg",
+        destination=tmp_path / "who_latest.jpg",
+        now=datetime.now(timezone.utc),
+        logger=None,
+    )
+
+    assert events == [
+        ("draft", "RGB", (960, 540)),
+        "load",
+        ("convert", "RGB"),
+        "encode",
+        "converted-close",
+        "source-close",
+    ]
+
+
+def test_who_resize_logs_quality_and_attempts_without_expanding_media_info(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "latest.jpg"
+    _write_test_jpeg(source, size=(1280, 720))
+    destination = tmp_path / "who_latest.jpg"
+    monkeypatch.setattr(
+        operator_cockpit_snapshots,
+        "encode_jpeg_under_budget",
+        lambda image, **kwargs: JpegBudgetResult(b"jpeg", 640, 360, 65, 7),
+        raising=False,
+    )
+    stream = StringIO()
+
+    result = operator_cockpit_snapshots._resize_who_snapshot_for_matrix(
+        source,
+        destination=destination,
+        now=datetime.now(timezone.utc),
+        logger=StructuredLogger(stream=stream),
+    )
+
+    assert result.info == {"mimetype": "image/jpeg", "size": 4, "w": 640, "h": 360}
+    assert json.loads(stream.getvalue()) == {
+        "event": "operator-who-snapshot-resized",
+        "level": "INFO",
+        "source_path": str(source),
+        "destination_path": str(destination),
+        "source_width": 1280,
+        "source_height": 720,
+        "output_width": 640,
+        "output_height": 360,
+        "byte_size": 4,
+        "quality": 65,
+        "attempts": 7,
+    }
+
+
+@pytest.mark.parametrize(
+    "operational_failure",
+    [
+        ImageBudgetError("access_token=budget-secret"),
+        OSError("Authorization: Bearer io-secret"),
+        operator_cockpit_snapshots.UnidentifiedImageError("secret=unidentified"),
+        Image.DecompressionBombError("password=bomb-secret"),
+        Image.DecompressionBombWarning("token=warning-secret"),
+    ],
+)
+def test_who_resize_expected_operational_failure_returns_safe_unavailable_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operational_failure: BaseException,
+) -> None:
+    source = tmp_path / "latest.jpg"
+    source.write_bytes(b"oversized")
+    stream = StringIO()
+    monkeypatch.setattr(
+        operator_cockpit_snapshots,
+        "_validate_latest_snapshot",
+        lambda path, **kwargs: operator_cockpit_snapshots.LatestSnapshotValidation(state="error", error_type="too large"),
+    )
+    monkeypatch.setattr(
+        operator_cockpit_snapshots,
+        "_resize_who_snapshot_for_matrix",
+        lambda *args, **kwargs: (_ for _ in ()).throw(operational_failure),
+    )
+
+    result = operator_cockpit_snapshots._prepare_who_snapshot_for_matrix(
+        source,
+        data_dir=tmp_path,
+        now=datetime.now(timezone.utc),
+        logger=StructuredLogger(stream=stream),
+    )
+
+    assert result == operator_cockpit_snapshots.LatestSnapshotValidation(state="error", error_type="resize failed")
+    rendered = stream.getvalue()
+    assert "operator-who-snapshot-unavailable" in rendered
+    assert "resize_failed" in rendered
+    assert "secret" not in rendered
+
+
+@pytest.mark.parametrize(
+    "unexpected",
+    [AssertionError("encoder invariant failed"), MemoryError("allocation invariant failed")],
+)
+def test_who_snapshot_availability_boundary_does_not_hide_unexpected_resize_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    unexpected: BaseException,
+) -> None:
+    monkeypatch.setattr(
+        operator_cockpit_snapshots,
+        "_prepare_who_snapshot_for_matrix",
+        lambda *args, **kwargs: (_ for _ in ()).throw(unexpected),
+    )
+
+    with pytest.raises(type(unexpected)) as exc_info:
+        operator_cockpit_snapshots.build_who_snapshot_response(
+            settings=object(),
+            data_dir=tmp_path,
+            base_text="Parking monitor who",
+            capture_func=lambda *args, **kwargs: SimpleNamespace(
+                latest_path=tmp_path / "latest.jpg",
+                timestamp="2026-05-16T17:42:39Z",
+            ),
+        )
+
+    assert exc_info.value is unexpected
 
 
 def test_latest_snapshot_summary_contract_returns_text_and_raw_image_path(tmp_path: Path) -> None:

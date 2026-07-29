@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -9,6 +10,7 @@ from PIL import Image, UnidentifiedImageError
 
 from parking_spot_monitor.capture import CaptureError, capture_latest
 from parking_spot_monitor.config import RuntimeSettings
+from parking_spot_monitor.image_budget import ImageBudgetError, encode_jpeg_under_budget
 from parking_spot_monitor.incident_review import build_incident_replay
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
 from parking_spot_monitor.matrix_models import MatrixCommandResponse
@@ -33,6 +35,15 @@ from parking_spot_monitor.operator_cockpit_shared import (
 )
 from parking_spot_monitor.operator_cockpit_memory import format_operator_why_reply
 from parking_spot_monitor.operator_timeline import DISPLAY_TIMEZONE, nearest_timeline_frame, parse_incident_time
+
+
+_WHO_SNAPSHOT_OPERATIONAL_ERRORS = (
+    ImageBudgetError,
+    OSError,
+    UnidentifiedImageError,
+    Image.DecompressionBombError,
+    Image.DecompressionBombWarning,
+)
 
 
 def build_latest_snapshot_response(
@@ -103,11 +114,6 @@ def build_who_snapshot_response(
         reason = redact_diagnostic_text(exc.reason or exc.__class__.__name__)
         _log_snapshot_failure(logger, reason=reason, error_type=exc.__class__.__name__)
         return MatrixCommandResponse(text=_prepend_who_snapshot_line(base_text, _who_snapshot_unavailable_line(reason)))
-    except Exception as exc:
-        reason = redact_diagnostic_text(exc.__class__.__name__)
-        _log_snapshot_failure(logger, reason=reason, error_type=exc.__class__.__name__)
-        return MatrixCommandResponse(text=_prepend_who_snapshot_line(base_text, _who_snapshot_unavailable_line(reason)))
-
     if snapshot.state != "available" or snapshot.path is None or snapshot.info is None:
         reason = redact_diagnostic_text(snapshot.error_type or "unavailable")
         _log_snapshot_failure(logger, reason=reason, error_type="invalid_snapshot")
@@ -186,7 +192,7 @@ def _prepare_incident_snapshot_for_matrix(path: Path, *, data_dir: Path, spot_id
     destination = data_dir / INCIDENT_MATRIX_SNAPSHOT_TEMPLATE.format(spot_id=spot_id)
     try:
         return _resize_who_snapshot_for_matrix(path, destination=destination, now=now, logger=logger)
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
+    except _WHO_SNAPSHOT_OPERATIONAL_ERRORS as exc:
         error_type = redact_diagnostic_text(exc.__class__.__name__)
         _log_snapshot_failure(logger, reason="incident_resize_failed", error_type=error_type)
         return LatestSnapshotValidation(state="error", error_type="resize failed")
@@ -249,58 +255,101 @@ def _prepare_who_snapshot_for_matrix(path: Path, *, data_dir: Path, now: datetim
     destination = data_dir / WHO_MATRIX_SNAPSHOT_FILENAME
     try:
         return _resize_who_snapshot_for_matrix(path, destination=destination, now=now, logger=logger)
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
+    except _WHO_SNAPSHOT_OPERATIONAL_ERRORS as exc:
         error_type = redact_diagnostic_text(exc.__class__.__name__)
         _log_snapshot_failure(logger, reason="resize_failed", error_type=error_type)
         return LatestSnapshotValidation(state="error", error_type="resize failed")
 
 
 def _resize_who_snapshot_for_matrix(path: Path, *, destination: Path, now: datetime, logger: StructuredLogger | None) -> LatestSnapshotValidation:
-    with Image.open(path) as image:
-        working = image.convert("RGB")
-    width, height = working.size
-    if width <= 0 or height <= 0:
-        raise ValueError("invalid image dimensions")
+    image = Image.open(path)
+    try:
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            raise ImageBudgetError("image dimensions must be positive")
+        bounded_dimension = min(max(width, height), WHO_MATRIX_INITIAL_MAX_DIMENSION)
+        if width >= height:
+            bounded_size = (bounded_dimension, max(1, height * bounded_dimension // width))
+        else:
+            bounded_size = (max(1, width * bounded_dimension // height), bounded_dimension)
+        image.draft("RGB", bounded_size)
+        image.load()
+        working = image if image.mode == "RGB" else image.convert("RGB")
+        try:
+            result = encode_jpeg_under_budget(
+                working,
+                max_bytes=MAX_WHO_MATRIX_IMAGE_BYTES,
+                initial_max_dimension=WHO_MATRIX_INITIAL_MAX_DIMENSION,
+                min_dimension=WHO_MATRIX_MIN_DIMENSION,
+                dimension_scale=0.85,
+                qualities=WHO_MATRIX_JPEG_QUALITIES,
+                resampling=getattr(getattr(Image, "Resampling", Image), "LANCZOS"),
+            )
+        finally:
+            if working is not image:
+                working.close()
+    finally:
+        image.close()
 
-    max_dimension = min(max(width, height), WHO_MATRIX_INITIAL_MAX_DIMENSION)
-    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    while max_dimension >= WHO_MATRIX_MIN_DIMENSION:
-        target_width, target_height = _bounded_dimensions(width, height, max_dimension)
-        resized = working.resize((target_width, target_height), resampling)
-        for quality in WHO_MATRIX_JPEG_QUALITIES:
-            buffer = BytesIO()
-            resized.save(buffer, format="JPEG", quality=quality, optimize=True)
-            if buffer.tell() <= MAX_WHO_MATRIX_IMAGE_BYTES:
-                payload = buffer.getbuffer()
-                destination.write_bytes(payload)
-                stat = destination.stat()
-                output_width, output_height = resized.size
-                _log_who_snapshot_resized(
-                    logger,
-                    source_path=path,
-                    destination_path=destination,
-                    source_width=width,
-                    source_height=height,
-                    output_width=output_width,
-                    output_height=output_height,
-                    byte_size=payload.nbytes,
-                    quality=quality,
-                )
-                return LatestSnapshotValidation(
-                    state="available",
-                    path=destination,
-                    info={"mimetype": "image/jpeg", "size": payload.nbytes, "w": output_width, "h": output_height},
-                    freshness="fresh",
-                    age=age_label(datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc), now),
-                )
-        max_dimension = int(max_dimension * 0.85)
-    raise ValueError("resized image exceeds Matrix upload budget")
+    stat = _publish_who_snapshot(destination, result.data)
+    _log_who_snapshot_resized(
+        logger,
+        source_path=path,
+        destination_path=destination,
+        source_width=width,
+        source_height=height,
+        output_width=result.width,
+        output_height=result.height,
+        byte_size=len(result.data),
+        quality=result.quality,
+        attempts=result.attempts,
+    )
+    return LatestSnapshotValidation(
+        state="available",
+        path=destination,
+        info={"mimetype": "image/jpeg", "size": len(result.data), "w": result.width, "h": result.height},
+        freshness="fresh",
+        age=age_label(datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc), now),
+    )
 
 
-def _bounded_dimensions(width: int, height: int, max_dimension: int) -> tuple[int, int]:
-    scale = min(1.0, max_dimension / max(width, height))
-    return max(1, int(width * scale)), max(1, int(height * scale))
+def _publish_who_snapshot(destination: Path, data: bytes) -> os.stat_result:
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        view = memoryview(data)
+        try:
+            offset = 0
+            while offset < len(view):
+                written = os.write(file_descriptor, view[offset:])
+                if written <= 0:
+                    raise OSError("temporary snapshot write made no progress")
+                offset += written
+        finally:
+            view.release()
+        os.fsync(file_descriptor)
+        os.close(file_descriptor)
+        file_descriptor = -1
+        stat = temporary.stat()
+        os.replace(temporary, destination)
+        return stat
+    finally:
+        if file_descriptor >= 0:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def _log_who_snapshot_resized(logger: StructuredLogger | None, **fields: Any) -> None:
