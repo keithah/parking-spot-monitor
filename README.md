@@ -4,6 +4,8 @@ Local Python service for monitoring configured street-parking regions in a UniFi
 
 The working product spec is in [`parking-spot-monitor-spec.md`](parking-spot-monitor-spec.md).
 
+For a fresh host, upgrades, rollback, backups, and live resource checks, use [Docker deployment and operations](docs/deployment.md).
+
 ## Runtime architecture and dependency split
 
 The service is intentionally split into focused runtime modules. The package entrypoint loads config, builds shared services, and delegates capture-loop work to runtime helpers for command polling, outbox draining, frame capture, detection, overlay generation, state updates, vehicle-history events, health writes, lifecycle notices, and Matrix dispatch. This keeps startup wiring separate from per-frame work and makes frame-loop behavior easier to test.

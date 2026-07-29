@@ -8,6 +8,7 @@
 - High-resolution capture is now transition-aware with periodic verification, while primary frames retain ownership of `latest.jpg`, routine timeline frames, and debug overlays.
 - Runtime health now reports compact Matrix outbox counts instead of record-level items and reuses cached vehicle-history health until the archive changes or the cache expires.
 - Runtime decision-memory writes are locked and batched once per frame, and primary and named-profile captures publish atomically to separate paths so failed captures preserve the last known-good JPEG.
+- Added a Docker deployment and operations runbook plus a secret-safe environment template covering first deployment, validation, upgrades, rollback, backup, health checks, and resource measurement.
 
 These changes are intended to reduce steady-state CPU and durable filesystem traffic without changing occupancy thresholds or conservative transition behavior. Resource savings require post-deployment measurement and are not claimed by this release note.
 
