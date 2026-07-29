@@ -162,6 +162,55 @@ def test_wrong_match_subject_does_not_sort_archive_paths(tmp_path: Path, monkeyp
     assert first.session_id != second.session_id
 
 
+def test_wrong_match_latest_uses_parsed_timestamp_when_traversal_is_reversed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    chronologically_older = archive.start_session(
+        occupied_event(spot_id="left_spot", observed_at="2026-05-18T00:00:00+02:00")
+    )
+    archive.close_session(open_event(spot_id="left_spot", observed_at="2026-05-18T01:00:00+02:00"))
+    chronologically_newer = archive.start_session(
+        occupied_event(spot_id="left_spot", observed_at="2026-05-17T23:15:00Z")
+    )
+    archive.close_session(open_event(spot_id="left_spot", observed_at="2026-05-17T23:30:00Z"))
+    closed_records = archive.list_closed_sessions()
+
+    def reversed_records(directory: Path, *, ordered: bool = True):
+        del ordered
+        return iter(reversed(closed_records)) if directory == archive.closed_dir else iter(())
+
+    monkeypatch.setattr(archive, "_iter_records", reversed_records)
+
+    assert archive.resolve_wrong_match_subject("left_spot") == chronologically_newer.session_id
+    assert chronologically_older.session_id != chronologically_newer.session_id
+
+
+def test_wrong_match_equivalent_latest_timestamps_use_stable_session_id_tie_break(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    first = archive.start_session(occupied_event(spot_id="left_spot", observed_at="2026-05-17T22:00:00Z"))
+    archive.close_session(open_event(spot_id="left_spot", observed_at="2026-05-18T01:00:00Z"))
+    second = archive.start_session(occupied_event(spot_id="left_spot", observed_at="2026-05-17T23:00:00Z"))
+    archive.close_session(open_event(spot_id="left_spot", observed_at="2026-05-18T01:00:00Z"))
+    closed_records = archive.list_closed_sessions()
+
+    def resolve_with(records):
+        monkeypatch.setattr(
+            archive,
+            "_iter_records",
+            lambda directory, *, ordered=True: iter(records) if directory == archive.closed_dir else iter(()),
+        )
+        return archive.resolve_wrong_match_subject("left_spot")
+
+    assert (resolve_with(closed_records), resolve_with(reversed(closed_records))) == (
+        second.session_id,
+        second.session_id,
+    )
+    assert first.session_id < second.session_id
+
+
 def test_duplicate_start_for_same_spot_is_noop_and_logs_safe_warning(tmp_path: Path) -> None:
     stream = StringIO()
     archive = VehicleHistoryArchive(tmp_path, logger=setup_logging(stream=stream))
@@ -485,6 +534,47 @@ def test_health_oldest_session_uses_parsed_timestamp_order(tmp_path: Path) -> No
     health = archive.health_snapshot()
 
     assert health["oldest_retained_session_started_at"] == chronologically_oldest.started_at
+
+
+def test_health_equivalent_oldest_timestamps_use_legacy_sorted_path_tie_break(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    legacy_winner = archive.start_session(
+        occupied_event(spot_id="same_spot", observed_at="2026-05-17T23:00:00Z")
+    )
+    archive.close_session(open_event(spot_id="same_spot", observed_at="2026-05-17T23:15:00Z"))
+    archive.start_session(occupied_event(spot_id="same_spot", observed_at="2026-05-18T01:00:00+02:00"))
+    archive.close_session(open_event(spot_id="same_spot", observed_at="2026-05-18T01:15:00+02:00"))
+    closed_records = archive.list_closed_sessions()
+
+    def health_with(records) -> dict[str, Any]:
+        monkeypatch.setattr(
+            archive,
+            "_iter_records",
+            lambda directory, *, ordered=True: iter(records) if directory == archive.closed_dir else iter(()),
+        )
+        return archive.health_snapshot()
+
+    reverse_health = health_with(reversed(closed_records))
+    forward_health = health_with(closed_records)
+
+    assert reverse_health["oldest_retained_session_started_at"] == "2026-05-17T23:00:00Z"
+    assert forward_health["oldest_retained_session_started_at"] == "2026-05-17T23:00:00Z"
+    assert legacy_winner.session_id < closed_records[-1].session_id
+
+
+def test_health_equal_active_and_closed_timestamps_preserve_legacy_active_precedence(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.start_session(occupied_event(spot_id="same_spot", observed_at="2026-05-17T23:00:00Z"))
+    archive.close_session(open_event(spot_id="same_spot", observed_at="2026-05-17T23:15:00Z"))
+    legacy_winner = archive.start_session(
+        occupied_event(spot_id="same_spot", observed_at="2026-05-18T01:00:00+02:00")
+    )
+
+    health = archive.health_snapshot()
+
+    assert health["oldest_retained_session_started_at"] == legacy_winner.started_at
 
 
 def test_empty_archive_health_snapshot_exposes_retention_defaults_without_files(tmp_path: Path) -> None:

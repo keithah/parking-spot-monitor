@@ -275,7 +275,7 @@ class VehicleHistoryMaintenanceMixin:
         )
         closed_session_count = 0
         for record in self.iter_closed_sessions():
-            session_stats.add(record)
+            session_stats.add(record, archive_order=1)
             closed_session_count += 1
         self._log(
             "info",

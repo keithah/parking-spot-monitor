@@ -163,14 +163,21 @@ class SessionHealthAccumulator:
     missing_refs: int = 0
     profile_unknown_sessions: int = 0
     _oldest_timestamp: datetime | None = field(default=None, init=False, repr=False)
+    _oldest_order_key: tuple[int, str] | None = field(default=None, init=False, repr=False)
 
-    def add(self, record: SessionRecord) -> None:
+    def add(self, record: SessionRecord, *, archive_order: int = 0) -> None:
         self.count += 1
         self.missing_refs += int(record.occupied_snapshot_path is None or record.occupied_crop_path is None)
         self.profile_unknown_sessions += int(record.occupied_crop_path is not None and record.profile_id is None)
         parsed = _parse_timestamp(record.started_at)
-        if parsed is not None and (self._oldest_timestamp is None or parsed < self._oldest_timestamp):
+        order_key = (archive_order, record.session_id)
+        if parsed is not None and (
+            self._oldest_timestamp is None
+            or parsed < self._oldest_timestamp
+            or (parsed == self._oldest_timestamp and (self._oldest_order_key is None or order_key < self._oldest_order_key))
+        ):
             self._oldest_timestamp = parsed
+            self._oldest_order_key = order_key
             self.oldest_started_at = record.started_at
 
     def to_json(self) -> dict[str, int | str | None]:
