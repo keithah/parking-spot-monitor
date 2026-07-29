@@ -9,7 +9,6 @@ from typing import Sequence
 import pytest
 from PIL import Image
 
-import parking_spot_monitor.capture as capture
 from parking_spot_monitor.capture import (
     DEFAULT_DECODE_MODES,
     CaptureError,
@@ -228,16 +227,36 @@ def test_capture_rejects_wrong_dimensions_and_preserves_previous_frame(tmp_path:
     assert published.read_bytes() == previous_frame
 
 
-def test_capture_rejects_encoded_file_over_32_mib_and_preserves_previous_frame(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_capture_validates_encoded_file_at_exactly_literal_32_mib_before_rejecting_invalid_jpeg(
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(capture, "MAX_CAPTURE_JPEG_BYTES", 64, raising=False)
     published = tmp_path / "latest.jpg"
     previous_frame = jpeg_bytes()
     published.write_bytes(previous_frame)
 
     def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
-        Path(argv[-1]).write_bytes(jpeg_bytes())
+        with Path(argv[-1]).open("wb") as sparse_output:
+            sparse_output.truncate(32 * 1024 * 1024)
+        return subprocess.CompletedProcess(argv, 0, stderr="ok")
+
+    with pytest.raises(CaptureError) as raised:
+        capture_latest(fake_settings(), tmp_path, modes=[DecodeMode.SOFTWARE], runner=runner)
+
+    assert raised.value.reason == "output-invalid-jpeg"
+    assert published.read_bytes() == previous_frame
+    assert not list(tmp_path.glob(".latest.*.jpg"))
+
+
+def test_capture_rejects_encoded_file_one_byte_over_literal_32_mib(
+    tmp_path: Path,
+) -> None:
+    published = tmp_path / "latest.jpg"
+    previous_frame = jpeg_bytes()
+    published.write_bytes(previous_frame)
+
+    def runner(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        with Path(argv[-1]).open("wb") as sparse_output:
+            sparse_output.truncate(32 * 1024 * 1024 + 1)
         return subprocess.CompletedProcess(argv, 0, stderr="ok")
 
     with pytest.raises(CaptureError) as raised:
@@ -245,6 +264,7 @@ def test_capture_rejects_encoded_file_over_32_mib_and_preserves_previous_frame(
 
     assert raised.value.reason == "output-too-large"
     assert published.read_bytes() == previous_frame
+    assert not list(tmp_path.glob(".latest.*.jpg"))
 
 
 def test_capture_rejects_marker_wrapped_non_image_and_preserves_previous_frame(tmp_path: Path) -> None:
