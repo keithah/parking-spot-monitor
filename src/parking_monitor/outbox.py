@@ -17,7 +17,8 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Sequence
 from typing import Any, BinaryIO, Literal
 
 OutboxState = Literal["pending", "retrying", "delivered", "failed", "dead_lettered"]
@@ -314,43 +315,64 @@ class LocalOutbox:
             max_records=max_records,
             max_terminal_age_seconds=max_terminal_age_seconds,
         )
+        self._lock: threading.RLock = threading.RLock()
         self._records: list[OutboxRecord] = []
+        self._index_by_id: dict[str, int] = {}
         self.recovery = RecoveryResult()
-        self._records, self.recovery = self._load_records()
-        pruned = self._apply_retention(self._records)
-        if pruned != self._records:
-            self._persist_records(pruned)
-            self._records = pruned
+        with self._lock:
+            records, self.recovery = self._load_records()
+            self._set_records(records)
+            pruned = self._apply_retention(self._records)
+            if pruned != self._records:
+                self._persist_records(pruned)
+                self._set_records(pruned)
 
     def enqueue(self, intent: AlertIntent) -> OutboxRecord:
         """Persist a pending item unless the same logical alert already exists."""
         sanitized = intent.sanitized()
-        item_id = derive_outbox_item_id(sanitized)
-        existing = next((record for record in self._records if record.id == item_id), None)
-        if existing is not None:
-            return existing
+        return self.enqueue_with_phases(sanitized, (sanitized.phase,))
 
-        now = _utc_now()
-        record = OutboxRecord(
-            id=item_id,
-            transaction_id=derive_matrix_transaction_id(sanitized),
-            intent=sanitized,
-            state="pending",
-            created_at=now,
-            updated_at=now,
-            phase_states={sanitized.phase: "pending"},
-            phase_updated_at={sanitized.phase: now},
-            phase_results={},
-        )
-        updated_records = self._apply_retention([*self._records, record])
-        self._persist_records(updated_records)
-        self._records = updated_records
-        return next(item for item in self._records if item.id == record.id)
+    def enqueue_with_phases(
+        self,
+        intent: AlertIntent,
+        phases: Sequence[MatrixPhase | str],
+    ) -> OutboxRecord:
+        """Persist a pending item with every requested delivery phase in one write."""
+        sanitized = intent.sanitized()
+        requested_phases = tuple(phases) or (sanitized.phase,)
+        for phase in requested_phases:
+            if phase not in _VALID_PHASES:
+                raise OutboxTransitionError("unknown_phase")
+
+        with self._lock:
+            item_id = derive_outbox_item_id(sanitized)
+            if item_id in self._index_by_id:
+                return self._find_record(item_id)
+
+            now = _utc_now()
+            phase_states: dict[str, PhaseState] = {str(phase): "pending" for phase in requested_phases}
+            phase_updated_at = {phase: now for phase in phase_states}
+            record = OutboxRecord(
+                id=item_id,
+                transaction_id=derive_matrix_transaction_id(sanitized),
+                intent=sanitized,
+                state="pending",
+                created_at=now,
+                updated_at=now,
+                phase_states=phase_states,
+                phase_updated_at=phase_updated_at,
+                phase_results={},
+            )
+            updated_records = self._apply_retention([*self._records, record])
+            self._persist_records(updated_records)
+            self._set_records(updated_records)
+            return self._find_record(record.id)
 
     def list_records(self, state: OutboxState | None = None) -> list[OutboxRecord]:
-        if state is None:
-            return list(self._records)
-        return [record for record in self._records if record.state == state]
+        with self._lock:
+            if state is None:
+                return list(self._records)
+            return [record for record in self._records if record.state == state]
 
     def list_pending(self) -> list[OutboxRecord]:
         return self.list_records("pending")
@@ -387,8 +409,12 @@ class LocalOutbox:
 
     def mark_phase_failed(self, record_id: str, phase: MatrixPhase | str, *, reason: str) -> OutboxRecord:
         """Mark one Matrix delivery phase failed and dead-letter the record safely."""
-        record = self._transition_phase(record_id, phase=phase, phase_state="failed")
-        return self.mark_dead_lettered(record.id, reason=reason)
+        return self._transition_phase(
+            record_id,
+            phase=phase,
+            phase_state="failed",
+            dead_letter_reason=_safe_reason_code(reason),
+        )
 
     def status_summary(self) -> dict[str, JsonValue]:
         return self._status_summary(include_items=True)
@@ -397,34 +423,35 @@ class LocalOutbox:
         return self._status_summary(include_items=False)
 
     def _status_summary(self, *, include_items: bool) -> dict[str, JsonValue]:
-        counts: dict[str, int] = {}
-        retry_reason_counts: dict[str, int] = {}
-        dead_letter_reason_counts: dict[str, int] = {}
-        items: list[dict[str, JsonValue]] = []
-        timestamps: list[str] = []
-        for record in self._records:
-            counts[record.state] = counts.get(record.state, 0) + 1
-            timestamps.extend((record.created_at, record.updated_at))
-            if record.retry_reason is not None:
-                retry_reason_counts[record.retry_reason] = retry_reason_counts.get(record.retry_reason, 0) + 1
-            if record.dead_letter_reason is not None:
-                dead_letter_reason_counts[record.dead_letter_reason] = dead_letter_reason_counts.get(record.dead_letter_reason, 0) + 1
+        with self._lock:
+            counts: dict[str, int] = {}
+            retry_reason_counts: dict[str, int] = {}
+            dead_letter_reason_counts: dict[str, int] = {}
+            items: list[dict[str, JsonValue]] = []
+            timestamps: list[str] = []
+            for record in self._records:
+                counts[record.state] = counts.get(record.state, 0) + 1
+                timestamps.extend((record.created_at, record.updated_at))
+                if record.retry_reason is not None:
+                    retry_reason_counts[record.retry_reason] = retry_reason_counts.get(record.retry_reason, 0) + 1
+                if record.dead_letter_reason is not None:
+                    dead_letter_reason_counts[record.dead_letter_reason] = dead_letter_reason_counts.get(record.dead_letter_reason, 0) + 1
+                if include_items:
+                    items.append(self._status_item(record))
+            summary: dict[str, JsonValue] = {
+                "path": str(self.path),
+                "schema_version": _SCHEMA_VERSION,
+                "total": len(self._records),
+                "counts_by_state": counts,
+                "oldest_timestamp": min(timestamps) if timestamps else None,
+                "newest_timestamp": max(timestamps) if timestamps else None,
+                "retry_reason_counts": retry_reason_counts,
+                "dead_letter_reason_counts": dead_letter_reason_counts,
+                "recovery": self.recovery.to_json(),
+            }
             if include_items:
-                items.append(self._status_item(record))
-        summary: dict[str, JsonValue] = {
-            "path": str(self.path),
-            "schema_version": _SCHEMA_VERSION,
-            "total": len(self._records),
-            "counts_by_state": counts,
-            "oldest_timestamp": min(timestamps) if timestamps else None,
-            "newest_timestamp": max(timestamps) if timestamps else None,
-            "retry_reason_counts": retry_reason_counts,
-            "dead_letter_reason_counts": dead_letter_reason_counts,
-            "recovery": self.recovery.to_json(),
-        }
-        if include_items:
-            summary["items"] = items
-        return summary
+                summary["items"] = items
+            return summary
 
     def _status_item(self, record: OutboxRecord) -> dict[str, JsonValue]:
         return {
@@ -455,29 +482,30 @@ class LocalOutbox:
         retry_reason: str | None = None,
         dead_letter_reason: str | None = None,
     ) -> OutboxRecord:
-        record = self._find_record(record_id)
-        if record.state in _TERMINAL_STATES and state != record.state:
-            if not (record.state == "failed" and state == "dead_lettered"):
-                raise OutboxTransitionError("terminal_record_cannot_transition")
-        if state == "retrying" and record.state not in _RETRYABLE_STATES:
-            raise OutboxTransitionError("terminal_record_cannot_retry")
-        if record.state == state and retry_reason == record.retry_reason and dead_letter_reason == record.dead_letter_reason:
-            return record
-        now = _utc_now()
-        updated = OutboxRecord(
-            id=record.id,
-            transaction_id=record.transaction_id,
-            intent=record.intent,
-            state=state,
-            created_at=record.created_at,
-            updated_at=now,
-            retry_reason=retry_reason,
-            dead_letter_reason=dead_letter_reason or record.dead_letter_reason,
-            phase_states=record.phase_states,
-            phase_updated_at=record.phase_updated_at,
-            phase_results=record.phase_results,
-        )
-        return self._replace_record(updated)
+        with self._lock:
+            record = self._find_record(record_id)
+            if record.state in _TERMINAL_STATES and state != record.state:
+                if not (record.state == "failed" and state == "dead_lettered"):
+                    raise OutboxTransitionError("terminal_record_cannot_transition")
+            if state == "retrying" and record.state not in _RETRYABLE_STATES:
+                raise OutboxTransitionError("terminal_record_cannot_retry")
+            if record.state == state and retry_reason == record.retry_reason and dead_letter_reason == record.dead_letter_reason:
+                return record
+            now = _utc_now()
+            updated = OutboxRecord(
+                id=record.id,
+                transaction_id=record.transaction_id,
+                intent=record.intent,
+                state=state,
+                created_at=record.created_at,
+                updated_at=now,
+                retry_reason=retry_reason,
+                dead_letter_reason=dead_letter_reason or record.dead_letter_reason,
+                phase_states=record.phase_states,
+                phase_updated_at=record.phase_updated_at,
+                phase_results=record.phase_results,
+            )
+            return self._replace_record(updated)
 
     def _transition_phase(
         self,
@@ -486,61 +514,75 @@ class LocalOutbox:
         phase: MatrixPhase | str,
         phase_state: PhaseState,
         result: dict[str, JsonValue] | None = None,
+        dead_letter_reason: str | None = None,
     ) -> OutboxRecord:
         if phase not in _VALID_PHASES:
             raise OutboxTransitionError("unknown_phase")
         if phase_state not in _VALID_PHASE_STATES:
             raise OutboxTransitionError("unknown_phase_state")
         sanitized_result = _sanitize_phase_result(result, path=f"phase_results.{phase}") if result is not None else None
-        record = self._find_record(record_id)
-        if record.state in {"failed", "dead_lettered"}:
-            raise OutboxTransitionError("terminal_record_cannot_transition")
-        existing_result = record.phase_results.get(str(phase), {})
-        if record.phase_states.get(phase) == phase_state:
-            if sanitized_result is None or sanitized_result == existing_result:
-                return record
-            if existing_result:
-                raise OutboxTransitionError("delivered_phase_result_cannot_change")
-        now = _utc_now()
-        phase_states = dict(record.phase_states)
-        phase_states[phase] = phase_state
-        phase_updated_at = dict(record.phase_updated_at)
-        phase_updated_at[phase] = now
-        phase_results = dict(record.phase_results)
-        if sanitized_result:
-            phase_results[str(phase)] = sanitized_result
-        record_state: OutboxState = record.state
-        if phase_state == "failed":
-            record_state = "failed"
-        elif phase_states and all(state == "delivered" for state in phase_states.values()):
-            record_state = "delivered"
-        updated = OutboxRecord(
-            id=record.id,
-            transaction_id=record.transaction_id,
-            intent=record.intent,
-            state=record_state,
-            created_at=record.created_at,
-            updated_at=now,
-            retry_reason=record.retry_reason,
-            dead_letter_reason=record.dead_letter_reason,
-            phase_states=phase_states,
-            phase_updated_at=phase_updated_at,
-            phase_results=phase_results,
-        )
-        return self._replace_record(updated)
+        with self._lock:
+            record = self._find_record(record_id)
+            if record.state in {"failed", "dead_lettered"}:
+                raise OutboxTransitionError("terminal_record_cannot_transition")
+            existing_result = record.phase_results.get(str(phase), {})
+            if record.phase_states.get(phase) == phase_state and dead_letter_reason is None:
+                if sanitized_result is None or sanitized_result == existing_result:
+                    return record
+                if existing_result:
+                    raise OutboxTransitionError("delivered_phase_result_cannot_change")
+            now = _utc_now()
+            phase_states = dict(record.phase_states)
+            phase_states[phase] = phase_state
+            phase_updated_at = dict(record.phase_updated_at)
+            phase_updated_at[phase] = now
+            phase_results = dict(record.phase_results)
+            if sanitized_result:
+                phase_results[str(phase)] = sanitized_result
+            record_state: OutboxState = record.state
+            if phase_state == "failed":
+                record_state = "dead_lettered" if dead_letter_reason is not None else "failed"
+            elif phase_states and all(state == "delivered" for state in phase_states.values()):
+                record_state = "delivered"
+            updated = OutboxRecord(
+                id=record.id,
+                transaction_id=record.transaction_id,
+                intent=record.intent,
+                state=record_state,
+                created_at=record.created_at,
+                updated_at=now,
+                retry_reason=None if dead_letter_reason is not None else record.retry_reason,
+                dead_letter_reason=dead_letter_reason or record.dead_letter_reason,
+                phase_states=phase_states,
+                phase_updated_at=phase_updated_at,
+                phase_results=phase_results,
+            )
+            return self._replace_record(updated)
 
     def _find_record(self, record_id: str) -> OutboxRecord:
-        for record in self._records:
-            if record.id == record_id:
-                return record
-        raise OutboxTransitionError("unknown_record")
+        with self._lock:
+            try:
+                return self._records[self._index_by_id[record_id]]
+            except KeyError as exc:
+                raise OutboxTransitionError("unknown_record") from exc
 
     def _replace_record(self, updated: OutboxRecord) -> OutboxRecord:
-        records = [updated if record.id == updated.id else record for record in self._records]
-        records = self._apply_retention(records)
-        self._persist_records(records)
-        self._records = records
-        return next(record for record in self._records if record.id == updated.id)
+        with self._lock:
+            try:
+                index = self._index_by_id[updated.id]
+            except KeyError as exc:
+                raise OutboxTransitionError("unknown_record") from exc
+            records = list(self._records)
+            records[index] = updated
+            records = self._apply_retention(records)
+            self._persist_records(records)
+            self._set_records(records)
+            return self._find_record(updated.id)
+
+    def _set_records(self, records: list[OutboxRecord]) -> None:
+        with self._lock:
+            self._records = records
+            self._index_by_id = {record.id: index for index, record in enumerate(records)}
 
     def _apply_retention(self, records: list[OutboxRecord]) -> list[OutboxRecord]:
         retained = list(records)
@@ -634,8 +676,7 @@ class LocalOutbox:
                 delete=False,
             ) as handle:
                 tmp_path = handle.name
-                json.dump(payload, handle, indent=2, sort_keys=True)
-                handle.write("\n")
+                json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp_path, self.path)

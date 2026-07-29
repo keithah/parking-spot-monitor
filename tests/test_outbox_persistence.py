@@ -1,5 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import threading
+import time
 
 import pytest
 
@@ -69,6 +72,74 @@ def test_enqueue_is_idempotent_for_duplicate_logical_alerts(tmp_path):
     assert item["phases"] == [{"phase": "text", "state": "pending", "updated_at": first.updated_at}]
     assert item["retry_reason"] is None
     assert item["dead_letter_reason"] is None
+
+
+def test_concurrent_enqueue_and_transition_preserve_every_record(tmp_path: Path, monkeypatch) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    original = outbox._persist_records
+
+    def delayed_persist(records):
+        time.sleep(0.01)
+        return original(records)
+
+    monkeypatch.setattr(outbox, "_persist_records", delayed_persist)
+    intents = [
+        AlertIntent(event_id=f"event-{index}", phase="text", body=f"body-{index}")
+        for index in range(4)
+    ]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        records = list(pool.map(outbox.enqueue, intents))
+        transitioned = list(pool.map(lambda record: outbox.mark_retrying(record.id, reason="timeout"), records))
+
+    reloaded = LocalOutbox(outbox.path)
+    assert {record.id for record in reloaded.list_records()} == {record.id for record in records}
+    assert {record.id for record in transitioned} == {record.id for record in records}
+    assert {record.state for record in reloaded.list_records()} == {"retrying"}
+
+
+def test_concurrent_duplicate_id_enqueues_persist_once(tmp_path: Path, monkeypatch) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    intent = AlertIntent(event_id="event-duplicate", phase="text", body="Parking status")
+    original = outbox._persist_records
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def delayed_counted_persist(records):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        time.sleep(0.01)
+        return original(records)
+
+    monkeypatch.setattr(outbox, "_persist_records", delayed_counted_persist)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        records = list(pool.map(outbox.enqueue, [intent] * 4))
+
+    assert calls == 1
+    assert len({record.id for record in records}) == 1
+    assert outbox.list_records() == [records[0]]
+    assert LocalOutbox(outbox.path).list_records() == [records[0]]
+
+
+def test_persisted_outbox_is_compact_and_reloads_without_value_changes(tmp_path: Path) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    record = outbox.enqueue(
+        AlertIntent(
+            event_id="event-compact",
+            phase="text",
+            body="Parking status",
+            metadata={"nested": {"occupied": True}, "count": 2},
+        )
+    )
+    retrying = outbox.mark_retrying(record.id, reason="timeout")
+
+    raw = outbox.path.read_text(encoding="utf-8")
+
+    assert "\n  " not in raw
+    assert json.loads(raw)["schema_version"] == 1
+    assert LocalOutbox(outbox.path).list_records() == [retrying]
 
 
 def test_compact_status_summary_omits_record_items(tmp_path: Path) -> None:
@@ -287,6 +358,29 @@ def test_write_failure_preserves_prior_durable_file(tmp_path, monkeypatch):
     assert LocalOutbox(store_path).list_records() == [first]
 
 
+def test_failed_persistence_does_not_publish_a_stale_id_index(tmp_path: Path, monkeypatch) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    first = outbox.enqueue(AlertIntent(event_id="evt-first", phase="text", body="ok"))
+    second_intent = AlertIntent(event_id="evt-second", phase="text", body="ok")
+    original = outbox._persist_records
+
+    def fail_persist(records):
+        raise OutboxPersistenceError("failed to persist local outbox record")
+
+    monkeypatch.setattr(outbox, "_persist_records", fail_persist)
+    with pytest.raises(OutboxPersistenceError):
+        outbox.enqueue(second_intent)
+
+    assert outbox._index_by_id == {first.id: 0}
+    assert outbox.list_records() == [first]
+
+    monkeypatch.setattr(outbox, "_persist_records", original)
+    second = outbox.enqueue(second_intent)
+    retrying = outbox.mark_retrying(second.id, reason="timeout")
+    assert outbox._index_by_id == {first.id: 0, second.id: 1}
+    assert outbox.list_records() == [first, retrying]
+
+
 
 def test_quarantine_directory_is_bounded_for_many_bad_records(tmp_path):
     store_path = tmp_path / "matrix-outbox.json"
@@ -315,6 +409,28 @@ def test_phase_transition_is_idempotent_and_reloadable(tmp_path):
     assert delivered.phase_states == {"text": "delivered"}
     assert delivered.phase_results == {}
     assert LocalOutbox(store_path).list_records() == [delivered]
+
+
+def test_enqueue_with_phases_declares_all_phases_in_one_persistence(tmp_path: Path, monkeypatch) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    original = outbox._persist_records
+    calls = 0
+
+    def counted_persist(records):
+        nonlocal calls
+        calls += 1
+        return original(records)
+
+    monkeypatch.setattr(outbox, "_persist_records", counted_persist)
+
+    record = outbox.enqueue_with_phases(
+        AlertIntent(event_id="evt-snapshot", phase="text", body="Parking status"),
+        ("text", "upload", "image"),
+    )
+
+    assert calls == 1
+    assert record.phase_states == {"text": "pending", "upload": "pending", "image": "pending"}
+    assert LocalOutbox(outbox.path).list_records() == [record]
 
 
 def test_phase_result_round_trips_and_is_exposed_in_status_summary(tmp_path):
@@ -466,15 +582,26 @@ def test_dead_letter_reason_is_preserved_as_safe_code_and_not_retried(tmp_path):
 
 
 
-def test_phase_failure_dead_letters_record_with_reason_code(tmp_path):
+def test_phase_failure_dead_letters_record_with_reason_code_in_one_persistence(tmp_path, monkeypatch):
     outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
     record = outbox.enqueue(AlertIntent(event_id="evt-phase-fail", phase="image", body="ok"))
+    original = outbox._persist_records
+    calls = 0
+
+    def counted_persist(records):
+        nonlocal calls
+        calls += 1
+        return original(records)
+
+    monkeypatch.setattr(outbox, "_persist_records", counted_persist)
 
     dead = outbox.mark_phase_failed(record.id, "image", reason="matrix_upload_rejected")
 
+    assert calls == 1
     assert dead.state == "dead_lettered"
     assert dead.dead_letter_reason == "matrix_upload_rejected"
     assert dead.phase_states == {"image": "failed"}
+    assert LocalOutbox(outbox.path).list_records() == [dead]
 
 
 def test_status_summary_redacts_secret_shaped_failure_text(tmp_path):
@@ -524,6 +651,45 @@ def test_terminal_age_retention_prunes_old_delivered_records_only(tmp_path):
     reloaded = LocalOutbox(store_path, max_records=None, max_terminal_age_seconds=0)
 
     assert reloaded.list_records() == [pending]
+
+
+def test_duplicate_persisted_ids_use_the_last_rebuilt_index(tmp_path: Path) -> None:
+    store_path = tmp_path / "matrix-outbox.json"
+    outbox = LocalOutbox(store_path)
+    first = outbox.enqueue(AlertIntent(event_id="evt-duplicate-first", phase="text", body="first"))
+    second = outbox.enqueue(AlertIntent(event_id="evt-duplicate-second", phase="text", body="second"))
+    payload = json.loads(store_path.read_text(encoding="utf-8"))
+    payload["items"][1]["id"] = first.id
+    store_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    reloaded = LocalOutbox(store_path)
+    transitioned = reloaded.mark_retrying(first.id, reason="timeout")
+    records = reloaded.list_records()
+
+    assert reloaded._index_by_id == {first.id: 1}
+    assert records[0] == first
+    assert records[1] == transitioned
+    assert records[1].intent == second.intent
+    assert records[1].state == "retrying"
+
+
+def test_retention_and_replacement_rebuild_id_positions(tmp_path: Path) -> None:
+    store_path = tmp_path / "matrix-outbox.json"
+    outbox = LocalOutbox(store_path, max_records=2)
+    pruned = outbox.enqueue(AlertIntent(event_id="evt-pruned", phase="text", body="old"))
+    outbox.mark_delivered(pruned.id)
+    retained = outbox.enqueue(AlertIntent(event_id="evt-retained", phase="text", body="middle"))
+    newest = outbox.enqueue(AlertIntent(event_id="evt-newest", phase="text", body="new"))
+
+    assert outbox._index_by_id == {retained.id: 0, newest.id: 1}
+    retrying = outbox.mark_retrying(retained.id, reason="timeout")
+    delivered = outbox.mark_phase_delivered(newest.id, "text")
+    assert outbox.list_records() == [retrying, delivered]
+    assert outbox._index_by_id == {retained.id: 0, newest.id: 1}
+
+    reloaded = LocalOutbox(store_path, max_records=2)
+    assert reloaded.list_records() == [retrying, delivered]
+    assert reloaded._index_by_id == {retained.id: 0, newest.id: 1}
 
 
 def test_invalid_transitions_are_safe_and_do_not_mutate_store(tmp_path):
