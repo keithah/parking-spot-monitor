@@ -4,6 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 
 MAX_OWNER_VEHICLES = 20
@@ -25,6 +26,9 @@ class OwnerVehicle:
 class OwnerVehicleRegistry:
     vehicles_by_profile_id: Mapping[str, OwnerVehicle]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "vehicles_by_profile_id", MappingProxyType(dict(self.vehicles_by_profile_id)))
+
     @classmethod
     def empty(cls) -> OwnerVehicleRegistry:
         return cls({})
@@ -35,12 +39,22 @@ class OwnerVehicleRegistry:
         return self.vehicles_by_profile_id.get(profile_id.strip())
 
 
-def load_owner_vehicle_registry(path: str | Path) -> OwnerVehicleRegistry:
+def load_owner_vehicle_registry(
+    path: str | Path,
+    *,
+    raise_io_errors: bool = False,
+) -> OwnerVehicleRegistry:
     registry_path = Path(path)
-    if not registry_path.exists():
+    try:
+        registry_text = registry_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return OwnerVehicleRegistry.empty()
+    except Exception:
+        if raise_io_errors:
+            raise
         return OwnerVehicleRegistry.empty()
     try:
-        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        payload = json.loads(registry_text)
         return _registry_from_payload(payload)
     except Exception:
         return OwnerVehicleRegistry.empty()

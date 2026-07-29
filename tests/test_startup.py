@@ -764,8 +764,11 @@ def test_runtime_loop_vehicle_history_confirmed_occupied_creates_one_active_sess
 
 
 def test_runtime_loop_owner_vehicle_in_quiet_window_sends_deduped_alert(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    import parking_spot_monitor.runtime_owner_vehicle_cache as runtime_owner_vehicle_cache
+    import parking_spot_monitor.runtime_vehicle_events as runtime_vehicle_events
+    from parking_spot_monitor.owner_vehicles import load_owner_vehicle_registry
     from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
     data_dir = tmp_path
@@ -807,6 +810,23 @@ def test_runtime_loop_owner_vehicle_in_quiet_window_sends_deduped_alert(
         ),
         encoding="utf-8",
     )
+    active_loads = 0
+    registry_loads = 0
+    real_load_active_sessions = VehicleHistoryArchive.load_active_sessions
+
+    def counted_active_sessions(archive: VehicleHistoryArchive) -> list[object]:
+        nonlocal active_loads
+        active_loads += 1
+        return real_load_active_sessions(archive)
+
+    def counted_registry(path: str | Path, *, raise_io_errors: bool = False) -> object:
+        nonlocal registry_loads
+        registry_loads += 1
+        return load_owner_vehicle_registry(path, raise_io_errors=raise_io_errors)
+
+    monkeypatch.setattr(VehicleHistoryArchive, "load_active_sessions", counted_active_sessions)
+    monkeypatch.setattr(runtime_owner_vehicle_cache, "load_owner_vehicle_registry", counted_registry)
+    monkeypatch.setattr(runtime_vehicle_events, "load_owner_vehicle_registry", counted_registry)
 
     delivery = FakeMatrixDelivery()
 
@@ -835,6 +855,8 @@ def test_runtime_loop_owner_vehicle_in_quiet_window_sends_deduped_alert(
     assert delivery.owner_alerts[0]["owner_vehicle"]["label"] == "Keith's black Tesla"
     assert delivery.owner_alerts[0]["spot_id"] == "right_spot"
     assert state_payload["owner_quiet_window_alert_ids"] == [expected_event_id]
+    assert active_loads == 1
+    assert registry_loads == 1
     assert output.count("owner-vehicle-quiet-window-alert") >= 1
     assert_no_secret_leak(output)
 

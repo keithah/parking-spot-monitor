@@ -17,6 +17,7 @@ from parking_spot_monitor.runtime_frame import capture_and_detect_runtime_frame
 from parking_spot_monitor.runtime_frame_outcome import prepare_runtime_frame_loop_result
 from parking_spot_monitor.runtime_health import RuntimeLoopHealthState, observed_at
 from parking_spot_monitor.runtime_health_cache import VehicleHistoryHealthSnapshotCache
+from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache
 from parking_spot_monitor.runtime_commands import RuntimeMatrixCommandService, _poll_matrix_commands_once
 from parking_spot_monitor.runtime_detection import _configured_spot_polygons, build_detection_memory_records
 from parking_spot_monitor.runtime_resource_policy import RuntimeResourcePolicyState
@@ -65,6 +66,8 @@ def run_capture_loop(
         now=now_fn,
         ttl_seconds=VEHICLE_HISTORY_HEALTH_CACHE_SECONDS,
     )
+    archive_root = Path(getattr(effective_history_archive, "root", runtime_paths.vehicle_history_dir))
+    owner_vehicle_cache = OwnerVehicleRuntimeCache(archive_root / "owner-vehicles.json")
     outbox_health_provider = getattr(matrix_delivery, "outbox_health_summary", None)
     if not callable(outbox_health_provider):
         outbox_health_provider = None
@@ -161,6 +164,7 @@ def run_capture_loop(
                         state_path=state_path,
                         configured_spot_ids=spot_ids,
                         history_archive=effective_history_archive,
+                        owner_vehicle_cache=owner_vehicle_cache,
                         decision_memory_path=decision_memory_path,
                         pending_decision_records=pending_decision_records,
                     )
