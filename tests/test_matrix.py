@@ -155,6 +155,35 @@ def test_retry_jitter_is_bounded_and_retry_after_is_minimum() -> None:
     ) == 12
 
 
+def test_matrix_client_retry_applies_injected_positive_jitter() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(500, json={"errcode": "M_UNAVAILABLE"}, request=request)
+        return httpx.Response(200, json={"event_id": "$event:example.org"}, request=request)
+
+    client = MatrixClient(
+        homeserver=HOMESERVER,
+        access_token=ACCESS_TOKEN,
+        retry_attempts=2,
+        retry_backoff_seconds=10,
+        retry_jitter_ratio=0.2,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=sleeps.append,
+        random_unit=lambda: 1.0,
+    )
+
+    event_id = client.send_text(room_id=ROOM_ID, txn_id="txn", body="Parking spot is open")
+
+    assert event_id == "$event:example.org"
+    assert attempts == 2
+    assert sleeps == [12]
+
+
 def test_sender_reply_limiter_admits_once_per_cooldown_and_stays_bounded() -> None:
     from parking_spot_monitor.matrix_commands import SenderReplyLimiter
 
@@ -3690,9 +3719,12 @@ def test_default_matrix_factories_wire_safety_config_and_resolved_outbox_path(tm
     from parking_spot_monitor.paths import resolve_runtime_paths
 
     config_path = tmp_path / "config.yaml"
-    config_text = Path("config.yaml.example").read_text(encoding="utf-8").replace(
-        "command_authorized_senders: []",
-        "command_authorized_senders: ['@op:example']",
+    config_text = (
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("command_authorized_senders: []", "command_authorized_senders: ['@op:example']")
+        .replace("retry_jitter_ratio: 0.2", "retry_jitter_ratio: 0.75")
+        .replace("unauthorized_reply_cooldown_seconds: 300", "unauthorized_reply_cooldown_seconds: 0")
     )
     config_path.write_text(config_text, encoding="utf-8")
     settings = load_settings(config_path, environ=stream_env())
@@ -3704,6 +3736,6 @@ def test_default_matrix_factories_wire_safety_config_and_resolved_outbox_path(tm
     assert service is not None
     assert service.cockpit_context is not None
     assert service.cockpit_context.matrix_outbox_path == paths.matrix_outbox_file
-    assert service.client.retry_jitter_ratio == 0.2
-    assert service.unauthorized_reply_cooldown_seconds == 300
-    assert delivery.client.retry_jitter_ratio == 0.2
+    assert service.client.retry_jitter_ratio == 0.75
+    assert service.unauthorized_reply_cooldown_seconds == 0
+    assert delivery.client.retry_jitter_ratio == 0.75
