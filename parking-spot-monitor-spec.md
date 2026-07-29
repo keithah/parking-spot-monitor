@@ -354,14 +354,35 @@ runtime:
 ```
 
 `runtime.frame_interval_seconds` remains the active or uncertain sampling cadence. After
-`runtime.stable_settle_frames` unchanged frames, adaptive polling may use
-`runtime.stable_frame_interval_seconds`. Set `adaptive_polling_enabled: false` to keep a
-fixed cadence; setting `stable_frame_interval_seconds` equal to
-`frame_interval_seconds` is a second fixed-cadence rollback path.
+`runtime.stable_settle_frames` consecutive successful stable frames (three by default),
+adaptive polling may use `runtime.stable_frame_interval_seconds`. Unknown or degraded
+state, an occupancy transition, a partial confirmation/release streak, or weak presence
+uses the active cadence and resets settling. Set `adaptive_polling_enabled: false` to
+keep a fixed cadence; setting `stable_frame_interval_seconds` equal to
+`frame_interval_seconds` is a second fixed-cadence rollback path. The ignored
+operator-owned `config.yaml` is not rewritten by the runtime; model defaults apply to
+omitted adaptive keys until the operator chooses explicit overrides.
 
-`debug_overlay_interval_seconds: 0` disables periodic debug overlays.
-`escalation_verification_seconds: 0` disables periodic high-resolution verification;
+Every iteration first captures the primary stream to `latest.jpg`. Named profiles publish
+to separate paths such as `latest-high_resolution.jpg`; publication is atomic and a
+failed capture preserves the prior published JPEG. High-resolution capture is used when
+weak evidence could change occupancy and periodically after stable settling. It may be
+authoritative for that iteration's detection, state transition, and event snapshot, but
+the primary image owns `latest.jpg`, the routine timeline buffer, and routine debug
+overlays. Successful transition-driven verification also resets the periodic verification
+deadline.
+
+`debug_overlay_interval_seconds: 0` disables periodic debug overlays; state transitions
+may still force a primary-frame overlay. `escalation_verification_seconds: 0` disables periodic high-resolution verification;
 transition-driven escalation remains enabled when an escalation profile is configured.
+
+Runtime health exposes compact Matrix outbox totals, state counts, timestamps, and bounded
+reason counts instead of record-level `items`; detailed durable records remain in the
+outbox itself. The expected operational change is from potentially hundreds of item
+details to compact counts and a health file of only a few kilobytes, subject to
+post-deployment measurement. Vehicle-history health snapshots are cached between archive
+mutations, and each processed frame persists its bounded, sanitized decision-memory
+records in one locked batch.
 
 ---
 

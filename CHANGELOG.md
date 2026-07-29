@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-07-28
+
+### Changed
+
+- Added adaptive runtime pacing with a 30-second active/uncertain cadence, a 60-second stable cadence after three stable frames, and explicit fixed-cadence rollback controls.
+- High-resolution capture is now transition-aware with periodic verification, while primary frames retain ownership of `latest.jpg`, routine timeline frames, and debug overlays.
+- Runtime health now reports compact Matrix outbox counts instead of record-level items and reuses cached vehicle-history health until the archive changes or the cache expires.
+- Runtime decision-memory writes are locked and batched once per frame, and primary and named-profile captures publish atomically to separate paths so failed captures preserve the last known-good JPEG.
+
+These changes are intended to reduce steady-state CPU and durable filesystem traffic without changing occupancy thresholds or conservative transition behavior. Resource savings require post-deployment measurement and are not claimed by this release note.
+
 ## 2026-06-02
 
 ### Changed

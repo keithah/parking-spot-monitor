@@ -25,6 +25,21 @@ def test_first_check_artifact_guidance_and_structured_events_are_documented() ->
     )
     assert "startup-ready" in readme or "capture-frame-written" in readme
 
+
+def test_readme_documents_adaptive_resource_controls_and_primary_artifacts() -> None:
+    readme = read_tracked("README.md")
+
+    for key in (
+        "adaptive_polling_enabled",
+        "stable_frame_interval_seconds",
+        "stable_settle_frames",
+        "debug_overlay_interval_seconds",
+        "escalation_verification_seconds",
+    ):
+        assert key in readme
+    assert "fixed cadence" in readme.lower()
+    assert "primary" in readme.lower()
+
 def test_readme_troubleshooting_covers_s04_failure_classes_with_evidence_surfaces() -> None:
     section = read_readme_section("Troubleshooting and cleanup runbook")
 
