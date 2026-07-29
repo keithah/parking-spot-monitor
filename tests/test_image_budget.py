@@ -36,12 +36,6 @@ def _encode(
 
 def test_encoder_selects_largest_dimension_then_highest_quality(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts: list[tuple[tuple[int, int], int]] = []
-    materialized_sizes: list[int] = []
-
-    class RecordingBytesIO(BytesIO):
-        def getvalue(self) -> bytes:
-            materialized_sizes.append(self.tell())
-            return super().getvalue()
 
     def fake_encode(image: Image.Image, buffer: Any, quality: int) -> None:
         attempts.append((image.size, quality))
@@ -53,7 +47,6 @@ def test_encoder_selects_largest_dimension_then_highest_quality(monkeypatch: pyt
         }
         buffer.write(b"x" * sizes[(image.size, quality)])
 
-    monkeypatch.setattr(image_budget, "BytesIO", RecordingBytesIO)
     monkeypatch.setattr(image_budget, "_encode_jpeg", fake_encode)
     with Image.new("RGB", (100, 50)) as source:
         result = _encode(source)
@@ -67,7 +60,48 @@ def test_encoder_selects_largest_dimension_then_highest_quality(monkeypatch: pyt
         ((80, 40), 85),
     ]
     assert len(result.data) == 95
-    assert materialized_sizes == [80, 95]
+
+
+def test_encoder_copies_only_viable_payloads_from_promptly_released_buffer_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: list[int] = []
+    copied_sizes: list[int] = []
+    exported_views: list[memoryview] = []
+
+    class StrictBytesIO(BytesIO):
+        def getvalue(self) -> bytes:
+            raise AssertionError("getvalue may share reusable buffer storage")
+
+        def getbuffer(self) -> memoryview:
+            view = super().getbuffer()
+            copied_sizes.append(view.nbytes)
+            exported_views.append(view)
+            return view
+
+    def fake_encode(image: Image.Image, buffer: Any, quality: int) -> None:
+        attempts.append(quality)
+        payloads = {
+            40: b"l" * 80,
+            70: b"m" * 95,
+            85: b"h" * 110,
+        }
+        buffer.write(payloads[quality])
+
+    monkeypatch.setattr(image_budget, "BytesIO", StrictBytesIO)
+    monkeypatch.setattr(image_budget, "_encode_jpeg", fake_encode)
+    with Image.new("RGB", (80, 40)) as source:
+        result = _encode(source, initial_max_dimension=80)
+
+    assert attempts == [40, 70, 85]
+    assert result.attempts == 3
+    assert result.quality == 70
+    assert result.data == b"m" * 95
+    assert isinstance(result.data, bytes)
+    assert copied_sizes == [80, 95]
+    for view in exported_views:
+        with pytest.raises(ValueError, match="released memoryview"):
+            _ = view.nbytes
 
 
 def test_encoder_uses_exact_initial_dominant_dimension_when_float_scaling_would_round_down(
@@ -119,12 +153,16 @@ def test_encoder_uses_exact_terminal_minimum_dominant_dimension_when_float_scali
 def test_encoder_does_not_materialize_immutable_payloads_for_oversize_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    materialized_sizes: list[int] = []
+    copied_sizes: list[int] = []
 
     class RecordingBytesIO(BytesIO):
         def getvalue(self) -> bytes:
-            materialized_sizes.append(self.tell())
-            return super().getvalue()
+            raise AssertionError("getvalue may share reusable buffer storage")
+
+        def getbuffer(self) -> memoryview:
+            view = super().getbuffer()
+            copied_sizes.append(view.nbytes)
+            return view
 
     def fake_encode(image: Image.Image, buffer: Any, quality: int) -> None:
         buffer.write(b"x" * 101)
@@ -135,7 +173,7 @@ def test_encoder_does_not_materialize_immutable_payloads_for_oversize_attempts(
         with pytest.raises(ImageBudgetError):
             _encode(source, qualities=(40,))
 
-    assert materialized_sizes == []
+    assert copied_sizes == []
 
 
 def test_encoder_reuses_one_reset_buffer_for_every_attempt(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -73,7 +73,7 @@ def encode_jpeg_under_budget(
                         buffer,
                         normalized_qualities,
                         max_bytes=max_bytes,
-                        lowest_data=buffer.getvalue(),
+                        lowest_data=_copy_buffer_bytes(buffer),
                     )
                     attempts += quality_attempts
                     width, height = candidate.size
@@ -118,7 +118,7 @@ def _highest_viable_quality(
         if size <= max_bytes:
             high_index = middle_index
             best_quality = quality
-            best_data = buffer.getvalue()
+            best_data = _copy_buffer_bytes(buffer)
         else:
             low_index = middle_index + 1
 
@@ -130,6 +130,14 @@ def _attempt(image: Image.Image, buffer: BytesIO, quality: int) -> int:
     buffer.truncate(0)
     _encode_jpeg(image, buffer, quality)
     return buffer.tell()
+
+
+def _copy_buffer_bytes(buffer: BytesIO) -> bytes:
+    view = buffer.getbuffer()
+    try:
+        return bytes(view)
+    finally:
+        view.release()
 
 
 def _encode_jpeg(image: Image.Image, buffer: BytesIO, quality: int) -> None:
