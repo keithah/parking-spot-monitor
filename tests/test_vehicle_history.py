@@ -1363,28 +1363,29 @@ def test_malformed_correction_jsonl_is_quarantined_and_health_reports_metadata(t
 
 def test_correction_replay_is_cached_until_revision_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     archive = VehicleHistoryArchive(tmp_path)
-    calls = 0
-    original = archive.load_corrections
+    correction_reads = 0
+    original_open = Path.open
 
-    def counted() -> Any:
-        nonlocal calls
-        calls += 1
-        return original()
+    def counted(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal correction_reads
+        if path == archive.corrections_path and args and args[0] == "rb":
+            correction_reads += 1
+        return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(archive, "load_corrections", counted)
+    monkeypatch.setattr(Path, "open", counted)
 
     first = archive.correction_replay_state()
     second = archive.correction_replay_state()
 
     assert second is first
-    assert calls == 1
+    assert correction_reads == 1
     assert archive.correction_revision() == 0
 
     archive._bump_correction_revision()
     third = archive.correction_replay_state()
 
     assert third is not second
-    assert calls == 2
+    assert correction_reads == 2
     assert archive.correction_revision() == 1
 
 
@@ -1439,6 +1440,69 @@ def test_external_same_process_correction_replace_invalidates_signature_cache(tm
     assert dict(second.labels) == {"prof_external": "New"}
 
 
+def test_correction_replay_does_not_cache_state_read_before_external_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    old_payload = {
+        "schema_version": 1,
+        "correction_id": "corr_overlap",
+        "action": "rename_profile",
+        "created_at": "2026-05-18T14:45:00Z",
+        "matrix_event_id": None,
+        "matrix_sender": None,
+        "matrix_room_id": None,
+        "profile_id": "prof_overlap",
+        "label": "Old",
+    }
+    archive.corrections_path.write_text(json.dumps(old_payload, sort_keys=True) + "\n", encoding="utf-8")
+    old_stat = archive.corrections_path.stat()
+    replacement_path = archive.corrections_dir / "overlap-replacement.jsonl"
+    replacement_path.write_text(
+        json.dumps({**old_payload, "label": "New"}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.utime(replacement_path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns + 1_000_000))
+    original_open = Path.open
+    correction_reads = 0
+    replaced = False
+
+    class ReplaceAfterCorrectionRead:
+        def __init__(self, handle: Any) -> None:
+            self.handle = handle
+
+        def __enter__(self) -> Any:
+            return self.handle.__enter__()
+
+        def __exit__(self, *args: Any) -> Any:
+            nonlocal replaced
+            result = self.handle.__exit__(*args)
+            if not replaced:
+                os.replace(replacement_path, archive.corrections_path)
+                replaced = True
+            return result
+
+    def replace_after_read(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal correction_reads
+        handle = original_open(path, *args, **kwargs)
+        if path == archive.corrections_path and args and args[0] == "rb":
+            correction_reads += 1
+            return ReplaceAfterCorrectionRead(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", replace_after_read)
+
+    old = archive.correction_replay_state()
+    new = archive.correction_replay_state()
+    stable = archive.correction_replay_state()
+
+    assert dict(old.labels) == {"prof_overlap": "Old"}
+    assert dict(new.labels) == {"prof_overlap": "New"}
+    assert stable is new
+    assert correction_reads == 2
+
+
 def test_correction_replay_recomputes_after_transient_signature_stat_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1446,15 +1510,16 @@ def test_correction_replay_recomputes_after_transient_signature_stat_failure(
     archive.corrections_dir.mkdir(parents=True)
     archive.corrections_path.write_text("", encoding="utf-8")
     first = archive.correction_replay_state()
-    calls = 0
-    original_load = archive.load_corrections
+    correction_reads = 0
+    original_open = Path.open
     original_stat = Path.stat
     failed = False
 
-    def counted() -> Any:
-        nonlocal calls
-        calls += 1
-        return original_load()
+    def counted(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal correction_reads
+        if path == archive.corrections_path and args and args[0] == "rb":
+            correction_reads += 1
+        return original_open(path, *args, **kwargs)
 
     def fail_signature_stat_once(path: Path, *args: Any, **kwargs: Any) -> os.stat_result:
         nonlocal failed
@@ -1463,23 +1528,17 @@ def test_correction_replay_recomputes_after_transient_signature_stat_failure(
             raise PermissionError("transient signature failure")
         return original_stat(path, *args, **kwargs)
 
-    def exists_without_signature_probe(path: Path, *args: Any, **kwargs: Any) -> bool:
-        try:
-            original_stat(path, *args, **kwargs)
-        except OSError:
-            return False
-        return True
-
-    monkeypatch.setattr(archive, "load_corrections", counted)
-    monkeypatch.setattr(Path, "exists", exists_without_signature_probe)
+    monkeypatch.setattr(Path, "open", counted)
     monkeypatch.setattr(Path, "stat", fail_signature_stat_once)
 
     rebuilt = archive.correction_replay_state()
+    recovered = archive.correction_replay_state()
     stable = archive.correction_replay_state()
 
     assert rebuilt is not first
-    assert stable is rebuilt
-    assert calls == 1
+    assert recovered is not rebuilt
+    assert stable is recovered
+    assert correction_reads == 2
 
 
 def test_correction_replay_does_not_cache_transient_read_failure(
@@ -1576,24 +1635,126 @@ def test_malformed_correction_quarantine_signature_is_stable_after_replay(
     archive = VehicleHistoryArchive(tmp_path)
     archive.corrections_dir.mkdir(parents=True)
     archive.corrections_path.write_text("{not-json\n", encoding="utf-8")
-    calls = 0
-    original = archive.load_corrections
+    correction_reads = 0
+    original_open = Path.open
 
-    def counted() -> Any:
-        nonlocal calls
-        calls += 1
-        return original()
+    def counted(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal correction_reads
+        if path == archive.corrections_path and args and args[0] == "rb":
+            correction_reads += 1
+        return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(archive, "load_corrections", counted)
+    monkeypatch.setattr(Path, "open", counted)
 
     first = archive.correction_replay_state()
     second = archive.correction_replay_state()
 
     assert first.invalid_count == 1
     assert second is first
-    assert calls == 1
+    assert correction_reads == 1
     assert archive.correction_revision() == 1
     assert archive.corrections_quarantine_path.read_text(encoding="utf-8").count("\n") == 1
+
+
+def test_correction_replay_retries_after_quarantine_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    archive.corrections_path.write_text("{not-json\n", encoding="utf-8")
+    original_open = Path.open
+    correction_reads = 0
+    write_failed = False
+
+    def fail_quarantine_write_once(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal correction_reads, write_failed
+        if path == archive.corrections_path and args and args[0] == "rb":
+            correction_reads += 1
+        if path == archive.corrections_quarantine_path and args and args[0] == "a" and not write_failed:
+            write_failed = True
+            raise PermissionError("transient quarantine write failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_quarantine_write_once)
+
+    failed = archive.correction_replay_state()
+    recovered = archive.correction_replay_state()
+    stable = archive.correction_replay_state()
+
+    assert failed.invalid_count == 0
+    assert recovered.invalid_count == 1
+    assert stable is recovered
+    assert correction_reads == 2
+
+
+def test_correction_replay_retries_after_quarantine_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    archive.corrections_path.write_text("{not-json\n", encoding="utf-8")
+    archive.corrections_quarantine_path.write_text(
+        json.dumps({"line_number": 1, "reason": "JSONDecodeError", "quarantined_at": "2026-05-18T14:45:00Z"}) + "\n",
+        encoding="utf-8",
+    )
+    original_open = Path.open
+    correction_reads = 0
+    read_failed = False
+
+    def fail_quarantine_read_once(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal correction_reads, read_failed
+        if path == archive.corrections_path and args and args[0] == "rb":
+            correction_reads += 1
+        if path == archive.corrections_quarantine_path and args and args[0] == "r" and not read_failed:
+            read_failed = True
+            raise PermissionError("transient quarantine read failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_quarantine_read_once)
+
+    first = archive.correction_replay_state()
+    recovered = archive.correction_replay_state()
+    stable = archive.correction_replay_state()
+
+    assert first.invalid_count == 2
+    assert recovered.invalid_count == 2
+    assert stable is recovered
+    assert correction_reads == 2
+
+
+def test_correction_replay_retries_after_quarantine_count_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    archive.corrections_path.write_text("", encoding="utf-8")
+    archive.corrections_quarantine_path.write_text(
+        json.dumps({"line_number": 1, "reason": "JSONDecodeError", "quarantined_at": "2026-05-18T14:45:00Z"}) + "\n",
+        encoding="utf-8",
+    )
+    original_open = Path.open
+    correction_reads = 0
+    count_failed = False
+
+    def fail_quarantine_count_once(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal correction_reads, count_failed
+        if path == archive.corrections_path and args and args[0] == "rb":
+            correction_reads += 1
+        if path == archive.corrections_quarantine_path and args and args[0] == "r" and not count_failed:
+            count_failed = True
+            raise PermissionError("transient quarantine count failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_quarantine_count_once)
+
+    failed = archive.correction_replay_state()
+    recovered = archive.correction_replay_state()
+    stable = archive.correction_replay_state()
+
+    assert failed.invalid_count == 0
+    assert recovered.invalid_count == 1
+    assert stable is recovered
+    assert correction_reads == 2
 
 
 def test_cached_correction_replay_mappings_are_immutable(tmp_path: Path) -> None:

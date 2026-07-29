@@ -10,6 +10,7 @@ from typing import Any
 
 from parking_spot_monitor.logging import redact_diagnostic_text
 from parking_spot_monitor.vehicle_history_correction_cache import _canonical_profile_map, build_correction_replay_state
+from parking_spot_monitor.vehicle_history_correction_io import count_correction_quarantine, load_correction_events, quarantine_correction_line
 from parking_spot_monitor.vehicle_history_models import (
     CORRECTION_ACTION_MERGE_PROFILES,
     CORRECTION_ACTION_PROFILE_SUMMARY_REQUESTED,
@@ -137,45 +138,47 @@ class VehicleHistoryCorrectionMixin:
 
     def load_corrections(self) -> list[ProfileCorrectionEvent]:
         self.corrections_dir.mkdir(parents=True, exist_ok=True)
-        self._correction_load_succeeded = True
-        corrections: list[ProfileCorrectionEvent] = []
-        try:
-            with self.corrections_path.open("rb") as handle:
-                for line_number, raw_line in enumerate(handle, start=1):
-                    if len(raw_line) > MAX_CORRECTION_LINE_BYTES:
-                        self._quarantine_correction_line(line_number=line_number, reason="line-too-large")
-                        continue
-                    try:
-                        text = raw_line.decode("utf-8")
-                        if not text.strip():
-                            continue
-                        payload = json.loads(text)
-                        corrections.append(ProfileCorrectionEvent.from_json_dict(payload))
-                    except (UnicodeDecodeError, json.JSONDecodeError, ArchiveSchemaError, ValueError) as exc:
-                        self._quarantine_correction_line(line_number=line_number, reason=type(exc).__name__)
-        except FileNotFoundError:
-            return corrections
-        except OSError as exc:
-            self._correction_load_succeeded = False
-            self._record_failure(phase="correction-load", path_name=self.corrections_path.name, error=exc)
-            return corrections
-        return corrections
+        return list(self._load_correction_replay().events)
+
+    def _load_correction_replay(self):
+        return load_correction_events(
+            self.corrections_path,
+            max_line_bytes=MAX_CORRECTION_LINE_BYTES,
+            quarantine_line=self._quarantine_correction_line,
+            record_failure=self._record_failure,
+        )
 
     def correction_replay_state(self) -> CorrectionReplayState:
-        cached = self._correction_replay_cache.get(
+        cached, before = self._correction_replay_cache.lookup(
             revision=self.correction_revision(),
             corrections_path=self.corrections_path,
             quarantine_path=self.corrections_quarantine_path,
         )
         if cached is not None:
             return cached
-        events = self.load_corrections()
-        state = build_correction_replay_state(events, quarantine_count=self._correction_quarantine_count())
-        self._correction_replay_cache.store(
+        loaded = self._load_correction_replay()
+        after_load = self._correction_replay_cache.snapshot(
             revision=self.correction_revision(),
             corrections_path=self.corrections_path,
             quarantine_path=self.corrections_quarantine_path,
-            value=state if self._correction_load_succeeded else None,
+        )
+        quarantine = count_correction_quarantine(
+            self.corrections_quarantine_path,
+            record_failure=self._record_failure,
+        )
+        after_count = self._correction_replay_cache.snapshot(
+            revision=self.correction_revision(),
+            corrections_path=self.corrections_path,
+            quarantine_path=self.corrections_quarantine_path,
+        )
+        state = build_correction_replay_state(loaded.events, quarantine_count=quarantine.count)
+        self._correction_replay_cache.store_if_stable(
+            before=before,
+            after_load=after_load,
+            after_count=after_count,
+            quarantine_writes=loaded.quarantine_writes,
+            safe=loaded.succeeded and quarantine.succeeded,
+            value=state,
         )
         return state
 
@@ -350,50 +353,19 @@ class VehicleHistoryCorrectionMixin:
                 profile_ids.add(resolved)
         return {profile_id for profile_id in profile_ids if profile_id is not None}
 
-    def _quarantine_correction_line(self, *, line_number: int, reason: str) -> None:
+    def _quarantine_correction_line(self, *, line_number: int, reason: str):
         self.corrections_dir.mkdir(parents=True, exist_ok=True)
         safe_reason = redact_diagnostic_text(reason)
-        if self._correction_line_already_quarantined(line_number=line_number, reason=safe_reason):
-            return
-        entry = {"line_number": line_number, "reason": safe_reason, "quarantined_at": _utc_now()}
-        try:
-            with self.corrections_quarantine_path.open("a", encoding="utf-8") as handle:
-                json.dump(entry, handle, sort_keys=True, separators=(",", ":"), allow_nan=False)
-                handle.write("\n")
-        except OSError as exc:
-            self._correction_load_succeeded = False
-            self._record_failure(phase="correction-quarantine", path_name=self.corrections_quarantine_path.name, error=exc)
-        else:
-            self._bump_correction_revision()
+        outcome = quarantine_correction_line(
+            self.corrections_quarantine_path,
+            line_number=line_number,
+            reason=safe_reason,
+            quarantined_at=_utc_now(),
+            record_failure=self._record_failure,
+            bump_revision=self._bump_correction_revision,
+        )
         self._log("warning", "vehicle-profile-correction-quarantined", phase="correction-load", line_number=line_number, reason=reason)
-
-    def _correction_line_already_quarantined(self, *, line_number: int, reason: str) -> bool:
-        if not self.corrections_quarantine_path.exists():
-            return False
-        try:
-            with self.corrections_quarantine_path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(entry, Mapping) and entry.get("line_number") == line_number and entry.get("reason") == reason:
-                        return True
-        except OSError as exc:
-            self._correction_load_succeeded = False
-            self._record_failure(phase="correction-quarantine-read", path_name=self.corrections_quarantine_path.name, error=exc)
-        return False
-
-    def _correction_quarantine_count(self) -> int:
-        if not self.corrections_quarantine_path.exists():
-            return 0
-        try:
-            with self.corrections_quarantine_path.open("r", encoding="utf-8") as handle:
-                return sum(1 for _ in handle)
-        except OSError as exc:
-            self._correction_load_succeeded = False
-            self._record_failure(phase="correction-quarantine-count", path_name=self.corrections_quarantine_path.name, error=exc)
-            return 0
+        return outcome
 
 
 def _required_correction_field(value: str | None, field_name: str) -> str:

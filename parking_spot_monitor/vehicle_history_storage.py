@@ -41,7 +41,6 @@ class VehicleHistoryStorageMixin:
         self._mutation_revision = 0
         self._correction_revision = 0
         self._correction_replay_cache = CorrectionReplayCache()
-        self._correction_load_succeeded = True
 
     def mutation_revision(self) -> int:
         """Monotonic counter bumped on every archive write that affects health_snapshot."""

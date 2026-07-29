@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
@@ -19,44 +20,69 @@ class CorrectionReplayCache:
     """One-entry replay cache guarded by revision and source-file signatures."""
 
     def __init__(self) -> None:
-        self._signature: CorrectionReplaySignature | None = None
-        self._value: CorrectionReplayState | None = None
+        self._entry: tuple[CorrectionReplaySignature, CorrectionReplayState] | None = None
 
-    def get(
+    def lookup(
         self,
         *,
         revision: int,
         corrections_path: Path,
         quarantine_path: Path,
-    ) -> CorrectionReplayState | None:
-        signature, available = _replay_signature(
+    ) -> tuple[CorrectionReplayState | None, CorrectionReplaySourceSnapshot]:
+        snapshot = self.snapshot(
             revision=revision,
             corrections_path=corrections_path,
             quarantine_path=quarantine_path,
         )
-        if available and signature == self._signature:
-            return self._value
-        return None
+        entry = self._entry
+        if snapshot.available and entry is not None and snapshot.signature == entry[0]:
+            return entry[1], snapshot
+        return None, snapshot
 
-    def store(
+    def snapshot(
         self,
         *,
         revision: int,
         corrections_path: Path,
         quarantine_path: Path,
-        value: CorrectionReplayState | None,
-    ) -> None:
-        signature, available = _replay_signature(
+    ) -> CorrectionReplaySourceSnapshot:
+        return _replay_snapshot(
             revision=revision,
             corrections_path=corrections_path,
             quarantine_path=quarantine_path,
         )
-        if value is None or not available:
-            self._signature = None
-            self._value = None
-            return
-        self._signature = signature
-        self._value = value
+
+    def store_if_stable(
+        self,
+        *,
+        before: CorrectionReplaySourceSnapshot,
+        after_load: CorrectionReplaySourceSnapshot,
+        after_count: CorrectionReplaySourceSnapshot,
+        quarantine_writes: int,
+        safe: bool,
+        value: CorrectionReplayState,
+    ) -> bool:
+        corrections_stat = before.signature.corrections_stat
+        stable = (
+            safe
+            and before.available
+            and after_load.available
+            and after_count.available
+            and corrections_stat == after_load.signature.corrections_stat == after_count.signature.corrections_stat
+            and after_load.signature == after_count.signature
+            and after_load.signature.revision == before.signature.revision + quarantine_writes
+        )
+        if not stable:
+            self._entry = None
+            return False
+        self._entry = (after_count.signature, value)
+        return True
+
+
+@dataclass(frozen=True)
+class CorrectionReplaySourceSnapshot:
+    signature: CorrectionReplaySignature
+    available: bool
 
 
 def build_correction_replay_state(
@@ -121,21 +147,21 @@ def _canonical_profile_map(merges: Mapping[str, str]) -> dict[str, str]:
     return canonical
 
 
-def _replay_signature(
+def _replay_snapshot(
     *,
     revision: int,
     corrections_path: Path,
     quarantine_path: Path,
-) -> tuple[CorrectionReplaySignature, bool]:
+) -> CorrectionReplaySourceSnapshot:
     corrections_stat, corrections_available = _file_stat_signature(corrections_path)
     quarantine_stat, quarantine_available = _file_stat_signature(quarantine_path)
-    return (
-        CorrectionReplaySignature(
+    return CorrectionReplaySourceSnapshot(
+        signature=CorrectionReplaySignature(
             revision=revision,
             corrections_stat=corrections_stat,
             quarantine_stat=quarantine_stat,
         ),
-        corrections_available and quarantine_available,
+        available=corrections_available and quarantine_available,
     )
 
 
