@@ -13,6 +13,7 @@ htmlcov/
 .venv/
 venv/
 env/
+.worktrees/
 
 # Local environment and secrets
 .env
