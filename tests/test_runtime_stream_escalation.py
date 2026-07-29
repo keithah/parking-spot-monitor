@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
 from PIL import Image
 
 from parking_spot_monitor.capture import DecodeMode, FrameCaptureResult, FrameGeometry
@@ -28,29 +29,21 @@ def _settings() -> object:
 
 
 def _settings_without_escalation(tmp_path: Path) -> object:
+    config = yaml.safe_load(Path("config.yaml.example").read_text(encoding="utf-8"))
+    config["stream"].pop("escalation_profile")
+    config["stream"].pop("profiles")
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        Path("config.yaml.example")
-        .read_text(encoding="utf-8")
-        .replace(
-            "  escalation_profile: high_resolution\n"
-            "  escalation_min_confidence: 0.75\n"
-            "  profiles:\n"
-            "    high_resolution:\n"
-            "      rtsp_url_env: RTSP_URL_4K\n"
-            "      frame_width: 3840\n"
-            "      frame_height: 2160\n",
-            "",
-        ),
-        encoding="utf-8",
-    )
-    return load_settings(
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    settings = load_settings(
         config_path,
         environ={
             "RTSP_URL": "primary-camera",
             "MATRIX_ACCESS_TOKEN": "matrix-token",
         },
     )
+    assert settings.stream.escalation_profile is None
+    assert settings.stream.profiles == {}
+    return settings
 
 
 def test_missing_escalation_profile_does_not_recapture_primary_stream(tmp_path: Path) -> None:
