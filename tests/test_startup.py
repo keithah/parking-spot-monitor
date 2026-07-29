@@ -2308,6 +2308,10 @@ def test_runtime_loop_startup_prunes_existing_event_snapshots_without_touching_r
     health_file = tmp_path / "health.json"
     for path in [old, newest, latest, state_file, health_file]:
         path.write_bytes(b"runtime-artifact")
+    (tmp_path / "matrix-outbox.json").write_text(
+        json.dumps({"schema_version": 1, "items": []}),
+        encoding="utf-8",
+    )
 
     base = Path("config.yaml.example").read_text(encoding="utf-8")
     config_path = tmp_path / "config.yaml"
@@ -2322,6 +2326,7 @@ def test_runtime_loop_startup_prunes_existing_event_snapshots_without_touching_r
         capture=fake_capture,
         overlay=noop_overlay,
         detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: FakeMatrixDelivery(),
         sleep=lambda _seconds: None,
         max_iterations=1,
     )
@@ -2335,6 +2340,128 @@ def test_runtime_loop_startup_prunes_existing_event_snapshots_without_touching_r
     assert health_file.exists()
     assert '"event":"snapshot-retention-pruned"' in output
     assert '"trigger":"startup"' in output
+    assert_no_secret_leak(output)
+
+
+@pytest.mark.parametrize(
+    "outbox_payload",
+    [
+        f'{{"items": [token={SECRET_MARKER} raw_image_bytes abc',
+        json.dumps(
+            {
+                "schema_version": 999,
+                "items": [],
+                "unsafe": f"token={SECRET_MARKER} raw_image_bytes abc",
+            }
+        ),
+    ],
+    ids=["invalid-json", "unsupported-schema"],
+)
+def test_runtime_loop_startup_retention_skips_pruning_after_whole_outbox_quarantine(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    outbox_payload: str,
+) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+    old = snapshots / "occupancy-open-event-left-spot-2026-05-18t19-00-00z.jpg"
+    newest = snapshots / "occupancy-open-event-left-spot-2026-05-18t20-00-00z.jpg"
+    old.write_bytes(b"old")
+    newest.write_bytes(b"new")
+    (tmp_path / "matrix-outbox.json").write_text(outbox_payload, encoding="utf-8")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("snapshot_retention_count: 50", "snapshot_retention_count: 1"),
+        encoding="utf-8",
+    )
+
+    exit_code = _main(
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(
+            Path(data_dir), timestamp="2026-05-18T19:00:00Z"
+        ),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: FakeMatrixDelivery(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+    )
+
+    output = combined_output(capsys)
+    health = health_payload(tmp_path / "health.json")
+    rendered = output + json.dumps(health)
+    assert exit_code == 0
+    assert old.exists()
+    assert newest.exists()
+    assert health["status"] == "degraded"
+    assert health["retention_failure_count"] == 1
+    assert '"event":"startup-outbox-snapshot-protection-failed"' in output
+    assert SECRET_MARKER not in rendered
+    assert "raw_image_bytes abc" not in rendered
+    assert_no_secret_leak(output)
+
+
+def test_runtime_loop_startup_retention_skips_pruning_after_partial_record_quarantine(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+    old = snapshots / "occupancy-open-event-left-spot-2026-05-18t18-00-00z.jpg"
+    pending = snapshots / "occupancy-open-event-left-spot-2026-05-18t19-00-00z.jpg"
+    newest = snapshots / "occupancy-open-event-left-spot-2026-05-18t20-00-00z.jpg"
+    for path in (old, pending, newest):
+        path.write_bytes(path.name.encode("utf-8"))
+    outbox_path = tmp_path / "matrix-outbox.json"
+    LocalOutbox(outbox_path).enqueue(
+        AlertIntent(
+            event_id="pending-open-alert",
+            phase="upload",
+            body="Parking spot is open.",
+            metadata={"retained_snapshot_path": str(pending)},
+        )
+    )
+    payload = json.loads(outbox_path.read_text(encoding="utf-8"))
+    payload["items"].append(
+        f"invalid record token={SECRET_MARKER} raw_image_bytes abc"
+    )
+    outbox_path.write_text(json.dumps(payload), encoding="utf-8")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("snapshot_retention_count: 50", "snapshot_retention_count: 1"),
+        encoding="utf-8",
+    )
+
+    exit_code = _main(
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(
+            Path(data_dir), timestamp="2026-05-18T19:00:00Z"
+        ),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: FakeMatrixDelivery(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+    )
+
+    output = combined_output(capsys)
+    health = health_payload(tmp_path / "health.json")
+    rendered = output + json.dumps(health)
+    assert exit_code == 0
+    assert old.exists()
+    assert pending.exists()
+    assert newest.exists()
+    assert health["status"] == "degraded"
+    assert health["retention_failure_count"] == 1
+    assert '"event":"startup-outbox-snapshot-protection-failed"' in output
+    assert SECRET_MARKER not in rendered
+    assert "raw_image_bytes abc" not in rendered
     assert_no_secret_leak(output)
 
 

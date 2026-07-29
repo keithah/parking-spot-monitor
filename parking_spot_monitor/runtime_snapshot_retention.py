@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from parking_monitor.outbox import LocalOutbox
+from parking_monitor.outbox import LocalOutbox, OutboxRecoveryError
 from parking_spot_monitor.logging import StructuredLogger
 
 
@@ -14,7 +14,10 @@ def startup_retryable_retained_snapshots(
     logger: StructuredLogger,
 ) -> tuple[Path, ...] | None:
     try:
-        records = LocalOutbox(outbox_path).list_records()
+        outbox = LocalOutbox(outbox_path)
+        if outbox.recovery.quarantined_count or outbox.recovery.events:
+            raise OutboxRecoveryError("local outbox recovery was not clean")
+        records = outbox.list_records()
     except Exception as exc:
         logger.warning(
             "startup-outbox-snapshot-protection-failed",
