@@ -1,10 +1,13 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 
 import pytest
+import parking_monitor.outbox as outbox_module
 
 from parking_monitor.outbox import (
     AlertIntent,
@@ -12,6 +15,7 @@ from parking_monitor.outbox import (
     OutboxPersistenceError,
     OutboxTransitionError,
     SecretBearingIntentError,
+    derive_outbox_item_id,
     derive_matrix_transaction_id,
 )
 
@@ -121,6 +125,103 @@ def test_concurrent_duplicate_id_enqueues_persist_once(tmp_path: Path, monkeypat
     assert len({record.id for record in records}) == 1
     assert outbox.list_records() == [records[0]]
     assert LocalOutbox(outbox.path).list_records() == [records[0]]
+
+
+def test_mixed_enqueue_and_transition_share_one_mutation_lock(tmp_path: Path, monkeypatch) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    existing = outbox.enqueue(AlertIntent(event_id="event-existing", phase="text", body="existing"))
+    original = outbox._persist_records
+    enqueue_persist_entered = threading.Event()
+    allow_enqueue_persist = threading.Event()
+    transition_started = threading.Event()
+    transition_lock_attempted = threading.Event()
+    transition_persist_entered = threading.Event()
+    persist_calls = 0
+    calls_lock = threading.Lock()
+    enqueue_thread_id: int | None = None
+    real_lock = outbox._lock
+
+    class ObservedRLock:
+        def __enter__(self):
+            if (
+                enqueue_persist_entered.is_set()
+                and not allow_enqueue_persist.is_set()
+                and threading.get_ident() != enqueue_thread_id
+            ):
+                transition_lock_attempted.set()
+            real_lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            real_lock.release()
+
+    def controlled_persist(records):
+        nonlocal enqueue_thread_id, persist_calls
+        with calls_lock:
+            persist_calls += 1
+            call_number = persist_calls
+        if call_number == 1:
+            enqueue_thread_id = threading.get_ident()
+            enqueue_persist_entered.set()
+            assert allow_enqueue_persist.wait(timeout=2)
+        else:
+            transition_persist_entered.set()
+            if not allow_enqueue_persist.is_set():
+                raise RuntimeError("transition persistence entered while enqueue held the mutation lock")
+        return original(records)
+
+    def transition_existing():
+        transition_started.set()
+        return outbox.mark_retrying(existing.id, reason="timeout")
+
+    monkeypatch.setattr(outbox, "_lock", ObservedRLock())
+    monkeypatch.setattr(outbox, "_persist_records", controlled_persist)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        enqueue_future = pool.submit(
+            outbox.enqueue,
+            AlertIntent(event_id="event-new", phase="text", body="new"),
+        )
+        assert enqueue_persist_entered.wait(timeout=2)
+        transition_future = pool.submit(transition_existing)
+        assert transition_started.wait(timeout=2)
+        try:
+            assert transition_lock_attempted.wait(timeout=2)
+            assert not transition_persist_entered.is_set()
+        finally:
+            allow_enqueue_persist.set()
+        enqueued = enqueue_future.result(timeout=2)
+        transitioned = transition_future.result(timeout=2)
+
+    assert transition_persist_entered.is_set()
+    assert LocalOutbox(outbox.path).list_records() == [transitioned, enqueued]
+
+
+def test_nested_outbox_lock_paths_complete_within_a_bounded_subprocess(tmp_path: Path) -> None:
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from parking_monitor.outbox import AlertIntent, LocalOutbox
+
+outbox = LocalOutbox(Path(sys.argv[2]))
+record = outbox.enqueue_with_phases(
+    AlertIntent(event_id="event-reentrant", phase="text", body="body"),
+    ("text", "upload", "image"),
+)
+retrying = outbox.mark_retrying(record.id, reason="timeout")
+assert outbox.list_records() == [retrying]
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(source_root), str(tmp_path / "subprocess-outbox.json")],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_persisted_outbox_is_compact_and_reloads_without_value_changes(tmp_path: Path) -> None:
@@ -379,6 +480,35 @@ def test_failed_persistence_does_not_publish_a_stale_id_index(tmp_path: Path, mo
     retrying = outbox.mark_retrying(second.id, reason="timeout")
     assert outbox._index_by_id == {first.id: 0, second.id: 1}
     assert outbox.list_records() == [first, retrying]
+
+
+def test_post_rename_sync_failure_reconciles_memory_before_error_and_preserves_record(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store_path = tmp_path / "matrix-outbox.json"
+    outbox = LocalOutbox(store_path)
+    first = outbox.enqueue(AlertIntent(event_id="evt-first-committed", phase="text", body="first"))
+    second_intent = AlertIntent(event_id="evt-second-committed", phase="text", body="second")
+    second_id = derive_outbox_item_id(second_intent)
+    original_sync_directory = outbox_module._fsync_directory
+
+    def fail_directory_sync(_path: Path) -> None:
+        raise OSError("directory sync failed after replace")
+
+    monkeypatch.setattr(outbox_module, "_fsync_directory", fail_directory_sync)
+    with pytest.raises(OutboxPersistenceError, match="failed to persist local outbox record"):
+        outbox.enqueue(second_intent)
+
+    disk_records = LocalOutbox(store_path).list_records()
+    assert outbox.list_records() == disk_records
+    assert [record.id for record in disk_records] == [first.id, second_id]
+    assert outbox._index_by_id == {first.id: 0, second_id: 1}
+
+    monkeypatch.setattr(outbox_module, "_fsync_directory", original_sync_directory)
+    third = outbox.enqueue(AlertIntent(event_id="evt-third", phase="text", body="third"))
+
+    assert [record.id for record in LocalOutbox(store_path).list_records()] == [first.id, second_id, third.id]
 
 
 

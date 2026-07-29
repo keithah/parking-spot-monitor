@@ -60,6 +60,10 @@ class OutboxPersistenceError(OutboxError, OSError):
     """Raised when a local outbox write cannot be made durable."""
 
 
+class _OutboxPostCommitPersistenceError(OutboxPersistenceError):
+    """Raised when replacement succeeded but the directory durability step failed."""
+
+
 class OutboxRecoveryError(OutboxError, ValueError):
     """Raised internally when persisted outbox data cannot be trusted."""
 
@@ -324,8 +328,7 @@ class LocalOutbox:
             self._set_records(records)
             pruned = self._apply_retention(self._records)
             if pruned != self._records:
-                self._persist_records(pruned)
-                self._set_records(pruned)
+                self._persist_and_set_records(pruned)
 
     def enqueue(self, intent: AlertIntent) -> OutboxRecord:
         """Persist a pending item unless the same logical alert already exists."""
@@ -364,8 +367,7 @@ class LocalOutbox:
                 phase_results={},
             )
             updated_records = self._apply_retention([*self._records, record])
-            self._persist_records(updated_records)
-            self._set_records(updated_records)
+            self._persist_and_set_records(updated_records)
             return self._find_record(record.id)
 
     def list_records(self, state: OutboxState | None = None) -> list[OutboxRecord]:
@@ -575,9 +577,16 @@ class LocalOutbox:
             records = list(self._records)
             records[index] = updated
             records = self._apply_retention(records)
-            self._persist_records(records)
-            self._set_records(records)
+            self._persist_and_set_records(records)
             return self._find_record(updated.id)
+
+    def _persist_and_set_records(self, records: list[OutboxRecord]) -> None:
+        try:
+            self._persist_records(records)
+        except _OutboxPostCommitPersistenceError:
+            self._set_records(records)
+            raise
+        self._set_records(records)
 
     def _set_records(self, records: list[OutboxRecord]) -> None:
         with self._lock:
@@ -666,6 +675,7 @@ class LocalOutbox:
             "items": [record.to_json() for record in records],
         }
         tmp_path: str | None = None
+        replaced = False
         try:
             with tempfile.NamedTemporaryFile(
                 "w",
@@ -680,6 +690,7 @@ class LocalOutbox:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp_path, self.path)
+            replaced = True
             _fsync_directory(self.path.parent)
         except OSError as exc:
             if tmp_path is not None:
@@ -687,7 +698,8 @@ class LocalOutbox:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-            raise OutboxPersistenceError("failed to persist local outbox record") from exc
+            error_type = _OutboxPostCommitPersistenceError if replaced else OutboxPersistenceError
+            raise error_type("failed to persist local outbox record") from exc
 
     def _quarantine_bytes(self, payload: bytes, *, reason: str, suffix: str = "bin") -> RecoveryEvent:
         digest = hashlib.sha256(payload).hexdigest()[:16]
