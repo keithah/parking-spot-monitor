@@ -69,6 +69,8 @@ matrix:
   timeout_seconds: 10
   retry_attempts: 3
   retry_backoff_seconds: 1
+  retry_jitter_ratio: 0.2
+  unauthorized_reply_cooldown_seconds: 300
 
 quiet_windows:
   - name: street_sweeping

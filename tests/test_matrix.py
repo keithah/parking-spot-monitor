@@ -99,6 +99,7 @@ def test_sync_retries_transient_matrix_statuses() -> None:
         retry_backoff_seconds=0.25,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         sleep=sleeps.append,
+        random_unit=lambda: 0.0,
     )
 
     result = client.sync(room_id=ROOM_ID, timeout_ms=0)
@@ -133,6 +134,76 @@ def test_matrix_retry_honors_server_retry_after_ms_before_local_backoff() -> Non
 
     assert event_id == "$event:example.org"
     assert sleeps == [1.75]
+
+
+def test_retry_jitter_is_bounded_and_retry_after_is_minimum() -> None:
+    from parking_spot_monitor.matrix_client import retry_delay
+
+    assert retry_delay(
+        attempt=1,
+        backoff_seconds=10,
+        retry_after_seconds=12,
+        jitter_ratio=0.2,
+        random_unit=lambda: 0.0,
+    ) == 12
+    assert retry_delay(
+        attempt=1,
+        backoff_seconds=10,
+        retry_after_seconds=None,
+        jitter_ratio=0.2,
+        random_unit=lambda: 1.0,
+    ) == 12
+
+
+def test_sender_reply_limiter_admits_once_per_cooldown_and_stays_bounded() -> None:
+    from parking_spot_monitor.matrix_commands import SenderReplyLimiter
+
+    now = 100.0
+    limiter = SenderReplyLimiter(
+        cooldown_seconds=300,
+        monotonic=lambda: now,
+        max_senders=256,
+    )
+
+    assert limiter.admit("@sender:example.org") is True
+    assert limiter.admit("@sender:example.org") is False
+    now = 400.0
+    assert limiter.admit("@sender:example.org") is True
+    for index in range(300):
+        limiter.admit(f"@sender-{index}:example.org")
+    assert limiter.sender_count == 256
+
+
+def test_sender_reply_limiter_zero_cooldown_admits_every_reply() -> None:
+    from parking_spot_monitor.matrix_commands import SenderReplyLimiter
+
+    limiter = SenderReplyLimiter(
+        cooldown_seconds=0,
+        monotonic=lambda: 100.0,
+        max_senders=256,
+    )
+
+    assert limiter.admit("@sender:example.org") is True
+    assert limiter.admit("@sender:example.org") is True
+
+
+def test_sender_reply_limiter_evicts_least_recently_admitted_sender() -> None:
+    from parking_spot_monitor.matrix_commands import SenderReplyLimiter
+
+    now = 100.0
+    limiter = SenderReplyLimiter(
+        cooldown_seconds=300,
+        monotonic=lambda: now,
+        max_senders=256,
+    )
+    for index in range(256):
+        assert limiter.admit(f"@sender-{index}:example.org") is True
+    now = 400.0
+    assert limiter.admit("@sender-0:example.org") is True
+    assert limiter.admit("@new-sender:example.org") is True
+
+    assert limiter.admit("@sender-1:example.org") is True
+    assert limiter.admit("@sender-0:example.org") is False
 
 
 def test_upload_image_posts_media_with_filename_query_and_returns_content_uri() -> None:
@@ -361,6 +432,8 @@ def test_matrix_config_summary_includes_timeout_retry_and_backoff() -> None:
     assert summary["timeout_seconds"] == 10
     assert summary["retry_attempts"] == 3
     assert summary["retry_backoff_seconds"] == 1
+    assert summary["retry_jitter_ratio"] == 0.2
+    assert summary["unauthorized_reply_cooldown_seconds"] == 300
     assert ACCESS_TOKEN not in repr(summary)
 
 
@@ -991,6 +1064,7 @@ def test_send_text_retries_transient_http_statuses_and_logs_retry_decisions() ->
         retry_backoff_seconds=0.25,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         sleep=sleeps.append,
+        random_unit=lambda: 0.0,
         logger=StructuredLogger(stream=stream),
     )
 
@@ -1032,6 +1106,7 @@ def test_send_text_retries_timeout_then_succeeds_without_leaking_exception_text(
         retry_backoff_seconds=0.5,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         sleep=sleeps.append,
+        random_unit=lambda: 0.0,
         logger=StructuredLogger(stream=stream),
     )
 
@@ -1066,6 +1141,7 @@ def test_upload_image_retries_malformed_response_then_succeeds() -> None:
         retry_backoff_seconds=0.1,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         sleep=sleeps.append,
+        random_unit=lambda: 0.0,
     )
 
     assert client.upload_image(filename="snapshot.jpg", data=b"jpeg", content_type="image/jpeg") == "mxc://example.org/media-id"
@@ -1822,6 +1898,7 @@ def test_command_service_explicit_feedback_aliases_reject_unauthorized_and_malfo
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
         feedback_labeler=FeedbackLabeler(),
+        unauthorized_reply_cooldown_seconds=0,
     )
 
     result = service.poll_once()
@@ -2028,6 +2105,69 @@ def test_command_service_rejects_unauthorized_status_before_application() -> Non
     assert result.error_count == 1
     assert archive.calls == []
     assert replies == [{"room_id": ROOM_ID, "txn_id": "command:$status", "body": "Command rejected: sender is not authorized."}]
+
+
+def test_command_service_unauthorized_rejection_cooldown_consumes_every_event() -> None:
+    from io import StringIO
+
+    from parking_spot_monitor.logging import StructuredLogger
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult, MatrixTextEvent
+
+    now = 100.0
+    replies: list[dict[str, Any]] = []
+    log_stream = StringIO()
+    sync_results = [
+        MatrixSyncResult(
+            next_batch="s3",
+            events=(
+                MatrixTextEvent(event_id="$denied-1", sender="@intruder:example", room_id=ROOM_ID, body="!parking status"),
+                MatrixTextEvent(event_id="$denied-2", sender="@intruder:example", room_id=ROOM_ID, body="!parking status"),
+            ),
+        ),
+        MatrixSyncResult(
+            next_batch="s4",
+            events=(
+                MatrixTextEvent(event_id="$denied-3", sender="@intruder:example", room_id=ROOM_ID, body="!parking status"),
+            ),
+        ),
+    ]
+
+    class Client:
+        def sync(self, **kwargs: Any) -> MatrixSyncResult:
+            return sync_results.pop(0)
+
+        def send_text(self, **kwargs: Any) -> str:
+            replies.append(dict(kwargs))
+            return "$reply"
+
+    archive = FakeCommandArchive(cursor={"next_batch": "s2"})
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=archive,
+        room_id=ROOM_ID,
+        authorized_senders=["@operator:example"],
+        unauthorized_reply_cooldown_seconds=300,
+        monotonic=lambda: now,
+        logger=StructuredLogger(stream=log_stream),
+    )
+
+    first_result = service.poll_once()
+    now = 400.0
+    later_result = service.poll_once()
+
+    assert first_result.error_count == 2
+    assert later_result.error_count == 1
+    assert archive.cursor_writes[-2:] == [{"next_batch": "s3"}, {"next_batch": "s4"}]
+    assert replies == [
+        {"room_id": ROOM_ID, "txn_id": "command:$denied-1", "body": "Command rejected: sender is not authorized."},
+        {"room_id": ROOM_ID, "txn_id": "command:$denied-3", "body": "Command rejected: sender is not authorized."},
+    ]
+    denial_records = [
+        record
+        for record in (json.loads(line) for line in log_stream.getvalue().splitlines())
+        if record["event"] == "matrix-command-denied"
+    ]
+    assert [record["event_id"] for record in denial_records] == ["$denied-1", "$denied-3"]
 
 
 def test_command_service_authorized_status_and_config_reply_via_command_txn_path() -> None:
@@ -2743,6 +2883,7 @@ def test_command_service_rejects_unauthorized_why_and_explain_before_memory_or_p
         room_id=ROOM_ID,
         authorized_senders=["@operator:example"],
         cockpit_provider=cockpit_provider,
+        unauthorized_reply_cooldown_seconds=0,
     )
 
     result = service.poll_once()
@@ -3328,6 +3469,7 @@ def test_command_service_rejects_unauthorized_lab_before_provider_or_paths() -> 
         room_id=ROOM_ID,
         authorized_senders=["@operator:example"],
         cockpit_provider=cockpit_provider,
+        unauthorized_reply_cooldown_seconds=0,
     )
 
     result = service.poll_once()
@@ -3542,8 +3684,8 @@ def test_command_service_latest_media_delivery_failure_is_sanitized_text_failure
     assert raw_bytes.hex() not in rendered
 
 
-def test_default_matrix_command_service_factory_wires_resolved_outbox_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from parking_spot_monitor.__main__ import _default_matrix_command_service_factory
+def test_default_matrix_factories_wire_safety_config_and_resolved_outbox_path(tmp_path: Path) -> None:
+    from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _default_matrix_delivery_factory
     from parking_spot_monitor.config import load_settings
     from parking_spot_monitor.paths import resolve_runtime_paths
 
@@ -3557,7 +3699,11 @@ def test_default_matrix_command_service_factory_wires_resolved_outbox_path(tmp_p
     paths = resolve_runtime_paths(settings, tmp_path)
 
     service = _default_matrix_command_service_factory(settings, tmp_path, logger=None, archive=FakeCommandArchive())  # type: ignore[arg-type]
+    delivery = _default_matrix_delivery_factory(settings, tmp_path, logger=None)  # type: ignore[arg-type]
 
     assert service is not None
     assert service.cockpit_context is not None
     assert service.cockpit_context.matrix_outbox_path == paths.matrix_outbox_file
+    assert service.client.retry_jitter_ratio == 0.2
+    assert service.unauthorized_reply_cooldown_seconds == 300
+    assert delivery.client.retry_jitter_ratio == 0.2

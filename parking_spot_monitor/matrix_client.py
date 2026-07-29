@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import time
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
@@ -14,6 +15,11 @@ from parking_spot_monitor.matrix_support import MatrixError, _http_status_error,
 CLIENT_API_PREFIX = "/_matrix/client/v3"
 MEDIA_API_PREFIX = "/_matrix/media/v3"
 _T = TypeVar("_T")
+
+def retry_delay(*, attempt: int, backoff_seconds: float, retry_after_seconds: float | None, jitter_ratio: float, random_unit: Callable[[], float]) -> float:
+    local_delay = backoff_seconds * (2 ** max(0, attempt - 1))
+    return max(retry_after_seconds or 0, local_delay + local_delay * jitter_ratio * random_unit())
+
 
 def _room_message_path(room_id: str, txn_id: str) -> str:
     room_segment = quote(_require_non_empty("room_id", room_id), safe="")
@@ -31,8 +37,10 @@ class MatrixClient:
         timeout_seconds: float = 10,
         retry_attempts: int = 1,
         retry_backoff_seconds: float = 0,
+        retry_jitter_ratio: float = 0.2,
         http_client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        random_unit: Callable[[], float] = random.random,
         logger: StructuredLogger | None = None,
     ) -> None:
         self.homeserver = homeserver.rstrip("/")
@@ -40,7 +48,9 @@ class MatrixClient:
         self.timeout_seconds = timeout_seconds
         self.retry_attempts = max(1, retry_attempts)
         self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
+        self.retry_jitter_ratio = max(0.0, retry_jitter_ratio)
         self._sleep = sleep
+        self._random_unit = random_unit
         self._logger = logger
         self._owns_client = http_client is None
         self._client = http_client or httpx.Client(base_url=self.homeserver, timeout=timeout_seconds)
@@ -202,11 +212,11 @@ class MatrixClient:
         return False
 
     def _retry_delay_seconds(self, error: MatrixError, *, attempt: int) -> float:
-        local_backoff = self.retry_backoff_seconds * (2 ** max(0, attempt - 1))
         retry_after = error.diagnostics.get("retry_after_seconds")
-        if isinstance(retry_after, (int, float)):
-            return max(local_backoff, float(retry_after))
-        return local_backoff
+        return retry_delay(
+            attempt=attempt, backoff_seconds=self.retry_backoff_seconds,
+            retry_after_seconds=float(retry_after) if isinstance(retry_after, (int, float)) else None,
+            jitter_ratio=self.retry_jitter_ratio, random_unit=self._random_unit)
 
     def _log_retry_decision(self, *, error: MatrixError, operation: str, path: str, attempt: int, delay_seconds: float) -> None:
         if self._logger is None:

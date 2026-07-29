@@ -209,6 +209,8 @@ class MatrixConfig(StrictModel):
     timeout_seconds: float = Field(default=10, gt=0, allow_inf_nan=False)
     retry_attempts: int = Field(default=3, gt=0)
     retry_backoff_seconds: float = Field(default=1, ge=0, allow_inf_nan=False)
+    retry_jitter_ratio: float = Field(default=0.2, ge=0, le=1, allow_inf_nan=False)
+    unauthorized_reply_cooldown_seconds: float = Field(default=300, ge=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def command_failure_maximum_must_cover_initial_cooldown(self) -> Self:
@@ -399,6 +401,8 @@ class RuntimeSettings(StrictModel):
                 "timeout_seconds": self.matrix.timeout_seconds,
                 "retry_attempts": self.matrix.retry_attempts,
                 "retry_backoff_seconds": self.matrix.retry_backoff_seconds,
+                "retry_jitter_ratio": self.matrix.retry_jitter_ratio,
+                "unauthorized_reply_cooldown_seconds": self.matrix.unauthorized_reply_cooldown_seconds,
             },
             "quiet_windows": [window.model_dump() for window in self.quiet_windows],
             "storage": {

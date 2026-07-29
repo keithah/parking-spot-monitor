@@ -86,6 +86,8 @@ def test_example_config_loads_with_fake_env_values() -> None:
     assert settings.matrix.command_poll_interval_seconds == 60
     assert settings.matrix.command_failure_cooldown_seconds == 60
     assert settings.matrix.command_failure_max_cooldown_seconds == 900
+    assert settings.matrix.unauthorized_reply_cooldown_seconds == 300
+    assert settings.matrix.retry_jitter_ratio == 0.2
     assert settings.spots.left_spot.name == "Left spot"
     assert settings.spots.right_spot.name == "Right spot"
     assert settings.detection.inference_image_size == 1280
@@ -751,6 +753,8 @@ def test_legacy_matrix_config_omitting_command_schedule_uses_compatible_defaults
         base.replace("  command_poll_interval_seconds: 60\n", "")
         .replace("  command_failure_cooldown_seconds: 60\n", "")
         .replace("  command_failure_max_cooldown_seconds: 900\n", "")
+        .replace("  retry_jitter_ratio: 0.2\n", "")
+        .replace("  unauthorized_reply_cooldown_seconds: 300\n", "")
     )
     path = write_config(tmp_path, config)
 
@@ -759,6 +763,8 @@ def test_legacy_matrix_config_omitting_command_schedule_uses_compatible_defaults
     assert settings.matrix.command_poll_interval_seconds == 60
     assert settings.matrix.command_failure_cooldown_seconds == 60
     assert settings.matrix.command_failure_max_cooldown_seconds == 900
+    assert settings.matrix.retry_jitter_ratio == 0.2
+    assert settings.matrix.unauthorized_reply_cooldown_seconds == 300
 
 
 def test_matrix_command_schedule_is_configurable_and_summarized(tmp_path: Path) -> None:
@@ -832,6 +838,60 @@ def test_matrix_command_failure_maximum_cannot_be_below_initial_cooldown(
         load_settings(path, environ=fake_environ())
 
     assert "command_failure_max_cooldown_seconds" in str(exc_info.value)
+
+
+def test_matrix_retry_jitter_and_unauthorized_reply_cooldown_are_configurable_and_summarized(
+    tmp_path: Path,
+) -> None:
+    config = (
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("  retry_jitter_ratio: 0.2", "  retry_jitter_ratio: 0.75")
+        .replace(
+            "  unauthorized_reply_cooldown_seconds: 300",
+            "  unauthorized_reply_cooldown_seconds: 0",
+        )
+    )
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(path, environ=fake_environ())
+
+    assert settings.matrix.retry_jitter_ratio == 0.75
+    assert settings.matrix.unauthorized_reply_cooldown_seconds == 0
+    summary = settings.sanitized_summary()["matrix"]
+    assert summary["retry_jitter_ratio"] == 0.75
+    assert summary["unauthorized_reply_cooldown_seconds"] == 0
+    assert FAKE_MATRIX_TOKEN not in repr(summary)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("retry_jitter_ratio", "-0.1"),
+        ("retry_jitter_ratio", "1.1"),
+        ("retry_jitter_ratio", ".nan"),
+        ("retry_jitter_ratio", ".inf"),
+        ("unauthorized_reply_cooldown_seconds", "-1"),
+        ("unauthorized_reply_cooldown_seconds", ".nan"),
+        ("unauthorized_reply_cooldown_seconds", ".inf"),
+    ],
+)
+def test_matrix_retry_and_reply_timings_reject_invalid_or_nonfinite_values(
+    tmp_path: Path,
+    field: str,
+    bad_value: str,
+) -> None:
+    default_value = "0.2" if field == "retry_jitter_ratio" else "300"
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        f"  {field}: {default_value}",
+        f"  {field}: {bad_value}",
+    )
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert field in str(exc_info.value)
 
 
 def test_matrix_command_authorized_senders_are_configurable_without_secret_leaks(tmp_path: Path) -> None:

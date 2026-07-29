@@ -272,6 +272,7 @@ def _default_matrix_delivery_factory(settings: RuntimeSettings, data_dir: Path, 
         timeout_seconds=settings.matrix.timeout_seconds,
         retry_attempts=settings.matrix.retry_attempts,
         retry_backoff_seconds=settings.matrix.retry_backoff_seconds,
+        retry_jitter_ratio=settings.matrix.retry_jitter_ratio,
         logger=logger,
     )
     outbox = LocalOutbox(paths.matrix_outbox_file)
@@ -317,6 +318,7 @@ def _default_matrix_command_service_factory(
         timeout_seconds=settings.matrix.timeout_seconds,
         retry_attempts=settings.matrix.retry_attempts,
         retry_backoff_seconds=settings.matrix.retry_backoff_seconds,
+        retry_jitter_ratio=settings.matrix.retry_jitter_ratio,
         logger=logger,
     )
     return MatrixCommandService(
@@ -327,6 +329,7 @@ def _default_matrix_command_service_factory(
         command_prefix=settings.matrix.command_prefix,
         bot_user_id=settings.matrix.user_id,
         logger=logger,
+        unauthorized_reply_cooldown_seconds=settings.matrix.unauthorized_reply_cooldown_seconds,
         cockpit_context=MatrixOperatorCockpitContext(
             settings=settings,
             data_dir=paths.data_dir,

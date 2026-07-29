@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
@@ -28,6 +30,37 @@ from parking_spot_monitor.matrix_support import _require_non_empty, _sanitize_di
 _CockpitProvider: TypeAlias = Callable[..., str | MatrixCommandResponse]
 
 
+class SenderReplyLimiter:
+    def __init__(
+        self,
+        *,
+        cooldown_seconds: float = 300,
+        monotonic: Callable[[], float] = time.monotonic,
+        max_senders: int = 256,
+    ) -> None:
+        self.cooldown_seconds = max(0.0, cooldown_seconds)
+        self._monotonic = monotonic
+        self._max_senders = max(1, max_senders)
+        self._last_replies: OrderedDict[str, float] = OrderedDict()
+
+    @property
+    def sender_count(self) -> int:
+        return len(self._last_replies)
+
+    def admit(self, sender: str) -> bool:
+        if self.cooldown_seconds == 0:
+            return True
+        now = self._monotonic()
+        last_reply = self._last_replies.get(sender)
+        if last_reply is not None and now - last_reply < self.cooldown_seconds:
+            return False
+        self._last_replies[sender] = now
+        self._last_replies.move_to_end(sender)
+        while len(self._last_replies) > self._max_senders:
+            self._last_replies.popitem(last=False)
+        return True
+
+
 class MatrixCommandServiceArchive(MatrixCommandArchive, Protocol):
     def read_matrix_cursor(self) -> Mapping[str, Any] | None: ...
     def write_matrix_cursor(self, state: Mapping[str, Any]) -> None: ...
@@ -52,6 +85,8 @@ class MatrixCommandService:
         who_snapshot_provider: Callable[[str], str | MatrixCommandResponse] | None = None,
         cockpit_context: MatrixOperatorCockpitContext | None = None,
         feedback_labeler: MatrixFeedbackLabeler | None = None,
+        unauthorized_reply_cooldown_seconds: float = 300,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.client = client
         self.archive = archive
@@ -66,6 +101,12 @@ class MatrixCommandService:
         self.who_snapshot_provider = who_snapshot_provider
         self.cockpit_context = cockpit_context
         self.feedback_labeler = feedback_labeler
+        self.unauthorized_reply_cooldown_seconds = max(0.0, unauthorized_reply_cooldown_seconds)
+        self._unauthorized_reply_limiter = SenderReplyLimiter(
+            cooldown_seconds=self.unauthorized_reply_cooldown_seconds,
+            monotonic=monotonic,
+            max_senders=256,
+        )
 
     def close(self) -> None:
         close = getattr(self.client, "close", None)
@@ -120,8 +161,9 @@ class MatrixCommandService:
         if not event.body.strip().startswith(self.command_prefix):
             return "ignored"
         if event.sender not in self.authorized_senders:
-            self._log("warning", "matrix-command-denied", reason="unauthorized-sender", **context)
-            self._send_reply(event, "Command rejected: sender is not authorized.")
+            if self._unauthorized_reply_limiter.admit(event.sender):
+                self._log("warning", "matrix-command-denied", reason="unauthorized-sender", **context)
+                self._send_reply(event, "Command rejected: sender is not authorized.")
             return "error"
         try:
             command = parse_applied_matrix_command(event.body, command_prefix=self.command_prefix)
