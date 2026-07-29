@@ -112,6 +112,34 @@ def test_missing_fixed_inputs_blocks_without_running_runner(tmp_path: Path) -> N
     assert status["summary"]["missing_inputs"] == ["config", "labels"]
 
 
+@pytest.mark.parametrize(
+    ("blocked_path", "error_code"),
+    [
+        ("missing_inputs", "missing_fixed_inputs"),
+        ("runner_unavailable", "runner_unavailable"),
+    ],
+)
+def test_pre_admission_blocked_jobs_apply_bounded_retention(
+    tmp_path: Path,
+    blocked_path: str,
+    error_code: str,
+) -> None:
+    if blocked_path == "runner_unavailable":
+        _write_fixed_inputs(tmp_path)
+        manager = DetectionLabManager(tmp_path, max_jobs=2)
+    else:
+        manager = DetectionLabManager(
+            tmp_path,
+            replay_runner=lambda _inputs: {},
+            max_jobs=2,
+        )
+
+    jobs = [manager.start_replay() for _index in range(5)]
+
+    assert manager.summarize(jobs[-1].job_id)["error"]["code"] == error_code
+    assert len(list(manager.jobs_root.glob("lab-*"))) <= 2
+
+
 def test_malformed_report_is_persisted_as_blocked_status(tmp_path: Path) -> None:
     _write_fixed_inputs(tmp_path)
 
@@ -336,6 +364,39 @@ def test_retention_never_removes_active_job(tmp_path: Path) -> None:
     assert blocked.job_dir.exists()
     release.set()
     _wait_for_terminal(manager, active.job_id)
+
+
+def test_lab_busy_jobs_apply_bounded_retention_without_removing_active_job(
+    tmp_path: Path,
+) -> None:
+    _write_fixed_inputs(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner(inputs):
+        started.set()
+        assert release.wait(2)
+        report = inputs["job_dir"] / "replay-report.json"
+        report.write_text('{"status_counts": {}, "coverage": {}}', encoding="utf-8")
+        return report
+
+    manager = DetectionLabManager(tmp_path, replay_runner=runner, max_jobs=2)
+    active = manager.start_replay()
+    assert started.wait(1)
+    try:
+        blocked = [manager.start_replay() for _index in range(5)]
+
+        assert manager.summarize(blocked[-1].job_id)["error"]["code"] == "lab_busy"
+        assert active.job_dir.exists()
+        non_active = [
+            path
+            for path in manager.jobs_root.glob("lab-*")
+            if path != active.job_dir
+        ]
+        assert len(non_active) <= 2
+    finally:
+        release.set()
+        _wait_for_terminal(manager, active.job_id)
 
 
 def test_detection_lab_does_not_import_or_mutate_live_occupancy_state(tmp_path: Path) -> None:

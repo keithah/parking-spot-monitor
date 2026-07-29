@@ -311,6 +311,8 @@ class DetectionLabManager:
             _write_json_atomic(job.status_path, bounded_payload)
         if status in {"succeeded", "failed", "blocked"}:
             self._record_outcome(bounded_payload)
+        if status == "blocked":
+            self.retain_recent_jobs()
 
     def _record_outcome(self, status_payload: Mapping[str, Any]) -> None:
         if self.outcome_recorder is None:
