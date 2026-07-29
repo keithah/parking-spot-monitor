@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -46,6 +47,38 @@ def manifest(*frames: ReplayFrame, case_id: str = "case-1", scenario_id: str = "
     return LabelManifest(cases=[{"case_id": case_id, "scenarios": [{"scenario_id": scenario_id, "frames": list(frames)}]}])
 
 
+def empty_tuning_report() -> dict[str, Any]:
+    return build_tuning_comparison_report(
+        manifest(
+            ReplayFrame(
+                frame_id="empty-frame",
+                expected={"left_spot": ExpectedPresence.EMPTY, "right_spot": ExpectedPresence.EMPTY},
+                detections=[],
+            )
+        ),
+        baseline_config=replay_config(),
+        proposed_config=replay_config(),
+    )
+
+
+def duplicated_public_mapping_pair(report: dict[str, Any], pair_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    pairs = {
+        "baseline_thresholds": (report["baseline_thresholds"], report["baseline"]["config_thresholds"]),
+        "proposed_thresholds": (report["proposed_thresholds"], report["proposed"]["config_thresholds"]),
+        "baseline_status_counts": (report["status_counts"]["baseline"], report["baseline"]["status_counts"]),
+        "proposed_status_counts": (report["status_counts"]["proposed"], report["proposed"]["status_counts"]),
+    }
+    return pairs[pair_name]
+
+
+DUPLICATED_PUBLIC_MAPPING_PAIRS = (
+    "baseline_thresholds",
+    "proposed_thresholds",
+    "baseline_status_counts",
+    "proposed_status_counts",
+)
+
+
 def test_improved_proposed_config_applies_shared_tuning_and_serializes_report() -> None:
     report = build_tuning_comparison_report(
         manifest(
@@ -81,6 +114,32 @@ def test_improved_proposed_config_applies_shared_tuning_and_serializes_report() 
     assert "# Tuning Comparison Report" in markdown
     assert "Decision: **apply_shared_tuning**" in markdown
     assert "False negatives: -1" in markdown
+
+
+@pytest.mark.parametrize("pair_name", DUPLICATED_PUBLIC_MAPPING_PAIRS)
+def test_tuning_report_duplicate_mapping_paths_have_independent_identity(pair_name: str) -> None:
+    first, second = duplicated_public_mapping_pair(empty_tuning_report(), pair_name)
+
+    assert first == second
+    assert first is not second
+
+
+@pytest.mark.parametrize("pair_name", DUPLICATED_PUBLIC_MAPPING_PAIRS)
+def test_mutating_first_duplicate_mapping_path_does_not_change_second(pair_name: str) -> None:
+    first, second = duplicated_public_mapping_pair(empty_tuning_report(), pair_name)
+
+    first["first-path-only"] = {"owner": "first"}
+
+    assert "first-path-only" not in second
+
+
+@pytest.mark.parametrize("pair_name", DUPLICATED_PUBLIC_MAPPING_PAIRS)
+def test_mutating_second_duplicate_mapping_path_does_not_change_first(pair_name: str) -> None:
+    first, second = duplicated_public_mapping_pair(empty_tuning_report(), pair_name)
+
+    second["second-path-only"] = {"owner": "second"}
+
+    assert "second-path-only" not in first
 
 
 def test_rendering_tuning_report_preserves_nested_input_and_exact_markdown() -> None:

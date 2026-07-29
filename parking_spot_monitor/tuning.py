@@ -52,7 +52,10 @@ def build_tuning_comparison_report(
     event_deltas = _event_deltas(baseline_report.get("event_findings", []), proposed_report.get("event_findings", []))
     blocked_reasons = _combined_reasons(baseline_report, proposed_report, "blocked_reasons")
     not_covered_reasons = _combined_reasons(baseline_report, proposed_report, "not_covered_reasons")
-    status_counts = {"baseline": baseline_report.get("status_counts", {}), "proposed": proposed_report.get("status_counts", {})}
+    status_counts = {
+        "baseline": dict(baseline_report.get("status_counts", {})),
+        "proposed": dict(proposed_report.get("status_counts", {})),
+    }
 
     report: dict[str, Any] = {
         "schema_version": TUNING_REPORT_SCHEMA_VERSION,
@@ -60,8 +63,8 @@ def build_tuning_comparison_report(
         "case_ids": [case.case_id for case in parsed_manifest.cases],
         "baseline": _comparison_side(baseline_report),
         "proposed": _comparison_side(proposed_report),
-        "baseline_thresholds": baseline_report.get("config_thresholds", {}),
-        "proposed_thresholds": proposed_report.get("config_thresholds", {}),
+        "baseline_thresholds": dict(baseline_report.get("config_thresholds", {})),
+        "proposed_thresholds": dict(proposed_report.get("config_thresholds", {})),
         "metric_deltas": metric_deltas,
         "event_deltas": event_deltas,
         "status_counts": status_counts,
