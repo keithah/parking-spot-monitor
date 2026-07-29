@@ -178,6 +178,25 @@ def test_matrix_module_is_a_small_compatibility_shim() -> None:
         assert _line_count(path) <= max_lines
 
 
+def test_runtime_resource_policy_is_small_and_has_no_runtime_side_effect_dependencies() -> None:
+    relative_path = "parking_spot_monitor/runtime_resource_policy.py"
+
+    assert (ROOT / relative_path).exists()
+    assert _line_count(relative_path) <= 220
+    imported_modules = _imported_module_names(relative_path)
+    forbidden_import_prefixes = (
+        "PIL",
+        "parking_spot_monitor.capture",
+        "parking_spot_monitor.matrix",
+        "parking_spot_monitor.vehicle_history",
+    )
+    assert not any(
+        imported.startswith(forbidden)
+        for imported in imported_modules
+        for forbidden in forbidden_import_prefixes
+    )
+
+
 def test_matrix_command_contract_is_not_asserted_from_source_text() -> None:
     docs_test_strings = _string_constants("tests/test_operator_docs.py")
     command_strings = _string_constants("parking_spot_monitor/matrix_commands.py")
