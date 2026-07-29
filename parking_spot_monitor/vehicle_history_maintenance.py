@@ -6,8 +6,8 @@ import os
 import tarfile
 import tempfile
 from collections.abc import Mapping
-from itertools import chain
 from datetime import datetime, timezone
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +25,7 @@ from parking_spot_monitor.vehicle_history_maintenance_utils import (
     _referenced_archive_paths,
     _safe_file_size,
     _safe_maintenance_metadata,
-    _session_health_stats,
+    SessionHealthAccumulator,
 )
 from parking_spot_monitor.vehicle_history_models import (
     MAX_PROFILE_FILE_BYTES,
@@ -262,21 +262,39 @@ class VehicleHistoryMaintenanceMixin:
         return path
 
     def health_snapshot(self) -> dict[str, Any]:
-        active_records = self.load_active_sessions()
-        closed_records = self.list_closed_sessions()
+        session_stats = SessionHealthAccumulator()
+        active_session_count = 0
+        for record in self._iter_records(self.active_dir, ordered=False):
+            session_stats.add(record)
+            active_session_count += 1
+        self._log(
+            "info",
+            "vehicle-archive-loaded",
+            archive_state=self.active_dir.name,
+            session_count=active_session_count,
+        )
+        closed_session_count = 0
+        for record in self.iter_closed_sessions():
+            session_stats.add(record)
+            closed_session_count += 1
+        self._log(
+            "info",
+            "vehicle-archive-loaded",
+            archive_state=self.closed_dir.name,
+            session_count=closed_session_count,
+        )
         profiles = self.load_active_profiles()
         full_stats = self._image_directory_stats(self.root / "images" / "occupied-full", phase="image-scan")
         crop_stats = self._image_directory_stats(self.root / "images" / "occupied-crops", phase="image-scan")
-        session_stats = _session_health_stats(chain(active_records, closed_records))
         correction_state = self.correction_replay_state()
         archive_stats = self._archive_directory_stats()
         maintenance_metadata = self._last_maintenance_metadata()
         return {
-            "active_session_count": len(active_records),
-            "closed_session_count": len(closed_records),
+            "active_session_count": active_session_count,
+            "closed_session_count": closed_session_count,
             "retention_policy": "indefinite",
             "management_capabilities": ["export", "prune"],
-            "oldest_retained_session_started_at": session_stats["oldest_started_at"],
+            "oldest_retained_session_started_at": session_stats.oldest_started_at,
             "archive_file_count": archive_stats[0],
             "archive_bytes": archive_stats[1],
             "last_maintenance_metadata": maintenance_metadata,
@@ -284,10 +302,10 @@ class VehicleHistoryMaintenanceMixin:
             "occupied_crop_count": crop_stats[0],
             "image_file_count": full_stats[0] + crop_stats[0],
             "image_bytes": full_stats[1] + crop_stats[1],
-            "missing_occupied_image_reference_count": session_stats["missing_refs"],
+            "missing_occupied_image_reference_count": session_stats.missing_refs,
             "profile_count": len(profiles),
             "profile_sample_count": sum(profile.sample_count for profile in profiles),
-            "profile_unknown_session_count": session_stats["profile_unknown_sessions"],
+            "profile_unknown_session_count": session_stats.profile_unknown_sessions,
             "profile_quarantine_count": _profile_quarantine_count(self.profile_quarantine_dir),
             "correction_count": correction_state.valid_count,
             "correction_invalid_count": correction_state.invalid_count,

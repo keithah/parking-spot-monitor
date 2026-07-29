@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from parking_spot_monitor import vehicle_history_storage
 from parking_spot_monitor.logging import setup_logging
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
 from parking_spot_monitor.vehicle_history import (
@@ -142,6 +143,23 @@ def test_resolve_wrong_match_subject_prefers_exact_session_then_latest_spot_sess
     assert archive.resolve_wrong_match_subject("left_spot") == second.session_id
     assert archive.resolve_wrong_match_subject("missing_spot") == "missing_spot"
     assert archive.health_snapshot()["vehicle_history_failure_count"] == 0
+
+
+def test_wrong_match_subject_does_not_sort_archive_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    first = archive.start_session(occupied_event(spot_id="left_spot", observed_at="2026-05-18T10:00:00Z"))
+    archive.close_session(open_event(spot_id="left_spot", observed_at="2026-05-18T10:30:00Z"))
+    second = archive.start_session(occupied_event(spot_id="left_spot", observed_at="2026-05-19T10:00:00Z"))
+    archive.close_session(open_event(spot_id="left_spot", observed_at="2026-05-19T10:30:00Z"))
+    monkeypatch.setattr(
+        vehicle_history_storage,
+        "sorted",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected sort")),
+        raising=False,
+    )
+
+    assert archive.resolve_wrong_match_subject("left_spot") == second.session_id
+    assert first.session_id != second.session_id
 
 
 def test_duplicate_start_for_same_spot_is_noop_and_logs_safe_warning(tmp_path: Path) -> None:
@@ -413,6 +431,60 @@ def test_health_snapshot_summarizes_archive_counts_image_growth_retention_and_la
     assert "rtsp://camera.local" not in rendered
     assert "raw_image_bytes" not in rendered
     assert "should-not-export" not in rendered
+
+
+def test_health_snapshot_streams_closed_sessions_without_list_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    for index in range(250):
+        spot_id = f"closed-{index}"
+        archive.start_session(
+            occupied_event(spot_id=spot_id, observed_at=f"2026-05-18T{index // 60:02d}:{index % 60:02d}:00Z")
+        )
+        archive.close_session(
+            open_event(spot_id=spot_id, observed_at=f"2026-05-19T{index // 60:02d}:{index % 60:02d}:00Z")
+        )
+
+    def forbidden_list_closed_sessions() -> None:
+        raise AssertionError("health must stream the closed archive")
+
+    monkeypatch.setattr(archive, "list_closed_sessions", forbidden_list_closed_sessions)
+
+    health = archive.health_snapshot()
+
+    assert health["closed_session_count"] == 250
+    assert health["oldest_retained_session_started_at"] is not None
+
+
+def test_streaming_health_quarantines_corrupt_closed_records_without_counting_them(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    valid = archive.start_session(occupied_event(spot_id="valid"))
+    archive.close_session(open_event(spot_id="valid"))
+    corrupt_path = tmp_path / "vehicle-history" / "sessions" / "closed" / "broken.json"
+    corrupt_path.write_text("{not-json")
+
+    health = archive.health_snapshot()
+
+    assert health["closed_session_count"] == 1
+    assert health["vehicle_history_failure_count"] == 1
+    assert health["last_vehicle_history_error"] is not None
+    assert health["last_vehicle_history_error"]["phase"] == "json-load"
+    assert not corrupt_path.exists()
+    assert valid.session_id
+
+
+def test_health_oldest_session_uses_parsed_timestamp_order(tmp_path: Path) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    chronologically_oldest = archive.start_session(
+        occupied_event(spot_id="offset", observed_at="2026-05-18T01:00:00+02:00")
+    )
+    archive.close_session(open_event(spot_id="offset", observed_at="2026-05-18T01:15:00+02:00"))
+    archive.start_session(occupied_event(spot_id="utc", observed_at="2026-05-17T23:30:00Z"))
+
+    health = archive.health_snapshot()
+
+    assert health["oldest_retained_session_started_at"] == chronologically_oldest.started_at
 
 
 def test_empty_archive_health_snapshot_exposes_retention_defaults_without_files(tmp_path: Path) -> None:

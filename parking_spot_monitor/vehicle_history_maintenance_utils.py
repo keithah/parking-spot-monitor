@@ -4,6 +4,7 @@ import math
 import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -155,25 +156,39 @@ def _archive_directory_stats(directory: Path) -> tuple[int, int]:
     return (count, total_bytes)
 
 
-def _session_health_stats(records: Iterable[SessionRecord]) -> dict[str, int | str | None]:
-    missing_refs = 0
-    profile_unknown_sessions = 0
+@dataclass
+class SessionHealthAccumulator:
+    count: int = 0
     oldest_started_at: str | None = None
-    oldest_timestamp: datetime | None = None
-    for record in records:
-        if record.occupied_snapshot_path is None or record.occupied_crop_path is None:
-            missing_refs += 1
-        if record.occupied_crop_path is not None and record.profile_id is None:
-            profile_unknown_sessions += 1
+    missing_refs: int = 0
+    profile_unknown_sessions: int = 0
+    _oldest_timestamp: datetime | None = field(default=None, init=False, repr=False)
+
+    def add(self, record: SessionRecord) -> None:
+        self.count += 1
+        self.missing_refs += int(record.occupied_snapshot_path is None or record.occupied_crop_path is None)
+        self.profile_unknown_sessions += int(record.occupied_crop_path is not None and record.profile_id is None)
         parsed = _parse_timestamp(record.started_at)
-        if parsed is not None and (oldest_timestamp is None or parsed < oldest_timestamp):
-            oldest_timestamp = parsed
-            oldest_started_at = record.started_at
-    return {
-        "missing_refs": missing_refs,
-        "profile_unknown_sessions": profile_unknown_sessions,
-        "oldest_started_at": oldest_started_at,
-    }
+        if parsed is not None and (self._oldest_timestamp is None or parsed < self._oldest_timestamp):
+            self._oldest_timestamp = parsed
+            self.oldest_started_at = record.started_at
+
+    def to_json(self) -> dict[str, int | str | None]:
+        return {
+            "count": self.count,
+            "missing_refs": self.missing_refs,
+            "profile_unknown_sessions": self.profile_unknown_sessions,
+            "oldest_started_at": self.oldest_started_at,
+        }
+
+
+def _session_health_stats(records: Iterable[SessionRecord]) -> dict[str, int | str | None]:
+    accumulator = SessionHealthAccumulator()
+    for record in records:
+        accumulator.add(record)
+    stats = accumulator.to_json()
+    del stats["count"]
+    return stats
 
 
 def _safe_maintenance_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:

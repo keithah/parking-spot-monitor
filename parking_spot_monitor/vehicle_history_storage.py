@@ -5,7 +5,7 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
 from parking_spot_monitor.vehicle_history_models import (
@@ -51,6 +51,9 @@ class VehicleHistoryStorageMixin:
     def list_closed_sessions(self) -> list[SessionRecord]:
         return self._load_records(self.closed_dir)
 
+    def iter_closed_sessions(self) -> Iterator[SessionRecord]:
+        return self._iter_records(self.closed_dir, ordered=False)
+
     def resolve_wrong_match_subject(self, subject_id: str) -> str:
         for directory in (self.active_dir, self.closed_dir):
             path = directory / f"{subject_id}.json"
@@ -60,10 +63,10 @@ class VehicleHistoryStorageMixin:
                     return subject_id
 
         latest_match: SessionRecord | None = None
-        for record in self._iter_records(self.active_dir):
+        for record in self._iter_records(self.active_dir, ordered=False):
             if record.spot_id == subject_id:
                 latest_match = _latest_session_record(latest_match, record)
-        for record in self._iter_records(self.closed_dir):
+        for record in self.iter_closed_sessions():
             if record.spot_id == subject_id:
                 latest_match = _latest_session_record(latest_match, record)
         return subject_id if latest_match is None else latest_match.session_id
@@ -81,9 +84,12 @@ class VehicleHistoryStorageMixin:
         )
         return records
 
-    def _iter_records(self, directory: Path) -> Iterator[SessionRecord]:
+    def _iter_records(self, directory: Path, *, ordered: bool = True) -> Iterator[SessionRecord]:
         directory.mkdir(parents=True, exist_ok=True)
-        for path in sorted(directory.glob("*.json")):
+        paths: Iterable[Path] = directory.glob("*.json")
+        if ordered:
+            paths = sorted(paths)
+        for path in paths:
             record = self._load_record(path)
             if record is not None:
                 yield record
