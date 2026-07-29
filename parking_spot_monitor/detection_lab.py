@@ -86,7 +86,13 @@ class DetectionLabManager:
         self.max_jobs = max(1, int(max_jobs))
         self.logger = logger
         self.outcome_recorder = outcome_recorder
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._active_job_id: str | None = None
+
+    @property
+    def active_job_id(self) -> str | None:
+        with self._lock:
+            return self._active_job_id
 
     def start_replay(self) -> DetectionLabJob:
         return self.start_job("replay")
@@ -121,6 +127,14 @@ class DetectionLabManager:
             return job
 
         job = self._create_job(safe_kind)
+        if not self._admit(job):
+            self._write_status(
+                job,
+                status="blocked",
+                phase="admission",
+                error={"code": "lab_busy", "message": "Another detection lab job is already active"},
+            )
+            return job
         self._write_status(job, status="queued", phase="queued", summary={"inputs": sorted(inputs)})
         thread = threading.Thread(target=self._run_job, args=(job, runner), name=f"detection-lab-{job.job_id}", daemon=True)
         thread.start()
@@ -139,15 +153,20 @@ class DetectionLabManager:
         return _sanitize_status(payload)
 
     def retain_recent_jobs(self) -> list[Path]:
-        self.jobs_root.mkdir(parents=True, exist_ok=True)
-        job_dirs = sorted((path for path in self.jobs_root.iterdir() if path.is_dir()), key=lambda path: path.stat().st_mtime, reverse=True)
-        removed: list[Path] = []
-        for job_dir in job_dirs[self.max_jobs :]:
-            if not _JOB_ID_RE.match(job_dir.name):
-                continue
-            _remove_tree(job_dir)
-            removed.append(job_dir)
-        return removed
+        with self._lock:
+            self.jobs_root.mkdir(parents=True, exist_ok=True)
+            job_dirs = sorted(
+                (path for path in self.jobs_root.iterdir() if path.is_dir() and path.name != self._active_job_id),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            removed: list[Path] = []
+            for job_dir in job_dirs[self.max_jobs :]:
+                if not _JOB_ID_RE.match(job_dir.name):
+                    continue
+                _remove_tree(job_dir)
+                removed.append(job_dir)
+            return removed
 
     def _run_job(self, job: DetectionLabJob, runner: LabRunner) -> None:
         self._write_status(job, status="running", phase="running")
@@ -171,7 +190,20 @@ class DetectionLabManager:
             )
             self._log("warning", "detection-lab-job-failed", job_id=job.job_id, kind=job.kind, error_type=type(exc).__name__)
         finally:
+            self._release(job)
             self.retain_recent_jobs()
+
+    def _admit(self, job: DetectionLabJob) -> bool:
+        with self._lock:
+            if self._active_job_id is not None:
+                return False
+            self._active_job_id = job.job_id
+            return True
+
+    def _release(self, job: DetectionLabJob) -> None:
+        with self._lock:
+            if self._active_job_id == job.job_id:
+                self._active_job_id = None
 
     def _create_job(self, kind: LabJobKind) -> DetectionLabJob:
         self.jobs_root.mkdir(parents=True, exist_ok=True)

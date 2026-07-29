@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -189,6 +190,56 @@ def test_retention_removes_old_bounded_job_directories(tmp_path: Path) -> None:
     assert old in removed
     assert not old.exists()
     assert kept.exists()
+
+
+def test_second_job_is_blocked_while_first_job_is_active(tmp_path: Path) -> None:
+    _write_fixed_inputs(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner(inputs):
+        started.set()
+        assert release.wait(2)
+        report = inputs["job_dir"] / "replay-report.json"
+        report.write_text('{"status_counts": {}, "coverage": {}}', encoding="utf-8")
+        return report
+
+    manager = DetectionLabManager(tmp_path, replay_runner=runner)
+    first = manager.start_replay()
+    assert started.wait(1)
+    second = manager.start_replay()
+
+    blocked = manager.summarize(second.job_id)
+    assert blocked["status"] == "blocked"
+    assert blocked["phase"] == "admission"
+    assert blocked["error"]["code"] == "lab_busy"
+    assert manager.active_job_id == first.job_id
+
+    release.set()
+    assert _wait_for_terminal(manager, first.job_id)["status"] == "succeeded"
+
+
+def test_retention_never_removes_active_job(tmp_path: Path) -> None:
+    _write_fixed_inputs(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner(inputs):
+        started.set()
+        assert release.wait(2)
+        report = inputs["job_dir"] / "replay-report.json"
+        report.write_text('{"status_counts": {}, "coverage": {}}', encoding="utf-8")
+        return report
+
+    manager = DetectionLabManager(tmp_path, replay_runner=runner, max_jobs=1)
+    active = manager.start_replay()
+    assert started.wait(1)
+    blocked = manager.start_replay()
+    manager.retain_recent_jobs()
+    assert active.job_dir.exists()
+    assert blocked.job_dir.exists()
+    release.set()
+    _wait_for_terminal(manager, active.job_id)
 
 
 def test_detection_lab_does_not_import_or_mutate_live_occupancy_state(tmp_path: Path) -> None:
