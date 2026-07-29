@@ -370,6 +370,90 @@ def test_runtime_loop_transition_verification_resets_periodic_deadline(
     ]
 
 
+def test_disabled_adaptive_polling_keeps_fixed_cadence_and_periodic_verification(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "adaptive_polling_enabled": False,
+                    "debug_overlay_interval_seconds": 0,
+                }
+            )
+        }
+    )
+    primary_path = tmp_path / "latest-primary.jpg"
+    high_path = tmp_path / "latest-high.jpg"
+    capture_profiles: list[str | None] = []
+    sleeps: list[float] = []
+    save_runtime_state(
+        tmp_path / "state.json",
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(
+                    status=OccupancyStatus.EMPTY,
+                    miss_streak=3,
+                ),
+                "right_spot": SpotOccupancyState(
+                    status=OccupancyStatus.EMPTY,
+                    miss_streak=3,
+                ),
+            }
+        ),
+    )
+
+    def fake_capture(
+        _settings: object,
+        _data_dir: str | Path,
+        *,
+        stream_profile: str | None = None,
+    ) -> FrameCaptureResult:
+        capture_profiles.append(stream_profile)
+        profile = stream_profile or "primary"
+        size = (3840, 2160) if profile == "high_resolution" else (1458, 806)
+        path = high_path if profile == "high_resolution" else primary_path
+        Image.new("RGB", size, (20, 30, 40)).save(path, format="JPEG")
+        return FrameCaptureResult(
+            timestamp="2026-05-18T18:00:01Z" if stream_profile else "2026-05-18T18:00:00Z",
+            latest_path=path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=0.01,
+            byte_size=path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile=profile, expected_size=size),
+        )
+
+    monotonic_values = iter([0.0, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0])
+
+    class StableEmptyDetector:
+        def detect(
+            self,
+            _frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: StableEmptyDetector(),
+        matrix_delivery=None,
+        sleep=sleeps.append,
+        max_iterations=4,
+        monotonic=lambda: next(monotonic_values),
+    )
+
+    assert exit_code == 0
+    assert sleeps == [30, 30, 30, 30]
+    assert capture_profiles == [None, None, None, None, "high_resolution"]
+
+
 def test_failed_high_resolution_detection_preserves_primary_capture_identity(tmp_path: Path) -> None:
     settings = load_settings("config.yaml.example", environ=fake_environ())
     primary_path = tmp_path / "latest-primary.jpg"

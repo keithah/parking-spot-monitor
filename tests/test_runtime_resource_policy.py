@@ -215,6 +215,27 @@ def test_disabled_adaptation_always_uses_active_cadence(settings) -> None:
     assert decision == RuntimeResourceDecision(15.0, "adaptive-disabled", 0)
 
 
+def test_disabled_adaptation_tracks_stable_successes_for_verification(settings) -> None:
+    disabled = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={"adaptive_polling_enabled": False}
+            )
+        }
+    )
+    state = runtime_state(
+        SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=3)
+    )
+
+    decision = decide(
+        disabled,
+        state,
+        previous_stable_success_count=2,
+    )
+
+    assert decision == RuntimeResourceDecision(15.0, "adaptive-disabled", 3)
+
+
 @pytest.mark.parametrize("previous_stable_success_count", [0, 2])
 def test_equal_active_and_stable_intervals_preserve_fixed_cadence(
     settings, previous_stable_success_count: int

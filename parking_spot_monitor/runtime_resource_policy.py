@@ -65,16 +65,22 @@ def decide_runtime_interval(
     """Choose the next successful-loop cadence from current frame evidence."""
 
     active_interval = settings.runtime.frame_interval_seconds
-    if not settings.runtime.adaptive_polling_enabled:
-        return _active_decision(active_interval, "adaptive-disabled")
+    adaptive_enabled = settings.runtime.adaptive_polling_enabled
     if degraded:
-        return _active_decision(active_interval, "degraded")
+        return _active_decision(
+            active_interval, "degraded" if adaptive_enabled else "adaptive-disabled"
+        )
     if frame_had_transition:
-        return _active_decision(active_interval, "transition-settle")
+        return _active_decision(
+            active_interval,
+            "transition-settle" if adaptive_enabled else "adaptive-disabled",
+        )
 
     states = tuple(runtime_state.state_by_spot.values())
     if not states or any(state.status is OccupancyStatus.UNKNOWN for state in states):
-        return _active_decision(active_interval, "unknown")
+        return _active_decision(
+            active_interval, "unknown" if adaptive_enabled else "adaptive-disabled"
+        )
     if any(
         _has_partial_streak(
             state,
@@ -83,12 +89,24 @@ def decide_runtime_interval(
         )
         for state in states
     ):
-        return _active_decision(active_interval, "partial-streak")
+        return _active_decision(
+            active_interval,
+            "partial-streak" if adaptive_enabled else "adaptive-disabled",
+        )
     if frame_has_weak_presence:
-        return _active_decision(active_interval, "weak-presence")
+        return _active_decision(
+            active_interval,
+            "weak-presence" if adaptive_enabled else "adaptive-disabled",
+        )
 
     settle_frames = settings.runtime.stable_settle_frames
     stable_success_count = max(previous_stable_success_count, 0) + 1
+    if not adaptive_enabled:
+        return RuntimeResourceDecision(
+            interval_seconds=active_interval,
+            reason="adaptive-disabled",
+            stable_success_count=stable_success_count,
+        )
     if stable_success_count < settle_frames:
         return RuntimeResourceDecision(
             interval_seconds=active_interval,
