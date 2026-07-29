@@ -3135,7 +3135,9 @@ def test_runtime_loop_paces_successful_noop_matrix_command_polls_with_monotonic_
             poll_calls += 1
             return FakeCommandPollResult()
 
-    monotonic_values = iter([0.0, 1.0, 30.0, 31.0, 60.0, 61.0])
+    monotonic_values = iter(
+        [0.0, 0.0, 0.0, 1.0, 30.0, 30.0, 31.0, 60.0, 60.0, 60.0, 61.0]
+    )
 
     exit_code = run_capture_loop(
         settings,
@@ -3170,6 +3172,142 @@ def test_runtime_loop_paces_successful_noop_matrix_command_polls_with_monotonic_
     assert len(sleeps) == 3
     assert len(command_records) == 2
     assert [record["level"] for record in success_logs] == ["DEBUG", "DEBUG"]
+
+
+def test_runtime_loop_matrix_poll_interval_is_anchored_to_actual_poll_calls(
+    tmp_path: Path,
+) -> None:
+    current_time = 0.0
+    processing_durations = iter([8.0, 8.0, 1.0, 1.0])
+    poll_times: list[float] = []
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "matrix": settings.matrix.model_copy(
+                update={"command_poll_interval_seconds": 10}
+            ),
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "frame_interval_seconds": 1,
+                    "adaptive_polling_enabled": False,
+                    "debug_overlay_interval_seconds": 0,
+                }
+            ),
+            "stream": settings.stream.model_copy(
+                update={"escalation_verification_seconds": 0}
+            ),
+        }
+    )
+
+    def monotonic() -> float:
+        return current_time
+
+    def capture_frame(
+        _settings: object,
+        data_dir: str | Path,
+        **_kwargs: object,
+    ) -> FrameCaptureResult:
+        nonlocal current_time
+        current_time += next(processing_durations)
+        return captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z")
+
+    class CommandService:
+        def poll_once(self) -> FakeCommandPollResult:
+            poll_times.append(current_time)
+            return FakeCommandPollResult()
+
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=capture_frame,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        matrix_command_service=CommandService(),
+        sleep=lambda seconds: None,
+        max_iterations=4,
+        monotonic=monotonic,
+    )
+
+    assert exit_code == 0
+    assert poll_times == [8.0, 18.0]
+
+
+def test_runtime_loop_matrix_failure_cooldown_starts_after_failed_poll_completes(
+    tmp_path: Path,
+) -> None:
+    current_time = 0.0
+    processing_durations = iter([5.0, 2.0, 0.0, 7.0])
+    poll_times: list[float] = []
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "matrix": settings.matrix.model_copy(
+                update={
+                    "command_poll_interval_seconds": 0,
+                    "command_failure_cooldown_seconds": 10,
+                    "command_failure_max_cooldown_seconds": 10,
+                }
+            ),
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "frame_interval_seconds": 1,
+                    "adaptive_polling_enabled": False,
+                    "debug_overlay_interval_seconds": 0,
+                }
+            ),
+            "stream": settings.stream.model_copy(
+                update={"escalation_verification_seconds": 0}
+            ),
+        }
+    )
+
+    def monotonic() -> float:
+        return current_time
+
+    def capture_frame(
+        _settings: object,
+        data_dir: str | Path,
+        **_kwargs: object,
+    ) -> FrameCaptureResult:
+        nonlocal current_time
+        current_time += next(processing_durations)
+        return captured_frame(Path(data_dir), timestamp="2026-05-18T18:00:00Z")
+
+    class CommandService:
+        def poll_once(self) -> FakeCommandPollResult:
+            nonlocal current_time
+            poll_times.append(current_time)
+            if len(poll_times) == 1:
+                current_time += 4.0
+                raise RuntimeError("Matrix unavailable")
+            return FakeCommandPollResult()
+
+    def sleep(seconds: float) -> None:
+        nonlocal current_time
+        current_time += seconds
+
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=capture_frame,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        matrix_command_service=CommandService(),
+        sleep=sleep,
+        max_iterations=4,
+        monotonic=monotonic,
+    )
+
+    assert exit_code == 0
+    assert poll_times[0] == 5.0
+    assert len(poll_times) == 2
+    assert poll_times[1] >= 19.0
 
 
 def test_runtime_loop_open_matrix_command_circuit_skips_polls_without_sleeping_or_recounting(
@@ -3216,7 +3354,24 @@ def test_runtime_loop_open_matrix_command_circuit_skips_polls_without_sleeping_o
             poll_calls += 1
             raise RuntimeError("Matrix unavailable")
 
-    monotonic_values = iter([0.0, 1.0, 30.0, 31.0, 60.0, 61.0, 120.0, 121.0])
+    monotonic_values = iter(
+        [
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            30.0,
+            30.0,
+            31.0,
+            60.0,
+            60.0,
+            60.0,
+            61.0,
+            120.0,
+            120.0,
+            121.0,
+        ]
+    )
 
     exit_code = run_capture_loop(
         settings,

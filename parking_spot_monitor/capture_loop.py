@@ -174,24 +174,27 @@ def run_capture_loop(
                         history_errors=frame_update.history_errors,
                         state_save_error=frame_update.state_save_error,
                     )
-                    if runtime_matrix_commands.command_poll_due(
-                        settings.matrix,
-                        matrix_command_poll_state,
-                        iteration_started_at,
-                    ):
-                        command_outcome = _poll_matrix_commands_once(
-                            matrix_command_service,
-                            logger=logger,
-                            iteration=iteration,
-                            decision_memory_path=decision_memory_path,
-                        )
-                        matrix_command_poll_state = runtime_matrix_commands.record_command_poll_result(
+                    if matrix_command_service is not None:
+                        command_poll_due_at = monotonic()
+                        if runtime_matrix_commands.command_poll_due(
                             settings.matrix,
                             matrix_command_poll_state,
-                            iteration_started_at,
-                            failed=command_outcome.transport_failed,
-                        )
-                        health_state.record_command_result(command_outcome.health_error)
+                            command_poll_due_at,
+                        ):
+                            command_outcome = _poll_matrix_commands_once(
+                                matrix_command_service,
+                                logger=logger,
+                                iteration=iteration,
+                                decision_memory_path=decision_memory_path,
+                            )
+                            command_poll_completed_at = monotonic()
+                            matrix_command_poll_state = runtime_matrix_commands.record_command_poll_result(
+                                settings.matrix,
+                                matrix_command_poll_state,
+                                command_poll_completed_at,
+                                failed=command_outcome.transport_failed,
+                            )
+                            health_state.record_command_result(command_outcome.health_error)
                     overlay_written = runtime_loop_resources.record_primary_frame_artifacts(
                         settings,
                         frame_result.primary_capture,
