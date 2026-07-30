@@ -110,6 +110,20 @@ def require_matching_snapshot(
         raise ValueError("corpus snapshot differs from its original")
 
 
+def file_identity_matches(expected: FileIdentity) -> bool:
+    try:
+        current = os.stat(expected.path, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(current.st_mode) and _stable_fields(current) == (
+        expected.device,
+        expected.inode,
+        expected.size_bytes,
+        expected.modified_ns,
+        expected.changed_ns,
+    )
+
+
 def _stable_fields(item: os.stat_result) -> tuple[int, int, int, int, int]:
     return (
         item.st_dev,

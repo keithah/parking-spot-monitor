@@ -118,9 +118,11 @@ def _build_report(
 def _require_unchanged_inputs(
     model_snapshots: ModelSnapshots,
     corpus: CorpusSnapshot,
+    *,
+    comprehensive: bool = False,
 ) -> None:
-    model_snapshots.require_unchanged()
-    corpus.require_unchanged()
+    model_snapshots.require_unchanged(comprehensive=comprehensive)
+    corpus.require_unchanged(comprehensive=comprehensive)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -182,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
                             worker_timeout_seconds=args.worker_timeout_seconds,
                         ),
                         before_publish=lambda: _require_unchanged_inputs(
-                            model_snapshots, corpus
+                            model_snapshots, corpus, comprehensive=True
                         ),
                     )
                 finally:

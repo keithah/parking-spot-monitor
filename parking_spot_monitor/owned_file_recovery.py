@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import islice
 import os
 from pathlib import Path
 import re
@@ -22,6 +21,7 @@ from parking_spot_monitor.owned_file_disposal import (
     recover_disposal_at,
     same_regular_identity_at,
 )
+from parking_spot_monitor.owned_recovery_scan import scan_transition_batch
 
 MAX_RECOVERY_SCAN_ENTRIES = 256
 _TRANSITION_PATTERN = re.compile(
@@ -57,29 +57,30 @@ def _recover_locked(directory_fd: int, selected: str | None, *, max_entries: int
     budget = max(0, min(max_entries, MAX_RECOVERY_SCAN_ENTRIES))
     recovered = 0
     pending = False
-    entries = [
+    all_entries = manifest_entries_at(directory_fd)
+    matching_entries = [
         entry
-        for entry in manifest_entries_at(directory_fd, limit=budget)
+        for entry in all_entries
         if selected is None or entry.recovery == selected
     ]
-    indexed_disposals = {entry.disposal for entry in entries}
-    for entry in entries[:budget]:
+    entries = matching_entries[:budget]
+    indexed_disposals = {entry.disposal for entry in all_entries}
+    pending = len(matching_entries) > len(entries)
+    for entry in entries:
         result = _recover_manifest_entry(directory_fd, entry)
         recovered += result.recovered
         pending = pending or result.pending
-    remaining = budget - min(len(entries), budget)
+    remaining = budget - len(entries)
     if remaining <= 0:
         return RecoveryResult(recovered, pending)
 
-    candidates: list[tuple[str, str, str]] = []
-    with os.scandir(directory_fd) as directory_entries:
-        for item in islice(directory_entries, remaining):
-            if item.name in indexed_disposals:
-                continue
-            match = _TRANSITION_PATTERN.fullmatch(item.name)
-            if match is None or (selected is not None and match["recovery"] != selected):
-                continue
-            candidates.append((item.name, match["recovery"], match["kind"]))
+    candidates = scan_transition_batch(
+        directory_fd,
+        selected=selected,
+        indexed=indexed_disposals,
+        max_entries=remaining,
+        transition_pattern=_TRANSITION_PATTERN,
+    )
     for candidate, recovery, kind in sorted(candidates):
         if kind == "dispose":
             result = recover_disposal_at(directory_fd, candidate, recovery)
@@ -97,7 +98,8 @@ def restore_quarantined_at(directory_fd: int, quarantine: str, name: str) -> boo
 
 
 def _recover_manifest_entry(directory_fd: int, entry: DisposalManifestEntry) -> RecoveryResult:
-    if not disposal_pattern(entry.recovery).fullmatch(entry.disposal):
+    match = _TRANSITION_PATTERN.fullmatch(entry.disposal)
+    if match is None or match["recovery"] != entry.recovery:
         return RecoveryResult(pending=True)
     try:
         disposal_exists = _name_exists(directory_fd, entry.disposal)
@@ -105,6 +107,21 @@ def _recover_manifest_entry(directory_fd: int, entry: DisposalManifestEntry) -> 
         return RecoveryResult(pending=True)
     if not disposal_exists:
         return RecoveryResult(pending=not forget_disposal_at(directory_fd, entry.disposal))
+    if match["kind"] == "quarantine":
+        try:
+            current = os.stat(entry.disposal, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError:
+            return RecoveryResult(pending=True)
+        if not stat.S_ISREG(current.st_mode) or FileIdentity.from_stat(current) != FileIdentity(entry.dev, entry.ino):
+            return RecoveryResult(pending=True)
+        if not _restore_quarantined(directory_fd, entry.disposal, entry.recovery):
+            return RecoveryResult(pending=True)
+        return RecoveryResult(
+            recovered=1,
+            pending=not forget_disposal_at(directory_fd, entry.disposal),
+        )
+    if not disposal_pattern(entry.recovery).fullmatch(entry.disposal):
+        return RecoveryResult(pending=True)
     result = recover_disposal_at(
         directory_fd,
         entry.disposal,

@@ -10,13 +10,17 @@ from typing import Any
 
 from parking_spot_monitor.logging import redact_diagnostic_text
 from parking_spot_monitor.vehicle_history_correction_cache import _canonical_profile_map, build_correction_replay_state
-from parking_spot_monitor.vehicle_history_correction_io import count_correction_quarantine, load_correction_events, quarantine_correction_line
+from parking_spot_monitor.vehicle_history_correction_io import append_bounded_correction_event, load_correction_events, quarantine_correction_line
 from parking_spot_monitor.vehicle_history_models import (
     CORRECTION_ACTION_MERGE_PROFILES,
     CORRECTION_ACTION_PROFILE_SUMMARY_REQUESTED,
     CORRECTION_ACTION_RENAME_PROFILE,
     CORRECTION_ACTION_WRONG_MATCH,
     MAX_CORRECTION_LINE_BYTES,
+    MAX_CORRECTION_FILE_BYTES,
+    MAX_CORRECTION_COMPACT_BYTES,
+    MAX_CORRECTION_EVENTS,
+    MAX_CORRECTION_INVALID_LINES,
     MAX_CORRECTION_TEXT_LENGTH,
     SCHEMA_VERSION,
     ArchiveSchemaError,
@@ -32,6 +36,7 @@ from parking_spot_monitor.vehicle_history_models import (
     _utc_now,
 )
 from parking_spot_monitor.vehicle_history_profile_utils import _session_with_profile
+from parking_spot_monitor.vehicle_history_correction_validation import validate_correction
 
 _CorrectionValidationRecords = tuple[CorrectionReplayState, Sequence[SessionRecord], Sequence[SessionRecord]]
 
@@ -50,13 +55,21 @@ class VehicleHistoryCorrectionMixin:
         line = json.dumps(event.to_json_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
         if len(line.encode("utf-8")) > MAX_CORRECTION_LINE_BYTES:
             raise ArchiveSchemaError("correction event exceeds maximum size")
-        self.corrections_dir.mkdir(parents=True, exist_ok=True)
         try:
-            with self.corrections_path.open("a", encoding="utf-8") as handle:
-                handle.write(line)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            compacted = append_bounded_correction_event(
+                self.corrections_path,
+                line,
+                current_count=self.correction_replay_state().valid_count,
+                max_events=MAX_CORRECTION_EVENTS,
+                max_file_bytes=MAX_CORRECTION_FILE_BYTES,
+                compact_at_bytes=MAX_CORRECTION_COMPACT_BYTES,
+                load_events=self._load_correction_replay,
+                record_failure=self._record_failure,
+            )
+            if compacted:
+                self._bump_correction_revision()
+        except ArchiveWriteError:
+            raise
         except OSError as exc:
             self._record_failure(phase="correction-append", path_name=self.corrections_path.name, error=exc)
             raise ArchiveWriteError(_safe_error_message(exc)) from exc
@@ -154,6 +167,10 @@ class VehicleHistoryCorrectionMixin:
         return load_correction_events(
             self.corrections_path,
             max_line_bytes=MAX_CORRECTION_LINE_BYTES,
+            max_file_bytes=MAX_CORRECTION_FILE_BYTES,
+            max_events=MAX_CORRECTION_EVENTS,
+            max_invalid_lines=MAX_CORRECTION_INVALID_LINES,
+            quarantine_path=self.corrections_quarantine_path,
             quarantine_line=self._quarantine_correction_line,
             record_failure=self._record_failure,
         )
@@ -172,22 +189,18 @@ class VehicleHistoryCorrectionMixin:
             corrections_path=self.corrections_path,
             quarantine_path=self.corrections_quarantine_path,
         )
-        quarantine = count_correction_quarantine(
-            self.corrections_quarantine_path,
-            record_failure=self._record_failure,
-        )
         after_count = self._correction_replay_cache.snapshot(
             revision=self.correction_revision(),
             corrections_path=self.corrections_path,
             quarantine_path=self.corrections_quarantine_path,
         )
-        state = build_correction_replay_state(loaded.events, quarantine_count=quarantine.count)
+        state = build_correction_replay_state(loaded.events, quarantine_count=loaded.quarantine_count)
         self._correction_replay_cache.store_if_stable(
             before=before,
             after_load=after_load,
             after_count=after_count,
             quarantine_writes=loaded.quarantine_writes,
-            safe=loaded.succeeded and quarantine.succeeded,
+            safe=loaded.succeeded,
             value=state,
         )
         return state
@@ -331,38 +344,7 @@ class VehicleHistoryCorrectionMixin:
     def _validate_correction_against_archive(
         self, event: ProfileCorrectionEvent, *, records: _CorrectionValidationRecords | None = None
     ) -> None:
-        if records is None:
-            state = self.correction_replay_state()
-            active_records, closed_records = self.load_active_sessions(), self.list_closed_sessions()
-        else:
-            state, active_records, closed_records = records
-        active_profiles = self.load_active_profiles()
-        session_by_id = {record.session_id: record for record in chain(active_records, closed_records)}
-        profile_ids = self._known_profile_ids(state=state, active_records=active_records, closed_records=closed_records, active_profiles=active_profiles)
-        if event.action == CORRECTION_ACTION_RENAME_PROFILE:
-            profile_id = _required_correction_field(event.profile_id, "profile_id")
-            if self.resolve_profile_id(profile_id, merges=state.merges) not in profile_ids:
-                raise ArchiveSchemaError("unknown profile_id")
-        elif event.action == CORRECTION_ACTION_MERGE_PROFILES:
-            source_profile_id = _required_correction_field(event.source_profile_id, "source_profile_id")
-            target_profile_id = _required_correction_field(event.target_profile_id, "target_profile_id")
-            source = self.resolve_profile_id(source_profile_id, merges=state.merges)
-            target = self.resolve_profile_id(target_profile_id, merges=state.merges)
-            if source not in profile_ids or target not in profile_ids:
-                raise ArchiveSchemaError("unknown profile_id")
-            if source == target:
-                raise ArchiveSchemaError("profile merge cycle detected")
-        elif event.action == CORRECTION_ACTION_WRONG_MATCH:
-            session_id = _required_correction_field(event.session_id, "session_id")
-            session = session_by_id.get(session_id)
-            if session is None:
-                raise ArchiveSchemaError("unknown session_id")
-            if event.profile_id is not None and self.resolve_profile_id(session.profile_id, merges=state.merges) != self.resolve_profile_id(event.profile_id, merges=state.merges):
-                raise ArchiveSchemaError("wrong_match profile_id does not match session profile")
-        elif event.action == CORRECTION_ACTION_PROFILE_SUMMARY_REQUESTED:
-            profile_id = _required_correction_field(event.profile_id, "profile_id")
-            if self.resolve_profile_id(profile_id, merges=state.merges) not in profile_ids:
-                raise ArchiveSchemaError("unknown profile_id")
+        validate_correction(self, event, records)
 
     def _known_profile_ids(self, *, state: CorrectionReplayState | None = None, active_records: Sequence[SessionRecord] | None = None, closed_records: Sequence[SessionRecord] | None = None, active_profiles: Sequence[Any] | None = None) -> set[str]:
         state = state if state is not None else self.correction_replay_state()
@@ -376,7 +358,13 @@ class VehicleHistoryCorrectionMixin:
                 profile_ids.add(resolved)
         return {profile_id for profile_id in profile_ids if profile_id is not None}
 
-    def _quarantine_correction_line(self, *, line_number: int, reason: str):
+    def _quarantine_correction_line(
+        self,
+        *,
+        line_number: int,
+        reason: str,
+        known_keys: set[tuple[int, str]] | None = None,
+    ):
         self.corrections_dir.mkdir(parents=True, exist_ok=True)
         safe_reason = redact_diagnostic_text(reason)
         outcome = quarantine_correction_line(
@@ -386,6 +374,7 @@ class VehicleHistoryCorrectionMixin:
             quarantined_at=_utc_now(),
             record_failure=self._record_failure,
             bump_revision=self._bump_correction_quarantine_revisions,
+            known_keys=known_keys,
         )
         self._log("warning", "vehicle-profile-correction-quarantined", phase="correction-load", line_number=line_number, reason=reason)
         return outcome
@@ -394,11 +383,6 @@ class VehicleHistoryCorrectionMixin:
         self._bump_revision()
         self._bump_correction_revision()
 
-
-def _required_correction_field(value: str | None, field_name: str) -> str:
-    if value is None:
-        raise ArchiveSchemaError(f"correction missing {field_name}")
-    return value
 
 def _profile_session_counts(records: Sequence[SessionRecord], *, profile_id: str, wrong_matches: set[str] | frozenset[str]) -> tuple[int, int]:
     kept = excluded = 0

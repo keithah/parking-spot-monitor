@@ -58,6 +58,7 @@ class _SourceEvidence:
     signature: tuple[int, int, int, int, int]
     digest: bytes
     mode: int
+    data: bytes
 
 
 def publish_canonical_jpeg(source: str | Path, destination: str | Path) -> JpegPublication:
@@ -87,7 +88,7 @@ def _publish_validated_to_owner(
 ) -> JpegPublication:
     temporary_name = f".{destination.name}.{secrets.token_hex(8)}.tmp"
     replaced = False
-    temporary_fd = committed_identity_fd = committed_fd = -1
+    temporary_fd = committed_fd = -1
     try:
         try:
             _reflink(source_fd, owner, temporary_name, evidence.mode)
@@ -95,41 +96,35 @@ def _publish_validated_to_owner(
         except OSError as reflink_exc:
             if reflink_exc.errno not in _FALLBACK_ERRNOS:
                 raise
-            _copy_file(source_fd, owner, temporary_name, evidence.mode, evidence.signature)
+            _copy_file(source_fd, owner, temporary_name, evidence.mode, evidence)
             strategy = "copy"
         temporary_fd = _open_artifact(owner, temporary_name)
         temporary_identity = descriptor_identity(temporary_fd)
-        _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
         os.fsync(temporary_fd)
-        _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
+        if descriptor_identity(temporary_fd) != temporary_identity:
+            raise JpegDecodeError("read_failed")
         owner.replace(temporary_name, destination.name)
         replaced = True
+        owner.fsync()
         try:
-            committed_identity_fd = owner.open_identity(destination.name)
-            committed_identity = descriptor_identity(committed_identity_fd)
-            if committed_identity != temporary_identity:
-                raise JpegDecodeError("read_failed") from None
             committed_fd = _open_artifact(owner, destination.name)
+            committed_identity = descriptor_identity(committed_fd)
+            if committed_identity != temporary_identity:
+                raise JpegDecodeError("read_failed")
             _validate_artifact_descriptor(committed_fd, source_fd, evidence)
             if descriptor_identity(committed_fd) != temporary_identity or not owner.matches(destination.name, committed_identity):
                 raise JpegDecodeError("read_failed")
         except (JpegDecodeError, OSError):
-            cleanup_identity = descriptor_identity(committed_identity_fd) if committed_identity_fd >= 0 else temporary_identity
-            owner.unlink_if_matches(destination.name, cleanup_identity)
+            owner.unlink_if_matches(destination.name, temporary_identity)
             raise JpegDecodeError("read_failed") from None
-        owner.fsync()
-        try:
-            _validate_artifact_descriptor(committed_fd, source_fd, evidence)
-            if not owner.matches(destination.name, committed_identity) or not owner.is_still_bound():
-                raise JpegDecodeError("read_failed")
-        except JpegDecodeError:
+        if not owner.matches(destination.name, committed_identity) or not owner.is_still_bound():
             owner.unlink_if_matches(destination.name, committed_identity)
-            raise
+            raise JpegDecodeError("read_failed")
         return JpegPublication(path=destination, strategy=strategy, identity=committed_identity)
     finally:
         if not replaced and temporary_fd >= 0:
             owner.unlink_if_matches(temporary_name, descriptor_identity(temporary_fd))
-        for descriptor in (committed_fd, committed_identity_fd, temporary_fd):
+        for descriptor in (committed_fd, temporary_fd):
             if descriptor >= 0:
                 os.close(descriptor)
 
@@ -178,14 +173,13 @@ def _copy_file(
     owner: RootedDirectoryOwner,
     temporary_name: str,
     source_mode: int,
-    source_signature: tuple[int, int, int, int, int],
+    evidence: _SourceEvidence,
 ) -> None:
     destination_fd = owner.open_file(temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode)
     try:
-        try:
-            read_descriptor_exact(source_fd, source_signature, destination_fd=destination_fd)
-        except OSError as exc:
-            raise JpegDecodeError("read_failed") from exc
+        _write_all(destination_fd, evidence.data)
+        if _descriptor_signature(source_fd) != evidence.signature:
+            raise JpegDecodeError("read_failed")
         os.fchmod(destination_fd, source_mode)
     except Exception:
         identity = descriptor_identity(destination_fd)
@@ -214,10 +208,9 @@ def _validated_source_evidence(source_fd: int) -> _SourceEvidence:
     if captured.data is None:
         raise JpegDecodeError("read_failed")
     _validate_jpeg_bytes(captured.data)
-    digest_after = _bounded_digest(source_fd, before)
-    if _descriptor_signature(source_fd) != before or digest_after != captured.digest:
+    if _descriptor_signature(source_fd) != before:
         raise JpegDecodeError("read_failed")
-    return _SourceEvidence(before, captured.digest, stat.S_IMODE(value.st_mode))
+    return _SourceEvidence(before, captured.digest, stat.S_IMODE(value.st_mode), captured.data)
 
 
 def _open_artifact(owner: RootedDirectoryOwner, name: str) -> int:
@@ -237,17 +230,9 @@ def _validate_artifact_descriptor(descriptor: int, source_fd: int, evidence: _So
     _validate_jpeg_bytes(captured.data)
     if (
         _descriptor_signature(descriptor) != signature
-        or _bounded_digest(descriptor, signature) != evidence.digest
         or _descriptor_signature(source_fd) != evidence.signature
     ):
         raise JpegDecodeError("read_failed")
-
-
-def _bounded_digest(descriptor: int, signature: tuple[int, int, int, int, int]) -> bytes:
-    try:
-        return read_descriptor_exact(descriptor, signature).digest
-    except OSError as exc:
-        raise JpegDecodeError("read_failed") from exc
 
 
 def _bounded_capture(
@@ -257,6 +242,19 @@ def _bounded_capture(
         return read_descriptor_exact(descriptor, signature, capture_bytes=True)
     except OSError as exc:
         raise JpegDecodeError("read_failed") from exc
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    try:
+        offset = 0
+        while offset < len(view):
+            written = os.write(descriptor, view[offset:])
+            if written <= 0:
+                raise JpegDecodeError("read_failed")
+            offset += written
+    finally:
+        view.release()
 
 
 def _descriptor_signature(descriptor: int) -> tuple[int, int, int, int, int]:

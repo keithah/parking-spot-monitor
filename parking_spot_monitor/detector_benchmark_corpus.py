@@ -11,6 +11,7 @@ from typing import Any
 from parking_spot_monitor.detector_benchmark_corpus_files import (
     FileIdentity,
     create_snapshot,
+    file_identity_matches,
     read_identity,
     require_matching_snapshot,
 )
@@ -63,26 +64,27 @@ class CorpusSnapshot:
             "workload_bytes": self.workload_bytes,
         }
 
-    def require_unchanged(self) -> None:
-        if read_identity(
-            self.manifest.path, "manifest", MAX_MANIFEST_BYTES
-        )[0] != self.manifest:
+    def require_unchanged(self, *, comprehensive: bool = False) -> None:
+        if not _identity_is_current(
+            self.manifest, "manifest", MAX_MANIFEST_BYTES, comprehensive=comprehensive
+        ):
             raise ValueError("manifest changed after corpus preflight")
         for expected in self.frames:
-            if read_identity(expected.path, "frame", MAX_FRAME_BYTES)[0] != expected:
+            if not _identity_is_current(expected, "frame", MAX_FRAME_BYTES, comprehensive=comprehensive):
                 raise ValueError("frame changed after corpus preflight")
-        if read_identity(
-            self.manifest_snapshot.path,
+        if not _identity_is_current(
+            self.manifest_snapshot,
             "manifest snapshot",
             MAX_MANIFEST_BYTES,
-        )[0] != self.manifest_snapshot:
+            comprehensive=comprehensive,
+        ):
             raise ValueError(
                 "manifest snapshot changed after preflight validation"
             )
         for expected in self.frame_snapshots:
-            if read_identity(
-                expected.path, "frame snapshot", MAX_FRAME_BYTES
-            )[0] != expected:
+            if not _identity_is_current(
+                expected, "frame snapshot", MAX_FRAME_BYTES, comprehensive=comprehensive
+            ):
                 raise ValueError("frame snapshot changed after preflight validation")
 
     def close(self) -> None:
@@ -172,3 +174,15 @@ def _parse_manifest(path: Path, raw: bytes) -> list[Path]:
         )
         for frame in frames
     ]
+
+
+def _identity_is_current(
+    expected: FileIdentity,
+    label: str,
+    limit: int,
+    *,
+    comprehensive: bool,
+) -> bool:
+    if not comprehensive and file_identity_matches(expected):
+        return True
+    return read_identity(expected.path, label, limit)[0] == expected

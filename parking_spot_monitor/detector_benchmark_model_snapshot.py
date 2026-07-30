@@ -9,8 +9,8 @@ from parking_spot_monitor.detector_benchmark_models import (
     MODEL_SUFFIXES,
     ModelIdentity,
     copy_model_to_descriptor,
+    model_identity_matches,
     read_model_identity,
-    require_unchanged_models,
     validate_distinct_model_identities,
 )
 
@@ -22,12 +22,15 @@ class ModelSnapshots:
     paths: dict[str, Path]
     _temporary: tempfile.TemporaryDirectory[str]
 
-    def require_unchanged(self) -> None:
-        require_unchanged_models(self.originals)
-        for backend, expected in self.snapshots.items():
-            if read_model_identity(backend, expected.path) != expected:
+    def require_unchanged(self, *, comprehensive: bool = False) -> None:
+        for collection, kind in ((self.originals, "model"), (self.snapshots, "model snapshot")):
+            for backend, expected in collection.items():
+                if not comprehensive and model_identity_matches(expected):
+                    continue
+                if read_model_identity(backend, expected.path) == expected:
+                    continue
                 raise ValueError(
-                    f"{backend} model snapshot changed after preflight validation"
+                    f"{backend} {kind} changed after preflight validation"
                 )
 
     def close(self) -> None:

@@ -57,6 +57,20 @@ def read_model_identity(backend: str, path: Path) -> ModelIdentity:
     return _read_model(backend, path)
 
 
+def model_identity_matches(expected: ModelIdentity) -> bool:
+    try:
+        current = os.stat(expected.path, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(current.st_mode) and _stable_fields(current) == (
+        expected.device,
+        expected.inode,
+        expected.size_bytes,
+        expected.modified_ns,
+        expected.changed_ns,
+    )
+
+
 def copy_model_to_descriptor(
     backend: str,
     path: Path,
