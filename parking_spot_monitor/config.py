@@ -184,6 +184,19 @@ class DetectionConfig(StrictModel):
         return value
 
 
+def validate_model_path(model: str) -> None:
+    """Fail early for explicit model paths while preserving bare Ultralytics names."""
+    path = Path(model)
+    is_explicit = "/" in model or "\\" in model or re.match(r"^[A-Za-z]:", model) is not None
+    if is_explicit and not path.is_file():
+        raise ConfigError(
+            "configured model file does not exist",
+            path=model,
+            phase="model",
+            fields=("detection.model",),
+        )
+
+
 class OccupancyConfig(StrictModel):
     iou_threshold: float = Field(ge=0, le=1)
     confirm_frames: int = Field(gt=0)

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -23,7 +22,7 @@ from parking_spot_monitor.logging import StructuredLogger, setup_logging
 from parking_spot_monitor.matrix_client import MatrixClient
 from parking_spot_monitor.matrix_snapshots import SnapshotRetentionResult, prune_event_snapshots
 from parking_spot_monitor.capture_loop import run_capture_loop
-from parking_spot_monitor.config import RuntimeSettings, load_settings
+from parking_spot_monitor.config import RuntimeSettings, load_settings, validate_model_path
 from parking_spot_monitor.paths import RuntimePaths, resolve_runtime_paths
 from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as _matrix_outbox_health_payload
 from parking_spot_monitor.runtime_decision_memory import _append_lab_outcome_memory
@@ -259,19 +258,6 @@ def _close_if_available(resource: Any | None) -> None:
 
 def _default_detector_factory(settings: RuntimeSettings) -> UltralyticsVehicleDetector:
     return UltralyticsVehicleDetector(settings.detection.model)
-
-
-def validate_model_path(model: str) -> None:
-    """Fail early for explicit model paths while preserving bare Ultralytics names."""
-    path = Path(model)
-    is_explicit = "/" in model or "\\" in model or re.match(r"^[A-Za-z]:", model) is not None
-    if is_explicit and not path.is_file():
-        raise ConfigError(
-            "configured model file does not exist",
-            path=model,
-            phase="model",
-            fields=("detection.model",),
-        )
 
 
 class _LazyIncidentReplayDetector:
