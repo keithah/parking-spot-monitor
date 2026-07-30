@@ -110,3 +110,24 @@ def test_strict_missing_owner_vehicle_registry_is_empty(tmp_path: Path) -> None:
     registry = load_owner_vehicle_registry(tmp_path / "missing.json", strict=True)
 
     assert dict(registry.vehicles_by_profile_id) == {}
+
+
+def test_strict_owner_registry_translates_deep_json_recursion(tmp_path: Path) -> None:
+    path = tmp_path / "owner-vehicles.json"
+    path.write_text("[" * 10_000 + "]" * 10_000, encoding="utf-8")
+
+    with pytest.raises(OwnerVehicleRegistryError) as raised:
+        load_owner_vehicle_registry(path, strict=True)
+
+    assert raised.value.code == "invalid_json"
+    assert str(raised.value) == "invalid_json"
+    assert "[" not in raised.value.safe_message
+
+
+def test_permissive_owner_registry_returns_empty_for_deep_json_recursion(tmp_path: Path) -> None:
+    path = tmp_path / "owner-vehicles.json"
+    path.write_text("[" * 10_000 + "]" * 10_000, encoding="utf-8")
+
+    registry = load_owner_vehicle_registry(path)
+
+    assert dict(registry.vehicles_by_profile_id) == {}

@@ -515,6 +515,32 @@ def test_runtime_cache_initial_invalid_registry_fails_closed(tmp_path: Path) -> 
         cache.snapshot(FakeArchive())
 
 
+def test_repeated_active_scan_of_initial_invalid_registry_logs_only_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry_path = tmp_path / "owner-vehicles.json"
+    registry_path.write_text("{broken", encoding="utf-8")
+    cache = OwnerVehicleRuntimeCache(registry_path, logger=StructuredLogger())
+    archive = FakeArchive()
+
+    for _ in range(2):
+        alerts = _owner_vehicle_quiet_window_alerts(
+            archive,  # type: ignore[arg-type]
+            quiet_status=QuietWindowStatus(active=True, active_window_id="window-a"),
+            observed_at=datetime(2026, 5, 18, 20, 5, 6, tzinfo=timezone.utc),
+            emitted_alert_ids=set(),
+            configured_spot_ids=("left_spot",),
+            logger=StructuredLogger(),
+            owner_vehicle_snapshot_provider=cache,
+        )
+        assert alerts == []
+
+    output = capsys.readouterr().err
+    assert output.count('"event":"owner-vehicle-registry-invalid"') == 1
+    assert '"event":"owner-vehicle-alert-scan-failed"' not in output
+
+
 def test_runtime_cache_recovers_after_invalid_registry_is_repaired(tmp_path: Path) -> None:
     registry_path = tmp_path / "owner-vehicles.json"
     write_registry(registry_path, "profile-a")

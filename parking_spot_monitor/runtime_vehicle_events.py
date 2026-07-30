@@ -15,7 +15,10 @@ from parking_spot_monitor.matrix_alerts import (
 )
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
 from parking_spot_monitor.runtime_health import safe_error_context as _safe_error_context
-from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleSnapshotProvider
+from parking_spot_monitor.runtime_owner_vehicle_cache import (
+    OwnerVehicleSnapshotProvider,
+    OwnerVehicleSnapshotUnavailableError,
+)
 from parking_spot_monitor.scheduler import QuietWindowStatus
 from parking_spot_monitor.vehicle_history_alert_payloads import (
     likely_vehicle_payload,
@@ -62,6 +65,8 @@ def _owner_vehicle_quiet_window_alerts(
         snapshot = owner_vehicle_snapshot_provider.snapshot(history_archive)
         registry = snapshot.registry
         sessions = snapshot.active_sessions
+    except OwnerVehicleSnapshotUnavailableError:
+        return []
     except Exception as exc:
         logger.warning(
             "owner-vehicle-alert-scan-failed",

@@ -85,7 +85,7 @@ def _load_owner_vehicle_registry(path: Path, *, max_bytes: int) -> OwnerVehicleR
         raise OwnerVehicleRegistryError("too_large", "owner vehicle registry exceeds the configured byte limit")
     try:
         payload = json.loads(encoded.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise OwnerVehicleRegistryError("invalid_json", "owner vehicle registry is not valid UTF-8 JSON") from exc
     try:
         return _registry_from_payload(payload)
