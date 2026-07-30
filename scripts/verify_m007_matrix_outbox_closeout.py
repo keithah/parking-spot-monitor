@@ -22,6 +22,17 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.closeout_helpers import (
+    assert_no_forbidden_markers,
+    bounded_text,
+    redact_text,
+    safe_output,
+    smoke_env,
+)
+
 TIMEOUT_SECONDS = 180
 DOCKER_TIMEOUT_SECONDS = 300
 OUTPUT_LIMIT = 4_000
@@ -623,58 +634,6 @@ def _build_commands(temp_data_dir: Path) -> tuple[SmokeCommand, ...]:
     )
 
 
-def _smoke_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
-    env = dict(os.environ if base is None else base)
-    env["RTSP_URL"] = PLACEHOLDER_RTSP_URL
-    env["MATRIX_ACCESS_TOKEN"] = PLACEHOLDER_MATRIX_TOKEN
-    project_src = str(ROOT / "src")
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = project_src if not existing_pythonpath else f"{project_src}{os.pathsep}{existing_pythonpath}"
-    return env
-
-
-def _redact(text: str) -> str:
-    redacted = text
-    for pattern in SENSITIVE_PATTERNS:
-        if pattern.groups >= 3:
-            redacted = pattern.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", redacted)
-        else:
-            redacted = pattern.sub("<redacted>", redacted)
-    return redacted
-
-
-def _bounded(text: str, *, limit: int = OUTPUT_LIMIT) -> str:
-    if len(text) <= limit:
-        return text
-    marker = f"... <{len(text) - limit} chars omitted> ...\n"
-    tail_limit = max(0, limit - len(marker))
-    return f"{marker}{text[-tail_limit:]}"
-
-
-def _safe_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
-    def decode(value: str | bytes | None) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, bytes):
-            return value.decode("utf-8", errors="replace")
-        return value
-
-    rendered = ""
-    out = decode(stdout)
-    err = decode(stderr)
-    if out:
-        rendered += f"stdout:\n{out}"
-    if err:
-        rendered += f"\nstderr:\n{err}"
-    return _bounded(_redact(rendered.strip()))
-
-
-def _assert_no_forbidden_markers(rendered: str) -> None:
-    for marker in FORBIDDEN_OUTPUT_MARKERS:
-        if marker in rendered:
-            raise RuntimeError(f"redaction failure for marker: {marker}")
-
-
 def _run_command(command: SmokeCommand, *, env: Mapping[str, str]) -> int:
     print(f"{M007_CLOSEOUT_START} {command.label}", flush=True)
     started = time.monotonic()
@@ -691,24 +650,39 @@ def _run_command(command: SmokeCommand, *, env: Mapping[str, str]) -> int:
         )
     except subprocess.TimeoutExpired as exc:
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        rendered = _safe_output(exc.stdout, exc.stderr)
-        _assert_no_forbidden_markers(rendered)
+        rendered = safe_output(
+            exc.stdout,
+            exc.stderr,
+            patterns=SENSITIVE_PATTERNS,
+            limit=OUTPUT_LIMIT,
+        )
+        assert_no_forbidden_markers(rendered, FORBIDDEN_OUTPUT_MARKERS)
         print(f"{M007_CLOSEOUT_FAIL} {command.label} timeout_seconds={command.timeout_seconds} duration_ms={elapsed_ms}", flush=True)
         if rendered:
             print(rendered, flush=True)
         return 124
     except FileNotFoundError as exc:
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        rendered = _safe_output("", str(exc))
-        _assert_no_forbidden_markers(rendered)
+        rendered = safe_output(
+            "",
+            str(exc),
+            patterns=SENSITIVE_PATTERNS,
+            limit=OUTPUT_LIMIT,
+        )
+        assert_no_forbidden_markers(rendered, FORBIDDEN_OUTPUT_MARKERS)
         print(f"{M007_CLOSEOUT_FAIL} {command.label} exit_code=127 duration_ms={elapsed_ms}", flush=True)
         if rendered:
             print(rendered, flush=True)
         return 127
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    rendered = _safe_output(completed.stdout, completed.stderr)
-    _assert_no_forbidden_markers(rendered)
+    rendered = safe_output(
+        completed.stdout,
+        completed.stderr,
+        patterns=SENSITIVE_PATTERNS,
+        limit=OUTPUT_LIMIT,
+    )
+    assert_no_forbidden_markers(rendered, FORBIDDEN_OUTPUT_MARKERS)
     if completed.returncode == 0:
         print(f"{M007_CLOSEOUT_PASS} {command.label} duration_ms={elapsed_ms}", flush=True)
         if rendered:
@@ -726,7 +700,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("usage: verify_m007_matrix_outbox_closeout.py", file=sys.stderr)
         return 2
 
-    env = _smoke_env()
+    env = smoke_env(
+        rtsp_placeholder=PLACEHOLDER_RTSP_URL,
+        matrix_token_placeholder=PLACEHOLDER_MATRIX_TOKEN,
+        base=None,
+        pythonpath_prefix=str(ROOT / "src"),
+    )
     with tempfile.TemporaryDirectory(prefix="m007-outbox-smoke-data-") as temp_dir:
         for command in _build_commands(Path(temp_dir)):
             exit_code = _run_command(command, env=env)

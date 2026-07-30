@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import yaml
-from PIL import Image, UnidentifiedImageError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -22,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from parking_spot_monitor.logging import redact_diagnostic_text
 from scripts.hardware_decode_evidence import collect_hardware_decode_summary
 from scripts.matrix_readback import fetch_matrix_room_messages
+from scripts.verification_helpers import jpeg_check
 
 CONFIG_PATH = Path("config.yaml")
 DATA_DIR = Path("data")
@@ -366,26 +366,8 @@ def _duplicate_counts(values: Sequence[str]) -> dict[str, int]:
 
 def _artifact_summary(data_dir: Path) -> dict[str, Any]:
     snapshots = sorted((data_dir / "snapshots").glob("occupancy-open-event-*.jpg"))
-    snapshot_checks = [_jpeg_check(path) for path in snapshots[:100]]
-    return {"latest_jpeg": _jpeg_check(data_dir / "latest.jpg"), "event_snapshot_jpegs": {"count": len(snapshots), "summarized_count": len(snapshot_checks), "valid_count": sum(1 for item in snapshot_checks if item.get("valid_jpeg") is True), "files": snapshot_checks}}
-
-
-def _jpeg_check(path: Path) -> dict[str, Any]:
-    exists = path.is_file()
-    byte_size = path.stat().st_size if exists else 0
-    check: dict[str, Any] = {"path": str(path), "exists": exists, "byte_size": byte_size, "valid_jpeg": False}
-    if not exists:
-        check["error_type"] = "missing"
-        return check
-    try:
-        with Image.open(path) as image:
-            check["format"] = image.format
-            check["width"], check["height"] = image.size
-            image.verify()
-        check["valid_jpeg"] = check.get("format") == "JPEG"
-    except (OSError, UnidentifiedImageError) as exc:
-        check["error_type"] = type(exc).__name__
-    return check
+    snapshot_checks = [jpeg_check(path) for path in snapshots[:100]]
+    return {"latest_jpeg": jpeg_check(data_dir / "latest.jpg"), "event_snapshot_jpegs": {"count": len(snapshots), "summarized_count": len(snapshot_checks), "valid_count": sum(1 for item in snapshot_checks if item.get("valid_jpeg") is True), "files": snapshot_checks}}
 
 
 def _json_artifact_summary(path: Path) -> dict[str, Any]:

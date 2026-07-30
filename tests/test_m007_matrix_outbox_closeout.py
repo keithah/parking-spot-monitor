@@ -47,17 +47,29 @@ def test_m007_closeout_contract_is_bounded_redacted_and_no_shell() -> None:
     assert module.M007_OUTBOX_QUARANTINE_OK == "M007_OUTBOX_QUARANTINE_OK"
     assert module.M007_OUTBOX_RETENTION_OK == "M007_OUTBOX_RETENTION_OK"
 
-    env = module._smoke_env({})
+    env = module.smoke_env(
+        rtsp_placeholder=module.PLACEHOLDER_RTSP_URL,
+        matrix_token_placeholder=module.PLACEHOLDER_MATRIX_TOKEN,
+        base={},
+        pythonpath_prefix=str(module.ROOT / "src"),
+    )
     assert env["RTSP_URL"] == module.PLACEHOLDER_RTSP_URL
     assert env["MATRIX_ACCESS_TOKEN"] == module.PLACEHOLDER_MATRIX_TOKEN
     assert env["PYTHONPATH"] == str(module.ROOT / "src")
 
-    env_with_existing_path = module._smoke_env({"PYTHONPATH": "/already-there"})
+    env_with_existing_path = module.smoke_env(
+        rtsp_placeholder=module.PLACEHOLDER_RTSP_URL,
+        matrix_token_placeholder=module.PLACEHOLDER_MATRIX_TOKEN,
+        base={"PYTHONPATH": "/already-there"},
+        pythonpath_prefix=str(module.ROOT / "src"),
+    )
     assert env_with_existing_path["PYTHONPATH"] == f"{module.ROOT / 'src'}{os.pathsep}/already-there"
 
-    redacted = module._safe_output(
+    redacted = module.safe_output(
         "rtsp://camera.local/stream MATRIX_ACCESS_TOKEN=matrix-secret Authorization: bearer-secret",
         f"{module.PLACEHOLDER_RTSP_URL} {module.PLACEHOLDER_MATRIX_TOKEN} Traceback (most recent call last)",
+        patterns=module.SENSITIVE_PATTERNS,
+        limit=module.OUTPUT_LIMIT,
     )
     assert module.PLACEHOLDER_RTSP_URL not in redacted
     assert module.PLACEHOLDER_MATRIX_TOKEN not in redacted
@@ -67,7 +79,7 @@ def test_m007_closeout_contract_is_bounded_redacted_and_no_shell() -> None:
     assert "Traceback (most recent call last)" not in redacted
 
     oversized = "x" * (module.OUTPUT_LIMIT + 25)
-    bounded = module._bounded(oversized)
+    bounded = module.bounded_text(oversized, limit=module.OUTPUT_LIMIT)
     assert len(bounded) < len(oversized)
     assert "chars omitted" in bounded
 
@@ -144,7 +156,12 @@ def test_m007_in_container_smoke_snippets_assert_failure_health_and_recovery_con
     assert "write_health_status" in failure
     assert "M007_OUTBOX_FAILURE_OK" in failure
     assert "M007_OUTBOX_HEALTH_OK" in failure
-    assert "should-not-leak" not in module._safe_output(failure, "")
+    assert "should-not-leak" not in module.safe_output(
+        failure,
+        "",
+        patterns=module.SENSITIVE_PATTERNS,
+        limit=module.OUTPUT_LIMIT,
+    )
 
     assert "drain_outbox" in recovery
     assert "assert [call['kind'] for call in client.calls] == ['upload', 'image']" in recovery
@@ -157,8 +174,14 @@ def test_m007_in_container_smoke_snippets_assert_failure_health_and_recovery_con
     assert ".matrix-outbox-quarantine" in quarantine
     assert "quarantined_count'] == 1" in quarantine
     assert "M007_OUTBOX_QUARANTINE_OK" in quarantine
-    assert "quarantine-secret" not in module._safe_output(quarantine, "")
-    assert "BEGIN RAW IMAGE BYTES" not in module._safe_output(quarantine, "")
+    quarantine_output = module.safe_output(
+        quarantine,
+        "",
+        patterns=module.SENSITIVE_PATTERNS,
+        limit=module.OUTPUT_LIMIT,
+    )
+    assert "quarantine-secret" not in quarantine_output
+    assert "BEGIN RAW IMAGE BYTES" not in quarantine_output
 
     assert "MatrixError('Matrix upload rejected'" in dead_letter
     assert "status_code=403" in dead_letter
@@ -176,6 +199,81 @@ def test_m007_in_container_smoke_snippets_assert_failure_health_and_recovery_con
     assert "assert recovery.upload_bytes == original_retained_bytes" in retention
     assert "assert not stale.exists()" in retention
     assert "M007_OUTBOX_RETENTION_OK" in retention
+
+
+def test_m007_run_command_binds_canonical_output_policy(monkeypatch, capsys) -> None:
+    module = _load_closeout_script_module()
+    calls: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="raw stdout",
+            stderr="raw stderr",
+        ),
+    )
+
+    def fake_safe_output(stdout, stderr, *, patterns, limit):
+        calls.append(("safe_output", stdout, stderr, patterns, limit))
+        return "safe rendered output"
+
+    def fake_assert_no_forbidden_markers(rendered, forbidden_markers):
+        calls.append(("assert_no_forbidden_markers", rendered, forbidden_markers))
+
+    monkeypatch.setattr(module, "safe_output", fake_safe_output)
+    monkeypatch.setattr(
+        module,
+        "assert_no_forbidden_markers",
+        fake_assert_no_forbidden_markers,
+    )
+
+    result = module._run_command(
+        module.SmokeCommand(label="delegated", argv=("command",)),
+        env={},
+    )
+
+    assert result == 0
+    assert calls == [
+        (
+            "safe_output",
+            "raw stdout",
+            "raw stderr",
+            module.SENSITIVE_PATTERNS,
+            module.OUTPUT_LIMIT,
+        ),
+        (
+            "assert_no_forbidden_markers",
+            "safe rendered output",
+            module.FORBIDDEN_OUTPUT_MARKERS,
+        ),
+    ]
+    assert "safe rendered output" in capsys.readouterr().out
+
+
+def test_m007_main_binds_canonical_smoke_environment(monkeypatch) -> None:
+    module = _load_closeout_script_module()
+    calls: list[dict[str, object]] = []
+
+    def fake_smoke_env(**kwargs):
+        calls.append(kwargs)
+        return {"SAFE": "environment"}
+
+    monkeypatch.setattr(module, "smoke_env", fake_smoke_env)
+    monkeypatch.setattr(module, "_build_commands", lambda _data_dir: [])
+
+    result = module.main([])
+
+    assert result == 0
+    assert calls == [
+        {
+            "rtsp_placeholder": module.PLACEHOLDER_RTSP_URL,
+            "matrix_token_placeholder": module.PLACEHOLDER_MATRIX_TOKEN,
+            "base": None,
+            "pythonpath_prefix": str(module.ROOT / "src"),
+        }
+    ]
 
 
 def test_m007_run_command_reports_redacted_failure_without_raising(monkeypatch, capsys) -> None:

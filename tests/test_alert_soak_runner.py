@@ -44,6 +44,27 @@ def read_result(data_dir: Path) -> dict[str, Any]:
     return json.loads((data_dir / "alert-soak-result.json").read_text(encoding="utf-8"))
 
 
+def test_artifact_summary_delegates_to_shared_jpeg_check(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    snapshot = data_dir / "snapshots" / "occupancy-open-event-example.jpg"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_bytes(b"delegated")
+    calls: list[Path] = []
+
+    def fake_jpeg_check(path: Path) -> dict[str, Any]:
+        calls.append(path)
+        return {"path": str(path), "valid_jpeg": True}
+
+    monkeypatch.setattr(runner, "jpeg_check", fake_jpeg_check)
+
+    result = runner._artifact_summary(data_dir)
+
+    assert calls == [snapshot, data_dir / "latest.jpg"]
+    assert result["event_snapshot_jpegs"]["valid_count"] == 1
+
+
 def alert_lines(*, duplicate_txn: bool = False, include_live_proof_marker: bool = False) -> str:
     txn = EVENT_ID
     lines = [

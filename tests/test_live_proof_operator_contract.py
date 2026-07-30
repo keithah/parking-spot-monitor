@@ -47,6 +47,27 @@ def read_result(data_dir: Path) -> dict[str, Any]:
     return json.loads((data_dir / "live-proof-result.json").read_text(encoding="utf-8"))
 
 
+def test_artifact_checks_delegate_to_shared_jpeg_check(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    snapshot = data_dir / "snapshots" / "live-proof-example.jpg"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_bytes(b"delegated")
+    calls: list[Path] = []
+
+    def fake_jpeg_check(path: Path) -> dict[str, Any]:
+        calls.append(path)
+        return {"path": str(path), "valid_jpeg": True}
+
+    monkeypatch.setattr(runner, "jpeg_check", fake_jpeg_check)
+
+    result = runner._check_artifacts(data_dir)
+
+    assert calls == [snapshot, data_dir / "latest.jpg"]
+    assert result["snapshot_jpegs"]["valid_count"] == 1
+
+
 def test_preflight_missing_inputs_writes_names_only_and_does_not_run_docker(tmp_path: Path) -> None:
     calls: list[list[str]] = []
 

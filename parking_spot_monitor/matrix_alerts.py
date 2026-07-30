@@ -218,11 +218,6 @@ def _plural(word: str, count: int) -> str:
     return word if count == 1 else f"{word}s"
 
 
-def _occupied_snapshot_body(*, spot_id: str, observed_at: object) -> str:
-    return f"Raw occupied full-frame snapshot for {redact_diagnostic_text(spot_id)} at {display_observed_at(observed_at)}"
-
-
-
 def owner_vehicle_quiet_window_event_id(event: Mapping[str, Any]) -> str:
     spot_id = _require_non_empty("spot_id", redact_diagnostic_text(event.get("spot_id", "")))
     profile_id = _safe_text(event.get("profile_id"), default="unknown")

@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -51,25 +50,6 @@ def skip_markers(*, config_path: Path = CONFIG_PATH, environ: Mapping[str, str] 
     if not source_environ.get("MATRIX_ACCESS_TOKEN"):
         markers.append(SKIPPED_MATRIX_ENV_ABSENT)
     return markers
-
-
-def run_live_proof_command(*, config_path: Path = CONFIG_PATH, data_dir: Path = DATA_DIR) -> subprocess.CompletedProcess[str]:
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "parking_spot_monitor",
-            "--config",
-            str(config_path),
-            "--data-dir",
-            str(data_dir),
-            "--live-proof-once",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
 
 
 def build_parser() -> argparse.ArgumentParser:

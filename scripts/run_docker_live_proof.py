@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from PIL import Image, UnidentifiedImageError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -21,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from parking_spot_monitor.logging import redact_diagnostic_text
 from scripts.hardware_decode_evidence import collect_hardware_decode_summary
 from scripts.matrix_readback import fetch_matrix_room_messages
+from scripts.verification_helpers import jpeg_check
 
 CONFIG_PATH = Path("config.yaml")
 DATA_DIR = Path("data")
@@ -401,33 +401,15 @@ def _check_markers(output: str) -> dict[str, Any]:
 def _check_artifacts(data_dir: Path) -> dict[str, Any]:
     latest_path = data_dir / "latest.jpg"
     snapshots = sorted((data_dir / "snapshots").glob("live-proof-*.jpg"))
-    snapshot_results = [_jpeg_check(path) for path in snapshots]
+    snapshot_results = [jpeg_check(path) for path in snapshots]
     return {
-        "latest_jpeg": _jpeg_check(latest_path),
+        "latest_jpeg": jpeg_check(latest_path),
         "snapshot_jpegs": {
             "count": len(snapshot_results),
             "valid_count": sum(1 for item in snapshot_results if item["valid_jpeg"]),
             "files": snapshot_results,
         },
     }
-
-
-def _jpeg_check(path: Path) -> dict[str, Any]:
-    exists = path.is_file()
-    byte_size = path.stat().st_size if exists else 0
-    check: dict[str, Any] = {"path": str(path), "exists": exists, "byte_size": byte_size, "valid_jpeg": False}
-    if not exists:
-        check["error_type"] = "missing"
-        return check
-    try:
-        with Image.open(path) as image:
-            check["format"] = image.format
-            check["width"], check["height"] = image.size
-            image.verify()
-        check["valid_jpeg"] = check.get("format") == "JPEG"
-    except (OSError, UnidentifiedImageError) as exc:
-        check["error_type"] = type(exc).__name__
-    return check
 
 
 def _read_matrix_config(config_path: Path) -> dict[str, str | float | None]:

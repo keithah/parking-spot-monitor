@@ -4,14 +4,45 @@ import os
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from scripts.closeout_helpers import bounded_text, smoke_env
 from scripts.matrix_readback import fetch_matrix_room_messages
-from scripts.verification_helpers import load_result_json
+from scripts.verification_helpers import jpeg_check, load_result_json
 
 
 class VerificationError(RuntimeError):
     pass
+
+
+def test_jpeg_check_reports_valid_missing_and_corrupt(tmp_path: Path) -> None:
+    valid = tmp_path / "valid.jpg"
+    Image.new("RGB", (8, 6)).save(valid, "JPEG")
+    corrupt = tmp_path / "corrupt.jpg"
+    corrupt.write_bytes(b"bad")
+
+    assert jpeg_check(valid) == {
+        "path": str(valid),
+        "exists": True,
+        "byte_size": valid.stat().st_size,
+        "valid_jpeg": True,
+        "format": "JPEG",
+        "width": 8,
+        "height": 6,
+    }
+    assert jpeg_check(tmp_path / "missing.jpg") == {
+        "path": str(tmp_path / "missing.jpg"),
+        "exists": False,
+        "byte_size": 0,
+        "valid_jpeg": False,
+        "error_type": "missing",
+    }
+    corrupt_result = jpeg_check(corrupt)
+    assert corrupt_result["path"] == str(corrupt)
+    assert corrupt_result["exists"] is True
+    assert corrupt_result["byte_size"] == 3
+    assert corrupt_result["valid_jpeg"] is False
+    assert corrupt_result["error_type"] == "UnidentifiedImageError"
 
 
 def test_smoke_env_uses_safe_default_environment(monkeypatch: pytest.MonkeyPatch) -> None:
