@@ -24,6 +24,11 @@ class ModelSnapshots:
 
     def require_unchanged(self) -> None:
         require_unchanged_models(self.originals)
+        for backend, expected in self.snapshots.items():
+            if read_model_identity(backend, expected.path) != expected:
+                raise ValueError(
+                    f"{backend} model snapshot changed after preflight validation"
+                )
 
     def close(self) -> None:
         self._temporary.cleanup()

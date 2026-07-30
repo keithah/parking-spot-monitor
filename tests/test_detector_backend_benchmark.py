@@ -56,6 +56,7 @@ def _run_fake_benchmark(
     late_backend: str | None = None,
     restore_model_bytes: bool = False,
     fifo_input: str | None = None,
+    mutate_private_snapshot: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
     fake_modules = tmp_path / "fake-modules"
     fake_modules.mkdir()
@@ -91,12 +92,24 @@ class YOLO:
             "path": str(model_path),
             "bytes": Path(model_path).read_bytes().hex(),
         }))
+        if self.backend == "pt" and self.evidence.get("mutate_private_snapshot") in {"own-model", "sibling-model"}:
+            target = Path(model_path)
+            if self.evidence["mutate_private_snapshot"] == "sibling-model":
+                target = target.with_name("onnx.onnx")
+            original = target.read_bytes()
+            target.chmod(0o600)
+            target.write_bytes(b"s" * len(original))
         if self.backend == "torchscript" and self.evidence.get("swap_output_to"):
             output = Path(self.evidence["output_path"])
             output.unlink(missing_ok=True)
             os.link(self.evidence["swap_output_to"], output)
 
     def predict(self, *, source, verbose=False):
+        if self.backend == "pt" and self.evidence.get("mutate_private_snapshot") == "frame":
+            target = Path(source)
+            original = target.read_bytes()
+            target.chmod(0o600)
+            target.write_bytes(b"f" * len(original))
         if self.backend == self.evidence.get("partial_stall_backend"):
             Path(os.environ["PARKING_BENCHMARK_EVIDENCE_PATH"]).write_text('{"backend":')
             time.sleep(5)
@@ -215,6 +228,7 @@ class YOLO:
                 "partial_stall_backend": partial_stall_backend,
                 "late_backend": late_backend,
                 "restore_model_bytes": restore_model_bytes,
+                "mutate_private_snapshot": mutate_private_snapshot,
             }
         ),
         encoding="utf-8",
@@ -619,6 +633,29 @@ def test_backend_benchmark_snapshots_models_and_rejects_transient_restore(
 
 
 @pytest.mark.parametrize(
+    "snapshot_target",
+    ["own-model", "sibling-model", "frame"],
+)
+def test_backend_benchmark_rejects_any_private_snapshot_mutation(
+    tmp_path: Path,
+    snapshot_target: str,
+) -> None:
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        mutate_private_snapshot=snapshot_target,
+    )
+
+    assert result.returncode == 2
+    assert "snapshot changed after preflight validation" in result.stderr
+    assert report == {}
+    assert (tmp_path / "started-pt").is_file()
+    assert not (tmp_path / "started-onnx").exists()
+    assert not (tmp_path / "report.json").exists()
+    assert list((tmp_path / "benchmark-temp").iterdir()) == []
+
+
+@pytest.mark.parametrize(
     "unsafe_output",
     ["symlink", "directory", "parent-symlink", "lexical-alias"],
 )
@@ -657,6 +694,14 @@ def test_backend_benchmark_records_bound_ordered_corpus_provenance(
     assert all(
         len(digest) == 64
         for digest in report["corpus"]["ordered_frame_sha256"]
+    )
+    assert (
+        report["corpus"]["manifest_snapshot_sha256"]
+        == report["corpus"]["manifest_sha256"]
+    )
+    assert (
+        report["corpus"]["ordered_frame_snapshot_sha256"]
+        == report["corpus"]["ordered_frame_sha256"]
     )
     assert len(report["corpus"]["corpus_sha256"]) == 64
 

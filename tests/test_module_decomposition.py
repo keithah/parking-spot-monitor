@@ -178,6 +178,7 @@ def test_detector_benchmark_is_decomposed_into_bounded_modules() -> None:
     caps = {
         "scripts/benchmark_detector_backends.py": 240,
         "parking_spot_monitor/detector_benchmark_corpus.py": 230,
+        "parking_spot_monitor/detector_benchmark_corpus_files.py": 150,
         "parking_spot_monitor/detector_benchmark_evidence.py": 240,
         "parking_spot_monitor/detector_benchmark_models.py": 160,
         "parking_spot_monitor/detector_benchmark_model_snapshot.py": 100,
