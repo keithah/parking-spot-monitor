@@ -372,13 +372,11 @@ class MatrixOutboxDelivery:
         max_records: int | None,
     ) -> MatrixOutboxDrainResult:
 
-        records = [
-            record
-            for record in self.outbox.list_records()
-            if record.state in {"pending", "retrying"} and (record_id is None or record.id == record_id)
-        ]
-        if max_records is not None:
-            records = records[: max(0, int(max_records))]
+        records = self.outbox.due_records(
+            self._utc_now(),
+            record_id=record_id,
+            max_records=max_records,
+        )
         self._log(
             "info" if records else "debug",
             "matrix-outbox-drain-started",

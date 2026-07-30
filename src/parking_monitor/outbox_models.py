@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from math import isfinite
+from numbers import Real
 import re
 from typing import Any, Literal
 
@@ -92,12 +93,12 @@ class OutboxRetryPolicy:
 
     def __post_init__(self) -> None:
         values = (self.initial_seconds, self.max_seconds, self.jitter_ratio)
-        if not all(isfinite(value) for value in values):
-            raise ValueError("retry policy values must be finite")
-        if self.initial_seconds <= 0:
-            raise ValueError("initial_seconds must be positive")
-        if self.max_seconds <= 0:
-            raise ValueError("max_seconds must be positive")
+        if any(isinstance(value, bool) or not isinstance(value, Real) or not isfinite(value) for value in values):
+            raise ValueError("retry policy values must be finite real numbers")
+        if self.initial_seconds <= 0 or self.max_seconds <= 0:
+            raise ValueError("retry intervals must be positive")
+        if self.max_seconds < self.initial_seconds:
+            raise ValueError("max_seconds must cover initial_seconds")
         if not 0 <= self.jitter_ratio <= 1:
             raise ValueError("jitter_ratio must be between 0 and 1")
 
@@ -105,10 +106,9 @@ class OutboxRetryPolicy:
         _validate_retry_count(attempt_count)
         if attempt_count < 1:
             raise ValueError("attempt_count must be positive")
-        if not isfinite(random_unit) or not 0 <= random_unit <= 1:
+        if isinstance(random_unit, bool) or not isinstance(random_unit, Real) or not isfinite(random_unit) or not 0 <= random_unit <= 1:
             raise ValueError("random_unit must be finite and between 0 and 1")
-        exponent = min(attempt_count - 1, 1023)
-        base = min(self.initial_seconds * (2.0**exponent), self.max_seconds)
+        base = min(self.initial_seconds * (2.0 ** min(attempt_count - 1, 1023)), self.max_seconds)
         return min(base * (1 + self.jitter_ratio * random_unit), self.max_seconds)
 
 
@@ -347,6 +347,23 @@ def status_item(record: OutboxRecord) -> dict[str, JsonValue]:
         "updated_at": record.updated_at,
     }
 
+
+def require_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+        raise ValueError("now must be UTC")
+    return value.astimezone(timezone.utc)
+
+def is_record_due(record: OutboxRecord, now: datetime) -> bool:
+    if record.state == "pending" or (record.state == "retrying" and record.retry_due_at is None):
+        return True
+    due = parse_utc_timestamp(record.retry_due_at or "")
+    return record.state == "retrying" and due is not None and due <= now
+
+def due_record_sort_key(record: OutboxRecord) -> tuple[int, datetime, str, str]:
+    immediate = datetime.min.replace(tzinfo=timezone.utc)
+    rank = 0 if record.state == "pending" else 1 if record.retry_due_at is None else 2
+    due_at = parse_utc_timestamp(record.retry_due_at or "") if rank == 2 else immediate
+    return (rank, due_at or immediate, record.created_at, record.id)
 
 def require_mapping(value: Any, _path: str) -> dict[str, Any]:
     if not isinstance(value, dict):

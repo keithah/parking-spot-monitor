@@ -23,6 +23,7 @@ from parking_spot_monitor.matrix_client import MatrixClient
 
 ROOM_ID = "!parking-room:example.org"
 EVENT_ID = "occupancy-open-event:left_spot:2026-05-18T20:01:02Z"
+RETRY_DUE_NOW = datetime(2100, 1, 1, tzinfo=timezone.utc)
 
 
 def write_jpeg(path: Path, *, size: tuple[int, int] = (8, 6), color: tuple[int, int, int] = (25, 50, 75)) -> bytes:
@@ -168,6 +169,60 @@ def test_retry_failure_persists_per_record_exponential_schedule_across_restart(
     [second] = LocalOutbox(path).list_records()
     assert second.retry_attempt_count == 2
     assert second.retry_due_at == "2026-07-30T12:03:00Z"
+
+
+def test_public_drain_does_not_bypass_persisted_retry_due_even_by_id(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
+    client = FakeMatrixClient()
+    delivery = MatrixOutboxDelivery(
+        client=client,
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(tmp_path / "matrix-outbox.json"),
+        utc_now=lambda: now,
+    )
+    record = delivery.enqueue_text_notice(
+        "quiet-window-started",
+        {"event_type": "quiet-window-started", "event_id": "future-retry", "window_id": "w"},
+    )
+    delivery.outbox.mark_retrying(
+        record.id,
+        reason="timeout",
+        retry_due_at="2026-07-30T13:00:00Z",
+        retry_attempt_count=1,
+    )
+
+    all_result = delivery.drain_outbox()
+    id_result = delivery.drain_outbox(record_id=record.id)
+
+    assert all_result.attempted_count == 0
+    assert id_result.attempted_count == 0
+    assert client.calls == []
+
+
+def test_duplicate_send_does_not_bypass_existing_record_retry_due(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    client = FakeMatrixClient(fail={"upload": MatrixError("timeout", error_type="timeout")})
+    delivery = MatrixOutboxDelivery(
+        client=client,
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(tmp_path / "matrix-outbox.json"),
+        utc_now=lambda: datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc),
+        random_unit=lambda: 0,
+    )
+    first = delivery.send_open_spot_alert(open_event(source))
+    assert first.retrying_count == 1
+    client.fail.clear()
+    client.calls.clear()
+
+    duplicate = delivery.send_open_spot_alert(open_event(source))
+
+    assert duplicate.attempted_count == 0
+    assert client.calls == []
 
 
 def test_delivery_publishes_once_per_durable_phase_outcome(
@@ -446,7 +501,7 @@ def test_retryable_failure_waits_before_worker_retries(tmp_path: Path) -> None:
     )
     delivery = make_delivery(tmp_path, client)
     try:
-        delivery.start_worker(retry_interval_seconds=3_600)
+        delivery.start_worker(retry_interval_seconds=600)
         delivery.enqueue_open_spot_alert(open_event(source))
         assert first_attempt.wait(2), "worker did not make its first Matrix attempt"
         assert not threading.Event().wait(0.1)
@@ -1015,6 +1070,7 @@ def test_text_retry_uploads_retained_event_snapshot_not_changed_latest(tmp_path:
         data_dir=tmp_path,
         snapshots_dir=tmp_path / "snapshots",
         outbox=LocalOutbox(store_path),
+        utc_now=lambda: RETRY_DUE_NOW,
     )
 
     result = restarted.drain_outbox()
@@ -1070,7 +1126,7 @@ def test_drain_outbox_respects_max_records_budget(tmp_path: Path) -> None:
     assert result.delivered_count == 1
     assert [call["kind"] for call in drain_client.calls] == ["text", "upload", "image"]
     records = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
-    assert [record.state for record in records] == ["delivered", "pending"]
+    assert sorted(record.state for record in records) == ["delivered", "pending"]
 
 
 def test_snapshot_retention_preserves_retryable_outbox_evidence_while_pruning_unprotected(tmp_path: Path) -> None:
@@ -1125,6 +1181,7 @@ def test_upload_failure_leaves_upload_pending_across_restart(tmp_path: Path) -> 
         data_dir=tmp_path,
         snapshots_dir=tmp_path / "snapshots",
         outbox=LocalOutbox(store_path),
+        utc_now=lambda: RETRY_DUE_NOW,
     )
 
     result = restarted.drain_outbox()
@@ -1161,6 +1218,7 @@ def test_image_failure_after_upload_stores_content_uri_and_restart_does_not_reup
         data_dir=tmp_path,
         snapshots_dir=tmp_path / "snapshots",
         outbox=LocalOutbox(store_path),
+        utc_now=lambda: RETRY_DUE_NOW,
     )
 
     result = restarted.drain_outbox()
@@ -1327,6 +1385,7 @@ def test_malformed_persisted_upload_result_dead_letters_image_phase_safely(tmp_p
         data_dir=tmp_path,
         snapshots_dir=tmp_path / "snapshots",
         outbox=LocalOutbox(store_path),
+        utc_now=lambda: RETRY_DUE_NOW,
     )
 
     result = restarted.drain_outbox()
@@ -1356,6 +1415,7 @@ def test_missing_retained_snapshot_evidence_dead_letters_upload_without_raw_path
         snapshots_dir=tmp_path / "snapshots",
         outbox=LocalOutbox(store_path),
         logger=StructuredLogger(stream=stream),
+        utc_now=lambda: RETRY_DUE_NOW,
     )
 
     result = restarted.drain_outbox()

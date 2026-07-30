@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -35,8 +35,11 @@ from parking_monitor.outbox_models import (
     TERMINAL_STATES,
     VALID_PHASES,
     VALID_PHASE_STATES,
+    due_record_sort_key,
     format_utc_timestamp,
+    is_record_due,
     parse_utc_timestamp,
+    require_utc_datetime,
     safe_reason_code,
     sanitize_phase_result,
     status_item,
@@ -131,10 +134,25 @@ class LocalOutbox:
         return self.list_records("pending")
 
     def next_due_record(self, now: datetime) -> OutboxRecord | None:
-        now_utc = _require_utc_datetime(now)
+        records = self.due_records(now, max_records=1)
+        return records[0] if records else None
+
+    def due_records(
+        self,
+        now: datetime,
+        *,
+        record_id: str | None = None,
+        max_records: int | None = None,
+    ) -> list[OutboxRecord]:
+        now_utc = require_utc_datetime(now)
         with self._lock:
-            eligible = [record for record in self._records if _is_due(record, now_utc)]
-            return min(eligible, key=_due_sort_key, default=None)
+            eligible = [
+                record
+                for record in self._records
+                if is_record_due(record, now_utc) and (record_id is None or record.id == record_id)
+            ]
+            eligible.sort(key=due_record_sort_key)
+            return eligible if max_records is None else eligible[: max(0, int(max_records))]
 
     def next_retry_due_at(self) -> datetime | None:
         with self._lock:
@@ -426,23 +444,3 @@ def derive_matrix_transaction_id(intent: AlertIntent) -> str:
 def _stable_digest(intent: AlertIntent) -> str:
     stable = json.dumps(intent.sanitized().to_json(), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(stable.encode("utf-8")).hexdigest()
-
-
-def _require_utc_datetime(value: datetime) -> datetime:
-    if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
-        raise ValueError("now must be UTC")
-    return value.astimezone(timezone.utc)
-
-
-def _is_due(record: OutboxRecord, now: datetime) -> bool:
-    if record.state == "pending":
-        return True
-    if record.state != "retrying" or record.retry_due_at is None:
-        return record.state == "retrying"
-    due = parse_utc_timestamp(record.retry_due_at)
-    return due is not None and due <= now
-
-
-def _due_sort_key(record: OutboxRecord) -> tuple[datetime, str, str]:
-    immediate = datetime.min.replace(tzinfo=timezone.utc)
-    return (parse_utc_timestamp(record.retry_due_at or "") or immediate, record.created_at, record.id)

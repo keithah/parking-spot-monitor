@@ -75,6 +75,27 @@ def test_next_due_record_selects_pending_then_earliest_eligible_retry(tmp_path: 
     assert outbox.next_due_record(datetime(2026, 7, 30, 12, 6, tzinfo=timezone.utc)).id == second.id
 
 
+def test_due_records_rank_pending_before_legacy_and_scheduled_retries(tmp_path: Path) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    legacy_one = outbox.enqueue(AlertIntent(event_id="legacy-one", phase="text", body="body"))
+    legacy_two = outbox.enqueue(AlertIntent(event_id="legacy-two", phase="text", body="body"))
+    scheduled = outbox.enqueue(AlertIntent(event_id="scheduled", phase="text", body="body"))
+    pending = outbox.enqueue(AlertIntent(event_id="new-pending", phase="text", body="body"))
+    outbox.mark_retrying(legacy_one.id, reason="timeout")
+    outbox.mark_retrying(legacy_two.id, reason="timeout")
+    outbox.mark_retrying(
+        scheduled.id,
+        reason="timeout",
+        retry_due_at="2026-07-30T11:00:00Z",
+        retry_attempt_count=1,
+    )
+
+    due = outbox.due_records(datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc))
+
+    legacy_ids = [record.id for record in sorted((legacy_one, legacy_two), key=lambda item: (item.created_at, item.id))]
+    assert [record.id for record in due] == [pending.id, *legacy_ids, scheduled.id]
+
+
 def test_retry_policy_caps_exponential_delay_and_validates_randomness() -> None:
     policy = OutboxRetryPolicy(initial_seconds=60, max_seconds=900, jitter_ratio=0.2)
 
@@ -83,6 +104,36 @@ def test_retry_policy_caps_exponential_delay_and_validates_randomness() -> None:
     assert policy.delay_seconds(99, random_unit=1) == 900
     with pytest.raises(ValueError, match="random_unit"):
         policy.delay_seconds(1, random_unit=float("nan"))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"initial_seconds": True, "max_seconds": 900, "jitter_ratio": 0.2},
+        {"initial_seconds": 60, "max_seconds": False, "jitter_ratio": 0.2},
+        {"initial_seconds": 60, "max_seconds": 900, "jitter_ratio": True},
+        {"initial_seconds": "60", "max_seconds": 900, "jitter_ratio": 0.2},
+        {"initial_seconds": 60, "max_seconds": 900j, "jitter_ratio": 0.2},
+        {"initial_seconds": 60, "max_seconds": 900, "jitter_ratio": None},
+        {"initial_seconds": 60, "max_seconds": 30, "jitter_ratio": 0.2},
+    ],
+)
+def test_retry_policy_rejects_non_real_booleans_and_smaller_maximum(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        OutboxRetryPolicy(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("random_unit", [True, "0.5", 0.5j, None])
+def test_retry_policy_delay_rejects_boolean_and_non_real_randomness(random_unit: object) -> None:
+    policy = OutboxRetryPolicy(initial_seconds=60, max_seconds=900, jitter_ratio=0.2)
+    with pytest.raises(ValueError):
+        policy.delay_seconds(1, random_unit=random_unit)  # type: ignore[arg-type]
+
+
+def test_retry_policy_delay_rejects_boolean_attempt_count() -> None:
+    policy = OutboxRetryPolicy(initial_seconds=60, max_seconds=900, jitter_ratio=0.2)
+    with pytest.raises(ValueError):
+        policy.delay_seconds(True, random_unit=0.5)
 
 
 def test_apply_phase_result_requires_one_outcome_and_publishes_once(tmp_path: Path, monkeypatch) -> None:
