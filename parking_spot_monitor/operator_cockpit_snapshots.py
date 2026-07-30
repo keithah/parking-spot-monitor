@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import stat as stat_module
 import tempfile
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -44,6 +46,7 @@ _WHO_SNAPSHOT_OPERATIONAL_ERRORS = (
     Image.DecompressionBombError,
     Image.DecompressionBombWarning,
 )
+_WHO_SNAPSHOT_DEFAULT_MODE = 0o644
 
 
 def build_latest_snapshot_response(
@@ -109,11 +112,16 @@ def build_who_snapshot_response(
     try:
         capture = capture_func(settings, Path(data_dir), logger=logger)
         latest_path = Path(capture.latest_path)
-        snapshot = _prepare_who_snapshot_for_matrix(latest_path, data_dir=Path(data_dir), now=observed_now, logger=logger)
     except CaptureError as exc:
         reason = redact_diagnostic_text(exc.reason or exc.__class__.__name__)
         _log_snapshot_failure(logger, reason=reason, error_type=exc.__class__.__name__)
         return MatrixCommandResponse(text=_prepend_who_snapshot_line(base_text, _who_snapshot_unavailable_line(reason)))
+    except Exception as exc:
+        reason = redact_diagnostic_text(exc.__class__.__name__)
+        _log_snapshot_failure(logger, reason=reason, error_type=exc.__class__.__name__)
+        return MatrixCommandResponse(text=_prepend_who_snapshot_line(base_text, _who_snapshot_unavailable_line(reason)))
+
+    snapshot = _prepare_who_snapshot_for_matrix(latest_path, data_dir=Path(data_dir), now=observed_now, logger=logger)
     if snapshot.state != "available" or snapshot.path is None or snapshot.info is None:
         reason = redact_diagnostic_text(snapshot.error_type or "unavailable")
         _log_snapshot_failure(logger, reason=reason, error_type="invalid_snapshot")
@@ -262,37 +270,40 @@ def _prepare_who_snapshot_for_matrix(path: Path, *, data_dir: Path, now: datetim
 
 
 def _resize_who_snapshot_for_matrix(path: Path, *, destination: Path, now: datetime, logger: StructuredLogger | None) -> LatestSnapshotValidation:
-    image = Image.open(path)
-    try:
-        width, height = image.size
-        if width <= 0 or height <= 0:
-            raise ImageBudgetError("image dimensions must be positive")
-        bounded_dimension = min(max(width, height), WHO_MATRIX_INITIAL_MAX_DIMENSION)
-        if width >= height:
-            bounded_size = (bounded_dimension, max(1, height * bounded_dimension // width))
-        else:
-            bounded_size = (max(1, width * bounded_dimension // height), bounded_dimension)
-        image.draft("RGB", bounded_size)
-        image.load()
-        working = image if image.mode == "RGB" else image.convert("RGB")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        image = Image.open(path)
         try:
-            result = encode_jpeg_under_budget(
-                working,
-                max_bytes=MAX_WHO_MATRIX_IMAGE_BYTES,
-                initial_max_dimension=WHO_MATRIX_INITIAL_MAX_DIMENSION,
-                min_dimension=WHO_MATRIX_MIN_DIMENSION,
-                dimension_scale=0.85,
-                qualities=WHO_MATRIX_JPEG_QUALITIES,
-                resampling=getattr(getattr(Image, "Resampling", Image), "LANCZOS"),
-            )
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                raise ImageBudgetError("image dimensions must be positive")
+            bounded_dimension = min(max(width, height), WHO_MATRIX_INITIAL_MAX_DIMENSION)
+            if width >= height:
+                bounded_size = (bounded_dimension, max(1, height * bounded_dimension // width))
+            else:
+                bounded_size = (max(1, width * bounded_dimension // height), bounded_dimension)
+            image.draft("RGB", bounded_size)
+            image.load()
+            working = image if image.mode == "RGB" else image.convert("RGB")
+            try:
+                result = encode_jpeg_under_budget(
+                    working,
+                    max_bytes=MAX_WHO_MATRIX_IMAGE_BYTES,
+                    initial_max_dimension=WHO_MATRIX_INITIAL_MAX_DIMENSION,
+                    min_dimension=WHO_MATRIX_MIN_DIMENSION,
+                    dimension_scale=0.85,
+                    qualities=WHO_MATRIX_JPEG_QUALITIES,
+                    resampling=getattr(getattr(Image, "Resampling", Image), "LANCZOS"),
+                )
+            finally:
+                if working is not image:
+                    working.close()
         finally:
-            if working is not image:
-                working.close()
-    finally:
-        image.close()
+            image.close()
 
+    destination_mode = _who_snapshot_destination_mode(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    stat = _publish_who_snapshot(destination, result.data)
+    stat = _publish_who_snapshot(destination, result.data, mode=destination_mode, logger=logger)
     _log_who_snapshot_resized(
         logger,
         source_path=path,
@@ -314,7 +325,20 @@ def _resize_who_snapshot_for_matrix(path: Path, *, destination: Path, now: datet
     )
 
 
-def _publish_who_snapshot(destination: Path, data: bytes) -> os.stat_result:
+def _who_snapshot_destination_mode(destination: Path) -> int:
+    try:
+        return stat_module.S_IMODE(destination.stat().st_mode)
+    except FileNotFoundError:
+        return _WHO_SNAPSHOT_DEFAULT_MODE
+
+
+def _publish_who_snapshot(
+    destination: Path,
+    data: bytes,
+    *,
+    mode: int,
+    logger: StructuredLogger | None,
+) -> os.stat_result:
     file_descriptor, temporary_name = tempfile.mkstemp(
         dir=destination.parent,
         prefix=f".{destination.name}.",
@@ -322,6 +346,7 @@ def _publish_who_snapshot(destination: Path, data: bytes) -> os.stat_result:
     )
     temporary = Path(temporary_name)
     try:
+        os.fchmod(file_descriptor, mode)
         view = memoryview(data)
         try:
             offset = 0
@@ -348,8 +373,17 @@ def _publish_who_snapshot(destination: Path, data: bytes) -> os.stat_result:
             temporary.unlink()
         except FileNotFoundError:
             pass
-        except OSError:
-            pass
+        except OSError as exc:
+            try:
+                _log_snapshot_failure(
+                    logger,
+                    reason="temp_cleanup_failed",
+                    error_type=exc.__class__.__name__,
+                    destination_path=destination,
+                    temporary_name=temporary.name,
+                )
+            except Exception:
+                pass
 
 
 def _log_who_snapshot_resized(logger: StructuredLogger | None, **fields: Any) -> None:
