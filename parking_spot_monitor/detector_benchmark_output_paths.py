@@ -14,11 +14,21 @@ class ProtectedInput:
 
 
 def protected_input(path: Path) -> ProtectedInput:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor: int | None = None
     try:
-        file_stat = path.stat()
+        descriptor = os.open(path, flags)
+        file_stat = os.fstat(descriptor)
         resolved = path.resolve(strict=True)
     except OSError as exc:
         raise ValueError("benchmark input changed during output preflight") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if not stat.S_ISREG(file_stat.st_mode):
         raise ValueError("benchmark protected input must be a regular file")
     return ProtectedInput(
@@ -35,6 +45,7 @@ def open_directory_walk(path: Path) -> int:
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
     )
     try:
         descriptor = os.open("/", flags)

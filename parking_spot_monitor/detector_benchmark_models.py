@@ -19,24 +19,32 @@ class ModelIdentity:
     inode: int
     size_bytes: int
     modified_ns: int
+    changed_ns: int
     sha256: str
 
 
 def validated_model_identities(models: dict[str, Path]) -> dict[str, ModelIdentity]:
     identities = {
-        backend: _model_identity(backend, path) for backend, path in models.items()
+        backend: read_model_identity(backend, path)
+        for backend, path in models.items()
     }
+    validate_distinct_model_identities(identities)
+    return identities
+
+
+def validate_distinct_model_identities(
+    identities: dict[str, ModelIdentity],
+) -> None:
     if len({identity.resolved_path for identity in identities.values()}) != len(identities):
         raise ValueError("backend models must resolve to distinct paths")
     if len({(identity.device, identity.inode) for identity in identities.values()}) != len(identities):
         raise ValueError("backend models must use distinct files")
     if len({identity.sha256 for identity in identities.values()}) != len(identities):
         raise ValueError("backend models must have distinct content")
-    return identities
 
 
 def require_unchanged_model(backend: str, expected: ModelIdentity) -> None:
-    if _model_identity(backend, expected.path) != expected:
+    if read_model_identity(backend, expected.path) != expected:
         raise ValueError(f"{backend} model changed after preflight validation")
 
 
@@ -45,12 +53,33 @@ def require_unchanged_models(identities: dict[str, ModelIdentity]) -> None:
         require_unchanged_model(backend, identity)
 
 
-def _model_identity(backend: str, path: Path) -> ModelIdentity:
+def read_model_identity(backend: str, path: Path) -> ModelIdentity:
+    return _read_model(backend, path)
+
+
+def copy_model_to_descriptor(
+    backend: str,
+    path: Path,
+    destination_descriptor: int,
+) -> ModelIdentity:
+    return _read_model(backend, path, destination_descriptor=destination_descriptor)
+
+
+def _read_model(
+    backend: str,
+    path: Path,
+    *,
+    destination_descriptor: int | None = None,
+) -> ModelIdentity:
     if path.suffix != MODEL_SUFFIXES[backend]:
         raise ValueError(
             f"{backend} model must use the documented {MODEL_SUFFIXES[backend]} suffix"
         )
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -68,6 +97,8 @@ def _model_identity(backend: str, path: Path) -> ModelIdentity:
             if total > MAX_MODEL_BYTES:
                 raise ValueError(f"{backend} model size is outside the supported bound")
             digest.update(chunk)
+            if destination_descriptor is not None:
+                _write_all(destination_descriptor, chunk)
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
@@ -89,9 +120,22 @@ def _model_identity(backend: str, path: Path) -> ModelIdentity:
         inode=after.st_ino,
         size_bytes=after.st_size,
         modified_ns=after.st_mtime_ns,
+        changed_ns=after.st_ctime_ns,
         sha256=digest.hexdigest(),
     )
 
 
-def _stable_fields(item: os.stat_result) -> tuple[int, int, int, int]:
-    return (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+def _stable_fields(item: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        item.st_dev,
+        item.st_ino,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        offset += os.write(descriptor, payload[offset:])

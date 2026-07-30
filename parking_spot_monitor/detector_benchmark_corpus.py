@@ -153,7 +153,11 @@ def _parse_manifest(path: Path, raw: bytes) -> list[Path]:
 
 
 def _read_identity(path: Path, label: str, limit: int) -> tuple[FileIdentity, bytes]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:

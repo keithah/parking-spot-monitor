@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +12,9 @@ from parking_spot_monitor.detector_benchmark_output_paths import (
     open_directory_walk,
     output_identity,
     protected_input,
+)
+from parking_spot_monitor.detector_benchmark_output_temp import (
+    create_owned_temporary,
 )
 
 
@@ -78,14 +80,20 @@ def write_guarded_report(
     try:
         _verify_requested_parent(guard)
         _recheck_output(guard)
-        temporary_name, descriptor = _create_temporary(guard)
+        temporary = create_owned_temporary(
+            guard.parent_descriptor, guard.path.name
+        )
+        temporary_name = temporary.name
+        owned_identity = (temporary.device, temporary.inode)
         try:
-            _write_all(descriptor, encoded)
-            os.fsync(descriptor)
-            item = os.fstat(descriptor)
-            owned_identity = (item.st_dev, item.st_ino)
+            os.fchmod(temporary.descriptor, 0o600)
+            _write_all(temporary.descriptor, encoded)
+            os.fsync(temporary.descriptor)
+            item = os.fstat(temporary.descriptor)
+            if (item.st_dev, item.st_ino) != owned_identity:
+                raise ValueError("benchmark output temporary changed while writing")
         finally:
-            os.close(descriptor)
+            os.close(temporary.descriptor)
         before_publish()
         _verify_requested_parent(guard)
         _recheck_output(guard)
@@ -120,22 +128,6 @@ def _verify_requested_parent(guard: OutputGuard) -> None:
             raise ValueError("benchmark output parent changed after preflight")
     finally:
         os.close(descriptor)
-
-
-def _create_temporary(guard: OutputGuard) -> tuple[str, int]:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    for _attempt in range(128):
-        name = f".{guard.path.name}.tmp-{secrets.token_hex(16)}"
-        try:
-            return name, os.open(
-                name,
-                flags,
-                0o600,
-                dir_fd=guard.parent_descriptor,
-            )
-        except FileExistsError:
-            continue
-    raise ValueError("unable to reserve a unique benchmark output temporary")
 
 
 def _recheck_output(guard: OutputGuard) -> None:

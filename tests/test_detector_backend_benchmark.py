@@ -54,6 +54,8 @@ def _run_fake_benchmark(
     oversize_frame: bool = False,
     partial_stall_backend: str | None = None,
     late_backend: str | None = None,
+    restore_model_bytes: bool = False,
+    fifo_input: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
     fake_modules = tmp_path / "fake-modules"
     fake_modules.mkdir()
@@ -85,6 +87,10 @@ class YOLO:
         self.evidence = json.loads(Path(os.environ["FAKE_BACKEND_EVIDENCE"]).read_text())
         self.calls = {}
         Path(os.environ["FAKE_BACKEND_EVIDENCE"]).with_name(f"started-{self.backend}").write_text(str(os.getpid()))
+        Path(os.environ["FAKE_BACKEND_EVIDENCE"]).with_name(f"loaded-{self.backend}.json").write_text(json.dumps({
+            "path": str(model_path),
+            "bytes": Path(model_path).read_bytes().hex(),
+        }))
         if self.backend == "torchscript" and self.evidence.get("swap_output_to"):
             output = Path(self.evidence["output_path"])
             output.unlink(missing_ok=True)
@@ -97,7 +103,13 @@ class YOLO:
         if self.backend == self.evidence.get("late_backend"):
             time.sleep(0.8)
         if self.backend == self.evidence.get("mutate_from_backend") and self.evidence.get("mutate_model"):
-            Path(self.evidence["mutate_model"]).write_bytes(b"mutated-model")
+            target = Path(self.evidence["mutate_model"])
+            original = target.read_bytes()
+            original_stat = target.stat()
+            target.write_bytes(b"x" * len(original))
+            if self.evidence.get("restore_model_bytes"):
+                target.write_bytes(original)
+                os.utime(target, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
         if self.backend == self.evidence.get("mutate_frame_from_backend"):
             target = Path(self.evidence["original_frame"])
             original = target.read_bytes()
@@ -144,6 +156,9 @@ class YOLO:
         json.dumps({"frames": [item.name for item in frames]}),
         encoding="utf-8",
     )
+    if fifo_input == "manifest":
+        manifest.unlink()
+        os.mkfifo(manifest)
     models = {
         "pt": tmp_path / "model.pt",
         "onnx": tmp_path / "model.onnx",
@@ -151,6 +166,12 @@ class YOLO:
     }
     for backend, model in models.items():
         model.write_bytes(f"fake-{backend}-model".encode())
+    if fifo_input == "frame":
+        frame.unlink()
+        os.mkfifo(frame)
+    if fifo_input == "model":
+        models["pt"].unlink()
+        os.mkfifo(models["pt"])
     if duplicate_model_content:
         models["onnx"].write_bytes(models["pt"].read_bytes())
     if symlink_backend is not None:
@@ -162,7 +183,7 @@ class YOLO:
     evidence.write_text(
         json.dumps(
             {
-                "delays": {"pt": 0.002, "onnx": 0.0, "torchscript": 0.0},
+                "delays": {"pt": 0.01, "onnx": 0.0, "torchscript": 0.0},
                 "detections": {
                     "pt": {item.name: [_detection()] for item in frames},
                     "onnx": {item.name: onnx_detections for item in frames},
@@ -193,6 +214,7 @@ class YOLO:
                 "manifest_path": str(manifest),
                 "partial_stall_backend": partial_stall_backend,
                 "late_backend": late_backend,
+                "restore_model_bytes": restore_model_bytes,
             }
         ),
         encoding="utf-8",
@@ -251,16 +273,24 @@ class YOLO:
         ]
     if worker_timeout_seconds is not None:
         command.extend(["--worker-timeout-seconds", str(worker_timeout_seconds)])
-    result = subprocess.run(
-        command,
-        cwd=Path.cwd(),
-        env=environment,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=30,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=Path.cwd(),
+            env=environment,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1.5 if fifo_input else 30,
+        )
+    except subprocess.TimeoutExpired:
+        result = subprocess.CompletedProcess(
+            command,
+            -999,
+            stdout="",
+            stderr="benchmark blocked on special input",
+        )
     report = (
         json.loads(output.read_text(encoding="utf-8"))
         if result.returncode == 0 and output.exists()
@@ -323,13 +353,18 @@ def test_backend_benchmark_requires_all_parity_and_resource_improvement(
         for name in ("pt", "onnx", "torchscript")
     )
     assert report["backends"]["onnx"]["resource_improvement_passed"]
-    assert report["backends"]["pt"]["load_seconds"] >= 0.0015
+    assert report["backends"]["pt"]["load_seconds"] >= 0.009
     model_hashes = {
         report["backends"][name]["model_sha256"]
         for name in ("pt", "onnx", "torchscript")
     }
     assert len(model_hashes) == 3
     assert all(len(digest) == 64 for digest in model_hashes)
+    assert all(
+        report["backends"][name]["model_snapshot_sha256"]
+        == report["backends"][name]["model_sha256"]
+        for name in ("pt", "onnx", "torchscript")
+    )
     assert report["production_switch_eligible"] is True
     assert ("torch" in sys.modules) is torch_was_loaded
 
@@ -539,7 +574,7 @@ def test_backend_benchmark_rechecks_output_alias_before_atomic_publication(
     )
 
     assert result.returncode == 2
-    assert "benchmark output changed after preflight" in result.stderr
+    assert "benchmark input/evidence error" in result.stderr
     assert report == {}
     assert (tmp_path / "model.pt").read_bytes() == b"fake-pt-model"
 
@@ -559,6 +594,28 @@ def test_backend_benchmark_revalidates_earlier_models_after_later_workers(
     assert report == {}
     assert not (tmp_path / "report.json").exists()
     assert not (tmp_path / "started-torchscript").exists()
+
+
+def test_backend_benchmark_snapshots_models_and_rejects_transient_restore(
+    tmp_path: Path,
+) -> None:
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        mutate_target="pt",
+        mutate_from_backend="pt",
+        restore_model_bytes=True,
+    )
+
+    loaded = json.loads((tmp_path / "loaded-pt.json").read_text())
+    assert result.returncode == 2
+    assert "pt model changed after preflight validation" in result.stderr
+    assert report == {}
+    assert loaded["path"] != str(tmp_path / "model.pt")
+    assert loaded["path"].endswith(".pt")
+    assert bytes.fromhex(loaded["bytes"]) == b"fake-pt-model"
+    assert list((tmp_path / "benchmark-temp").iterdir()) == []
+    assert not (tmp_path / "started-onnx").exists()
 
 
 @pytest.mark.parametrize(
@@ -737,3 +794,58 @@ def test_guarded_report_rejects_parent_replacement_at_every_publication_phase(
     assert not list(moved_parent.glob(".report.json.tmp-*"))
     assert not (moved_parent / "report.json").exists()
     guard.close()
+
+
+def test_guarded_report_removes_owned_temporary_when_file_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from parking_spot_monitor import detector_benchmark_output as output_module
+
+    parent = tmp_path / "evidence"
+    parent.mkdir()
+    protected = tmp_path / "manifest.json"
+    protected.write_text('{"frames":["frame.jpg"]}', encoding="utf-8")
+    output = parent / "report.json"
+    guard = validate_benchmark_output(output, protected_paths=[protected])
+    real_fsync = output_module.os.fsync
+
+    def fail_file_fsync(descriptor: int) -> None:
+        if stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("injected file fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(output_module.os, "fsync", fail_file_fsync)
+
+    with pytest.raises(OSError, match="injected file fsync failure"):
+        write_guarded_report(
+            guard,
+            {"schema_version": 1},
+            before_publish=lambda: None,
+        )
+
+    assert not output.exists()
+    assert not list(parent.glob(".report.json.tmp-*"))
+    guard.close()
+
+
+@pytest.mark.parametrize("fifo_input", ["manifest", "frame", "model"])
+def test_backend_benchmark_rejects_fifo_inputs_without_blocking(
+    tmp_path: Path,
+    fifo_input: str,
+) -> None:
+    started = time.monotonic()
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        fifo_input=fifo_input,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 2, result.stderr
+    assert elapsed < 1.5
+    assert "benchmark input/evidence error" in result.stderr
+    assert report == {}
+    assert not (tmp_path / "started-pt").exists()
+    assert not (tmp_path / "report.json").exists()
+    assert list((tmp_path / "benchmark-temp").iterdir()) == []

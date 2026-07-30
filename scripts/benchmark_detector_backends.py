@@ -22,9 +22,9 @@ from parking_spot_monitor.detector_benchmark_evidence import (
     improved_by_resource_gate,
     parity_metrics,
 )
-from parking_spot_monitor.detector_benchmark_models import (
-    require_unchanged_models,
-    validated_model_identities,
+from parking_spot_monitor.detector_benchmark_model_snapshot import (
+    ModelSnapshots,
+    prepare_model_snapshots,
 )
 from parking_spot_monitor.detector_benchmark_output import (
     validate_benchmark_output,
@@ -116,10 +116,10 @@ def _build_report(
 
 
 def _require_unchanged_inputs(
-    identities: dict[str, Any],
+    model_snapshots: ModelSnapshots,
     corpus: CorpusSnapshot,
 ) -> None:
-    require_unchanged_models(identities)
+    model_snapshots.require_unchanged()
     corpus.require_unchanged()
 
 
@@ -147,42 +147,48 @@ def main(argv: list[str] | None = None) -> int:
             iterations=args.iterations,
         )
         try:
-            identities = validated_model_identities(models)
-            output_guard = validate_benchmark_output(
-                args.output,
-                protected_paths=[*models.values(), *corpus.protected_paths],
-            )
+            model_snapshots = prepare_model_snapshots(models)
             try:
-                results: dict[str, dict[str, Any]] = {}
-                for backend, model in models.items():
-                    _require_unchanged_inputs(identities, corpus)
-                    result = run_isolated_backend(
-                        backend,
-                        model,
-                        list(corpus.snapshot_paths),
-                        warmup=args.warmup,
-                        iterations=args.iterations,
-                        worker_timeout_seconds=args.worker_timeout_seconds,
-                    )
-                    _require_unchanged_inputs(identities, corpus)
-                    result["model_sha256"] = identities[backend].sha256
-                    result["model_size_bytes"] = identities[backend].size_bytes
-                    results[backend] = result
-                write_guarded_report(
-                    output_guard,
-                    _build_report(
-                        results,
-                        corpus=corpus.evidence,
-                        warmup=args.warmup,
-                        iterations=args.iterations,
-                        worker_timeout_seconds=args.worker_timeout_seconds,
-                    ),
-                    before_publish=lambda: _require_unchanged_inputs(
-                        identities, corpus
-                    ),
+                output_guard = validate_benchmark_output(
+                    args.output,
+                    protected_paths=[*models.values(), *corpus.protected_paths],
                 )
+                try:
+                    results: dict[str, dict[str, Any]] = {}
+                    for backend, model in model_snapshots.paths.items():
+                        _require_unchanged_inputs(model_snapshots, corpus)
+                        result = run_isolated_backend(
+                            backend,
+                            model,
+                            list(corpus.snapshot_paths),
+                            warmup=args.warmup,
+                            iterations=args.iterations,
+                            worker_timeout_seconds=args.worker_timeout_seconds,
+                        )
+                        _require_unchanged_inputs(model_snapshots, corpus)
+                        original = model_snapshots.originals[backend]
+                        snapshot = model_snapshots.snapshots[backend]
+                        result["model_sha256"] = original.sha256
+                        result["model_snapshot_sha256"] = snapshot.sha256
+                        result["model_size_bytes"] = original.size_bytes
+                        results[backend] = result
+                    write_guarded_report(
+                        output_guard,
+                        _build_report(
+                            results,
+                            corpus=corpus.evidence,
+                            warmup=args.warmup,
+                            iterations=args.iterations,
+                            worker_timeout_seconds=args.worker_timeout_seconds,
+                        ),
+                        before_publish=lambda: _require_unchanged_inputs(
+                            model_snapshots, corpus
+                        ),
+                    )
+                finally:
+                    output_guard.close()
             finally:
-                output_guard.close()
+                model_snapshots.close()
         finally:
             corpus.close()
     except ValueError as exc:
