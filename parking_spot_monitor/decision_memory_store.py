@@ -57,8 +57,11 @@ class DecisionMemoryStore:
                 logger=logger,
             )
             after = decision_memory_source_snapshot(self.path)
+        load_is_consistent = decision_memory_load_is_consistent(
+            loaded.state, before, after
+        )
         self._records: deque[DecisionMemoryRecord] = deque(
-            loaded.records,
+            loaded.records if load_is_consistent else (),
             maxlen=self.max_records,
         )
         self._dirty_records: deque[DecisionMemoryRecord] = deque(maxlen=self.max_records)
@@ -67,9 +70,7 @@ class DecisionMemoryStore:
         now = self._monotonic()
         self._next_checkpoint_at = now + self.checkpoint_interval_seconds
         self._signature = after.signature
-        self._reconcile_required = not decision_memory_load_is_consistent(
-            loaded.state, before, after
-        )
+        self._reconcile_required = not load_is_consistent
 
     @property
     def records(self) -> tuple[DecisionMemoryRecord, ...]:

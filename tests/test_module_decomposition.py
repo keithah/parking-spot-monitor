@@ -385,6 +385,7 @@ def test_runtime_modules_stay_decomposed() -> None:
         "parking_spot_monitor/runtime_frame_outcome.py": 90,
         "parking_spot_monitor/runtime_frame_plan.py": 160,
         "parking_spot_monitor/runtime_health.py": 290,
+        "parking_spot_monitor/runtime_health_reporting.py": 100,
         "parking_spot_monitor/runtime_lifecycle.py": 150,
         "parking_spot_monitor/runtime_loop_resources.py": 260,
         "parking_spot_monitor/runtime_overlay.py": 90,
@@ -398,6 +399,12 @@ def test_runtime_modules_stay_decomposed() -> None:
     for path, max_lines in module_caps.items():
         assert (ROOT / path).exists()
         assert _line_count(path) <= max_lines
+
+    resource_functions = _function_names(
+        "parking_spot_monitor/runtime_loop_resources.py"
+    )
+    assert "loop_health_writer" not in resource_functions
+    assert "write_current_loop_health" not in resource_functions
 
     retired_module = ROOT / "parking_spot_monitor/runtime_detector_capabilities.py"
     assert not retired_module.exists()

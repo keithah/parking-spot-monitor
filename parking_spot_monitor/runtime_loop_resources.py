@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,12 +11,6 @@ from parking_spot_monitor.detection import DetectionFilterResult
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_alerts import MONITOR_STARTED_EVENT_TYPE, monitor_lifecycle_event
 from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery, dispatch_matrix_event
-from parking_spot_monitor.paths import RuntimePaths
-from parking_spot_monitor.runtime_health import (
-    RuntimeLoopHealthState,
-    write_loop_health,
-)
-from parking_spot_monitor.runtime_health_cache import VehicleHistoryHealthSnapshotCache
 from parking_spot_monitor.runtime_overlay import write_overlay_for_capture
 from parking_spot_monitor.runtime_presence import presence_by_spot
 from parking_spot_monitor.runtime_resource_policy import (
@@ -30,26 +23,6 @@ from parking_spot_monitor.runtime_resource_policy import (
 )
 from parking_spot_monitor.state import RuntimeState
 from parking_spot_monitor.timeline_buffer import record_timeline_frame
-
-
-def loop_health_writer(
-    settings: RuntimeSettings,
-    *,
-    logger: StructuredLogger,
-    health_state: RuntimeLoopHealthState,
-    vehicle_history_health: VehicleHistoryHealthSnapshotCache,
-    runtime_paths: RuntimePaths,
-    outbox_health_provider: Callable[[], Any] | None,
-) -> Callable[..., None]:
-    return partial(
-        write_current_loop_health,
-        settings,
-        logger=logger,
-        health_state=health_state,
-        vehicle_history_health=vehicle_history_health,
-        runtime_paths=runtime_paths,
-        outbox_health_provider=outbox_health_provider,
-    )
 
 
 def dispatch_startup_lifecycle(
@@ -77,45 +50,6 @@ def dispatch_startup_lifecycle(
 class ResourcePolicyUpdate:
     state: RuntimeResourcePolicyState
     decision: RuntimeResourceDecision
-
-
-def write_current_loop_health(
-    settings: RuntimeSettings,
-    *,
-    logger: StructuredLogger,
-    health_state: RuntimeLoopHealthState,
-    status: str,
-    iteration: int,
-    vehicle_history_health: VehicleHistoryHealthSnapshotCache,
-    runtime_paths: RuntimePaths,
-    outbox_health_provider: Callable[[], Any] | None,
-) -> None:
-    write_loop_health(
-        settings,
-        logger=logger,
-        status=status,
-        iteration=iteration,
-        last_frame_at=health_state.last_frame_at,
-        selected_decode_mode=health_state.selected_decode_mode,
-        capture_last_success_at=health_state.capture_last_success_at,
-        capture_selected_decode_mode=health_state.capture_selected_decode_mode,
-        consecutive_capture_failures=health_state.consecutive_capture_failures,
-        consecutive_detection_failures=health_state.consecutive_detection_failures,
-        last_matrix_error=health_state.last_matrix_error,
-        last_error=health_state.last_error,
-        retention_failure_count=health_state.retention_failure_count,
-        state_save_error=health_state.state_save_error,
-        matrix_command_failure_count=health_state.matrix_command_failure_count,
-        last_matrix_command_error=health_state.last_matrix_command_error,
-        vehicle_history_failure_count=health_state.vehicle_history_failure_count,
-        last_vehicle_history_error=health_state.last_vehicle_history_error,
-        vehicle_history=vehicle_history_health.snapshot(
-            force=health_state.last_vehicle_history_error is not None
-            or health_state.vehicle_history_failure_count > 0
-        ),
-        matrix_outbox_file=runtime_paths.matrix_outbox_file,
-        matrix_outbox_summary_provider=outbox_health_provider,
-    )
 
 
 def periodic_verification_due(

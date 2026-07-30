@@ -21,6 +21,7 @@ from parking_spot_monitor.runtime_frame import capture_and_detect_runtime_frame
 from parking_spot_monitor.runtime_frame_outcome import prepare_runtime_frame_loop_result
 from parking_spot_monitor.runtime_health import RuntimeLoopHealthState, observed_at
 from parking_spot_monitor.runtime_health_cache import VehicleHistoryHealthSnapshotCache
+from parking_spot_monitor.runtime_health_reporting import RuntimeLoopHealthReporter
 from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache
 from parking_spot_monitor.runtime_command_worker import advance_matrix_command_poll, build_matrix_command_worker
 from parking_spot_monitor.runtime_commands import RuntimeMatrixCommandService
@@ -91,7 +92,7 @@ def run_capture_loop(
         outbox_health_provider = None
     matrix_command_worker = build_matrix_command_worker(matrix_command_service)
 
-    write_current_health = runtime_loop_resources.loop_health_writer(settings, logger=logger, health_state=health_state, vehicle_history_health=vehicle_history_health, runtime_paths=runtime_paths, outbox_health_provider=outbox_health_provider)
+    health_reporter = RuntimeLoopHealthReporter(settings, logger, health_state, vehicle_history_health, runtime_paths, outbox_health_provider)
 
     def shutdown_exit(current_iteration: int) -> int | None:
         return return_if_shutdown_requested(
@@ -115,7 +116,7 @@ def run_capture_loop(
             decision_memory_store=decision_memory_store,
         )
         startup_status = "degraded" if health_state.retention_failure_count else "starting"
-        write_current_health(status=startup_status, iteration=iteration)
+        health_reporter.write(status=startup_status, iteration=iteration)
         while max_iterations is None or iteration < max_iterations:
             requested_exit = shutdown_exit(iteration)
             if requested_exit is not None:
@@ -222,7 +223,7 @@ def run_capture_loop(
                         transition_occurred=transition_occurred,
                     )
                 logger.debug("capture-loop-frame-written", iteration=iteration, **result.diagnostics())
-                write_current_health(status=health_state.status(), iteration=iteration)
+                health_reporter.write(status=health_state.status(), iteration=iteration)
                 iteration_finished_at = monotonic()
                 flush_runtime_log_summary(log_aggregator, logger, iteration_finished_at)
                 policy_update = runtime_loop_resources.advance_resource_policy(
@@ -268,7 +269,7 @@ def run_capture_loop(
                     logger=logger,
                     iteration=iteration,
                 )
-                write_current_health(status="down", iteration=iteration)
+                health_reporter.write(status="down", iteration=iteration)
                 flush_runtime_log_summary(log_aggregator, logger, monotonic())
                 decision_memory_store.wait_for_checkpoint(
                     backoff_seconds, wait=wait_for_shutdown

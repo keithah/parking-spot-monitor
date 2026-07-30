@@ -469,6 +469,58 @@ def test_constructor_reconciles_false_missing_when_source_appears_during_load(
     ]
 
 
+@pytest.mark.parametrize("load_state", ["available", "unavailable", "partial"])
+def test_constructor_rejects_unstable_records_when_source_remains_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    load_state: str,
+) -> None:
+    path = decision_memory_path(tmp_path)
+    with monkeypatch.context() as context:
+        context.setattr(
+            decision_memory,
+            "load_decision_memory",
+            lambda *_args, **_kwargs: DecisionMemoryLoad(
+                state=load_state,  # type: ignore[arg-type]
+                records=(_record("alert", None, "unstable ghost"),),
+                error_type="TransientLoad" if load_state != "available" else None,
+            ),
+        )
+        store = _store(path, monotonic=lambda: 0)
+
+    assert store.records == ()
+    assert store.append(
+        _record("miss", "left_spot", "local"), durability="immediate"
+    )
+    assert [record.summary for record in load_decision_memory(path).records] == [
+        "local"
+    ]
+
+
+def test_constructor_false_missing_for_stable_available_source_reloads_external(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = decision_memory_path(tmp_path)
+    assert append_decision_memory_record(path, _record("alert", None, "external"))
+    with monkeypatch.context() as context:
+        context.setattr(
+            decision_memory,
+            "load_decision_memory",
+            lambda *_args, **_kwargs: DecisionMemoryLoad(state="missing"),
+        )
+        store = _store(path, monotonic=lambda: 0)
+
+    assert store.records == ()
+    assert store.append(
+        _record("miss", "left_spot", "local"), durability="immediate"
+    )
+    assert [record.summary for record in load_decision_memory(path).records] == [
+        "external",
+        "local",
+    ]
+
+
 def test_external_signature_change_during_reconciliation_defers_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
