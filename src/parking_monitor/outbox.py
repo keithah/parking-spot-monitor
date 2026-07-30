@@ -133,6 +133,12 @@ class LocalOutbox:
     def list_pending(self) -> list[OutboxRecord]:
         return self.list_records("pending")
 
+    def update_intent_metadata(self, record_id: str, metadata: dict[str, JsonValue]) -> OutboxRecord:
+        with self._lock:
+            record = self._find_record(record_id)
+            intent = replace(record.intent, metadata=metadata).sanitized()
+            return self._replace_record(replace(record, intent=intent, updated_at=utc_now_text()))
+
     def next_due_record(self, now: datetime) -> OutboxRecord | None:
         records = self.due_records(now, max_records=1)
         return records[0] if records else None
@@ -284,9 +290,7 @@ class LocalOutbox:
                 summary["items"] = items
             return summary
 
-    def _apply_retry(
-        self, record_id: str, phase: MatrixPhase | str, retry: RetrySchedule
-    ) -> OutboxRecord:
+    def _apply_retry(self, record_id: str, phase: MatrixPhase | str, retry: RetrySchedule) -> OutboxRecord:
         if phase not in VALID_PHASES:
             raise OutboxTransitionError("unknown_phase")
         with self._lock:

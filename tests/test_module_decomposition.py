@@ -216,6 +216,7 @@ def test_matrix_module_is_a_small_compatibility_shim() -> None:
         "parking_spot_monitor/matrix_commands.py": 740,
         "parking_spot_monitor/matrix_cockpit.py": 430,
         "parking_spot_monitor/matrix_delivery.py": 280,
+        "parking_spot_monitor/jpeg_artifacts.py": 350,
         "parking_spot_monitor/matrix_models.py": 100,
         "parking_spot_monitor/matrix_snapshots.py": 430,
         "parking_spot_monitor/matrix_sync.py": 100,

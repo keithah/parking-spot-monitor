@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
+
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, open_decoded_rgb_jpeg, publish_canonical_jpeg
 
 BBoxInput = Sequence[float]
 
@@ -45,10 +47,10 @@ def capture_occupied_images(
     source_frame_path: str | os.PathLike[str],
     bbox: BBoxInput,
 ) -> OccupiedImageCaptureResult:
-    """Copy full-frame JPEG and crop accepted bbox into archive-owned paths.
+    """Publish a canonical full-frame JPEG and crop the accepted bbox.
 
-    The source frame is opened with Pillow and re-saved as RGB JPEG output so the
-    archive owns durable artifacts independent of any mutable runtime snapshot.
+    The archive owns a durable link, clone, or bounded copy of the validated
+    source bytes, avoiding a full-frame decode/encode cycle.
     Bboxes use detector-style ``(x_min, y_min, x_max, y_max)`` coordinates with
     floor/ceil rounding, clamping to the source image, and empty-box rejection.
     """
@@ -58,22 +60,17 @@ def capture_occupied_images(
     crop_path = root / "images" / "occupied-crops" / f"{session_id}.jpg"
 
     try:
-        with Image.open(source_frame_path) as opened:
-            if opened.format != "JPEG":
-                raise VehicleHistoryImageError("source occupied frame must be a JPEG")
-            image = opened.convert("RGB")
-    except VehicleHistoryImageError:
-        raise
-    except (FileNotFoundError, UnidentifiedImageError, OSError) as exc:
-        raise VehicleHistoryImageError("source occupied frame is missing or unreadable") from exc
-
-    crop_box = clamp_crop_box(bbox, image.size)
-    crop = image.crop(crop_box.as_pillow_box)
-
-    try:
-        _write_jpeg_atomic(full_frame_path, image)
-        _write_jpeg_atomic(crop_path, crop)
-    except Exception as exc:
+        publish_canonical_jpeg(source_frame_path, full_frame_path)
+        with open_decoded_rgb_jpeg(full_frame_path, initial_max_dimension=2**31 - 1) as decoded:
+            crop_box = clamp_crop_box(bbox, decoded.image.size)
+            with decoded.image.crop(crop_box.as_pillow_box) as crop:
+                _write_jpeg_atomic(crop_path, crop)
+    except JpegDecodeError as exc:
+        full_frame_path.unlink(missing_ok=True)
+        message = "source occupied frame must be a JPEG" if exc.code == "unidentified" else "source occupied frame is missing or unreadable"
+        raise VehicleHistoryImageError(message) from exc
+    except (VehicleHistoryImageError, OSError, ValueError) as exc:
+        full_frame_path.unlink(missing_ok=True)
         raise VehicleHistoryImageError(str(exc) or exc.__class__.__name__) from exc
 
     return OccupiedImageCaptureResult(full_frame_path=full_frame_path, crop_path=crop_path)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -9,9 +10,83 @@ from PIL import Image
 
 from parking_spot_monitor import image_budget
 from parking_spot_monitor.image_budget import ImageBudgetError, encode_jpeg_under_budget
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, open_decoded_rgb_jpeg
 
 
 RESAMPLING = Image.Resampling.LANCZOS
+
+
+def test_shared_jpeg_decoder_drafts_before_load_converts_rgb_and_closes_both_images(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    class FakeImage:
+        format = "JPEG"
+        size = (1600, 900)
+        mode = "CMYK"
+        closed = False
+
+        def draft(self, mode: str, size: tuple[int, int]) -> None:
+            calls.append(("draft", mode, size))
+
+        def load(self) -> None:
+            calls.append("load")
+
+        def convert(self, mode: str) -> "FakeImage":
+            calls.append(("convert", mode))
+            converted = FakeImage()
+            converted.mode = "RGB"
+            converted.size = (960, 540)
+            calls.append(converted)
+            return converted
+
+        def close(self) -> None:
+            self.closed = True
+            calls.append(("close", self.mode))
+
+    opened = FakeImage()
+    monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts.Image.open", lambda path: opened)
+
+    with open_decoded_rgb_jpeg(Path("snapshot.jpg"), initial_max_dimension=960) as decoded:
+        converted = decoded.image
+        assert decoded.source_width == 1600
+        assert decoded.source_height == 900
+        assert calls[:3] == [("draft", "RGB", (960, 540)), "load", ("convert", "RGB")]
+        assert not opened.closed
+        assert not converted.closed
+
+    assert opened.closed
+    assert converted.closed
+
+
+def test_shared_jpeg_decoder_translates_read_failure_and_closes_opened_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingImage:
+        format = "JPEG"
+        size = (10, 5)
+        mode = "RGB"
+        closed = False
+
+        def draft(self, mode: str, size: tuple[int, int]) -> None:
+            pass
+
+        def load(self) -> None:
+            raise OSError("secret decode failure")
+
+        def close(self) -> None:
+            self.closed = True
+
+    opened = FailingImage()
+    monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts.Image.open", lambda path: opened)
+
+    with pytest.raises(JpegDecodeError) as caught:
+        with open_decoded_rgb_jpeg(Path("snapshot.jpg"), initial_max_dimension=960):
+            pass
+
+    assert caught.value.code == "read_failed"
+    assert opened.closed
 
 
 def _encode(

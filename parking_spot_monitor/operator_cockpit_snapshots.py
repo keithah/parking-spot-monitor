@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import secrets
 import stat as stat_module
-import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -13,6 +12,7 @@ from PIL import Image, UnidentifiedImageError
 from parking_spot_monitor.capture import CaptureError, capture_latest
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.image_budget import ImageBudgetError, encode_jpeg_under_budget
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, open_decoded_rgb_jpeg
 from parking_spot_monitor.incident_review import build_incident_replay
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
 from parking_spot_monitor.matrix_models import MatrixCommandResponse
@@ -41,6 +41,7 @@ from parking_spot_monitor.operator_timeline import DISPLAY_TIMEZONE, nearest_tim
 
 _WHO_SNAPSHOT_OPERATIONAL_ERRORS = (
     ImageBudgetError,
+    JpegDecodeError,
     OSError,
     UnidentifiedImageError,
     Image.DecompressionBombError,
@@ -200,7 +201,9 @@ def _prepare_incident_snapshot_for_matrix(path: Path, *, data_dir: Path, spot_id
     try:
         return _resize_who_snapshot_for_matrix(path, destination=destination, now=now, logger=logger)
     except _WHO_SNAPSHOT_OPERATIONAL_ERRORS as exc:
-        error_type = redact_diagnostic_text(exc.__class__.__name__)
+        error_type = redact_diagnostic_text(
+            exc.source_error_type if isinstance(exc, JpegDecodeError) and exc.source_error_type else exc.__class__.__name__
+        )
         _log_snapshot_failure(logger, reason="incident_resize_failed", error_type=error_type)
         return LatestSnapshotValidation(state="error", error_type="resize failed")
 
@@ -263,42 +266,25 @@ def _prepare_who_snapshot_for_matrix(path: Path, *, data_dir: Path, now: datetim
     try:
         return _resize_who_snapshot_for_matrix(path, destination=destination, now=now, logger=logger)
     except _WHO_SNAPSHOT_OPERATIONAL_ERRORS as exc:
-        error_type = redact_diagnostic_text(exc.__class__.__name__)
+        error_type = redact_diagnostic_text(
+            exc.source_error_type if isinstance(exc, JpegDecodeError) and exc.source_error_type else exc.__class__.__name__
+        )
         _log_snapshot_failure(logger, reason="resize_failed", error_type=error_type)
         return LatestSnapshotValidation(state="error", error_type="resize failed")
 
 
 def _resize_who_snapshot_for_matrix(path: Path, *, destination: Path, now: datetime, logger: StructuredLogger | None) -> LatestSnapshotValidation:
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", Image.DecompressionBombWarning)
-        image = Image.open(path)
-        try:
-            width, height = image.size
-            if width <= 0 or height <= 0:
-                raise ImageBudgetError("image dimensions must be positive")
-            bounded_dimension = min(max(width, height), WHO_MATRIX_INITIAL_MAX_DIMENSION)
-            if width >= height:
-                bounded_size = (bounded_dimension, max(1, height * bounded_dimension // width))
-            else:
-                bounded_size = (max(1, width * bounded_dimension // height), bounded_dimension)
-            image.draft("RGB", bounded_size)
-            image.load()
-            working = image if image.mode == "RGB" else image.convert("RGB")
-            try:
-                result = encode_jpeg_under_budget(
-                    working,
-                    max_bytes=MAX_WHO_MATRIX_IMAGE_BYTES,
-                    initial_max_dimension=WHO_MATRIX_INITIAL_MAX_DIMENSION,
-                    min_dimension=WHO_MATRIX_MIN_DIMENSION,
-                    dimension_scale=0.85,
-                    qualities=WHO_MATRIX_JPEG_QUALITIES,
-                    resampling=getattr(getattr(Image, "Resampling", Image), "LANCZOS"),
-                )
-            finally:
-                if working is not image:
-                    working.close()
-        finally:
-            image.close()
+    with open_decoded_rgb_jpeg(path, initial_max_dimension=WHO_MATRIX_INITIAL_MAX_DIMENSION) as decoded:
+        width, height = decoded.source_width, decoded.source_height
+        result = encode_jpeg_under_budget(
+            decoded.image,
+            max_bytes=MAX_WHO_MATRIX_IMAGE_BYTES,
+            initial_max_dimension=WHO_MATRIX_INITIAL_MAX_DIMENSION,
+            min_dimension=WHO_MATRIX_MIN_DIMENSION,
+            dimension_scale=0.85,
+            qualities=WHO_MATRIX_JPEG_QUALITIES,
+            resampling=getattr(getattr(Image, "Resampling", Image), "LANCZOS"),
+        )
 
     destination_mode = _who_snapshot_destination_mode(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)

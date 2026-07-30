@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 import shutil
-import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +12,8 @@ from typing import Any
 from PIL import Image, UnidentifiedImageError
 
 from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult, encode_jpeg_under_budget
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, open_decoded_rgb_jpeg
+from parking_spot_monitor.jpeg_artifacts import upload_derivative_path
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
 from parking_spot_monitor.matrix_support import MatrixError, _require_non_empty, _sanitize_diagnostics
 from parking_spot_monitor.matrix_time import format_observed_at
@@ -82,48 +83,28 @@ def _resize_jpeg_for_matrix_upload(path: Path) -> tuple[bytes, dict[str, int | s
 
 def _resize_jpeg_for_matrix_upload_result(path: Path) -> _MatrixSnapshotResize:
     try:
-        with warnings.catch_warnings(action="error", category=Image.DecompressionBombWarning):
-            image = Image.open(path)
-            try:
-                width, height = image.size
-                if width <= 0 or height <= 0:
-                    raise MatrixError("Matrix snapshot dimensions are invalid", error_type="snapshot_resize_failed", snapshot_path=str(path))
-                bounded_dimension = min(max(width, height), MATRIX_UPLOAD_INITIAL_MAX_DIMENSION)
-                if width >= height:
-                    bounded_size = (bounded_dimension, max(1, height * bounded_dimension // width))
-                else:
-                    bounded_size = (max(1, width * bounded_dimension // height), bounded_dimension)
-                image.draft("RGB", bounded_size)
-                image.load()
-                resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
-                working = image.convert("RGB") if image.mode != "RGB" else image
-                try:
-                    result = encode_jpeg_under_budget(
-                        working,
-                        max_bytes=MAX_MATRIX_UPLOAD_IMAGE_BYTES,
-                        initial_max_dimension=MATRIX_UPLOAD_INITIAL_MAX_DIMENSION,
-                        min_dimension=MATRIX_UPLOAD_MIN_DIMENSION,
-                        dimension_scale=0.85,
-                        qualities=MATRIX_UPLOAD_JPEG_QUALITIES,
-                        resampling=resampling,
-                    )
-                finally:
-                    if working is not image:
-                        working.close()
-                return _MatrixSnapshotResize(
-                    result=result,
-                    info={
-                        "mimetype": JPEG_MIMETYPE,
-                        "size": len(result.data),
-                        "w": result.width,
-                        "h": result.height,
-                    },
-                )
-            finally:
-                image.close()
-    except (ImageBudgetError, OSError, UnidentifiedImageError, Image.DecompressionBombError, Image.DecompressionBombWarning):
+        with open_decoded_rgb_jpeg(path, initial_max_dimension=MATRIX_UPLOAD_INITIAL_MAX_DIMENSION) as decoded:
+            result = encode_jpeg_under_budget(
+                decoded.image,
+                max_bytes=MAX_MATRIX_UPLOAD_IMAGE_BYTES,
+                initial_max_dimension=MATRIX_UPLOAD_INITIAL_MAX_DIMENSION,
+                min_dimension=MATRIX_UPLOAD_MIN_DIMENSION,
+                dimension_scale=0.85,
+                qualities=MATRIX_UPLOAD_JPEG_QUALITIES,
+                resampling=getattr(getattr(Image, "Resampling", Image), "LANCZOS"),
+            )
+        return _MatrixSnapshotResize(
+            result=result,
+            info={"mimetype": JPEG_MIMETYPE, "size": len(result.data), "w": result.width, "h": result.height},
+        )
+    except (ImageBudgetError, JpegDecodeError) as exc:
+        message = (
+            "Matrix snapshot dimensions are invalid"
+            if isinstance(exc, JpegDecodeError) and exc.code == "invalid_dimensions"
+            else "Matrix snapshot could not be resized under upload budget"
+        )
         raise MatrixError(
-            "Matrix snapshot could not be resized under upload budget",
+            message,
             error_type="snapshot_resize_failed",
             snapshot_path=str(path),
         ) from None
@@ -303,6 +284,18 @@ def prune_event_snapshots(
             continue
         pruned_count += 1
         pruned_bytes += byte_size
+        derivative = upload_derivative_path(path)
+        try:
+            if derivative.is_file() and not derivative.is_symlink():
+                pruned_bytes += derivative.stat().st_size
+                derivative.unlink()
+                try:
+                    derivative.parent.rmdir()
+                except OSError:
+                    pass
+        except OSError as exc:
+            failed_count += 1
+            _log_retention_failure(logger, root=root, trigger=trigger, error_type=type(exc).__name__, message=str(exc))
 
     if pruned_count:
         _log_retention_pruned(

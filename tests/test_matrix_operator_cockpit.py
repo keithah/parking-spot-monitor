@@ -566,6 +566,7 @@ def test_who_resize_drafts_before_load_reuses_rgb_source_and_closes_it(
     events: list[object] = []
 
     class TrackingImage:
+        format = "JPEG"
         size = (1280, 720)
         mode = "RGB"
 
@@ -619,6 +620,7 @@ def test_who_resize_converts_non_rgb_once_and_closes_both_images(
     converted = ConvertedImage()
 
     class SourceImage:
+        format = "JPEG"
         size = (1280, 720)
         mode = "CMYK"
 

@@ -4,13 +4,60 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from parking_monitor.outbox import AlertIntent, LocalOutbox
 from parking_spot_monitor.config import load_settings
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError
+from parking_spot_monitor import operator_cockpit_snapshots
+from parking_spot_monitor.operator_cockpit_shared import LatestSnapshotValidation
 from parking_spot_monitor.operator_cockpit import format_operator_confidence_reply, format_operator_status_reply
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
 from parking_spot_monitor.state import RuntimeState, save_runtime_state
 
 ACCESS_TOKEN = "secret-token-value"
+
+
+def test_operator_resize_uses_shared_decoder_and_preserves_error_mapping_and_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[Path] = []
+    warnings: list[tuple[str, dict[str, object]]] = []
+
+    class Logger:
+        def warning(self, event: str, **fields: object) -> None:
+            warnings.append((event, fields))
+
+    class FailingDecoder:
+        def __enter__(self) -> object:
+            raise JpegDecodeError("read_failed")
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    def fail(path: Path, *, initial_max_dimension: int) -> FailingDecoder:
+        calls.append(path)
+        return FailingDecoder()
+
+    source = tmp_path / "latest.jpg"
+    source.write_bytes(b"not read directly")
+    monkeypatch.setattr(operator_cockpit_snapshots, "open_decoded_rgb_jpeg", fail, raising=False)
+    monkeypatch.setattr(
+        operator_cockpit_snapshots,
+        "_validate_latest_snapshot",
+        lambda *args, **kwargs: LatestSnapshotValidation(state="error", error_type="too large"),
+    )
+
+    result = operator_cockpit_snapshots._prepare_who_snapshot_for_matrix(
+        source,
+        data_dir=tmp_path,
+        now=datetime(2026, 5, 18, tzinfo=timezone.utc),
+        logger=Logger(),  # type: ignore[arg-type]
+    )
+
+    assert result == LatestSnapshotValidation(state="error", error_type="resize failed")
+    assert calls == [source]
+    assert warnings == [("operator-who-snapshot-unavailable", {"reason": "resize_failed", "error_type": "JpegDecodeError"})]
 
 
 def load_test_settings(tmp_path: Path):

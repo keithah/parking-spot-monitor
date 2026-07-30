@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import math
 import os
 import stat
@@ -15,6 +16,7 @@ from PIL import Image
 
 from parking_spot_monitor import vehicle_history_corrections, vehicle_history_storage
 from parking_spot_monitor.logging import setup_logging
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, publish_canonical_jpeg
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
 from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache
 from parking_spot_monitor.vehicle_history import (
@@ -714,11 +716,132 @@ def write_test_jpeg(path: Path, *, size: tuple[int, int] = (8, 6), color: tuple[
     return path
 
 
+def test_canonical_jpeg_prefers_hardlink_without_reencoding_or_mode_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    source.chmod(0o600)
+    source_inode = source.stat().st_ino
+    original_chmod = os.chmod
+    original_fchmod = os.fchmod
+
+    def reject_shared_chmod(path: str | os.PathLike[str], mode: int, *args: object, **kwargs: object) -> None:
+        if Path(path).exists() and Path(path).stat().st_ino == source_inode:
+            raise AssertionError("must not chmod a shared hardlink inode")
+        original_chmod(path, mode, *args, **kwargs)
+
+    def reject_shared_fchmod(fd: int, mode: int) -> None:
+        if os.fstat(fd).st_ino == source_inode:
+            raise AssertionError("must not fchmod a shared hardlink inode")
+        original_fchmod(fd, mode)
+
+    monkeypatch.setattr(os, "chmod", reject_shared_chmod)
+    monkeypatch.setattr(os, "fchmod", reject_shared_fchmod)
+
+    publication = publish_canonical_jpeg(source, tmp_path / "archive" / "full.jpg")
+
+    assert publication.strategy == "hardlink"
+    assert publication.path.read_bytes() == source.read_bytes()
+    assert publication.path.stat().st_ino == source_inode
+    assert stat.S_IMODE(source.stat().st_mode) == 0o600
+    assert stat.S_IMODE(publication.path.stat().st_mode) == 0o600
+
+
+def test_canonical_jpeg_falls_back_from_cross_device_link_to_reflink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    calls: list[str] = []
+
+    def cross_device(*args: object, **kwargs: object) -> None:
+        calls.append("hardlink")
+        raise OSError(errno.EXDEV, "cross-device")
+
+    def reflink(source_path: Path, temporary: Path, source_mode: int) -> None:
+        calls.append("reflink")
+        temporary.write_bytes(source_path.read_bytes())
+
+    monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts.os.link", cross_device)
+    monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts._reflink", reflink)
+
+    publication = publish_canonical_jpeg(source, tmp_path / "archive" / "full.jpg")
+
+    assert publication.strategy == "reflink"
+    assert publication.path.read_bytes() == source.read_bytes()
+    assert calls == ["hardlink", "reflink"]
+
+
+def test_canonical_jpeg_falls_back_to_bounded_copy_and_cleans_failed_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    destination = tmp_path / "archive" / "full.jpg"
+    calls: list[str] = []
+
+    def cross_device(*args: object, **kwargs: object) -> None:
+        calls.append("hardlink")
+        raise OSError(errno.EXDEV, "cross-device")
+
+    def unsupported(*args: object, **kwargs: object) -> None:
+        calls.append("reflink")
+        raise OSError(errno.EOPNOTSUPP, "unsupported")
+
+    monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts.os.link", cross_device)
+    monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts._reflink", unsupported)
+
+    publication = publish_canonical_jpeg(source, destination)
+
+    assert publication.strategy == "copy"
+    assert publication.path.read_bytes() == source.read_bytes()
+    assert calls == ["hardlink", "reflink"]
+    assert list(destination.parent.glob(".*.tmp")) == []
+
+
+def test_canonical_jpeg_post_replace_directory_sync_failure_keeps_committed_file_without_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    destination = tmp_path / "archive" / "full.jpg"
+    monkeypatch.setattr(
+        "parking_spot_monitor.jpeg_artifacts._fsync_directory",
+        lambda path: (_ for _ in ()).throw(OSError("directory sync failed")),
+    )
+
+    with pytest.raises(OSError, match="directory sync failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert destination.read_bytes() == source.read_bytes()
+    assert list(destination.parent.glob(".*.tmp")) == []
+
+
+def test_canonical_jpeg_rejects_source_replaced_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (8, 6), (200, 20, 20)).save(replacement, "PNG")
+    destination = tmp_path / "archive" / "full.jpg"
+    real_link = os.link
+
+    def swap_then_link(source_path: Path, temporary: Path) -> None:
+        os.replace(replacement, source_path)
+        real_link(source_path, temporary)
+
+    monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts.os.link", swap_then_link)
+
+    with pytest.raises(JpegDecodeError, match="read_failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert not destination.exists()
+    assert list(destination.parent.glob(".*.tmp")) == []
+
+
 def test_attach_occupied_images_writes_full_frame_and_clamped_crop_then_close_preserves_refs(tmp_path: Path) -> None:
     stream = StringIO()
     archive = VehicleHistoryArchive(tmp_path, logger=setup_logging(stream=stream))
     active = archive.start_session(occupied_event(spot_id="image spot"))
     source = write_test_jpeg(tmp_path / "source.jpg", size=(8, 6))
+    source_bytes = source.read_bytes()
 
     updated = archive.attach_occupied_images(
         session_id=active.session_id,
@@ -735,14 +858,17 @@ def test_attach_occupied_images_writes_full_frame_and_clamped_crop_then_close_pr
     assert full_path != crop_path
     assert full_path.name == f"{active.session_id}.jpg"
     assert crop_path.name == f"{active.session_id}.jpg"
-    assert stat.S_IMODE(full_path.stat().st_mode) == 0o644
+    assert stat.S_IMODE(full_path.stat().st_mode) == stat.S_IMODE(source.stat().st_mode)
     assert stat.S_IMODE(crop_path.stat().st_mode) == 0o644
+    assert full_path.read_bytes() == source_bytes
+    assert full_path.stat().st_ino == source.stat().st_ino
     with Image.open(full_path) as full_frame:
         assert full_frame.size == (8, 6)
         assert full_frame.format == "JPEG"
     with Image.open(crop_path) as crop:
         assert crop.size == (6, 5)
         assert crop.format == "JPEG"
+        assert all(abs(actual - expected) <= 3 for actual, expected in zip(crop.getpixel((2, 2)), (10, 80, 140)))
 
     active_path = tmp_path / "vehicle-history" / "sessions" / "active" / f"{active.session_id}.json"
     raw_active = json.loads(active_path.read_text())

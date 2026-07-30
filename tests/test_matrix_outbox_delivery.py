@@ -16,6 +16,7 @@ import parking_spot_monitor.matrix_snapshots as matrix_snapshots
 from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery, MatrixOutboxDrainResult
 from parking_monitor.outbox import LocalOutbox
 from parking_spot_monitor.image_budget import JpegBudgetResult
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix import MatrixError
 from parking_spot_monitor.matrix_alerts import MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, monitor_lifecycle_event
@@ -343,6 +344,172 @@ def test_oversized_outbox_snapshot_preserves_upload_and_persisted_info_schema(
         "body": "Raw full-frame snapshot for left_spot at 2026-05-18T20:01:02+00:00",
         "info": {"mimetype": "image/jpeg", "size": 4, "w": 640, "h": 360},
     }
+
+
+def test_matrix_resize_uses_shared_decoder_and_preserves_matrix_error_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called: list[Path] = []
+
+    class FailingDecoder:
+        def __enter__(self) -> object:
+            raise JpegDecodeError("read_failed")
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    def fail(path: Path, *, initial_max_dimension: int) -> FailingDecoder:
+        called.append(path)
+        return FailingDecoder()
+
+    monkeypatch.setattr(matrix_snapshots, "open_decoded_rgb_jpeg", fail, raising=False)
+    source = tmp_path / "oversized.jpg"
+    write_jpeg(source)
+
+    with pytest.raises(MatrixError) as caught:
+        matrix_snapshots._resize_jpeg_for_matrix_upload(source)
+
+    assert caught.value.diagnostics["error_type"] == "snapshot_resize_failed"
+    assert called == [source]
+
+
+def test_upload_retry_reuses_persisted_derivative_after_restart(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
+    store_path = tmp_path / "matrix-outbox.json"
+    first_client = FakeMatrixClient(fail={"upload": MatrixError("timeout", error_type="timeout")})
+    first = make_delivery(tmp_path, first_client)
+
+    record = first.enqueue_open_spot_alert(open_event(source))
+    first.drain_outbox(record_id=record.id)
+
+    [persisted] = LocalOutbox(store_path).list_records()
+    derivative = Path(str(persisted.intent.metadata["upload_derivative_path"]))
+    retained = Path(str(persisted.intent.metadata["retained_snapshot_path"]))
+    info = persisted.intent.metadata["upload_derivative_info"]
+    before = derivative.read_bytes()
+    assert derivative.parent == tmp_path / "snapshots" / ".upload-derivatives"
+    assert derivative.name == retained.name
+    assert list((tmp_path / "snapshots").glob("occupancy-open-event-left-spot-*.jpg")) == [retained]
+    source.unlink()
+    retained.write_bytes(b"changed after derivative selection")
+
+    second_client = FakeMatrixClient()
+    restarted = MatrixOutboxDelivery(
+        client=second_client,
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(store_path),
+        utc_now=lambda: RETRY_DUE_NOW,
+    )
+    delivered = restarted.drain_outbox(record_id=record.id)
+
+    assert delivered.delivered_count == 1
+    assert [call for call in second_client.calls if call["kind"] == "upload"][0]["data"] == before
+    assert derivative.read_bytes() == before
+    assert info == {
+        "mimetype": "image/jpeg",
+        "size": len(before),
+        "w": 960,
+        "h": 540,
+    }
+
+
+def test_snapshot_retention_keeps_pending_derivative_then_prunes_terminal_pair(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
+    first_client = FakeMatrixClient(fail={"upload": MatrixError("timeout", error_type="timeout")})
+    first = make_delivery(tmp_path, first_client, snapshot_retention_count=1)
+    retrying = first.send_open_spot_alert(open_event(source))
+    assert retrying.retrying_count == 1
+    [record] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
+    retained = Path(str(record.intent.metadata["retained_snapshot_path"]))
+    derivative = Path(str(record.intent.metadata["upload_derivative_path"]))
+    assert retained.exists() and derivative.exists()
+
+    later = open_event(source) | {"observed_at": datetime(2026, 5, 18, 20, 2, 0, tzinfo=timezone.utc)}
+    make_delivery(tmp_path, FakeMatrixClient(), snapshot_retention_count=1).send_open_spot_alert(later)
+    assert retained.exists() and derivative.exists()
+
+    restarted = MatrixOutboxDelivery(
+        client=FakeMatrixClient(), room_id=ROOM_ID, data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots", outbox=LocalOutbox(tmp_path / "matrix-outbox.json"),
+        snapshot_retention_count=1, utc_now=lambda: RETRY_DUE_NOW,
+    )
+    restarted.drain_outbox(record_id=record.id)
+    newest = open_event(source) | {"observed_at": datetime(2026, 5, 18, 20, 3, 0, tzinfo=timezone.utc)}
+    make_delivery(tmp_path, FakeMatrixClient(), snapshot_retention_count=1).send_open_spot_alert(newest)
+
+    assert not retained.exists()
+    assert not derivative.exists()
+
+
+def test_legacy_upload_regenerates_and_persists_derivative_before_network(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
+    store_path = tmp_path / "matrix-outbox.json"
+    first = make_delivery(tmp_path, FakeMatrixClient())
+    record = first.enqueue_open_spot_alert(open_event(source))
+    legacy_metadata = dict(record.intent.metadata)
+    old_derivative = Path(str(legacy_metadata.pop("upload_derivative_path")))
+    legacy_metadata.pop("upload_derivative_info")
+    old_derivative.unlink()
+    first.outbox.update_intent_metadata(record.id, legacy_metadata)
+
+    class InspectingClient(FakeMatrixClient):
+        def upload_image(self, *, filename: str, data: bytes, content_type: str) -> str:
+            [persisted] = LocalOutbox(store_path).list_records()
+            path = Path(str(persisted.intent.metadata["upload_derivative_path"]))
+            assert path.read_bytes() == data
+            assert persisted.intent.metadata["upload_derivative_info"] == {
+                "mimetype": "image/jpeg", "size": len(data), "w": 960, "h": 540,
+            }
+            return super().upload_image(filename=filename, data=data, content_type=content_type)
+
+    restarted = MatrixOutboxDelivery(
+        client=InspectingClient(), room_id=ROOM_ID, data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots", outbox=LocalOutbox(store_path),
+    )
+
+    assert restarted.drain_outbox(record_id=record.id).delivered_count == 1
+
+
+def test_upload_rejects_out_of_contract_derivative_path_without_reading_it(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    store_path = tmp_path / "matrix-outbox.json"
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    record = delivery.enqueue_open_spot_alert(open_event(source))
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"must not be uploaded")
+    metadata = dict(record.intent.metadata)
+    metadata["upload_derivative_path"] = str(outside)
+    delivery.outbox.update_intent_metadata(record.id, metadata)
+
+    result = delivery.drain_outbox(record_id=record.id)
+
+    assert result.retrying_count == 0
+    [dead] = LocalOutbox(store_path).list_records()
+    assert dead.state == "dead_lettered"
+    assert dead.dead_letter_reason == "matrix_upload_snapshot_resize_failed"
+    assert outside.read_bytes() == b"must not be uploaded"
+    assert not [call for call in delivery.client.calls if call["kind"] == "upload"]
+
+
+def test_duplicate_enqueue_does_not_replace_immutable_upload_derivative(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    first = delivery.enqueue_open_spot_alert(open_event(source))
+    derivative = Path(str(first.intent.metadata["upload_derivative_path"]))
+    selected = derivative.read_bytes()
+    write_jpeg(source, color=(200, 10, 10))
+
+    duplicate = delivery.enqueue_open_spot_alert(open_event(source))
+
+    assert duplicate.id == first.id
+    assert derivative.read_bytes() == selected
 
 
 def test_matrix_outbox_delivery_close_closes_owned_client(tmp_path: Path) -> None:

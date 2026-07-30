@@ -707,6 +707,7 @@ def test_matrix_snapshot_resize_drafts_before_load_and_reuses_rgb_source(
     events: list[object] = []
 
     class TrackingImage:
+        format = "JPEG"
         size = (1280, 720)
         mode = "RGB"
 
@@ -845,6 +846,7 @@ def test_matrix_snapshot_resize_rejects_invalid_dimensions_with_safe_matrix_erro
     events: list[str] = []
 
     class InvalidImage:
+        format = "JPEG"
         size = (0, 720)
 
         def close(self) -> None:
@@ -882,6 +884,7 @@ def test_matrix_snapshot_resize_converts_non_rgb_once_and_closes_both_images(
     converted = ConvertedImage()
 
     class SourceImage:
+        format = "JPEG"
         size = (1280, 720)
         mode = "CMYK"
 
