@@ -298,10 +298,10 @@ def _default_matrix_delivery_factory(settings: RuntimeSettings, data_dir: Path, 
         outbox=outbox,
         logger=logger,
         snapshot_retention_count=settings.storage.snapshot_retention_count,
+        outbox_retry_max_seconds=settings.matrix.outbox_retry_max_seconds,
+        outbox_retry_jitter_ratio=settings.matrix.retry_jitter_ratio,
     )
-    delivery.start_worker(
-        retry_interval_seconds=settings.matrix.outbox_retry_interval_seconds
-    )
+    delivery.start_worker(retry_interval_seconds=settings.matrix.outbox_retry_interval_seconds)
     return delivery
 
 

@@ -195,6 +195,17 @@ def test_confirmed_dead_retry_and_replay_declarations_are_absent() -> None:
     )
 
 
+def test_outbox_is_decomposed_behind_a_small_compatibility_facade() -> None:
+    caps = {
+        "src/parking_monitor/outbox.py": 450,
+        "src/parking_monitor/outbox_models.py": 500,
+        "src/parking_monitor/outbox_storage.py": 500,
+    }
+    for path, max_lines in caps.items():
+        assert (ROOT / path).exists()
+        assert _line_count(path) <= max_lines, path
+
+
 def test_matrix_module_is_a_small_compatibility_shim() -> None:
     assert _line_count("parking_spot_monitor/matrix.py") <= 220
     module_caps = {

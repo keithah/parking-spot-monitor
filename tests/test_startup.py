@@ -6,7 +6,8 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -6042,7 +6043,13 @@ class UploadFailsOnceMatrixClient(FakeMatrixClient):
         return super().upload_image(filename=filename, data=data, content_type=content_type)
 
 
-def outbox_delivery(client: object, data_dir: Path, logger: StructuredLogger) -> MatrixOutboxDelivery:
+def outbox_delivery(
+    client: object,
+    data_dir: Path,
+    logger: StructuredLogger,
+    *,
+    utc_now: Callable[[], datetime] | None = None,
+) -> MatrixOutboxDelivery:
     delivery = MatrixOutboxDelivery(
         client=client,
         room_id="!room:example.org",
@@ -6050,6 +6057,7 @@ def outbox_delivery(client: object, data_dir: Path, logger: StructuredLogger) ->
         snapshots_dir=data_dir / "snapshots",
         outbox=LocalOutbox(data_dir / "matrix-outbox.json"),
         logger=logger,
+        utc_now=utc_now,
     )
     delivery.start_worker(retry_interval_seconds=60)
     return delivery
@@ -6148,7 +6156,12 @@ def test_runtime_worker_restarts_existing_matrix_outbox_without_new_occupancy_ev
         data_dir: Path,
         logger: StructuredLogger,
     ) -> MatrixOutboxDelivery:
-        delivery = outbox_delivery(client, data_dir, logger)
+        delivery = outbox_delivery(
+            client,
+            data_dir,
+            logger,
+            utc_now=lambda: datetime.now(timezone.utc) + timedelta(seconds=120),
+        )
         assert client.image_sent.wait(2), "restarted worker did not finish durable delivery"
         return delivery
 

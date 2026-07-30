@@ -8,16 +8,24 @@ restarts retry only missing work.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import isfinite
 from pathlib import Path
+import random
 import threading
 import time
 from typing import Any
 
-from parking_monitor.outbox import AlertIntent, LocalOutbox, OutboxRecord
+from parking_monitor.outbox import (
+    AlertIntent,
+    LocalOutbox,
+    OutboxRecord,
+    OutboxRetryPolicy,
+    RetrySchedule,
+    format_utc_timestamp,
+)
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
 from parking_spot_monitor.matrix_alerts import (
     LIFECYCLE_EVENT_TYPES,
@@ -69,6 +77,11 @@ class MatrixOutboxDelivery:
         outbox: LocalOutbox,
         logger: StructuredLogger | None = None,
         snapshot_retention_count: int = 50,
+        outbox_retry_max_seconds: float = 900,
+        outbox_retry_jitter_ratio: float = 0.2,
+        utc_now: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        random_unit: Callable[[], float] = random.random,
     ) -> None:
         self.client = client
         self.room_id = room_id
@@ -77,6 +90,12 @@ class MatrixOutboxDelivery:
         self.outbox = outbox
         self.logger = logger
         self.snapshot_retention_count = snapshot_retention_count
+        self._utc_now = utc_now or (lambda: datetime.now(timezone.utc))
+        self._monotonic = monotonic
+        self._random_unit = random_unit
+        self._retry_max_seconds = float(outbox_retry_max_seconds)
+        self._retry_jitter_ratio = float(outbox_retry_jitter_ratio)
+        self._retry_policy = OutboxRetryPolicy(60, self._retry_max_seconds, self._retry_jitter_ratio)
         self._worker_lock = threading.Lock()
         self._drain_lock = threading.Lock()
         self._wake_event = threading.Event()
@@ -142,6 +161,11 @@ class MatrixOutboxDelivery:
             if self._worker is not None and self._worker.is_alive():
                 return
             self._retry_interval_seconds = retry_interval
+            self._retry_policy = OutboxRetryPolicy(
+                retry_interval,
+                self._retry_max_seconds,
+                self._retry_jitter_ratio,
+            )
             self._stop_event.clear()
             self._worker = threading.Thread(
                 target=self._worker_main,
@@ -149,44 +173,21 @@ class MatrixOutboxDelivery:
                 daemon=True,
             )
             self._worker.start()
-        self._wake_event.set()
 
     def _worker_main(self) -> None:
-        retry_deadline: float | None = None
         while not self._stop_event.is_set():
-            timeout = None if retry_deadline is None else max(0.0, retry_deadline - time.monotonic())
-            signaled = self._wake_event.wait(timeout)
-            self._wake_event.clear()
-            if self._stop_event.is_set():
-                break
-            retry_due = retry_deadline is None or time.monotonic() >= retry_deadline
-            self._record_worker_attempt()
             try:
-                record_id: str | None = None
-                if signaled and retry_deadline is not None and not retry_due:
-                    record_id = next(
-                        (record.id for record in self.outbox.list_records() if record.state == "pending"),
-                        None,
-                    )
-                    if record_id is None:
-                        continue
-                result = self.drain_outbox(record_id=record_id, max_records=1)
-                if self._stop_event.is_set():
-                    break
-                counts = self.outbox.compact_status_summary().get("counts_by_state", {})
-                pending_count = counts.get("pending", 0) if isinstance(counts, Mapping) else 0
-                retrying_count = counts.get("retrying", 0) if isinstance(counts, Mapping) else 0
-                if result.retrying_count > 0:
-                    retry_deadline = time.monotonic() + self._retry_interval_seconds
-                if isinstance(pending_count, int) and pending_count > 0:
-                    self._wake_event.set()
-                elif isinstance(retrying_count, int) and retrying_count > 0:
-                    if retry_deadline is None:
-                        self._wake_event.set()
-                    elif retry_deadline <= time.monotonic():
-                        self._wake_event.set()
-                else:
-                    retry_deadline = None
+                now = self._utc_now()
+                record = self.outbox.next_due_record(now)
+                if record is None:
+                    due_at = self.outbox.next_retry_due_at()
+                    timeout = None if due_at is None else max(0.0, (due_at - now).total_seconds())
+                    self._wake_event.wait(timeout)
+                    self._wake_event.clear()
+                    continue
+                self._record_worker_attempt()
+                self.drain_outbox(record_id=record.id, max_records=1)
+                self.outbox.compact_status_summary()
             except Exception as exc:
                 self._record_worker_error(exc)
                 self._log(
@@ -194,8 +195,17 @@ class MatrixOutboxDelivery:
                     "matrix-outbox-worker-pass-failed",
                     error_type=redact_diagnostic_text(exc.__class__.__name__) or "Exception",
                 )
-                retry_deadline = time.monotonic() + self._retry_interval_seconds
+                self._pace_unexpected_worker_failure()
                 continue
+
+    def _pace_unexpected_worker_failure(self) -> None:
+        deadline = self._monotonic() + self._retry_policy.initial_seconds
+        while not self._stop_event.is_set():
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                return
+            if self._stop_event.wait(remaining):
+                return
 
     def _record_worker_attempt(self) -> None:
         attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -431,7 +441,11 @@ class MatrixOutboxDelivery:
                     self._record_worker_error(exc)
                 classification = _classify_delivery_failure(exc, phase=phase)
                 if classification.retryable:
-                    current = self.outbox.mark_retrying(current.id, reason=classification.reason)
+                    current = self.outbox.apply_phase_result(
+                        current.id,
+                        phase,
+                        retry=self._retry_schedule(current, reason=classification.reason),
+                    )
                     self._log(
                         "warning",
                         "matrix-outbox-phase-retryable-failure",
@@ -456,6 +470,15 @@ class MatrixOutboxDelivery:
         if current.state == "delivered":
             self._log("info", "matrix-outbox-record-delivered", item_id=current.id, event_id=current.intent.event_id)
         return current
+
+    def _retry_schedule(self, record: OutboxRecord, *, reason: str) -> RetrySchedule:
+        attempt_count = record.retry_attempt_count + 1
+        delay = self._retry_policy.delay_seconds(
+            attempt_count,
+            random_unit=self._random_unit(),
+        )
+        due_at = format_utc_timestamp(self._utc_now() + timedelta(seconds=delay))
+        return RetrySchedule(due_at=due_at, attempt_count=attempt_count, reason=reason)
 
     def _send_text_phase(self, record: OutboxRecord) -> OutboxRecord:
         event_id = self.client.send_text(

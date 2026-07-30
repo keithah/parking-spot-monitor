@@ -236,6 +236,7 @@ class MatrixConfig(StrictModel):
     retry_backoff_seconds: float = Field(default=1, ge=0, allow_inf_nan=False)
     retry_jitter_ratio: float = Field(default=0.2, ge=0, le=1, allow_inf_nan=False)
     outbox_retry_interval_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
+    outbox_retry_max_seconds: float = Field(default=900, gt=0, allow_inf_nan=False)
     unauthorized_reply_cooldown_seconds: float = Field(default=300, ge=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
@@ -247,6 +248,11 @@ class MatrixConfig(StrictModel):
             raise ValueError(
                 "matrix.command_failure_max_cooldown_seconds must be greater than "
                 "or equal to matrix.command_failure_cooldown_seconds"
+            )
+        if self.outbox_retry_max_seconds < self.outbox_retry_interval_seconds:
+            raise ValueError(
+                "matrix.outbox_retry_max_seconds must be greater than or equal to "
+                "matrix.outbox_retry_interval_seconds"
             )
         return self
 
@@ -434,6 +440,7 @@ class RuntimeSettings(StrictModel):
                 "retry_backoff_seconds": self.matrix.retry_backoff_seconds,
                 "retry_jitter_ratio": self.matrix.retry_jitter_ratio,
                 "outbox_retry_interval_seconds": self.matrix.outbox_retry_interval_seconds,
+                "outbox_retry_max_seconds": self.matrix.outbox_retry_max_seconds,
                 "unauthorized_reply_cooldown_seconds": self.matrix.unauthorized_reply_cooldown_seconds,
             },
             "quiet_windows": [window.model_dump() for window in self.quiet_windows],

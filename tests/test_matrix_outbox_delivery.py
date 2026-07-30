@@ -128,6 +128,92 @@ def make_delivery(
     )
 
 
+def test_retry_failure_persists_per_record_exponential_schedule_across_restart(
+    tmp_path: Path,
+) -> None:
+    now = [datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)]
+    path = tmp_path / "matrix-outbox.json"
+    client = FakeMatrixClient(fail={"text": TimeoutError("timeout")})
+    delivery = MatrixOutboxDelivery(
+        client=client,
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(path),
+        utc_now=lambda: now[0],
+        random_unit=lambda: 0,
+    )
+    record = delivery.enqueue_text_notice(
+        "quiet-window-started",
+        {"event_type": "quiet-window-started", "event_id": "retry-schedule", "window_id": "w"},
+    )
+
+    delivery.drain_outbox(record_id=record.id)
+    [first] = LocalOutbox(path).list_records()
+    assert first.retry_attempt_count == 1
+    assert first.retry_due_at == "2026-07-30T12:01:00Z"
+    assert LocalOutbox(path).next_due_record(now[0]) is None
+
+    now[0] = datetime(2026, 7, 30, 12, 1, tzinfo=timezone.utc)
+    restarted = MatrixOutboxDelivery(
+        client=client,
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(path),
+        utc_now=lambda: now[0],
+        random_unit=lambda: 0,
+    )
+    restarted.drain_outbox(record_id=record.id)
+    [second] = LocalOutbox(path).list_records()
+    assert second.retry_attempt_count == 2
+    assert second.retry_due_at == "2026-07-30T12:03:00Z"
+
+
+def test_delivery_publishes_once_per_durable_phase_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    record = delivery.enqueue_open_spot_alert(open_event(source))
+    original = delivery.outbox._persist_records
+    calls = 0
+
+    def counted(records):
+        nonlocal calls
+        calls += 1
+        return original(records)
+
+    monkeypatch.setattr(delivery.outbox, "_persist_records", counted)
+    delivered = delivery.drain_outbox(record_id=record.id)
+
+    assert delivered.delivered_count == 1
+    assert calls == 3
+
+
+def test_retryable_phase_failure_publishes_one_retry_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    delivery = make_delivery(tmp_path, FakeMatrixClient(fail={"text": TimeoutError("timeout")}))
+    record = delivery.enqueue_text_notice(
+        "quiet-window-started",
+        {"event_type": "quiet-window-started", "event_id": "retry-write-count", "window_id": "w"},
+    )
+    original = delivery.outbox._persist_records
+    calls = 0
+
+    def counted(records):
+        nonlocal calls
+        calls += 1
+        return original(records)
+
+    monkeypatch.setattr(delivery.outbox, "_persist_records", counted)
+    delivery.drain_outbox(record_id=record.id)
+
+    assert calls == 1
+
+
 def test_occupied_alert_queues_image_outbox_record_without_network(tmp_path: Path) -> None:
     source = tmp_path / "occupied.jpg"
     write_jpeg(source, color=(110, 25, 80))
@@ -261,9 +347,14 @@ def test_worker_requests_at_most_one_record_per_drain_pass(tmp_path: Path) -> No
 
     delivery = RecordingDelivery()
     try:
+        delivery.enqueue_text_notice(
+            "quiet-window-started",
+            {"event_type": "quiet-window-started", "event_id": "bounded-drain", "window_id": "w"},
+        )
         delivery.start_worker(retry_interval_seconds=60)
         assert drained.wait(2), "worker did not perform its initial bounded drain"
-        assert delivery.max_records == [1]
+        assert delivery.max_records
+        assert set(delivery.max_records) == {1}
     finally:
         delivery.close()
 
@@ -325,10 +416,10 @@ def test_idle_worker_waits_without_polling_the_outbox_filesystem(tmp_path: Path)
             super().__init__(path)
             self.list_calls = 0
 
-        def list_records(self, state: Any | None = None) -> list[Any]:
+        def next_due_record(self, now: datetime) -> Any | None:
             self.list_calls += 1
             (first_read if self.list_calls == 1 else repeated_read).set()
-            return super().list_records(state)
+            return super().next_due_record(now)
 
     delivery = MatrixOutboxDelivery(
         client=FakeMatrixClient(),
@@ -392,6 +483,10 @@ def test_worker_survives_unexpected_drain_failure_and_health_redacts_error_detai
 
     delivery = FlakyDelivery()
     try:
+        delivery.enqueue_text_notice(
+            "quiet-window-started",
+            {"event_type": "quiet-window-started", "event_id": "flaky-worker", "window_id": "w"},
+        )
         delivery.start_worker(retry_interval_seconds=0.01)
         assert recovered.wait(2), "worker died after an unexpected drain failure"
         health = delivery.outbox_health_summary()
@@ -444,6 +539,10 @@ def test_worker_survives_unexpected_post_pass_summary_failure_and_paces_retry(tm
 
     delivery = RecordingDelivery(SummaryFailureOutbox(tmp_path / "matrix-outbox.json"))
     try:
+        delivery.enqueue_text_notice(
+            "quiet-window-started",
+            {"event_type": "quiet-window-started", "event_id": "summary-worker", "window_id": "w"},
+        )
         delivery.start_worker(retry_interval_seconds=0.2)
         assert summary_failed.wait(2), "worker did not reach post-pass outbox summarization"
         assert not resumed.wait(0.05), "worker retried immediately after an unexpected summary failure"
@@ -467,12 +566,12 @@ def test_worker_survives_unexpected_cooldown_selection_failure_and_paces_retry(t
             self.retrying = True
             self.selection_calls = 0
 
-        def list_records(self, state: Any | None = None) -> list[Any]:
+        def next_due_record(self, now: datetime) -> Any | None:
             self.selection_calls += 1
-            if self.selection_calls == 1:
+            if self.selection_calls == 2:
                 selection_failed.set()
                 raise RuntimeError("access_token=selection-secret")
-            return super().list_records(state)
+            return super().next_due_record(now)
 
         def compact_status_summary(self) -> dict[str, Any]:
             cooldown_ready.set()
@@ -506,16 +605,16 @@ def test_worker_survives_unexpected_cooldown_selection_failure_and_paces_retry(t
     outbox = SelectionFailureOutbox(tmp_path / "matrix-outbox.json")
     delivery = RecordingDelivery(outbox)
     try:
-        delivery.start_worker(retry_interval_seconds=0.2)
-        assert cooldown_ready.wait(2), "worker did not enter retry cooldown"
         delivery.enqueue_text_notice(
             "quiet-window-started",
             {
                 "event_type": "quiet-window-started",
-                "event_id": "quiet-window-started:selection-race",
-                "window_id": "selection-race",
+                "event_id": "selection-worker",
+                "window_id": "selection-worker",
             },
         )
+        delivery.start_worker(retry_interval_seconds=0.2)
+        assert cooldown_ready.wait(2), "worker did not enter retry cooldown"
         assert selection_failed.wait(2), "worker did not select pending work during cooldown"
         assert not resumed.wait(0.05), "worker retried immediately after an unexpected selection failure"
         assert resumed.wait(2), "worker died after an unexpected cooldown selection failure"
