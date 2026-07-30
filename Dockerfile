@@ -38,6 +38,8 @@ CMD ["python", "-m", "parking_spot_monitor", "--config", "/config/config.yaml"]
 
 FROM capture-base AS runtime-detector
 
+ENV YOLO_CONFIG_DIR=/data/ultralytics
+
 COPY requirements-detector.lock ./
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip install --require-hashes -r requirements-detector.lock

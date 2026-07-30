@@ -9,6 +9,7 @@ services:
       - RTSP_URL_360P
       - MATRIX_ACCESS_TOKEN
       - TZ=America/Los_Angeles
+      - YOLO_CONFIG_DIR=/data/ultralytics
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ./data:/data

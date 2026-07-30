@@ -28,7 +28,7 @@ from parking_spot_monitor.matrix_client import MatrixClient
 from parking_spot_monitor.matrix_snapshots import SnapshotRetentionResult, prune_event_snapshots
 from parking_spot_monitor.capture_loop import run_capture_loop
 from parking_spot_monitor.config import RuntimeSettings, load_settings, validate_model_path
-from parking_spot_monitor.paths import RuntimePaths, resolve_runtime_paths
+from parking_spot_monitor.paths import RuntimePaths, prepare_ultralytics_config_dir, resolve_runtime_paths
 from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as _matrix_outbox_health_payload
 from parking_spot_monitor.runtime_lifecycle import ShutdownState, _close_resources
 from parking_spot_monitor.runtime_decision_memory import _append_lab_outcome_memory
@@ -129,6 +129,8 @@ def _main(
         paths = resolve_runtime_paths(settings, data_dir)
         settings = _with_effective_runtime_paths(settings, paths)
         validate_model_path(settings.detection.model)
+        if not args.validate_config:
+            prepare_ultralytics_config_dir(paths.data_dir)
     except ConfigError as exc:
         _log_config_error(logger, exc, config_path=config_path)
         return 2

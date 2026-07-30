@@ -333,6 +333,80 @@ A synthetic scheduler trace, without a Matrix network request, confirmed the doc
 
 These measurements establish a healthy, rollback-ready deployment, not a performance win. Network and block I/O are cumulative from container creation and reset on recreation, while memory and CPU can vary substantially with capture and inference timing. Keep the rollback image and backup until a representative observation period confirms acceptable behavior and resource use.
 
+## Offline detector backend benchmark (no automatic switch)
+
+Production continues to use the configured `.pt` model. The benchmark below is an offline evidence tool only: it does not change `detection.model`, the detector factory, the Compose command, fallback behavior, or the running service. An ONNX or TorchScript production change requires a separate design, review, explicit operator approval, and deployment after the evidence gates pass.
+
+Use a dedicated, approved export/benchmark environment with the repository's pinned Ultralytics version and all format-specific exporter/runtime dependencies already installed. Do not let an offline benchmark auto-install missing packages. Stage an authenticated copy of the baseline and export both alternatives into the ignored `data/` tree:
+
+```sh
+(
+set -eu
+if [ -z "${MODEL_DIR+x}" ]; then
+  compose_environment="$(docker compose config --environment)"
+  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
+fi
+model_dir="${MODEL_DIR:-./models}"
+export MODEL_DIR="$model_dir"
+BENCH_ROOT=data/detector-benchmark
+mkdir -p "$BENCH_ROOT/models" "$BENCH_ROOT/frames" "$BENCH_ROOT/evidence" "$BENCH_ROOT/ultralytics"
+chmod 0750 "$BENCH_ROOT" "$BENCH_ROOT/models" "$BENCH_ROOT/frames" "$BENCH_ROOT/evidence" "$BENCH_ROOT/ultralytics"
+cp -- "$model_dir/yolov8n.pt" "$BENCH_ROOT/models/baseline.pt"
+sha256sum "$model_dir/yolov8n.pt" "$BENCH_ROOT/models/baseline.pt"
+YOLO_CONFIG_DIR="$BENCH_ROOT/ultralytics" python - <<'PY'
+from pathlib import Path
+from ultralytics import YOLO
+
+source = Path("data/detector-benchmark/models/baseline.pt")
+for export_format, expected_name in (
+    ("onnx", "baseline.onnx"),
+    ("torchscript", "baseline.torchscript"),
+):
+    exported = Path(YOLO(str(source)).export(format=export_format))
+    expected = source.with_name(expected_name)
+    if exported.resolve() != expected.resolve():
+        raise SystemExit(f"stage the exported {export_format} artifact as {expected}")
+PY
+)
+```
+
+Copy a fixed, representative set of JPEG frames into `data/detector-benchmark/frames/`. Preserve their serial order in a JSON manifest; paths are relative to the manifest:
+
+```sh
+python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path("data/detector-benchmark")
+frames = sorted(root.joinpath("frames").glob("*.jpg"))
+if not frames:
+    raise SystemExit("stage at least one representative JPEG frame")
+root.joinpath("manifest.json").write_text(
+    json.dumps({"frames": [str(path.relative_to(root)) for path in frames]}, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+```
+
+Run the three heavy backends serially. The harness gives `.pt`, ONNX, and TorchScript separate spawned processes, performs three warmup passes and twenty measured passes by default, and writes aggregate evidence to the requested output. Do not run multiple copies concurrently, do not add `pytest-xdist`, and run the related tests without `-n`; minimizing peak host CPU and memory is more important than test throughput.
+
+```sh
+YOLO_CONFIG_DIR=data/detector-benchmark/ultralytics \
+  python scripts/benchmark_detector_backends.py \
+  --manifest data/detector-benchmark/manifest.json \
+  --pt-model data/detector-benchmark/models/baseline.pt \
+  --onnx-model data/detector-benchmark/models/baseline.onnx \
+  --torchscript-model data/detector-benchmark/models/baseline.torchscript \
+  --output data/detector-benchmark/evidence/backends.json \
+  --warmup 3 \
+  --iterations 20
+
+python -m json.tool data/detector-benchmark/evidence/backends.json
+python -m pytest tests/test_detector_backend_benchmark.py -q
+```
+
+A completed benchmark exits zero even when no alternative is eligible. Missing models or frames, a malformed manifest, a failed backend worker, or malformed evidence exits two. Eligibility requires exact frame and ordered class/count parity with no added or omitted detections, minimum bbox IoU `0.99`, maximum confidence delta `0.02`, and at least a 15% improvement in p95 inference time or isolated-process peak RSS. All alternatives must pass parity before the report can set `production_switch_eligible` to true. Treat that flag as permission to begin a separately approved production-switch review, never as authorization to edit the live backend automatically.
+
 ## Backup and recovery
 
 The minimum recovery set is:

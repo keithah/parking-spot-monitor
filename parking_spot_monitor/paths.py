@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +45,35 @@ def resolve_runtime_paths(settings: RuntimeSettings, data_dir: str | Path) -> Ru
         detection_lab_dir=effective_data_dir / "detection-lab",
         matrix_outbox_file=effective_data_dir / "matrix-outbox.json",
     )
+
+
+def prepare_ultralytics_config_dir(
+    data_dir: str | Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Create the writable Ultralytics state directory without following a leaf symlink."""
+
+    effective_data_dir = Path(data_dir)
+    selected_environ = os.environ if environ is None else environ
+    config_dir = Path(
+        selected_environ.get("YOLO_CONFIG_DIR", str(effective_data_dir / "ultralytics"))
+    )
+    if config_dir.parent != effective_data_dir or config_dir.name != "ultralytics":
+        raise ValueError("YOLO_CONFIG_DIR must be the ultralytics directory under --data-dir")
+
+    effective_data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        config_dir.mkdir(mode=0o750)
+    except FileExistsError:
+        pass
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(config_dir, flags)
+    try:
+        os.fchmod(descriptor, 0o750)
+    finally:
+        os.close(descriptor)
+    return config_dir
 
 
 def _resolve_under_data_dir(value: Path | None, data_dir: Path, *, default: str | None = None) -> Path:

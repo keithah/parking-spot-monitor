@@ -2872,6 +2872,66 @@ def test_validate_config_success_emits_effective_runtime_paths_without_secrets(c
     assert_no_secret_leak(output)
 
 
+def test_runtime_prepares_ultralytics_config_before_detector_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_modules = tmp_path / "fake-modules"
+    fake_modules.mkdir()
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    data_dir = tmp_path / "data"
+    yolo_config_dir = data_dir / "ultralytics"
+    (fake_modules / "ultralytics.py").write_text(
+        """\
+import os
+from pathlib import Path
+
+config_dir = Path(os.environ.get("YOLO_CONFIG_DIR", Path.home() / ".config" / "Ultralytics"))
+config_dir.mkdir(parents=True, exist_ok=True)
+(config_dir / "settings.json").write_text("{}", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(fake_modules))
+    monkeypatch.delitem(sys.modules, "ultralytics", raising=False)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("YOLO_CONFIG_DIR", str(yolo_config_dir))
+
+    class ImportingDetector:
+        def detect(
+            self,
+            _frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    def detector_factory(_settings: object) -> ImportingDetector:
+        assert yolo_config_dir.is_dir()
+        assert (yolo_config_dir.stat().st_mode & 0o777) == 0o750
+        __import__("ultralytics")
+        return ImportingDetector()
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(data_dir)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path),
+        overlay=noop_overlay,
+        detector_factory=detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: FakeMatrixDelivery(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+    )
+
+    assert exit_code == 0
+    assert (yolo_config_dir / "settings.json").is_file()
+    assert not (fake_home / ".config" / "Ultralytics" / "settings.json").exists()
+    assert_no_secret_leak(combined_output(capsys))
+
+
 def test_runtime_loop_startup_prunes_existing_event_snapshots_without_touching_runtime_files(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

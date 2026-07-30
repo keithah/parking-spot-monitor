@@ -601,7 +601,14 @@ def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
     assert "./config.yaml:/config/config.yaml:ro" in service["volumes"]
     assert "./data:/data" in service["volumes"]
     assert "env_file" not in service
-    assert service["environment"] == ["RTSP_URL", "RTSP_URL_4K", "RTSP_URL_360P", "MATRIX_ACCESS_TOKEN", "TZ=America/Los_Angeles"]
+    assert service["environment"] == [
+        "RTSP_URL",
+        "RTSP_URL_4K",
+        "RTSP_URL_360P",
+        "MATRIX_ACCESS_TOKEN",
+        "TZ=America/Los_Angeles",
+        "YOLO_CONFIG_DIR=/data/ultralytics",
+    ]
     assert service["command"] == [
         "python",
         "-m",
@@ -619,6 +626,19 @@ def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
     assert service["stop_grace_period"] in {"2m", "120s"}
     assert "/dev/dri:/dev/dri" in compose_text
     assert "${MODEL_DIR:-./models}:/models:ro" in service["volumes"]
+
+
+def test_detector_runtime_routes_ultralytics_config_to_writable_data() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    stages = {
+        alias: instructions
+        for _flags, _base, alias, instructions in _docker_stages(dockerfile)
+        if alias is not None
+    }
+
+    assert _instruction_arguments(stages["runtime-detector"], "ENV") == [
+        "YOLO_CONFIG_DIR=/data/ultralytics"
+    ]
 
 
 def test_rendered_compose_has_bounded_graceful_shutdown_contract() -> None:
