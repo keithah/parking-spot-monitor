@@ -194,19 +194,21 @@ def _main(
             _close_resources((("matrix_delivery", matrix_delivery),), logger=logger)
 
     history_archive = VehicleHistoryArchive(paths.vehicle_history_dir, logger=logger)
-    matrix_delivery = matrix_factory(settings, paths.data_dir, logger)
-    shared_detector = SharedLazyDetector(lambda: detector_fn(settings))
-    if matrix_command_service_factory is None:
-        matrix_command_service = _default_matrix_command_service_factory(
-            settings,
-            paths.data_dir,
-            logger,
-            history_archive,
-            incident_detector=shared_detector,
-        )
-    else:
-        matrix_command_service = matrix_command_service_factory(settings, paths.data_dir, logger, history_archive)
+    matrix_delivery: Any | None = None
+    matrix_command_service: Any | None = None
     try:
+        matrix_delivery = matrix_factory(settings, paths.data_dir, logger)
+        shared_detector = SharedLazyDetector(lambda: detector_fn(settings))
+        if matrix_command_service_factory is None:
+            matrix_command_service = _default_matrix_command_service_factory(
+                settings,
+                paths.data_dir,
+                logger,
+                history_archive,
+                incident_detector=shared_detector,
+            )
+        else:
+            matrix_command_service = matrix_command_service_factory(settings, paths.data_dir, logger, history_archive)
         shutdown_state = ShutdownState()
         return run_capture_loop(
             settings,

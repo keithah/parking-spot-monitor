@@ -4444,6 +4444,84 @@ def test_shutdown_state_wakes_wait_immediately() -> None:
     assert thread.is_alive() is False
 
 
+def test_shutdown_state_reentrant_request_preserves_first_signal() -> None:
+    from parking_spot_monitor.runtime_lifecycle import ShutdownState
+
+    state = ShutdownState()
+    underlying = threading.Event()
+
+    class ReentrantSetEvent:
+        reentered = False
+
+        def is_set(self) -> bool:
+            return underlying.is_set()
+
+        def set(self) -> None:
+            if not self.reentered:
+                self.reentered = True
+                state.request(signal.SIGINT)
+            underlying.set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            return underlying.wait(timeout)
+
+    state._event = ReentrantSetEvent()  # type: ignore[assignment]
+    state.request(signal.SIGTERM)
+
+    assert state.signum == signal.SIGTERM
+    assert state.requested is True
+
+
+def test_shutdown_state_concurrent_request_preserves_first_signal() -> None:
+    from parking_spot_monitor.runtime_lifecycle import ShutdownState
+
+    state = ShutdownState()
+    underlying = threading.Event()
+    first_setting = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    second_returned = threading.Event()
+
+    class OrderedSetEvent:
+        def is_set(self) -> bool:
+            return underlying.is_set()
+
+        def set(self) -> None:
+            if threading.current_thread().name == "first-request":
+                first_setting.set()
+                assert release_first.wait(1)
+            underlying.set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            return underlying.wait(timeout)
+
+    state._event = OrderedSetEvent()  # type: ignore[assignment]
+    first = threading.Thread(
+        target=lambda: state.request(signal.SIGTERM),
+        name="first-request",
+    )
+
+    def request_second() -> None:
+        second_started.set()
+        state.request(signal.SIGINT)
+        second_returned.set()
+
+    second = threading.Thread(target=request_second, name="second-request")
+    first.start()
+    assert first_setting.wait(1)
+    second.start()
+    assert second_started.wait(1)
+    second_returned.wait(0.05)
+    release_first.set()
+    first.join(1)
+    second.join(1)
+
+    assert first.is_alive() is False
+    assert second.is_alive() is False
+    assert state.signum == signal.SIGTERM
+    assert state.requested is True
+
+
 def test_reconnect_wait_wakes_and_exits_immediately_on_shutdown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4524,6 +4602,40 @@ def test_close_resources_continues_after_first_close_failure(
     assert '"event":"runtime-resource-close-failed"' in output
     assert '"resource":"commands"' in output
     assert SECRET_MARKER not in output
+
+
+def test_command_factory_failure_closes_already_created_delivery(tmp_path: Path) -> None:
+    closed: list[str] = []
+    original = RuntimeError("command construction failed")
+
+    class Delivery(FakeMatrixDelivery):
+        def close(self) -> None:
+            closed.append("delivery")
+            raise RuntimeError("delivery close failed")
+
+    def fail_command_factory(
+        _settings: object,
+        _data_dir: Path,
+        _logger: StructuredLogger,
+        _archive: object,
+    ) -> object:
+        raise original
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _main(
+            ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+            environ=fake_environ(),
+            capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir)),
+            overlay=noop_overlay,
+            detector_factory=noop_detector_factory,
+            matrix_delivery_factory=lambda _settings, _data_dir, _logger: Delivery(),
+            matrix_command_service_factory=fail_command_factory,
+            sleep=lambda _seconds: None,
+            max_iterations=0,
+        )
+
+    assert exc_info.value is original
+    assert closed == ["delivery"]
 
 
 def test_dispatch_shutdown_lifecycle_notice_once(

@@ -803,6 +803,41 @@ def test_worker_stop_between_phases_does_not_start_next_phase(tmp_path: Path) ->
     }
 
 
+def test_manual_drain_close_between_phases_does_not_start_next_phase(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    entered_text = threading.Event()
+    release_text = threading.Event()
+    upload_started = threading.Event()
+
+    class BlockingClient(FakeMatrixClient):
+        def send_text(self, *, room_id: str, txn_id: str, body: str) -> str:
+            entered_text.set()
+            assert release_text.wait(1)
+            return super().send_text(room_id=room_id, txn_id=txn_id, body=body)
+
+        def cancel_pending(self) -> None:
+            release_text.set()
+
+        def upload_image(self, *, filename: str, data: bytes, content_type: str) -> str:
+            upload_started.set()
+            return super().upload_image(filename=filename, data=data, content_type=content_type)
+
+    client = BlockingClient()
+    delivery = make_delivery(tmp_path, client)
+    delivery.enqueue_open_spot_alert(open_event(source))
+    drain = threading.Thread(target=delivery.drain_outbox, name="manual-outbox-drain")
+    drain.start()
+    assert entered_text.wait(1)
+
+    delivery.close()
+    drain.join(1)
+
+    assert drain.is_alive() is False
+    assert upload_started.is_set() is False
+    assert [call["kind"] for call in client.calls] == ["text"]
+
+
 def test_matrix_client_cancel_interrupts_retry_wait_with_safe_error() -> None:
     attempted = threading.Event()
     attempts = 0

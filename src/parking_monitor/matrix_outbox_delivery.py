@@ -207,10 +207,8 @@ class MatrixOutboxDelivery:
         with self._worker_lock:
             self._worker_last_error_type = error_type
 
-    def _worker_stop_requested(self) -> bool:
-        with self._worker_lock:
-            worker = self._worker
-        return threading.current_thread() is worker and self._stop_event.is_set()
+    def _stop_requested(self) -> bool:
+        return self._stop_event.is_set()
 
     def outbox_health_summary(self) -> Mapping[str, Any]:
         summary = dict(self.outbox.compact_status_summary())
@@ -381,7 +379,7 @@ class MatrixOutboxDelivery:
         delivered = 0
         retrying = 0
         for record in records:
-            if self._worker_stop_requested():
+            if self._stop_requested():
                 break
             attempted += 1
             drained = self._drain_record(record)
@@ -402,7 +400,7 @@ class MatrixOutboxDelivery:
     def _drain_record(self, record: OutboxRecord) -> OutboxRecord:
         current = record
         for phase in _record_delivery_phases(current):
-            if self._worker_stop_requested():
+            if self._stop_requested():
                 return current
             if current.phase_states.get(phase) == "delivered":
                 self._log("info", "matrix-outbox-phase-skip", item_id=current.id, phase=phase, reason="already_delivered")

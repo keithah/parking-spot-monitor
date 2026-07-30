@@ -22,13 +22,16 @@ class ShutdownState:
 
     signum: int | None = None
     _event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _request_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     @property
     def requested(self) -> bool:
         return self._event.is_set()
 
     def request(self, signum: int) -> None:
-        if not self._event.is_set():
+        with self._request_lock:
+            if self.signum is not None:
+                return
             self.signum = signum
             self._event.set()
 
