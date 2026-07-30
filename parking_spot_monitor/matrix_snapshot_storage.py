@@ -2,18 +2,32 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import secrets
 import stat
-import warnings
+from types import MappingProxyType
 
-from PIL import Image
+from parking_spot_monitor.jpeg_artifacts import jpeg_bytes_dimensions
 
 _COPY_CHUNK_BYTES = 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+MAX_RETAINED_JPEG_BYTES = 32 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class RootedJpegEvidence:
+    data: bytes
+    info: Mapping[str, int | str]
+    sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "data", bytes(self.data))
+        object.__setattr__(self, "info", MappingProxyType(dict(self.info)))
 
 
 def absolute_snapshot_root(path: Path) -> Path:
@@ -98,6 +112,40 @@ def read_owned_bytes(
             os.close(file_fd)
 
 
+def read_owned_jpeg_evidence(
+    snapshot_root: Path,
+    filename: str,
+    *,
+    max_bytes: int = MAX_RETAINED_JPEG_BYTES,
+) -> RootedJpegEvidence:
+    """Capture validated JPEG bytes and metadata from one rooted descriptor."""
+
+    with _artifact_directory(snapshot_root, None, create=False) as (root_fd, _root):
+        file_fd = os.open(
+            safe_artifact_name(filename),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        try:
+            before = _descriptor_signature(file_fd)
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode) or not 0 < before[2] <= max_bytes:
+                raise OSError("snapshot is not a bounded regular file")
+            payload = _read_exact(file_fd, before[2])
+            payload_digest = hashlib.sha256(payload).digest()
+            width, height = jpeg_bytes_dimensions(payload)
+            if _descriptor_signature(file_fd) != before:
+                raise OSError("snapshot changed while reading")
+            if _digest_descriptor(file_fd) != payload_digest or _descriptor_signature(file_fd) != before:
+                raise OSError("snapshot changed while reading")
+            return RootedJpegEvidence(
+                data=payload,
+                info={"mimetype": "image/jpeg", "size": len(payload), "w": width, "h": height},
+                sha256=payload_digest.hex(),
+            )
+        finally:
+            os.close(file_fd)
+
+
 def validate_owned_file(snapshot_root: Path, directory: str | None, filename: str) -> Path:
     with _artifact_directory(snapshot_root, directory, create=False) as (directory_fd, parent):
         safe_name = safe_artifact_name(filename)
@@ -165,35 +213,6 @@ def publish_retained_snapshot(source: Path, snapshot_root: Path, filename: str) 
                     _unlink_best_effort(root_fd, temporary_name)
     finally:
         os.close(source_fd)
-
-
-def owned_jpeg_dimensions(snapshot_root: Path, filename: str) -> tuple[int, int]:
-    with _artifact_directory(snapshot_root, None, create=False) as (root_fd, _root):
-        file_fd = os.open(safe_artifact_name(filename), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd)
-        try:
-            before = _descriptor_signature(file_fd)
-            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
-                raise OSError("snapshot is not a regular file")
-            with os.fdopen(os.dup(file_fd), "rb") as handle, warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(handle) as image:
-                    if image.format != "JPEG" or image.width <= 0 or image.height <= 0:
-                        raise OSError("snapshot is not a JPEG image")
-                    dimensions = image.size
-                    image.verify()
-            if _descriptor_signature(file_fd) != before:
-                raise OSError("snapshot changed during validation")
-            return dimensions
-        finally:
-            os.close(file_fd)
-
-
-def owned_file_size(snapshot_root: Path, filename: str) -> int:
-    with _artifact_directory(snapshot_root, None, create=False) as (root_fd, _root):
-        value = os.stat(safe_artifact_name(filename), dir_fd=root_fd, follow_symlinks=False)
-        if not stat.S_ISREG(value.st_mode):
-            raise OSError("snapshot is not a regular file")
-        return value.st_size
 
 
 def secure_snapshot_candidates(snapshot_root: Path) -> list[Path]:
@@ -276,6 +295,15 @@ def _read_exact(descriptor: int, size: int) -> bytes:
             raise OSError("artifact read was incomplete")
         payload.extend(chunk)
     return bytes(payload)
+
+
+def _digest_descriptor(descriptor: int) -> bytes:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, _COPY_CHUNK_BYTES):
+        digest.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.digest()
 
 
 def _descriptor_signature(descriptor: int) -> tuple[int, int, int, int, int]:

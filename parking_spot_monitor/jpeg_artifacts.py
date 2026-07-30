@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import errno
 import fcntl
 import hashlib
+from io import BytesIO
 import os
 from pathlib import Path
 import secrets
@@ -101,8 +102,43 @@ def open_decoded_rgb_jpeg(path: Path, *, initial_max_dimension: int) -> Abstract
     return _decoded_rgb_jpeg(Path(path), initial_max_dimension=initial_max_dimension)
 
 
+def open_decoded_rgb_jpeg_bytes(
+    payload: bytes, *, initial_max_dimension: int
+) -> AbstractContextManager[DecodedRgbJpeg]:
+    return _decoded_rgb_jpeg_bytes(bytes(payload), initial_max_dimension=initial_max_dimension)
+
+
+def jpeg_bytes_dimensions(payload: bytes) -> tuple[int, int]:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(payload)) as image:
+                if image.format != "JPEG":
+                    raise JpegDecodeError("unidentified")
+                if image.width <= 0 or image.height <= 0:
+                    raise JpegDecodeError("invalid_dimensions")
+                dimensions = image.size
+                image.verify()
+                return dimensions
+    except JpegDecodeError:
+        raise
+    except UnidentifiedImageError as exc:
+        raise JpegDecodeError("unidentified", source_error_type=exc.__class__.__name__) from exc
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise JpegDecodeError("decompression_bomb", source_error_type=exc.__class__.__name__) from exc
+    except (OSError, ValueError) as exc:
+        raise JpegDecodeError("read_failed", source_error_type=exc.__class__.__name__) from exc
+
+
 @contextmanager
-def _decoded_rgb_jpeg(path: Path, *, initial_max_dimension: int) -> Iterator[DecodedRgbJpeg]:
+def _decoded_rgb_jpeg_bytes(payload: bytes, *, initial_max_dimension: int) -> Iterator[DecodedRgbJpeg]:
+    with BytesIO(payload) as source:
+        with _decoded_rgb_jpeg(source, initial_max_dimension=initial_max_dimension) as decoded:
+            yield decoded
+
+
+@contextmanager
+def _decoded_rgb_jpeg(path: Path | BytesIO, *, initial_max_dimension: int) -> Iterator[DecodedRgbJpeg]:
     opened: Image.Image | None = None
     working: Image.Image | None = None
     try:

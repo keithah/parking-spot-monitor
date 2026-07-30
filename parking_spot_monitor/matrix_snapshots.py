@@ -11,14 +11,14 @@ from typing import Any
 from PIL import Image, UnidentifiedImageError
 
 from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult, encode_jpeg_under_budget
-from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, open_decoded_rgb_jpeg
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, open_decoded_rgb_jpeg_bytes
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_snapshot_storage import (
     delete_owned_artifact,
     ensure_owned_directory,
-    owned_file_size,
-    owned_jpeg_dimensions,
+    RootedJpegEvidence,
     publish_retained_snapshot,
+    read_owned_jpeg_evidence,
     secure_snapshot_candidates,
 )
 from parking_spot_monitor.matrix_snapshot_naming import event_snapshot_path, snapshot_body
@@ -42,6 +42,7 @@ class MatrixSnapshot:
     body: str
     info: dict[str, int | str]
     log_context: dict[str, Any]
+    evidence: RootedJpegEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -65,11 +66,16 @@ def _matrix_snapshot_upload(
     *,
     logger: StructuredLogger | None,
 ) -> dict[str, Any]:
-    source_size = snapshot.path.stat().st_size
+    try:
+        evidence = snapshot.evidence or read_owned_jpeg_evidence(snapshot.path.parent, snapshot.filename)
+    except (JpegDecodeError, OSError):
+        raise MatrixError(
+            "Matrix snapshot could not be read for upload", error_type="snapshot_resize_failed", snapshot_path=str(snapshot.path)
+        ) from None
+    source_size = len(evidence.data)
     if source_size <= MAX_MATRIX_UPLOAD_IMAGE_BYTES:
-        raw = snapshot.path.read_bytes()
-        return {"data": raw, "info": dict(snapshot.info)}
-    resized = _resize_jpeg_for_matrix_upload_result(snapshot.path)
+        return {"data": evidence.data, "info": dict(evidence.info)}
+    resized = _resize_jpeg_bytes_for_matrix_upload_result(evidence.data, snapshot_path=snapshot.path)
     if logger is not None:
         logger.info(
             "matrix-snapshot-upload-resized",
@@ -85,13 +91,19 @@ def _matrix_snapshot_upload(
 
 
 def _resize_jpeg_for_matrix_upload(path: Path) -> tuple[bytes, dict[str, int | str]]:
-    resized = _resize_jpeg_for_matrix_upload_result(path)
+    try:
+        evidence = read_owned_jpeg_evidence(path.parent, path.name)
+    except (JpegDecodeError, OSError):
+        raise MatrixError(
+            "Matrix snapshot could not be resized under upload budget", error_type="snapshot_resize_failed", snapshot_path=str(path)
+        ) from None
+    resized = _resize_jpeg_bytes_for_matrix_upload_result(evidence.data, snapshot_path=path)
     return resized.result.data, resized.info
 
 
-def _resize_jpeg_for_matrix_upload_result(path: Path) -> _MatrixSnapshotResize:
+def _resize_jpeg_bytes_for_matrix_upload_result(payload: bytes, *, snapshot_path: Path) -> _MatrixSnapshotResize:
     try:
-        with open_decoded_rgb_jpeg(path, initial_max_dimension=MATRIX_UPLOAD_INITIAL_MAX_DIMENSION) as decoded:
+        with open_decoded_rgb_jpeg_bytes(payload, initial_max_dimension=MATRIX_UPLOAD_INITIAL_MAX_DIMENSION) as decoded:
             result = encode_jpeg_under_budget(
                 decoded.image,
                 max_bytes=MAX_MATRIX_UPLOAD_IMAGE_BYTES,
@@ -112,9 +124,7 @@ def _resize_jpeg_for_matrix_upload_result(path: Path) -> _MatrixSnapshotResize:
             else "Matrix snapshot could not be resized under upload budget"
         )
         raise MatrixError(
-            message,
-            error_type="snapshot_resize_failed",
-            snapshot_path=str(path),
+            message, error_type="snapshot_resize_failed", snapshot_path=str(snapshot_path)
         ) from None
 
 
@@ -190,9 +200,11 @@ def prepare_event_snapshot(
 
     byte_size = 0
     try:
-        byte_size = owned_file_size(snapshot_root, filename)
-        width, height = owned_jpeg_dimensions(snapshot_root, filename)
+        evidence = read_owned_jpeg_evidence(snapshot_root, filename)
+        byte_size = int(evidence.info["size"])
+        width, height = int(evidence.info["w"]), int(evidence.info["h"])
     except (
+        JpegDecodeError,
         OSError,
         UnidentifiedImageError,
         Image.DecompressionBombError,
@@ -245,6 +257,7 @@ def prepare_event_snapshot(
         body=snapshot_body(spot_id=spot_id, observed_at=observed_text),
         info=info,
         log_context=log_context,
+        evidence=evidence,
     )
 
 

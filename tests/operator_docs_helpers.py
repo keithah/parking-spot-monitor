@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import tempfile
 
+from PIL import Image
 import yaml
 
 
@@ -64,10 +65,14 @@ def read_matrix_command_contract() -> str:
     service = MatrixCommandService(client=client, archive=object(), room_id="!room:example", authorized_senders=["@op:example"], who_snapshot_provider=lambda base_reply: base_reply)
     with tempfile.TemporaryDirectory() as tmp:
         image_path = Path(tmp) / "latest.jpg"
-        image_path.write_bytes(b"jpeg")
+        Image.new("RGB", (1, 1), color=(25, 50, 75)).save(image_path, format="JPEG")
         service._send_command_response(
             MatrixTextEvent(event_id="$event", sender="@op:example", room_id="!room:example", body="!parking latest"),
-            MatrixCommandResponse(text="Latest", image_path=image_path, image_info={"mimetype": "image/jpeg", "size": 4, "w": 1, "h": 1}),
+            MatrixCommandResponse(
+                text="Latest",
+                image_path=image_path,
+                image_info={"mimetype": "image/jpeg", "size": image_path.stat().st_size, "w": 1, "h": 1},
+            ),
         )
     image_call = next(call for call in client.calls if call["kind"] == "image")
 

@@ -49,7 +49,7 @@ def capture_occupied_images(
 ) -> OccupiedImageCaptureResult:
     """Publish a canonical full-frame JPEG and crop the accepted bbox.
 
-    The archive owns a durable link, clone, or bounded copy of the validated
+    The archive owns an independent reflink or bounded copy of the validated
     source bytes, avoiding a full-frame decode/encode cycle.
     Bboxes use detector-style ``(x_min, y_min, x_max, y_max)`` coordinates with
     floor/ceil rounding, clamping to the source image, and empty-box rejection.

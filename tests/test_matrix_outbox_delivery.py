@@ -13,6 +13,7 @@ import httpx
 from PIL import Image
 
 import parking_spot_monitor.matrix_snapshots as matrix_snapshots
+import parking_monitor.matrix_outbox_snapshots as matrix_outbox_snapshots
 from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery, MatrixOutboxDrainResult
 from parking_monitor.outbox import LocalOutbox
 from parking_spot_monitor.image_budget import JpegBudgetResult
@@ -365,7 +366,7 @@ def test_oversized_outbox_snapshot_preserves_upload_and_persisted_info_schema(
 def test_matrix_resize_uses_shared_decoder_and_preserves_matrix_error_mapping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    called: list[Path] = []
+    called: list[bytes] = []
 
     class FailingDecoder:
         def __enter__(self) -> object:
@@ -374,19 +375,19 @@ def test_matrix_resize_uses_shared_decoder_and_preserves_matrix_error_mapping(
         def __exit__(self, *args: object) -> None:
             pass
 
-    def fail(path: Path, *, initial_max_dimension: int) -> FailingDecoder:
-        called.append(path)
+    def fail(payload: bytes, *, initial_max_dimension: int) -> FailingDecoder:
+        called.append(payload)
         return FailingDecoder()
 
-    monkeypatch.setattr(matrix_snapshots, "open_decoded_rgb_jpeg", fail, raising=False)
+    monkeypatch.setattr(matrix_snapshots, "open_decoded_rgb_jpeg_bytes", fail)
     source = tmp_path / "oversized.jpg"
-    write_jpeg(source)
+    payload = write_jpeg(source)
 
     with pytest.raises(MatrixError) as caught:
         matrix_snapshots._resize_jpeg_for_matrix_upload(source)
 
     assert caught.value.diagnostics["error_type"] == "snapshot_resize_failed"
-    assert called == [source]
+    assert called == [payload]
 
 
 def test_upload_retry_reuses_persisted_derivative_after_restart(tmp_path: Path) -> None:
@@ -498,6 +499,62 @@ def test_legacy_upload_regenerates_and_persists_derivative_before_network(tmp_pa
     assert restarted.drain_outbox(record_id=record.id).delivered_count == 1
 
 
+def test_concurrent_legacy_upload_preparation_attaches_derivative_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source, size=(640, 360))
+    store_path = tmp_path / "matrix-outbox.json"
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    record = delivery.enqueue_open_spot_alert(open_event(source))
+    derivative = Path(str(record.intent.metadata["upload_derivative_path"]))
+    derivative.unlink()
+    rewrite_first_outbox_metadata(
+        store_path,
+        lambda metadata: (metadata.pop("upload_derivative_path", None), metadata.pop("upload_derivative_info", None)),
+    )
+    outbox = LocalOutbox(store_path)
+    restarted = MatrixOutboxDelivery(
+        client=FakeMatrixClient(),
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=outbox,
+    )
+    original_attach = outbox.attach_upload_derivative
+    attach_calls = 0
+    attach_lock = threading.Lock()
+
+    def counted_attach(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attach_calls
+        with attach_lock:
+            attach_calls += 1
+        return original_attach(*args, **kwargs)
+
+    monkeypatch.setattr(outbox, "attach_upload_derivative", counted_attach)
+    results: list[Any] = []
+    errors: list[BaseException] = []
+
+    def prepare() -> None:
+        try:
+            results.append(restarted._snapshot_artifacts.prepare_upload(record))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=prepare) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2)
+
+    assert errors == []
+    assert len(results) == 2
+    assert attach_calls == 1
+    assert results[0].data == results[1].data
+    [persisted] = outbox.list_records()
+    assert Path(str(persisted.intent.metadata["upload_derivative_path"])).exists()
+
+
 def test_upload_rejects_out_of_contract_derivative_path_without_reading_it(tmp_path: Path) -> None:
     source = tmp_path / "latest.jpg"
     write_jpeg(source)
@@ -581,6 +638,124 @@ def test_concurrent_duplicate_enqueue_publishes_canonical_and_derivative_once(
     derivative = Path(str(persisted.intent.metadata["upload_derivative_path"]))
     assert derivative.exists()
     assert persisted.intent.metadata["upload_derivative_info"]["size"] == derivative.stat().st_size
+
+
+def test_drain_waits_for_enqueue_to_attach_the_initial_upload_derivative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source, size=(640, 360))
+    client = FakeMatrixClient()
+    delivery = make_delivery(tmp_path, client)
+    original_upload = matrix_outbox_snapshots._matrix_snapshot_upload
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def blocked_upload(snapshot: Any, *, logger: Any) -> Any:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        (first_entered if call_number == 1 else second_entered).set()
+        assert release.wait(2)
+        return original_upload(snapshot, logger=logger)
+
+    monkeypatch.setattr(matrix_outbox_snapshots, "_matrix_snapshot_upload", blocked_upload)
+    enqueue_results: list[Any] = []
+    enqueue_errors: list[BaseException] = []
+    drain_results: list[MatrixOutboxDrainResult] = []
+    drain_errors: list[BaseException] = []
+
+    def enqueue() -> None:
+        try:
+            enqueue_results.append(delivery.enqueue_open_spot_alert(open_event(source)))
+        except BaseException as exc:
+            enqueue_errors.append(exc)
+
+    enqueue_thread = threading.Thread(target=enqueue)
+    enqueue_thread.start()
+    assert first_entered.wait(2)
+    [visible] = delivery.outbox.list_records()
+
+    def drain() -> None:
+        try:
+            drain_results.append(delivery.drain_outbox(record_id=visible.id))
+        except BaseException as exc:
+            drain_errors.append(exc)
+
+    drain_thread = threading.Thread(target=drain)
+    drain_thread.start()
+    try:
+        assert not second_entered.wait(0.1), "drain regenerated a derivative before enqueue attached it"
+    finally:
+        release.set()
+        enqueue_thread.join(2)
+        drain_thread.join(2)
+
+    assert not enqueue_thread.is_alive() and not drain_thread.is_alive()
+    assert enqueue_errors == []
+    assert drain_errors == []
+    assert calls == 1
+    assert len(enqueue_results) == 1
+    assert drain_results == [MatrixOutboxDrainResult(attempted_count=1, delivered_count=1, retrying_count=0)]
+    assert len([call for call in client.calls if call["kind"] == "upload"]) == 1
+    [persisted] = delivery.outbox.list_records()
+    assert persisted.id == enqueue_results[0].id
+    assert persisted.state == "delivered"
+
+
+def test_unrelated_snapshot_enqueues_generate_derivatives_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source, size=(640, 360))
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    original_upload = matrix_outbox_snapshots._matrix_snapshot_upload
+    entered = [threading.Event(), threading.Event()]
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def blocked_upload(snapshot: Any, *, logger: Any) -> Any:
+        nonlocal calls
+        with calls_lock:
+            call_number = calls
+            calls += 1
+        entered[call_number].set()
+        assert release.wait(2)
+        return original_upload(snapshot, logger=logger)
+
+    monkeypatch.setattr(matrix_outbox_snapshots, "_matrix_snapshot_upload", blocked_upload)
+    events = [
+        open_event(source),
+        open_event(source) | {"observed_at": datetime(2026, 5, 18, 20, 1, 3, tzinfo=timezone.utc)},
+    ]
+    results: list[Any] = []
+    errors: list[BaseException] = []
+
+    def enqueue(event: dict[str, Any]) -> None:
+        try:
+            results.append(delivery.enqueue_open_spot_alert(event))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=enqueue, args=(event,)) for event in events]
+    for thread in threads:
+        thread.start()
+    try:
+        assert entered[0].wait(2)
+        assert entered[1].wait(2), "unrelated event publication was globally serialized"
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(2)
+
+    assert errors == []
+    assert len(results) == 2
+    assert len({record.id for record in results}) == 2
 
 
 def test_restart_rejects_same_size_corrupt_derivative_by_digest(tmp_path: Path) -> None:

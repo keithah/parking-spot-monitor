@@ -12,6 +12,7 @@ from PIL import Image
 
 import parking_spot_monitor.matrix_snapshots as matrix_snapshots
 import parking_spot_monitor.matrix_snapshot_storage as matrix_snapshot_storage
+import parking_spot_monitor.jpeg_artifacts as jpeg_artifacts
 from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult
 from parking_spot_monitor.logging import StructuredLogger
@@ -472,8 +473,13 @@ def test_matrix_config_summary_includes_timeout_retry_and_backoff() -> None:
     assert ACCESS_TOKEN not in repr(summary)
 
 
-def write_jpeg(path: Path, *, size: tuple[int, int] = (4, 3)) -> bytes:
-    image = Image.new("RGB", size, color=(25, 50, 75))
+def write_jpeg(
+    path: Path,
+    *,
+    size: tuple[int, int] = (4, 3),
+    color: tuple[int, int, int] = (25, 50, 75),
+) -> bytes:
+    image = Image.new("RGB", size, color=color)
     image.save(path, format="JPEG")
     return path.read_bytes()
 
@@ -737,7 +743,10 @@ def test_matrix_snapshot_resize_drafts_before_load_and_reuses_rgb_source(
 
     monkeypatch.setattr(matrix_snapshots, "encode_jpeg_under_budget", fake_encoder)
 
-    matrix_snapshots._resize_jpeg_for_matrix_upload(tmp_path / "oversized.jpg")
+    matrix_snapshots._resize_jpeg_bytes_for_matrix_upload_result(
+        b"captured-jpeg",
+        snapshot_path=tmp_path / "oversized.jpg",
+    )
 
     assert events == [("draft", "RGB", (960, 540)), "load", "encode", "source-close"]
 
@@ -806,7 +815,7 @@ def test_matrix_snapshot_resize_translates_shared_encoder_failure_without_leakin
     )
 
     with pytest.raises(MatrixError) as exc_info:
-        matrix_snapshots._resize_jpeg_for_matrix_upload(source)
+        matrix_snapshots._resize_jpeg_bytes_for_matrix_upload_result(source.read_bytes(), snapshot_path=source)
 
     assert str(exc_info.value) == "Matrix snapshot could not be resized under upload budget"
     assert exc_info.value.diagnostics == {
@@ -857,7 +866,7 @@ def test_matrix_snapshot_resize_rejects_invalid_dimensions_with_safe_matrix_erro
     monkeypatch.setattr(matrix_snapshots.Image, "open", lambda _path: InvalidImage())
 
     with pytest.raises(MatrixError) as exc_info:
-        matrix_snapshots._resize_jpeg_for_matrix_upload(source)
+        matrix_snapshots._resize_jpeg_bytes_for_matrix_upload_result(b"captured-jpeg", snapshot_path=source)
 
     assert str(exc_info.value) == "Matrix snapshot dimensions are invalid"
     assert exc_info.value.diagnostics == {
@@ -912,7 +921,10 @@ def test_matrix_snapshot_resize_converts_non_rgb_once_and_closes_both_images(
 
     monkeypatch.setattr(matrix_snapshots, "encode_jpeg_under_budget", fake_encoder)
 
-    matrix_snapshots._resize_jpeg_for_matrix_upload(tmp_path / "oversized-cmyk.jpg")
+    matrix_snapshots._resize_jpeg_bytes_for_matrix_upload_result(
+        b"captured-jpeg",
+        snapshot_path=tmp_path / "oversized-cmyk.jpg",
+    )
 
     assert events == [
         ("draft", "RGB", (960, 540)),
@@ -993,6 +1005,85 @@ def test_matrix_snapshot_upload_under_budget_returns_raw_bytes_without_encoding(
 
     assert upload == {"data": raw, "info": info}
     assert upload["info"] is not info
+
+
+def test_matrix_snapshot_upload_rejects_retained_path_swapped_to_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "retained.jpg"
+    raw = write_jpeg(source, size=(8, 6))
+    outside = tmp_path / "operator-secret.txt"
+    secret = b"arbitrary operator secret"
+    outside.write_bytes(secret)
+    snapshot = matrix_snapshots.MatrixSnapshot(
+        path=source,
+        filename=source.name,
+        txn_id="snapshot-swapped",
+        body="Raw full-frame snapshot",
+        info={"mimetype": "image/jpeg", "size": len(raw), "w": 8, "h": 6},
+        log_context={},
+    )
+    source.unlink()
+    source.symlink_to(outside)
+
+    with pytest.raises(MatrixError) as exc_info:
+        matrix_snapshots._matrix_snapshot_upload(snapshot, logger=None)
+
+    assert exc_info.value.diagnostics["error_type"] == "snapshot_resize_failed"
+    assert secret.decode() not in str(exc_info.value) + repr(exc_info.value.diagnostics)
+
+
+def test_matrix_snapshot_upload_derives_info_from_the_uploaded_bytes(tmp_path: Path) -> None:
+    source = tmp_path / "retained.jpg"
+    raw = write_jpeg(source, size=(11, 7))
+    snapshot = matrix_snapshots.MatrixSnapshot(
+        path=source,
+        filename=source.name,
+        txn_id="snapshot-evidence",
+        body="Raw full-frame snapshot",
+        info={"mimetype": "image/jpeg", "size": 1, "w": 1, "h": 1},
+        log_context={},
+    )
+
+    upload = matrix_snapshots._matrix_snapshot_upload(snapshot, logger=None)
+
+    assert upload == {
+        "data": raw,
+        "info": {"mimetype": "image/jpeg", "size": len(raw), "w": 11, "h": 7},
+    }
+
+
+def test_rooted_jpeg_evidence_rejects_mutation_during_descriptor_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retained = tmp_path / "retained.jpg"
+    original = write_jpeg(retained, size=(80, 60))
+    replacement_path = tmp_path / "replacement.jpg"
+    replacement = write_jpeg(replacement_path, size=(80, 60), color=(200, 10, 10))
+    padded_size = max(len(original), len(replacement))
+    original = original.ljust(padded_size, b"\0")
+    replacement = replacement.ljust(padded_size, b"\0")
+    retained.write_bytes(original)
+    assert len(replacement) == len(original)
+    assert replacement != original
+    real_read = matrix_snapshot_storage.os.read
+    mutated = False
+
+    def mutating_read(descriptor: int, size: int) -> bytes:
+        nonlocal mutated
+        chunk = real_read(descriptor, size)
+        if chunk and not mutated:
+            mutated = True
+            retained.write_bytes(replacement)
+        return chunk
+
+    monkeypatch.setattr(matrix_snapshot_storage.os, "read", mutating_read)
+
+    with pytest.raises(OSError, match="changed while reading"):
+        matrix_snapshot_storage.read_owned_jpeg_evidence(
+            tmp_path,
+            retained.name,
+            max_bytes=2 * 1024 * 1024,
+        )
 
 
 def test_matrix_snapshot_real_resize_honors_budget_dimensions_and_payload_metadata(tmp_path: Path) -> None:
@@ -1385,7 +1476,7 @@ def test_prepare_event_snapshot_maps_decompression_bombs_and_deletes_copy(
     def raise_bomb(*args: object, **kwargs: object) -> None:
         raise bomb
 
-    monkeypatch.setattr(matrix_snapshot_storage.Image, "open", raise_bomb)
+    monkeypatch.setattr(jpeg_artifacts.Image, "open", raise_bomb)
 
     with pytest.raises(MatrixError) as exc_info:
         prepare_event_snapshot(

@@ -68,7 +68,7 @@ class MatrixOutboxSnapshots:
         source_path: str,
         event_type: str,
     ) -> OutboxRecord:
-        with self._publication_locks.hold(f"{self.snapshot_root}::{event_id}"):
+        with self._publication_locks.hold(self._publication_key(event_id)):
             existing = next(
                 (
                     record
@@ -116,6 +116,13 @@ class MatrixOutboxSnapshots:
             )
 
     def prepare_upload(self, record: OutboxRecord) -> PreparedSnapshotUpload:
+        with self._publication_locks.hold(self._publication_key(record.intent.event_id)):
+            refreshed = next((item for item in self.outbox.list_records() if item.id == record.id), None)
+            if refreshed is None:
+                raise MatrixError("Matrix outbox record is missing", error_type="snapshot_missing_source")
+            return self._prepare_upload_locked(refreshed)
+
+    def _prepare_upload_locked(self, record: OutboxRecord) -> PreparedSnapshotUpload:
         metadata = record.intent.metadata
         try:
             retained_path = self._expected_retained_snapshot(record)
@@ -176,6 +183,9 @@ class MatrixOutboxSnapshots:
     def snapshot_root(self) -> Path:
         root = self.snapshots_dir if self.snapshots_dir is not None else self.data_dir / "snapshots"
         return Path(os.path.abspath(root))
+
+    def _publication_key(self, event_id: str) -> str:
+        return f"{self.snapshot_root}::{event_id}"
 
     def _load_or_create_derivative(
         self, record: OutboxRecord, *, retained_path: Path
