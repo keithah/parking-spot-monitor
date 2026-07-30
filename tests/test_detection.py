@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import math
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -298,15 +299,54 @@ class FakeResult:
 
 class FakeYOLO:
     constructed_with: list[str] = []
+    instances: list["FakeYOLO"] = []
+    next_results: list[FakeResult] = []
 
     def __init__(self, model_path: str) -> None:
         self.constructed_with.append(model_path)
+        self.instances.append(self)
         self.predict_calls: list[dict[str, object]] = []
-        self.results: list[FakeResult] = []
+        self.results = list(self.next_results)
 
     def predict(self, **kwargs: object) -> list[FakeResult]:
         self.predict_calls.append(kwargs)
         return self.results
+
+
+@pytest.fixture(autouse=True)
+def reset_fake_yolo() -> None:
+    FakeYOLO.constructed_with = []
+    FakeYOLO.instances = []
+    FakeYOLO.next_results = []
+
+
+def test_ultralytics_detector_defers_backend_construction_until_first_prediction(tmp_path: Path) -> None:
+    detector = UltralyticsVehicleDetector("lazy.pt", yolo_class=FakeYOLO)
+
+    assert FakeYOLO.constructed_with == []
+    detector.detect(tmp_path / "frame.jpg")
+    assert FakeYOLO.constructed_with == ["lazy.pt"]
+    assert len(FakeYOLO.instances) == 1
+
+
+def test_ultralytics_detector_retries_backend_construction_after_failure(tmp_path: Path) -> None:
+    attempts = 0
+
+    class FailsOnceYOLO(FakeYOLO):
+        def __init__(self, model_path: str) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("first load failed")
+            super().__init__(model_path)
+
+    detector = UltralyticsVehicleDetector("retry.pt", yolo_class=FailsOnceYOLO)
+
+    with pytest.raises(DetectionError) as exc_info:
+        detector.detect(tmp_path / "first.jpg")
+    assert exc_info.value.diagnostics()["phase"] == "model_load"
+    assert detector.detect(tmp_path / "second.jpg") == []
+    assert attempts == 2
 
 
 class FakeTensor:
@@ -331,33 +371,31 @@ def test_ultralytics_detector_forwards_configured_inference_image_size(tmp_path)
 
     detector.detect(tmp_path / "frame.jpg", confidence_threshold=0.35, inference_image_size=1280)
 
-    assert detector._model.predict_calls == [  # type: ignore[attr-defined]
+    assert FakeYOLO.instances[-1].predict_calls == [
         {"source": str(tmp_path / "frame.jpg"), "conf": 0.35, "imgsz": 1280, "verbose": False}
     ]
 
 
 def test_ultralytics_detector_accepts_in_memory_image() -> None:
-    detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
-    detector._model.results = [  # type: ignore[attr-defined]
+    FakeYOLO.next_results = [
         FakeResult(
             boxes=FakeBoxes(xyxy=[[1, 2, 11, 22]], conf=[0.91], cls=[2]),
             names={2: "car"},
         )
     ]
+    detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
     image = Image.new("RGB", (32, 24))
 
     detections = detector.detect_image(image, confidence_threshold=0.2, inference_image_size=320)
 
     assert detections == [VehicleDetection(class_name="car", confidence=0.91, bbox=(1, 2, 11, 22))]
-    assert detector._model.predict_calls == [  # type: ignore[attr-defined]
+    assert FakeYOLO.instances[-1].predict_calls == [
         {"source": image, "verbose": False, "conf": 0.2, "imgsz": 320}
     ]
 
 
 def test_ultralytics_detector_normalizes_fake_results_and_forwards_confidence(tmp_path) -> None:
-    FakeYOLO.constructed_with = []
-    detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
-    detector._model.results = [  # type: ignore[attr-defined]
+    FakeYOLO.next_results = [
         FakeResult(
             boxes=FakeBoxes(
                 xyxy=FakeTensor([[1, 2, 11, 22], [30.5, 40.5, 70.5, 90.5]]),
@@ -367,6 +405,7 @@ def test_ultralytics_detector_normalizes_fake_results_and_forwards_confidence(tm
             names={2: "car", 7: "truck"},
         )
     ]
+    detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
 
     detections = detector.detect(tmp_path / "frame.jpg", confidence_threshold=0.35)
 
@@ -374,33 +413,33 @@ def test_ultralytics_detector_normalizes_fake_results_and_forwards_confidence(tm
         VehicleDetection(class_name="car", confidence=0.91, bbox=(1, 2, 11, 22)),
         VehicleDetection(class_name="truck", confidence=0.42, bbox=(30.5, 40.5, 70.5, 90.5)),
     ]
-    assert detector._model.predict_calls == [  # type: ignore[attr-defined]
+    assert FakeYOLO.instances[-1].predict_calls == [
         {"source": str(tmp_path / "frame.jpg"), "conf": 0.35, "verbose": False}
     ]
     assert FakeYOLO.constructed_with == ["yolov8n.pt"]
 
 
 def test_ultralytics_detector_supports_empty_and_multiple_result_batches(tmp_path) -> None:
-    detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
-    detector._model.results = [  # type: ignore[attr-defined]
+    FakeYOLO.next_results = [
         FakeResult(boxes=None, names={}),
         FakeResult(boxes=FakeBoxes(xyxy=[], conf=[], cls=[]), names={}),
         FakeResult(boxes=FakeBoxes(xyxy=[[1, 1, 5, 5]], conf=[0.6], cls=[0]), names=["car"]),
         FakeResult(boxes=FakeBoxes(xyxy=[[10, 10, 20, 20]], conf=[0.7], cls=[1]), names={"1": "truck"}),
     ]
+    detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
 
     assert detector.detect(tmp_path / "frame.jpg") == [
         VehicleDetection(class_name="car", confidence=0.6, bbox=(1, 1, 5, 5)),
         VehicleDetection(class_name="truck", confidence=0.7, bbox=(10, 10, 20, 20)),
     ]
-    assert detector._model.predict_calls == [{"source": str(tmp_path / "frame.jpg"), "verbose": False}]  # type: ignore[attr-defined]
+    assert FakeYOLO.instances[-1].predict_calls == [{"source": str(tmp_path / "frame.jpg"), "verbose": False}]
 
 
 def test_ultralytics_detector_uses_stable_unknown_class_name(tmp_path) -> None:
-    detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
-    detector._model.results = [  # type: ignore[attr-defined]
+    FakeYOLO.next_results = [
         FakeResult(boxes=FakeBoxes(xyxy=[[1, 1, 5, 5]], conf=[0.6], cls=[99]), names={})
     ]
+    detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
 
     assert detector.detect(tmp_path / "frame.jpg") == [
         VehicleDetection(class_name="unknown_99", confidence=0.6, bbox=(1, 1, 5, 5))
@@ -417,8 +456,8 @@ def test_ultralytics_detector_uses_stable_unknown_class_name(tmp_path) -> None:
     ],
 )
 def test_ultralytics_detector_raises_safe_error_for_malformed_results(tmp_path, boxes: object) -> None:
+    FakeYOLO.next_results = [FakeResult(boxes=boxes, names={0: "car"})]
     detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
-    detector._model.results = [FakeResult(boxes=boxes, names={0: "car"})]  # type: ignore[attr-defined]
 
     with pytest.raises(DetectionError) as exc_info:
         detector.detect(tmp_path / "frame.jpg")
@@ -440,8 +479,9 @@ def test_ultralytics_detector_raises_safe_error_for_import_failure(monkeypatch) 
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
+    detector = UltralyticsVehicleDetector("yolov8n.pt")
     with pytest.raises(DetectionError) as exc_info:
-        UltralyticsVehicleDetector("yolov8n.pt")
+        detector.detect(Path("frame.jpg"))
 
     diagnostic = exc_info.value.diagnostics()
     assert diagnostic == {
@@ -460,8 +500,9 @@ def test_ultralytics_detector_raises_safe_error_for_construction_failure() -> No
         def __init__(self, model_path: str) -> None:
             raise RuntimeError(f"bad model {model_path}")
 
+    detector = UltralyticsVehicleDetector("bad.pt", yolo_class=FailingYOLO)
     with pytest.raises(DetectionError) as exc_info:
-        UltralyticsVehicleDetector("bad.pt", yolo_class=FailingYOLO)
+        detector.detect(Path("frame.jpg"))
 
     assert exc_info.value.diagnostics() == {
         "phase": "model_load",

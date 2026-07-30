@@ -6,6 +6,7 @@ from pathlib import Path
 from parking_spot_monitor.capture import CaptureError, FrameCaptureResult, StreamProfileCapture
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.detection import DetectionError, DetectionFilterResult
+from parking_spot_monitor.detector_adapter import DetectorRunner
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
 from parking_spot_monitor.runtime_detection import _process_detection_for_capture
@@ -40,7 +41,7 @@ def detect_with_stream_escalation(
     data_dir: Path,
     *,
     capture: StreamProfileCapture,
-    detector: object,
+    detector: DetectorRunner,
     runtime_state: RuntimeState,
     primary_result: FrameCaptureResult,
     logger: StructuredLogger,

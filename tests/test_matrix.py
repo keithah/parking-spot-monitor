@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 import parking_spot_monitor.matrix_snapshots as matrix_snapshots
+from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix import (
@@ -3180,7 +3181,7 @@ def test_command_service_incident_review_real_context_replays_detector_sends_saf
         data_dir=tmp_path,
         health_path=tmp_path / "health.json",
         state_path=state_path,
-        incident_detector=detector,
+        incident_detector=adapt_detector(detector),
     )
     archive = FakeCommandArchive(cursor={"next_batch": "s2"})
     service = MatrixCommandService(
@@ -4065,7 +4066,13 @@ def test_default_matrix_factories_wire_safety_config_and_resolved_outbox_path(tm
     settings = load_settings(config_path, environ=stream_env())
     paths = resolve_runtime_paths(settings, tmp_path)
 
-    service = _default_matrix_command_service_factory(settings, tmp_path, logger=None, archive=FakeCommandArchive())  # type: ignore[arg-type]
+    service = _default_matrix_command_service_factory(
+        settings,
+        tmp_path,
+        logger=None,
+        archive=FakeCommandArchive(),
+        incident_detector=object(),
+    )  # type: ignore[arg-type]
     delivery = _default_matrix_delivery_factory(settings, tmp_path, logger=None)  # type: ignore[arg-type]
 
     assert service is not None

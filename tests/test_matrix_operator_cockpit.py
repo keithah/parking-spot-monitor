@@ -14,6 +14,7 @@ from PIL import Image
 
 import parking_spot_monitor.operator_cockpit_snapshots as operator_cockpit_snapshots
 from parking_spot_monitor.config import load_settings
+from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.health import HealthStatus, write_health_status
 from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult
 from parking_spot_monitor.logging import StructuredLogger
@@ -1500,7 +1501,7 @@ def test_operator_cockpit_incident_review_contract_replays_detector_and_simulate
         state_path=state_path,
         spot_id="left_spot",
         time_text="7:39pm",
-        detector=detector,
+        detector=adapt_detector(detector),
         now=datetime(2026, 5, 18, 4, 0, tzinfo=timezone.utc),
     )
 
@@ -1563,7 +1564,7 @@ def test_operator_cockpit_incident_review_contract_degrades_safely_for_negative_
         state_path=state_path,
         spot_id="left_spot",
         time_text="7:39pm",
-        detector=detector,
+        detector=adapt_detector(detector),
         now=datetime(2026, 5, 18, 4, 0, tzinfo=timezone.utc),
     )
 

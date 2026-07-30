@@ -23,12 +23,12 @@ from parking_spot_monitor.state import RuntimeState, StateSchemaError, _state_fr
 
 
 class IncidentDetector(Protocol):
-    def detect(
+    def detect_path(
         self,
-        frame_path: str | Path,
+        frame_path: Path,
         *,
-        confidence_threshold: float | None = None,
-        inference_image_size: int | None = None,
+        confidence_threshold: float,
+        inference_image_size: int | None,
     ) -> Sequence[VehicleDetection]: ...
 
 
@@ -191,11 +191,14 @@ def _run_detector(
 ) -> tuple[list[VehicleDetection] | None, str | None]:
     if detector is None:
         return None, "detector_unavailable"
-    kwargs: dict[str, Any] = {"confidence_threshold": settings.detection.confidence_threshold}
-    if settings.detection.inference_image_size is not None:
-        kwargs["inference_image_size"] = settings.detection.inference_image_size
     try:
-        return list(detector.detect(frame.path, **kwargs)), None
+        return list(
+            detector.detect_path(
+                frame.path,
+                confidence_threshold=settings.detection.confidence_threshold,
+                inference_image_size=settings.detection.inference_image_size,
+            )
+        ), None
     except Exception as exc:  # safe degradation boundary for Matrix command replies
         return None, redact_diagnostic_text(exc.__class__.__name__) or "detector_error"
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 import math
 from os import PathLike
+import threading
 from typing import Any, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
 from parking_spot_monitor.geometry import (
@@ -170,17 +171,9 @@ class UltralyticsVehicleDetector:
 
     def __init__(self, model_path: str, *, yolo_class: Callable[[str], Any] | None = None) -> None:
         self.model_path = str(model_path)
-        try:
-            yolo = yolo_class if yolo_class is not None else _load_ultralytics_yolo()
-            self._model = yolo(self.model_path)
-        except DetectionError:
-            raise
-        except Exception as exc:
-            raise _detection_error_from_exception(
-                exc,
-                model_path=self.model_path,
-                phase="model_load",
-            ) from exc
+        self._yolo_class = yolo_class
+        self._model: Any | None = None
+        self._model_lock = threading.Lock()
 
     def detect(
         self,
@@ -230,7 +223,7 @@ class UltralyticsVehicleDetector:
             predict_kwargs["imgsz"] = inference_image_size
 
         try:
-            results = self._model.predict(**predict_kwargs)
+            results = self._load_model().predict(**predict_kwargs)
             return _normalize_ultralytics_results(results)
         except DetectionError:
             raise
@@ -241,6 +234,28 @@ class UltralyticsVehicleDetector:
                 phase="predict",
                 frame_path=frame_label,
             ) from exc
+
+    def _load_model(self) -> Any:
+        model = self._model
+        if model is not None:
+            return model
+        with self._model_lock:
+            model = self._model
+            if model is not None:
+                return model
+            try:
+                yolo = self._yolo_class if self._yolo_class is not None else _load_ultralytics_yolo()
+                model = yolo(self.model_path)
+            except DetectionError:
+                raise
+            except Exception as exc:
+                raise _detection_error_from_exception(
+                    exc,
+                    model_path=self.model_path,
+                    phase="model_load",
+                ) from exc
+            self._model = model
+            return model
 
 
 def translate_crop_detection(detection: VehicleDetection, *, offset_x: int, offset_y: int) -> VehicleDetection:

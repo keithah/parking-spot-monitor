@@ -16,6 +16,7 @@ from parking_spot_monitor.detection import (
     DetectionError,
     UltralyticsVehicleDetector,
 )
+from parking_spot_monitor.detector_adapter import SharedLazyDetector, adapt_detector
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.live_proof import run_live_proof_once
 from parking_spot_monitor.logging import StructuredLogger, setup_logging
@@ -174,7 +175,6 @@ def _main(
     overlay_fn = overlay if overlay is not None else _write_debug_overlay
     detector_fn = detector_factory if detector_factory is not None else _default_detector_factory
     matrix_factory = matrix_delivery_factory if matrix_delivery_factory is not None else _default_matrix_delivery_factory
-    command_factory = matrix_command_service_factory if matrix_command_service_factory is not None else _default_matrix_command_service_factory
 
     if args.capture_once:
         return _capture_once(settings, paths.data_dir, logger=logger, capture=capture_fn, overlay=overlay_fn, detector_factory=detector_fn)
@@ -194,7 +194,17 @@ def _main(
 
     history_archive = VehicleHistoryArchive(paths.vehicle_history_dir, logger=logger)
     matrix_delivery = matrix_factory(settings, paths.data_dir, logger)
-    matrix_command_service = command_factory(settings, paths.data_dir, logger, history_archive)
+    shared_detector = SharedLazyDetector(lambda: detector_fn(settings))
+    if matrix_command_service_factory is None:
+        matrix_command_service = _default_matrix_command_service_factory(
+            settings,
+            paths.data_dir,
+            logger,
+            history_archive,
+            incident_detector=shared_detector,
+        )
+    else:
+        matrix_command_service = matrix_command_service_factory(settings, paths.data_dir, logger, history_archive)
     try:
         return run_capture_loop(
             settings,
@@ -202,7 +212,7 @@ def _main(
             logger=logger,
             capture=capture_fn,
             overlay=overlay_fn,
-            detector_factory=detector_fn,
+            detector_factory=lambda _settings: shared_detector,
             matrix_delivery=matrix_delivery,
             history_archive=history_archive,
             matrix_command_service=matrix_command_service,
@@ -233,7 +243,7 @@ def _capture_once(
     if not write_overlay_for_capture(settings, result.latest_path, data_dir, logger=logger, overlay=overlay):
         return 1
     try:
-        detector = detector_factory(settings)
+        detector = adapt_detector(detector_factory(settings))
         _process_detection_for_capture(
             settings,
             detector,
@@ -258,19 +268,6 @@ def _close_if_available(resource: Any | None) -> None:
 
 def _default_detector_factory(settings: RuntimeSettings) -> UltralyticsVehicleDetector:
     return UltralyticsVehicleDetector(settings.detection.model)
-
-
-class _LazyIncidentReplayDetector:
-    """Lazy Matrix incident-review detector to avoid model loads at command-service startup."""
-
-    def __init__(self, settings: RuntimeSettings) -> None:
-        self._settings = settings
-        self._detector: Any | None = None
-
-    def detect(self, frame_path: str | Path, **kwargs: Any) -> Any:
-        if self._detector is None:
-            self._detector = _default_detector_factory(self._settings)
-        return self._detector.detect(frame_path, **kwargs)
 
 
 def _default_matrix_delivery_factory(settings: RuntimeSettings, data_dir: Path, logger: StructuredLogger) -> MatrixOutboxDelivery:
@@ -305,6 +302,8 @@ def _default_matrix_command_service_factory(
     data_dir: Path,
     logger: StructuredLogger,
     archive: VehicleHistoryArchive,
+    *,
+    incident_detector: object,
 ) -> "MatrixCommandService | None":
     if not settings.matrix.command_authorized_senders:
         logger.info(
@@ -363,7 +362,7 @@ def _default_matrix_command_service_factory(
             detection_lab_manager=DetectionLabManager(
                 paths.data_dir, logger=logger, outcome_recorder=record_outcome
             ),
-            incident_detector=_LazyIncidentReplayDetector(settings),
+            incident_detector=incident_detector,
         ),
         feedback_labeler=feedback_labeler,
         who_snapshot_provider=who_snapshot_provider,

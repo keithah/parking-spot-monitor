@@ -9,6 +9,7 @@ from PIL import Image
 from parking_spot_monitor.capture import DecodeMode, FrameCaptureResult, FrameGeometry
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.detection import VehicleDetection
+from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
 from parking_spot_monitor.operator_decision_memory import (
@@ -114,7 +115,7 @@ def test_weak_candidate_for_stable_occupied_spot_does_not_escalate(tmp_path: Pat
         settings,
         tmp_path,
         capture=capture,
-        detector=_RightSpotDetector(0.50),
+        detector=adapt_detector(_RightSpotDetector(0.50)),
         runtime_state=RuntimeState(
             state_by_spot={
                 "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
@@ -142,7 +143,7 @@ def test_weak_candidate_for_empty_spot_escalates_before_confirmation(tmp_path: P
         settings,
         tmp_path,
         capture=capture,
-        detector=_RightSpotDetector(0.50),
+        detector=adapt_detector(_RightSpotDetector(0.50)),
         runtime_state=RuntimeState(
             state_by_spot={
                 "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
@@ -171,7 +172,7 @@ def test_periodic_verification_escalates_stable_strong_primary_evidence(tmp_path
         settings,
         tmp_path,
         capture=capture,
-        detector=_RightSpotDetector(0.92),
+        detector=adapt_detector(_RightSpotDetector(0.92)),
         runtime_state=RuntimeState(
             state_by_spot={
                 "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
@@ -208,7 +209,7 @@ def test_occupied_spot_near_release_escalates_on_missing_candidate(tmp_path: Pat
         settings,
         tmp_path,
         capture=capture,
-        detector=NoDetection(),
+        detector=adapt_detector(NoDetection()),
         runtime_state=RuntimeState(
             state_by_spot={
                 "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
@@ -256,7 +257,7 @@ def test_missing_escalation_profile_does_not_recapture_primary_stream(tmp_path: 
         settings,
         tmp_path,
         capture=capture,
-        detector=WeakDetector(),
+        detector=adapt_detector(WeakDetector()),
         runtime_state=RuntimeState(
             state_by_spot={
                 "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
@@ -314,7 +315,7 @@ def test_escalation_returns_final_frame_for_caller_owned_memory_recording(tmp_pa
         settings,
         tmp_path,
         capture=capture,
-        detector=Detector(),
+        detector=adapt_detector(Detector()),
         runtime_state=RuntimeState(
             state_by_spot={
                 "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
@@ -371,7 +372,7 @@ def test_detection_uses_capture_profile_dimensions_when_image_size_is_unavailabl
 
     result = _process_detection_for_capture(
         settings,
-        LowResolutionDetector(),
+        adapt_detector(LowResolutionDetector()),
         unreadable_frame,
         frame_timestamp="2026-05-18T18:00:00Z",
         logger=StructuredLogger(),

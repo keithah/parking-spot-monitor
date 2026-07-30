@@ -12,6 +12,7 @@ from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureR
 from parking_spot_monitor.capture_loop import run_capture_loop
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.detection import DetectionError, VehicleDetection
+from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
 from parking_spot_monitor.runtime_frame import capture_and_detect_runtime_frame
@@ -506,7 +507,7 @@ def test_failed_high_resolution_detection_preserves_primary_capture_identity(tmp
         settings,
         tmp_path,
         capture=fake_capture,
-        detector=FailingHighDetector(),
+        detector=adapt_detector(FailingHighDetector()),
         detector_factory=lambda _settings: FailingHighDetector(),
         runtime_state=RuntimeState(
             state_by_spot={

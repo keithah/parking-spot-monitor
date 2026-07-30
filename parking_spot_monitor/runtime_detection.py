@@ -8,17 +8,13 @@ from typing import Any
 from parking_spot_monitor.capture import FrameGeometry
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.detection import (
-    DetectionError,
     DetectionFilterResult,
     crop_region_for_polygon,
     filter_spot_detections,
     translate_crop_detection,
 )
+from parking_spot_monitor.detector_adapter import DetectorRunner
 from parking_spot_monitor.logging import StructuredLogger
-from parking_spot_monitor.runtime_detector_capabilities import (
-    compatible_detect_image as _compatible_detect_image,
-    detect_accepts_inference_image_size as _detect_accepts_inference_image_size,
-)
 from parking_spot_monitor.runtime_detection_support import (
     accepted_by_spot as _accepted_by_spot,
     candidate_summaries as _candidate_summaries,
@@ -34,7 +30,7 @@ from parking_spot_monitor.runtime_detection_support import (
 
 def _process_detection_for_capture(
     settings: RuntimeSettings,
-    detector: Any,
+    detector: DetectorRunner,
     latest_path: Path,
     *,
     frame_timestamp: Any | None = None,
@@ -109,7 +105,7 @@ def _process_detection_for_capture(
 
 def _detect_spot_crop_vehicles_for_frame(
     settings: RuntimeSettings,
-    detector: Any,
+    detector: DetectorRunner,
     latest_path: Path,
     image: Any,
     actual_frame_size: tuple[int, int],
@@ -121,55 +117,56 @@ def _detect_spot_crop_vehicles_for_frame(
     )
     spot_polygons = _configured_spot_polygons(settings, scale=scale)
     translated: list[Any] = []
-    try:
-        detect_image = _compatible_detect_image(detector)
-        if detect_image is not None:
-            for spot_id, polygon in spot_polygons.items():
-                region = crop_region_for_polygon(
-                    polygon,
-                    frame_size=actual_frame_size,
-                    margin_px=settings.detection.spot_crop_margin_px,
-                    spot_id=spot_id,
-                )
-                with closing(image.crop((region.left, region.top, region.right, region.bottom))) as crop:
-                    detections = detect_image(
-                        crop,
-                        confidence_threshold=_detector_confidence_threshold(settings),
-                        inference_image_size=settings.detection.inference_image_size,
-                    )
-                    translated.extend(
-                        translate_crop_detection(detection, offset_x=region.left, offset_y=region.top)
-                        for detection in detections
-                    )
-        else:
-            with tempfile.TemporaryDirectory(prefix="spot-crops-", dir=str(latest_path.parent)) as temp_dir:
-                temp_root = Path(temp_dir)
-                for spot_id, polygon in spot_polygons.items():
-                    region = crop_region_for_polygon(
-                        polygon,
-                        frame_size=actual_frame_size,
-                        margin_px=settings.detection.spot_crop_margin_px,
-                        spot_id=spot_id,
-                    )
-                    crop_path = temp_root / f"{spot_id}.jpg"
-                    with closing(image.crop((region.left, region.top, region.right, region.bottom))) as crop:
-                        crop.save(crop_path, format="JPEG")
-                    translated.extend(
-                        translate_crop_detection(detection, offset_x=region.left, offset_y=region.top)
-                        for detection in _detect_vehicles_for_frame(settings, detector, crop_path)
-                    )
+    image_method_supported = True
+    for spot_id, polygon in spot_polygons.items():
+        region = crop_region_for_polygon(
+            polygon,
+            frame_size=actual_frame_size,
+            margin_px=settings.detection.spot_crop_margin_px,
+            spot_id=spot_id,
+        )
+        with closing(image.crop((region.left, region.top, region.right, region.bottom))) as crop:
+            detections = detector.detect_image_if_supported(
+                crop,
+                confidence_threshold=_detector_confidence_threshold(settings),
+                inference_image_size=settings.detection.inference_image_size,
+            )
+            if detections is None:
+                image_method_supported = False
+                break
+            translated.extend(
+                translate_crop_detection(detection, offset_x=region.left, offset_y=region.top)
+                for detection in detections
+            )
+    if image_method_supported:
         return translated
-    except DetectionError:
-        raise
+
+    translated.clear()
+    with tempfile.TemporaryDirectory(prefix="spot-crops-", dir=str(latest_path.parent)) as temp_dir:
+        temp_root = Path(temp_dir)
+        for spot_id, polygon in spot_polygons.items():
+            region = crop_region_for_polygon(
+                polygon,
+                frame_size=actual_frame_size,
+                margin_px=settings.detection.spot_crop_margin_px,
+                spot_id=spot_id,
+            )
+            crop_path = temp_root / f"{spot_id}.jpg"
+            with closing(image.crop((region.left, region.top, region.right, region.bottom))) as crop:
+                crop.save(crop_path, format="JPEG")
+            translated.extend(
+                translate_crop_detection(detection, offset_x=region.left, offset_y=region.top)
+                for detection in _detect_vehicles_for_frame(settings, detector, crop_path)
+            )
+    return translated
 
 
-def _detect_vehicles_for_frame(settings: RuntimeSettings, detector: Any, latest_path: Path) -> list[Any]:
-    kwargs: dict[str, Any] = {
-        "confidence_threshold": _detector_confidence_threshold(settings)
-    }
-    if _detect_accepts_inference_image_size(detector):
-        kwargs["inference_image_size"] = settings.detection.inference_image_size
-    return detector.detect(latest_path, **kwargs)
+def _detect_vehicles_for_frame(settings: RuntimeSettings, detector: DetectorRunner, latest_path: Path) -> list[Any]:
+    return detector.detect_path(
+        latest_path,
+        confidence_threshold=_detector_confidence_threshold(settings),
+        inference_image_size=settings.detection.inference_image_size,
+    )
 
 
 def _detector_confidence_threshold(settings: RuntimeSettings) -> float:

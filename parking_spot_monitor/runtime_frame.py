@@ -6,6 +6,7 @@ from pathlib import Path
 from parking_spot_monitor.capture import CaptureError, StreamProfileCapture
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.detection import DetectionError
+from parking_spot_monitor.detector_adapter import DetectorRunner, SharedLazyDetector, adapt_detector
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.runtime_frame_outcome import (
     RuntimeFrameAttempt,
@@ -27,7 +28,7 @@ def capture_and_detect_runtime_frame(
     data_dir: Path,
     *,
     capture: StreamProfileCapture,
-    detector: object | None,
+    detector: DetectorRunner | None,
     detector_factory: Callable[[RuntimeSettings], object],
     runtime_state: RuntimeState,
     logger: StructuredLogger,
@@ -41,7 +42,9 @@ def capture_and_detect_runtime_frame(
         return RuntimeFrameCaptureFailed(error=exc)
 
     try:
-        detector = detector if detector is not None else detector_factory(settings)
+        if detector is None:
+            raw_detector = detector_factory(settings)
+            detector = raw_detector if isinstance(raw_detector, SharedLazyDetector) else adapt_detector(raw_detector)
         outcome = detect_with_stream_escalation(
             settings,
             data_dir,

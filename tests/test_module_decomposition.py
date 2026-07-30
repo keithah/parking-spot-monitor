@@ -355,8 +355,8 @@ def test_runtime_modules_stay_decomposed() -> None:
         "parking_spot_monitor/runtime_commands.py": 120,
         "parking_spot_monitor/runtime_decision_memory.py": 240,
         "parking_spot_monitor/runtime_detection.py": 250,
-        # Focused detector helpers get only small local growth budgets.
-        "parking_spot_monitor/runtime_detector_capabilities.py": 200,
+        # Detector adaptation stays a small construction-time boundary.
+        "parking_spot_monitor/detector_adapter.py": 180,
         "parking_spot_monitor/runtime_detection_support.py": 110,
         "parking_spot_monitor/runtime_frame.py": 90,
         "parking_spot_monitor/runtime_frame_outcome.py": 90,
@@ -373,6 +373,11 @@ def test_runtime_modules_stay_decomposed() -> None:
     for path, max_lines in module_caps.items():
         assert (ROOT / path).exists()
         assert _line_count(path) <= max_lines
+
+    retired_module = ROOT / "parking_spot_monitor/runtime_detector_capabilities.py"
+    assert not retired_module.exists()
+    for source in (ROOT / "parking_spot_monitor").glob("*.py"):
+        assert "runtime_detector_capabilities" not in source.read_text(encoding="utf-8")
 
 
 def test_runtime_matrix_boundaries_use_narrow_protocols() -> None:

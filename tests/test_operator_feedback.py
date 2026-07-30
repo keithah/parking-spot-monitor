@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.logging import StructuredLogger
 
 FAKE_RTSP_URL = "rtsp://user:pass@example.local/live"
@@ -824,7 +825,7 @@ def test_labeler_records_learn_label_from_retained_timeline_replay_without_state
         requested_time="7:39pm",
         settings=settings,
         state_path=state_path,
-        detector=detector,
+        detector=adapt_detector(detector),
         matrix_event_id="$learn-record",
         matrix_sender="@operator:example",
         matrix_room_id="!room:example",
@@ -894,7 +895,7 @@ def test_labeler_repeats_duplicate_learn_ack_without_duplicate_label_or_memory(t
         requested_time="7:39pm",
         settings=settings,
         state_path=state_path,
-        detector=_LearnReplayDetector([]),
+        detector=adapt_detector(_LearnReplayDetector([])),
         matrix_event_id="$duplicate-learn",
         matrix_sender="@operator:example",
         matrix_room_id="!room:example",
@@ -906,7 +907,7 @@ def test_labeler_repeats_duplicate_learn_ack_without_duplicate_label_or_memory(t
         requested_time="7:39pm",
         settings=settings,
         state_path=state_path,
-        detector=_LearnReplayDetector([]),
+        detector=adapt_detector(_LearnReplayDetector([])),
         matrix_event_id="$duplicate-learn",
         matrix_sender="@operator:example",
         matrix_room_id="!room:example",
@@ -960,7 +961,7 @@ def test_labeler_learn_label_degrades_safely_for_timeline_detector_state_and_sto
         requested_time="7:39pm",
         settings=settings,
         state_path=state_path,
-        detector=_LearnReplayDetector(detections),
+        detector=adapt_detector(_LearnReplayDetector(detections)),
         matrix_event_id=f"$learn-{case}",
         matrix_sender="@operator:example",
         matrix_room_id="!room:example",
@@ -999,7 +1000,7 @@ def test_labeler_learn_label_reports_feedback_store_unavailable_without_memory_r
         requested_time="7:39pm",
         settings=settings,
         state_path=state_path,
-        detector=_LearnReplayDetector([]),
+        detector=adapt_detector(_LearnReplayDetector([])),
         matrix_event_id="$learn-store-fails",
         matrix_sender="@operator:example",
         matrix_room_id="!room:example",

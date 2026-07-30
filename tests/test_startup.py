@@ -30,6 +30,7 @@ from parking_spot_monitor.runtime_presence import presence_by_spot
 from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as _matrix_outbox_health_payload
 from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 from parking_spot_monitor.detection import DetectionError, DetectionFilterResult, RejectedDetection, RejectionReason, SpotDetectionResult, VehicleDetection
+from parking_spot_monitor.detector_adapter import SharedLazyDetector, adapt_detector
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
 from parking_spot_monitor.state import RuntimeState, save_runtime_state
@@ -257,7 +258,7 @@ def test_disabled_matrix_commands_do_not_import_operator_stack() -> None:
         "from parking_spot_monitor.logging import StructuredLogger; "
         "settings=SimpleNamespace(matrix=SimpleNamespace(command_authorized_senders=[])); "
         "result=cli._default_matrix_command_service_factory("
-        "settings, None, StructuredLogger(stream=StringIO()), object()); "
+        "settings, None, StructuredLogger(stream=StringIO()), object(), incident_detector=object()); "
         "assert result is None; "
         f"blocked={blocked!r}; "
         "present=sorted(blocked.intersection(sys.modules)); "
@@ -779,7 +780,7 @@ def test_process_detection_uses_spot_crop_inference_to_recover_full_frame_miss(
 
     result = _process_detection_for_capture(
         settings,
-        detector,
+        adapt_detector(detector),
         frame,
         logger=StructuredLogger(),
         mode="test",
@@ -844,7 +845,7 @@ def test_process_detection_uses_no_temporary_files_for_in_memory_crop_detector(
 
     result = runtime_detection._process_detection_for_capture(
         settings,
-        detector,
+        adapt_detector(detector),
         frame,
         logger=StructuredLogger(),
         mode="test",
@@ -903,7 +904,7 @@ def test_incompatible_detect_image_uses_temporary_jpeg_fallback(tmp_path: Path) 
     detector = IncidentalDetectImageDetector()
     result = runtime_detection._process_detection_for_capture(
         load_settings(config_path, environ=fake_environ()),
-        detector,
+        adapt_detector(detector),
         frame,
         logger=StructuredLogger(),
         mode="test",
@@ -946,7 +947,7 @@ def test_compatible_detect_image_internal_type_error_propagates(tmp_path: Path) 
     with pytest.raises(TypeError) as exc_info:
         runtime_detection._process_detection_for_capture(
             load_settings(config_path, environ=fake_environ()),
-            FailingInMemoryDetector(),
+            adapt_detector(FailingInMemoryDetector()),
             frame,
             logger=StructuredLogger(),
             mode="test",
@@ -990,7 +991,7 @@ def test_spot_crop_image_size_failure_closes_open_source(
 
     runtime_detection._process_detection_for_capture(
         load_settings(config_path, environ=fake_environ()),
-        EmptyDetector(),
+        adapt_detector(EmptyDetector()),
         tmp_path / "latest.jpg",
         logger=StructuredLogger(),
         mode="test",
@@ -1016,7 +1017,7 @@ def test_process_detection_scales_configured_polygons_to_actual_frame_size(
     settings = load_settings("config.yaml.example", environ=fake_environ())
     result = _process_detection_for_capture(
         settings,
-        LowResDetector(),
+        adapt_detector(LowResDetector()),
         frame,
         logger=StructuredLogger(),
         mode="test",
@@ -1049,7 +1050,7 @@ def test_process_detection_skips_candidate_summaries_when_info_is_disabled(
 
     result = runtime_detection._process_detection_for_capture(
         load_settings("config.yaml.example", environ=fake_environ()),
-        NoopDetector(),
+        adapt_detector(NoopDetector()),
         frame,
         logger=StructuredLogger(level="WARNING"),
         mode="test",
@@ -1080,7 +1081,7 @@ def test_process_detection_keeps_candidate_summary_schema_when_info_is_enabled(
 
     runtime_detection._process_detection_for_capture(
         load_settings("config.yaml.example", environ=fake_environ()),
-        NoopDetector(),
+        adapt_detector(NoopDetector()),
         frame,
         logger=StructuredLogger(),
         mode="test",
@@ -5202,7 +5203,13 @@ def test_default_matrix_command_service_wires_detection_lab_to_effective_paths_a
     logger = StructuredLogger()
     archive = VehicleHistoryArchive(tmp_path / "vehicle-history", logger=logger)
 
-    service = _default_matrix_command_service_factory(settings, tmp_path, logger, archive)
+    service = _default_matrix_command_service_factory(
+        settings,
+        tmp_path,
+        logger,
+        archive,
+        incident_detector=object(),
+    )
 
     assert service is not None
     context = service.cockpit_context
@@ -5238,20 +5245,26 @@ def test_default_matrix_command_service_wires_feedback_who_snapshot_and_incident
     logger = StructuredLogger()
     archive = VehicleHistoryArchive(tmp_path / "vehicle-history", logger=logger)
 
-    service = _default_matrix_command_service_factory(settings, tmp_path, logger, archive)
+    incident_detector = object()
+    service = _default_matrix_command_service_factory(
+        settings,
+        tmp_path,
+        logger,
+        archive,
+        incident_detector=incident_detector,
+    )
 
     assert service is not None
     assert service.feedback_labeler is not None
     assert service.who_snapshot_provider is not None
     assert service.cockpit_context is not None
-    assert service.cockpit_context.incident_detector is not None
+    assert service.cockpit_context.incident_detector is incident_detector
     assert not (tmp_path / "latest.jpg").exists()
     assert not (tmp_path / "state.json").exists()
 
 
 def test_default_matrix_command_service_defers_incident_detector_construction_until_replay(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
@@ -5273,13 +5286,18 @@ def test_default_matrix_command_service_defers_incident_detector_construction_un
         factory_calls.append(loaded_settings)
         return Detector()
 
-    monkeypatch.setattr("parking_spot_monitor.__main__._default_detector_factory", detector_factory)
-
-    service = _default_matrix_command_service_factory(settings, tmp_path, logger, archive)
+    shared_detector = SharedLazyDetector(lambda: detector_factory(settings))
+    service = _default_matrix_command_service_factory(
+        settings,
+        tmp_path,
+        logger,
+        archive,
+        incident_detector=shared_detector,
+    )
 
     assert service is not None
     assert service.cockpit_context is not None
-    assert service.cockpit_context.incident_detector is not None
+    assert service.cockpit_context.incident_detector is shared_detector
     assert factory_calls == []
 
     missing_frame_response = service.cockpit_context.incident_review_reply(
@@ -5304,6 +5322,66 @@ def test_default_matrix_command_service_defers_incident_detector_construction_un
     assert factory_calls == [settings]
     assert detect_calls == [frame]
     assert "Detector replay: no vehicle evidence" in replay_response.text
+
+
+def test_runtime_and_default_incident_replay_share_one_lazy_detector_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from parking_spot_monitor import __main__ as cli
+    from parking_spot_monitor.detector_adapter import SharedLazyDetector
+
+    constructed: list[object] = []
+    incident_owners: list[SharedLazyDetector] = []
+
+    class Detector:
+        def detect(
+            self,
+            _frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    def detector_factory(_settings: object) -> Detector:
+        backend = Detector()
+        constructed.append(backend)
+        return backend
+
+    def command_factory(
+        _settings: object,
+        _data_dir: Path,
+        _logger: StructuredLogger,
+        _archive: object,
+        *,
+        incident_detector: SharedLazyDetector,
+    ) -> None:
+        incident_owners.append(incident_detector)
+        return None
+
+    monkeypatch.setattr(cli, "_default_matrix_command_service_factory", command_factory)
+
+    exit_code = cli._main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path),
+        overlay=noop_overlay,
+        detector_factory=detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: FakeMatrixDelivery(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    assert exit_code == 0
+    assert len(incident_owners) == 1
+    assert incident_owners[0].loaded is True
+    incident_owners[0].detect_path(
+        tmp_path / "incident.jpg",
+        confidence_threshold=0.1,
+        inference_image_size=640,
+    )
+    assert len(constructed) == 1
 
 
 def test_startup_summary_includes_sanitized_detection_lab_dir(capsys: pytest.CaptureFixture[str]) -> None:

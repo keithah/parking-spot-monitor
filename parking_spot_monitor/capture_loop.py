@@ -9,6 +9,7 @@ from typing import Any
 from parking_spot_monitor import runtime_loop_resources, runtime_matrix_commands
 from parking_spot_monitor.capture import CaptureError, StreamProfileCapture
 from parking_spot_monitor.config import RuntimeSettings
+from parking_spot_monitor.detector_adapter import DetectorRunner
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_alerts import MONITOR_STARTED_EVENT_TYPE, monitor_lifecycle_event
 from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery, dispatch_matrix_event
@@ -46,7 +47,7 @@ def run_capture_loop(
     startup_retention_failure_count: int = 0,
 ) -> int:
     iteration = 0
-    detector: Any | None = None
+    detector: DetectorRunner | None = None
     spot_ids = list(_configured_spot_polygons(settings).keys())
     state_path = data_dir / "state.json"
     runtime_paths = resolve_runtime_paths(settings, data_dir)
