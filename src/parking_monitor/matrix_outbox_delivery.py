@@ -19,14 +19,10 @@ from typing import Any
 
 from parking_monitor.outbox import AlertIntent, LocalOutbox, OutboxRecord
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
-from parking_spot_monitor.matrix import (
-    JPEG_MIMETYPE,
+from parking_spot_monitor.matrix_alerts import (
     OCCUPIED_SPOT_EVENT_TYPE,
     OPEN_SPOT_EVENT_TYPE,
     OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
-    MatrixDelivery,
-    MatrixError,
-    MatrixSnapshot,
     format_occupied_spot_alert,
     format_open_spot_alert,
     format_owner_vehicle_quiet_window_alert,
@@ -34,9 +30,15 @@ from parking_spot_monitor.matrix import (
     occupied_spot_event_id,
     open_spot_event_id,
     owner_vehicle_quiet_window_event_id,
+)
+from parking_spot_monitor.matrix_delivery import MatrixDelivery
+from parking_spot_monitor.matrix_snapshots import (
+    JPEG_MIMETYPE,
+    MatrixSnapshot,
+    _matrix_snapshot_upload,
     prepare_event_snapshot,
 )
-from parking_spot_monitor.matrix_snapshots import _matrix_snapshot_upload
+from parking_spot_monitor.matrix_support import MatrixError
 
 _SNAPSHOT_ALERT_PHASES = ("text", "upload", "image")
 _QUIET_WINDOW_EVENT_TYPES = frozenset({"quiet-window-upcoming", "quiet-window-started", "quiet-window-ended"})
@@ -345,7 +347,12 @@ class MatrixOutboxDelivery:
         ]
         if max_records is not None:
             records = records[: max(0, int(max_records))]
-        self._log("info", "matrix-outbox-drain-started", attempted_count=len(records), item_id=record_id)
+        self._log(
+            "info" if records else "debug",
+            "matrix-outbox-drain-started",
+            attempted_count=len(records),
+            item_id=record_id,
+        )
         attempted = 0
         delivered = 0
         retrying = 0
@@ -357,7 +364,7 @@ class MatrixOutboxDelivery:
             elif drained.state in {"pending", "retrying"}:
                 retrying += 1
         self._log(
-            "info",
+            "info" if any((attempted, delivered, retrying)) else "debug",
             "matrix-outbox-drain-finished",
             attempted_count=attempted,
             delivered_count=delivered,

@@ -938,6 +938,32 @@ def test_delivered_records_and_phases_are_not_sent_again(tmp_path: Path) -> None
     assert restarted_client.calls == []
 
 
+def test_empty_outbox_drain_uses_debug_instead_of_info(tmp_path: Path) -> None:
+    info_stream = StringIO()
+    info_result = make_delivery(tmp_path, FakeMatrixClient(), stream=info_stream).drain_outbox(max_records=1)
+
+    assert info_result == MatrixOutboxDrainResult(attempted_count=0, delivered_count=0, retrying_count=0)
+    assert info_stream.getvalue() == ""
+
+    debug_stream = StringIO()
+    delivery = MatrixOutboxDelivery(
+        client=FakeMatrixClient(),
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(tmp_path / "debug-matrix-outbox.json"),
+        logger=StructuredLogger(level="DEBUG", stream=debug_stream),
+    )
+
+    delivery.drain_outbox(max_records=1)
+
+    records = [json.loads(line) for line in debug_stream.getvalue().splitlines()]
+    assert [(record["event"], record["level"]) for record in records] == [
+        ("matrix-outbox-drain-started", "DEBUG"),
+        ("matrix-outbox-drain-finished", "DEBUG"),
+    ]
+
+
 def test_retry_logs_use_safe_reason_codes_and_redact_unsafe_diagnostics(tmp_path: Path) -> None:
     source = tmp_path / "latest.jpg"
     write_jpeg(source)

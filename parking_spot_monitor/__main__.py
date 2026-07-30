@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery
 from parking_monitor.outbox import LocalOutbox
@@ -16,18 +16,13 @@ from parking_spot_monitor.detection import (
     DetectionError,
     UltralyticsVehicleDetector,
 )
-from parking_spot_monitor.detection_lab import DetectionLabManager
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.live_proof import run_live_proof_once
 from parking_spot_monitor.logging import StructuredLogger, setup_logging
 from parking_spot_monitor.matrix_client import MatrixClient
-from parking_spot_monitor.matrix_cockpit import MatrixOperatorCockpitContext
-from parking_spot_monitor.matrix_commands import MatrixCommandService
 from parking_spot_monitor.matrix_snapshots import SnapshotRetentionResult, prune_event_snapshots
 from parking_spot_monitor.capture_loop import run_capture_loop
 from parking_spot_monitor.config import RuntimeSettings, load_settings
-from parking_spot_monitor.operator_cockpit import build_who_snapshot_response
-from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler
 from parking_spot_monitor.paths import RuntimePaths, resolve_runtime_paths
 from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as _matrix_outbox_health_payload
 from parking_spot_monitor.runtime_decision_memory import _append_lab_outcome_memory
@@ -35,6 +30,9 @@ from parking_spot_monitor.runtime_detection import _process_detection_for_captur
 from parking_spot_monitor.runtime_overlay import _write_debug_overlay, write_overlay_for_capture
 from parking_spot_monitor.runtime_snapshot_retention import startup_retryable_retained_snapshots
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
+
+if TYPE_CHECKING:
+    from parking_spot_monitor.matrix_commands import MatrixCommandService
 
 DEFAULT_CONFIG_PATH = "/config/config.yaml"
 DEFAULT_DATA_DIR = "/data"
@@ -306,7 +304,7 @@ def _default_matrix_command_service_factory(
     data_dir: Path,
     logger: StructuredLogger,
     archive: VehicleHistoryArchive,
-) -> MatrixCommandService | None:
+) -> "MatrixCommandService | None":
     if not settings.matrix.command_authorized_senders:
         logger.info(
             "matrix-command-disabled",
@@ -315,8 +313,17 @@ def _default_matrix_command_service_factory(
             reason="no-authorized-senders",
         )
         return None
+    from parking_spot_monitor.detection_lab import DetectionLabManager
+    from parking_spot_monitor.matrix_cockpit import MatrixOperatorCockpitContext
+    from parking_spot_monitor.matrix_commands import MatrixCommandService
+    from parking_spot_monitor.operator_cockpit import build_who_snapshot_response
+    from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler
+
     paths = resolve_runtime_paths(settings, data_dir)
     feedback_labeler = OperatorFeedbackLabeler(data_dir=paths.data_dir, snapshots_dir=paths.snapshots_dir, logger=logger)
+
+    def record_lab_outcome(status_payload: Mapping[str, Any]) -> None:
+        _append_lab_outcome_memory(paths.decision_memory_file, status_payload, data_dir=paths.data_dir, logger=logger)
 
     def who_snapshot_provider(base_text: str) -> Any:
         return build_who_snapshot_response(
@@ -352,25 +359,14 @@ def _default_matrix_command_service_factory(
             matrix_outbox_path=paths.matrix_outbox_file,
             latest_path=paths.latest_frame,
             snapshots_dir=paths.snapshots_dir,
-            detection_lab_manager=_default_detection_lab_manager(settings, paths, logger),
+            detection_lab_manager=DetectionLabManager(
+                paths.data_dir, logger=logger, outcome_recorder=record_lab_outcome
+            ),
             incident_detector=_LazyIncidentReplayDetector(settings),
         ),
         feedback_labeler=feedback_labeler,
         who_snapshot_provider=who_snapshot_provider,
     )
-
-
-def _default_detection_lab_manager(
-    settings: RuntimeSettings,
-    paths: RuntimePaths,
-    logger: StructuredLogger,
-) -> DetectionLabManager:
-    del settings
-
-    def record_outcome(status_payload: Mapping[str, Any]) -> None:
-        _append_lab_outcome_memory(paths.decision_memory_file, status_payload, data_dir=paths.data_dir, logger=logger)
-
-    return DetectionLabManager(paths.data_dir, logger=logger, outcome_recorder=record_outcome)
 
 
 def _startup_mode(*, validate_config: bool, capture_once: bool, live_proof_once: bool) -> str:

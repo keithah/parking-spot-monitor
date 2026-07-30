@@ -58,8 +58,7 @@ def _poll_matrix_commands_once(
     bootstrapped = getattr(result, "bootstrapped", None)
     log_success = (
         logger.info
-        if bootstrapped is True
-        or any(
+        if any(
             isinstance(count, int) and count > 0
             for count in (processed_count, ignored_count, error_count)
         )

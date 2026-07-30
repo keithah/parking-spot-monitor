@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import signal
+import subprocess
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -133,6 +135,76 @@ def test_structured_logger_recursively_redacts_secret_bearing_fields(capsys: pyt
     assert "frame-secret" not in output
     assert "list-secret" not in output
     assert "Traceback" not in output
+
+
+def test_importing_main_does_not_import_operator_stack() -> None:
+    blocked = {
+        "parking_spot_monitor.matrix_cockpit",
+        "parking_spot_monitor.matrix_commands",
+        "parking_spot_monitor.operator_cockpit",
+        "parking_spot_monitor.operator_feedback",
+        "parking_spot_monitor.detection_lab",
+    }
+    script = (
+        "import sys; sys.path.insert(0, 'src'); import parking_spot_monitor.__main__; "
+        f"blocked={blocked!r}; "
+        "present=sorted(blocked.intersection(sys.modules)); "
+        "assert not present, present"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_disabled_matrix_commands_do_not_import_operator_stack() -> None:
+    blocked = {
+        "parking_spot_monitor.matrix_cockpit",
+        "parking_spot_monitor.matrix_commands",
+        "parking_spot_monitor.operator_cockpit",
+        "parking_spot_monitor.operator_feedback",
+        "parking_spot_monitor.detection_lab",
+    }
+    script = (
+        "import sys; sys.path.insert(0, 'src'); "
+        "from io import StringIO; from types import SimpleNamespace; "
+        "import parking_spot_monitor.__main__ as cli; "
+        "from parking_spot_monitor.logging import StructuredLogger; "
+        "settings=SimpleNamespace(matrix=SimpleNamespace(command_authorized_senders=[])); "
+        "result=cli._default_matrix_command_service_factory("
+        "settings, None, StructuredLogger(stream=StringIO()), object()); "
+        "assert result is None; "
+        f"blocked={blocked!r}; "
+        "present=sorted(blocked.intersection(sys.modules)); "
+        "assert not present, present"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script], text=True, capture_output=True, check=False
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_logger_reports_normalized_enabled_levels_without_serializing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import parking_spot_monitor.logging as structured_logging
+
+    logger = StructuredLogger(level="INFO")
+    monkeypatch.setattr(
+        structured_logging,
+        "redact_diagnostic_value",
+        lambda _value: pytest.fail("level query serialized a log record"),
+    )
+
+    assert logger.is_enabled_for("debug") is False
+    assert logger.is_enabled_for("info") is True
+    assert logger.is_enabled_for("WARNING") is True
+    assert logger.is_enabled_for("not-a-level") is True
 
 
 class NoopDetector:
@@ -545,6 +617,44 @@ class FakeCommandPollResult:
         self.bootstrapped = bootstrapped
 
 
+@pytest.mark.parametrize("bootstrapped", [False, True])
+def test_zero_count_matrix_command_success_uses_debug(
+    bootstrapped: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from parking_spot_monitor.runtime_commands import _poll_matrix_commands_once
+
+    class NoopCommandService:
+        def poll_once(self) -> FakeCommandPollResult:
+            return FakeCommandPollResult(bootstrapped=bootstrapped)
+
+    _poll_matrix_commands_once(NoopCommandService(), logger=StructuredLogger(level="DEBUG"), iteration=1)
+
+    success = [
+        record
+        for record in json_records(combined_output(capsys))
+        if record.get("event") == "matrix-command-poll-succeeded"
+    ]
+    assert [record["level"] for record in success] == ["DEBUG"]
+
+
+def test_nonzero_matrix_command_success_remains_info(capsys: pytest.CaptureFixture[str]) -> None:
+    from parking_spot_monitor.runtime_commands import _poll_matrix_commands_once
+
+    class ProcessedCommandService:
+        def poll_once(self) -> FakeCommandPollResult:
+            return FakeCommandPollResult(processed_count=1)
+
+    _poll_matrix_commands_once(ProcessedCommandService(), logger=StructuredLogger(), iteration=1)
+
+    success = [
+        record
+        for record in json_records(combined_output(capsys))
+        if record.get("event") == "matrix-command-poll-succeeded"
+    ]
+    assert [record["level"] for record in success] == ["INFO"]
+
+
 
 def test_process_detection_uses_spot_crop_inference_to_recover_full_frame_miss(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -839,6 +949,65 @@ def test_process_detection_scales_configured_polygons_to_actual_frame_size(
     assert record["configured_frame_size"] == {"height": 806, "width": 1458}
     assert record["actual_frame_size"] == {"height": 360, "width": 640}
     assert record["accepted_by_spot"] == {"left_spot": True, "right_spot": False}
+
+
+def test_process_detection_skips_candidate_summaries_when_info_is_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    frame = tmp_path / "latest.jpg"
+    Image.new("RGB", (1458, 806), (20, 30, 40)).save(frame, format="JPEG")
+
+    def forbidden_candidate_summaries(_result: DetectionFilterResult) -> list[dict[str, Any]]:
+        pytest.fail("candidate summaries were computed for a suppressed INFO record")
+
+    monkeypatch.setattr(runtime_detection, "_candidate_summaries", forbidden_candidate_summaries)
+
+    result = runtime_detection._process_detection_for_capture(
+        load_settings("config.yaml.example", environ=fake_environ()),
+        NoopDetector(),
+        frame,
+        logger=StructuredLogger(level="WARNING"),
+        mode="test",
+        frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
+    )
+
+    assert set(result.by_spot) == {"left_spot", "right_spot"}
+
+
+def test_process_detection_keeps_candidate_summary_schema_when_info_is_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    frame = tmp_path / "latest.jpg"
+    Image.new("RGB", (1458, 806), (20, 30, 40)).save(frame, format="JPEG")
+    calls = 0
+    original = runtime_detection._candidate_summaries
+
+    def candidate_summary_spy(result: DetectionFilterResult) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
+        return original(result)
+
+    monkeypatch.setattr(runtime_detection, "_candidate_summaries", candidate_summary_spy)
+
+    runtime_detection._process_detection_for_capture(
+        load_settings("config.yaml.example", environ=fake_environ()),
+        NoopDetector(),
+        frame,
+        logger=StructuredLogger(),
+        mode="test",
+        frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
+    )
+
+    [record] = json_records(combined_output(capsys))
+    assert calls == 1
+    assert record["candidate_summaries"] == []
 
 
 def test_runtime_loop_matrix_state_change_skip_log_explains_policy(

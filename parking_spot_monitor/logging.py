@@ -43,6 +43,10 @@ class StructuredLogger:
     def error(self, event: str, **fields: Any) -> None:
         self.log("ERROR", event, **fields)
 
+    def is_enabled_for(self, level: str) -> bool:
+        normalized_level = _normalize_level(level)
+        return _LOG_LEVELS[normalized_level] >= _LOG_LEVELS[self.level]
+
     def log(self, level: str, event: str, **fields: Any) -> None:
         normalized_level = _normalize_level(level)
         if _LOG_LEVELS[normalized_level] < _LOG_LEVELS[self.level]:

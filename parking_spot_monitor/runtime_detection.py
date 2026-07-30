@@ -102,8 +102,9 @@ def _process_detection_for_capture(
         "effective_frame_size": _frame_size_dict(effective_frame_size),
         "configured_frame_size": _frame_size_dict(configured_frame_size),
         "frame_size_mismatch": frame_size_mismatch,
-        "candidate_summaries": _candidate_summaries(result),
     }
+    if logger.is_enabled_for("INFO"):
+        fields["candidate_summaries"] = _candidate_summaries(result)
     if iteration is not None:
         fields["iteration"] = iteration
     logger.info("detection-frame-processed", **fields)
