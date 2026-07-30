@@ -14,6 +14,7 @@ import parking_spot_monitor.matrix_snapshots as matrix_snapshots
 from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult
 from parking_spot_monitor.logging import StructuredLogger
+from parking_spot_monitor.matrix_models import MatrixTextEvent
 from parking_spot_monitor.matrix import (
     MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
     MONITOR_STARTED_EVENT_TYPE,
@@ -1913,6 +1914,99 @@ def test_command_service_bootstraps_cursor_without_processing_backlog() -> None:
     assert result.processed_count == 0
     assert archive.calls == []
     assert archive.cursor_writes == [{"next_batch": "s2"}]
+
+
+def test_command_service_bootstrap_sync_remains_info_transition() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult
+
+    stream = StringIO()
+    service = MatrixCommandService(
+        client=object(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor=None),
+        room_id=ROOM_ID,
+        authorized_senders=(),
+        who_snapshot_provider=lambda base_reply: base_reply,
+        logger=StructuredLogger(level="DEBUG", stream=stream),
+    )
+
+    service.apply_sync_result(MatrixSyncResult(next_batch="s1", events=()))
+
+    sync_records = [
+        record
+        for record in map(json.loads, stream.getvalue().splitlines())
+        if record["event"] == "matrix-command-sync"
+    ]
+    assert sync_records == [
+        {
+            "event": "matrix-command-sync",
+            "level": "INFO",
+            "phase": "bootstrap",
+            "next_batch_present": True,
+            "processed_count": 0,
+            "ignored_count": 0,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("event", "authorized_senders", "expected_counts", "expected_level"),
+    [
+        (None, (), (0, 0, 0), "DEBUG"),
+        (
+            MatrixTextEvent(event_id="$processed", sender="@op:example", room_id=ROOM_ID, body="!parking help"),
+            ("@op:example",),
+            (1, 0, 0),
+            "INFO",
+        ),
+        (
+            MatrixTextEvent(event_id="$ignored", sender="@op:example", room_id=ROOM_ID, body="ordinary text"),
+            ("@op:example",),
+            (0, 1, 0),
+            "INFO",
+        ),
+        (
+            MatrixTextEvent(event_id="$error", sender="@intruder:example", room_id=ROOM_ID, body="!parking help"),
+            ("@op:example",),
+            (0, 0, 1),
+            "INFO",
+        ),
+    ],
+    ids=("empty", "processed", "ignored", "error"),
+)
+def test_command_service_apply_sync_log_level_depends_on_work_counts(
+    event: MatrixTextEvent | None,
+    authorized_senders: tuple[str, ...],
+    expected_counts: tuple[int, int, int],
+    expected_level: str,
+) -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService, MatrixSyncResult
+
+    class Client:
+        def send_text(self, **_kwargs: Any) -> str:
+            return "$reply"
+
+    stream = StringIO()
+    service = MatrixCommandService(
+        client=Client(),  # type: ignore[arg-type]
+        archive=FakeCommandArchive(cursor={"next_batch": "s0"}),
+        room_id=ROOM_ID,
+        authorized_senders=authorized_senders,
+        who_snapshot_provider=lambda base_reply: base_reply,
+        logger=StructuredLogger(level="DEBUG", stream=stream),
+    )
+
+    result = service.apply_sync_result(
+        MatrixSyncResult(next_batch="s1", events=() if event is None else (event,))
+    )
+
+    assert (result.processed_count, result.ignored_count, result.error_count) == expected_counts
+    sync_records = [
+        record
+        for record in map(json.loads, stream.getvalue().splitlines())
+        if record["event"] == "matrix-command-sync"
+    ]
+    assert len(sync_records) == 1
+    assert sync_records[0]["level"] == expected_level
 
 
 def test_command_service_authorizes_applies_and_replies_safely() -> None:

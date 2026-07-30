@@ -143,7 +143,13 @@ class MatrixCommandService:
         since = cursor.get("next_batch") if isinstance(cursor, Mapping) else None
         if not since:
             self.archive.write_matrix_cursor({"next_batch": result.next_batch})
-            self._log("info", "matrix-command-sync", phase="bootstrap", next_batch_present=True, processed_count=0, ignored_count=len(result.events))
+            self._log_sync_result(
+                phase="bootstrap",
+                processed_count=0,
+                ignored_count=len(result.events),
+                error_count=None,
+                transition=True,
+            )
             return MatrixCommandPollResult(next_batch=result.next_batch, processed_count=0, ignored_count=len(result.events), error_count=0, bootstrapped=True)
 
         processed_count = 0
@@ -158,11 +164,8 @@ class MatrixCommandService:
             else:
                 ignored_count += 1
         self.archive.write_matrix_cursor({"next_batch": result.next_batch})
-        self._log(
-            "info",
-            "matrix-command-sync",
+        self._log_sync_result(
             phase="apply",
-            next_batch_present=True,
             processed_count=processed_count,
             ignored_count=ignored_count,
             error_count=error_count,
@@ -173,6 +176,27 @@ class MatrixCommandService:
             ignored_count=ignored_count,
             error_count=error_count,
         )
+
+    def _log_sync_result(
+        self,
+        *,
+        phase: str,
+        processed_count: int,
+        ignored_count: int,
+        error_count: int | None,
+        transition: bool = False,
+    ) -> None:
+        counts = (processed_count, ignored_count, error_count or 0)
+        level = "info" if transition or any(count > 0 for count in counts) else "debug"
+        fields = {
+            "phase": phase,
+            "next_batch_present": True,
+            "processed_count": processed_count,
+            "ignored_count": ignored_count,
+        }
+        if error_count is not None:
+            fields["error_count"] = error_count
+        self._log(level, "matrix-command-sync", **fields)
 
     def _handle_event(self, event: MatrixTextEvent) -> str:
         context = {"phase": "command", "sender": event.sender, "event_id": event.event_id, "room_id": event.room_id}
