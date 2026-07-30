@@ -971,6 +971,308 @@ def test_in_memory_capability_cache_invalidates_when_class_method_changes() -> N
     assert detector_capabilities.compatible_detect_image(detector) is not None
 
 
+def test_in_memory_capability_invalidates_after_in_place_code_mutation() -> None:
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class MutableDetector:
+        def detect_image(
+            self,
+            image: Image.Image,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    def missing_inference_image_size(
+        self: MutableDetector,
+        image: Image.Image,
+        *,
+        confidence_threshold: float | None = None,
+    ) -> list[VehicleDetection]:
+        return []
+
+    detector = MutableDetector()
+    assert detector_capabilities.compatible_detect_image(detector) is not None
+
+    MutableDetector.detect_image.__code__ = missing_inference_image_size.__code__
+    MutableDetector.detect_image.__kwdefaults__ = missing_inference_image_size.__kwdefaults__
+
+    assert detector_capabilities.compatible_detect_image(detector) is None
+
+
+def test_in_memory_capability_invalidates_when_code_loses_confidence_keyword() -> None:
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class MutableDetector:
+        def detect_image(
+            self,
+            image: Image.Image,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    def missing_confidence_threshold(
+        self: MutableDetector,
+        image: Image.Image,
+        *,
+        inference_image_size: int | None = None,
+    ) -> list[VehicleDetection]:
+        return []
+
+    detector = MutableDetector()
+    assert detector_capabilities.compatible_detect_image(detector) is not None
+
+    MutableDetector.detect_image.__code__ = missing_confidence_threshold.__code__
+    MutableDetector.detect_image.__kwdefaults__ = missing_confidence_threshold.__kwdefaults__
+
+    assert detector_capabilities.compatible_detect_image(detector) is None
+
+
+def test_detect_image_missing_only_confidence_keyword_is_incompatible() -> None:
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class MissingConfidenceDetector:
+        def detect_image(
+            self,
+            image: Image.Image,
+            *,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    assert detector_capabilities.compatible_detect_image(MissingConfidenceDetector()) is None
+
+
+def test_detect_image_missing_only_inference_size_keyword_is_incompatible() -> None:
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class MissingImageSizeDetector:
+        def detect_image(
+            self,
+            image: Image.Image,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    assert detector_capabilities.compatible_detect_image(MissingImageSizeDetector()) is None
+
+
+def test_detect_image_kwargs_signature_is_compatible() -> None:
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class KeywordDetector:
+        def detect_image(self, image: Image.Image, **kwargs: object) -> list[VehicleDetection]:
+            return []
+
+    assert detector_capabilities.compatible_detect_image(KeywordDetector()) is not None
+
+
+def test_in_memory_capability_invalidates_when_positional_default_is_removed() -> None:
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class MutableDetector:
+        def detect_image(
+            self,
+            image: Image.Image,
+            optional_mode: str = "normal",
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    detector = MutableDetector()
+    assert detector_capabilities.compatible_detect_image(detector) is not None
+
+    MutableDetector.detect_image.__defaults__ = ()
+
+    assert detector_capabilities.compatible_detect_image(detector) is None
+
+
+def test_in_memory_capability_invalidates_when_keyword_default_is_removed() -> None:
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class MutableDetector:
+        def detect_image(
+            self,
+            image: Image.Image,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+            optional_mode: str = "normal",
+        ) -> list[VehicleDetection]:
+            return []
+
+    detector = MutableDetector()
+    assert detector_capabilities.compatible_detect_image(detector) is not None
+
+    assert MutableDetector.detect_image.__kwdefaults__ is not None
+    del MutableDetector.detect_image.__kwdefaults__["optional_mode"]
+
+    assert detector_capabilities.compatible_detect_image(detector) is None
+
+
+def test_in_memory_capability_recomputes_custom_signature() -> None:
+    import inspect
+
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class MutableDetector:
+        def detect_image(
+            self,
+            image: Image.Image,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    def missing_inference_image_size(
+        self: MutableDetector,
+        image: Image.Image,
+        *,
+        confidence_threshold: float | None = None,
+    ) -> list[VehicleDetection]:
+        return []
+
+    detector = MutableDetector()
+    assert detector_capabilities.compatible_detect_image(detector) is not None
+
+    MutableDetector.detect_image.__signature__ = inspect.signature(  # type: ignore[attr-defined]
+        missing_inference_image_size
+    )
+
+    assert detector_capabilities.compatible_detect_image(detector) is None
+
+
+def test_staticmethod_in_memory_capability_caches_and_invalidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class StaticDetector:
+        @staticmethod
+        def detect_image(
+            image: Image.Image,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    real_signature = detector_capabilities.inspect.signature
+    signature_calls = 0
+
+    def counting_signature(callable_object: object) -> object:
+        nonlocal signature_calls
+        signature_calls += 1
+        return real_signature(callable_object)
+
+    monkeypatch.setattr(detector_capabilities.inspect, "signature", counting_signature)
+    detector = StaticDetector()
+
+    assert detector_capabilities.compatible_detect_image(detector) is not None
+    assert detector_capabilities.compatible_detect_image(detector) is not None
+    assert signature_calls == 1
+
+    def incompatible_detect_image(
+        image: Image.Image,
+        *,
+        confidence_threshold: float | None = None,
+    ) -> list[VehicleDetection]:
+        return []
+
+    StaticDetector.detect_image = staticmethod(incompatible_detect_image)  # type: ignore[method-assign]
+
+    assert detector_capabilities.compatible_detect_image(detector) is None
+    assert signature_calls == 2
+
+
+def test_classmethod_in_memory_capability_caches_and_invalidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class ClassDetector:
+        @classmethod
+        def detect_image(
+            cls,
+            image: Image.Image,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    real_signature = detector_capabilities.inspect.signature
+    signature_calls = 0
+
+    def counting_signature(callable_object: object) -> object:
+        nonlocal signature_calls
+        signature_calls += 1
+        return real_signature(callable_object)
+
+    monkeypatch.setattr(detector_capabilities.inspect, "signature", counting_signature)
+    detector = ClassDetector()
+
+    assert detector_capabilities.compatible_detect_image(detector) is not None
+    assert detector_capabilities.compatible_detect_image(detector) is not None
+    assert signature_calls == 1
+
+    def incompatible_detect_image(
+        cls: type[ClassDetector],
+        image: Image.Image,
+        *,
+        inference_image_size: int | None = None,
+    ) -> list[VehicleDetection]:
+        return []
+
+    ClassDetector.detect_image = classmethod(incompatible_detect_image)  # type: ignore[method-assign]
+
+    assert detector_capabilities.compatible_detect_image(detector) is None
+    assert signature_calls == 2
+
+
+def test_in_memory_capability_recomputes_custom_getattribute_callable() -> None:
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class SwitchingDetector:
+        def __init__(self) -> None:
+            self.compatible = True
+
+        def __getattribute__(self, name: str) -> object:
+            if name == "detect_image":
+                target = "_compatible_detect_image" if object.__getattribute__(self, "compatible") else "_incompatible_detect_image"
+                return object.__getattribute__(self, target)
+            return object.__getattribute__(self, name)
+
+        def detect_image(self, image: Image.Image, **kwargs: object) -> list[VehicleDetection]:
+            raise AssertionError("custom attribute routing must choose the effective callable")
+
+        def _compatible_detect_image(
+            self,
+            image: Image.Image,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+        def _incompatible_detect_image(self, image: Image.Image) -> list[VehicleDetection]:
+            return []
+
+    detector = SwitchingDetector()
+    assert detector_capabilities.compatible_detect_image(detector) is not None
+
+    detector.compatible = False
+
+    assert detector_capabilities.compatible_detect_image(detector) is None
+
+
 def test_detector_signature_fingerprint_does_not_retain_replaced_method_closure() -> None:
     import parking_spot_monitor.runtime_detection as runtime_detection
 

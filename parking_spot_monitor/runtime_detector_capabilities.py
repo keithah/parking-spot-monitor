@@ -2,11 +2,37 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 from weakref import ReferenceType, ref
 
 
-_CapabilityCache = dict[int, tuple[ReferenceType[Any], ReferenceType[Any], bool]]
+@dataclass(frozen=True, slots=True)
+class _CallableFingerprint:
+    function: ReferenceType[Any]
+    code: ReferenceType[Any]
+    descriptor_kind: str
+    positional_default_count: int
+    keyword_default_names: frozenset[str]
+
+    def matches(self, other: _CallableFingerprint) -> bool:
+        return (
+            self.function() is other.function()
+            and self.code() is other.code()
+            and self.descriptor_kind == other.descriptor_kind
+            and self.positional_default_count == other.positional_default_count
+            and self.keyword_default_names == other.keyword_default_names
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CapabilityEntry:
+    detector: ReferenceType[Any]
+    callable: _CallableFingerprint
+    supported: bool
+
+
+_CapabilityCache = dict[int, _CapabilityEntry]
 _DETECT_CAPABILITY_CACHE: _CapabilityCache = {}
 _DETECT_IMAGE_CAPABILITY_CACHE: _CapabilityCache = {}
 
@@ -46,18 +72,14 @@ def _method_capability(
     if not callable(candidate):
         return None, False
 
-    class_descriptor = _stable_class_descriptor(detector, method_name)
-    if class_descriptor is None:
-        return candidate, predicate(candidate)
-    try:
-        fingerprint = ref(class_descriptor)
-    except TypeError:
+    fingerprint = _stable_callable_fingerprint(detector, method_name, candidate)
+    if fingerprint is None:
         return candidate, predicate(candidate)
 
     detector_id = id(detector)
     cached = cache.get(detector_id)
-    if cached is not None and cached[0]() is detector and cached[1]() is class_descriptor:
-        return candidate, cached[2]
+    if cached is not None and cached.detector() is detector and cached.callable.matches(fingerprint):
+        return candidate, cached.supported
 
     supported = predicate(candidate)
     try:
@@ -69,11 +91,15 @@ def _method_capability(
         )
     except TypeError:
         return candidate, supported
-    cache[detector_id] = (detector_reference, fingerprint, supported)
+    cache[detector_id] = _CapabilityEntry(detector_reference, fingerprint, supported)
     return candidate, supported
 
 
-def _stable_class_descriptor(detector: Any, method_name: str) -> object | None:
+def _stable_callable_fingerprint(
+    detector: Any,
+    method_name: str,
+    candidate: Callable[..., Any],
+) -> _CallableFingerprint | None:
     try:
         class_descriptor = inspect.getattr_static(type(detector), method_name)
         effective_descriptor = inspect.getattr_static(detector, method_name)
@@ -81,13 +107,43 @@ def _stable_class_descriptor(detector: Any, method_name: str) -> object | None:
         return None
     if effective_descriptor is not class_descriptor:
         return None
-    if (
-        inspect.isfunction(class_descriptor)
-        or inspect.ismethoddescriptor(class_descriptor)
-        or isinstance(class_descriptor, (classmethod, staticmethod))
-    ):
-        return class_descriptor
-    return None
+
+    if isinstance(class_descriptor, staticmethod):
+        function = class_descriptor.__func__
+        descriptor_kind = "staticmethod"
+        if candidate is not function:
+            return None
+    elif isinstance(class_descriptor, classmethod):
+        function = class_descriptor.__func__
+        descriptor_kind = "classmethod"
+        if not inspect.ismethod(candidate) or candidate.__func__ is not function:
+            return None
+    elif inspect.isfunction(class_descriptor):
+        function = class_descriptor
+        descriptor_kind = "method"
+        if (
+            not inspect.ismethod(candidate)
+            or candidate.__func__ is not function
+            or candidate.__self__ is not detector
+        ):
+            return None
+    else:
+        return None
+
+    if "__signature__" in function.__dict__ or "__wrapped__" in function.__dict__:
+        return None
+    try:
+        function_reference = ref(function)
+        code_reference = ref(function.__code__)
+    except (AttributeError, TypeError):
+        return None
+    return _CallableFingerprint(
+        function=function_reference,
+        code=code_reference,
+        descriptor_kind=descriptor_kind,
+        positional_default_count=len(function.__defaults__ or ()),
+        keyword_default_names=frozenset((function.__kwdefaults__ or {}).keys()),
+    )
 
 
 def _accepts_inference_image_size(candidate: Callable[..., Any]) -> bool:
@@ -124,5 +180,5 @@ def _expire_capability(
     expired: ReferenceType[Any],
 ) -> None:
     cached = cache.get(detector_id)
-    if cached is not None and cached[0] is expired:
+    if cached is not None and cached.detector is expired:
         del cache[detector_id]
