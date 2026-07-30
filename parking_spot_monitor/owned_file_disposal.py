@@ -1,9 +1,9 @@
-"""Identity-bound disposal inside a cooperatively owned directory.
+"""Crash-recoverable identity disposal in a cooperatively owned directory.
 
 Linux has no pathname unlink operation conditional on an already-open inode.
-We therefore move candidates to unguessable names, bind and recheck their
-identity, and keep the final stat/unlink window minimal.  This contract assumes
-noncooperating writers cannot modify the held application-owned directory.
+Candidates therefore move to exact, unguessable disposal names before identity
+binding.  The minimal final stat/unlink window still assumes noncooperating
+writers cannot modify the held application-owned directory.
 """
 
 from __future__ import annotations
@@ -11,11 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
+from typing import Literal
 
 _IDENTITY_OPEN_FLAGS = getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0)
-_DISPOSAL_PREFIX = ".dispose."
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,49 +29,81 @@ class FileIdentity:
         return cls(value.st_dev, value.st_ino)
 
 
-def dispose_owned_name_at(directory_fd: int, name: str, identity: FileIdentity) -> bool:
-    """Randomize a pathname before deleting only its bound regular inode."""
+@dataclass(frozen=True, slots=True)
+class DisposalResult:
+    status: Literal["deleted", "pending", "restored"]
 
-    if not name or name in {".", ".."} or Path(name).name != name or Path(name).is_absolute():
-        return False
+
+def disposal_pattern(name: str) -> re.Pattern[str]:
+    safe_name = _safe_basename(name)
+    return re.compile(rf"^\.{re.escape(safe_name)}\.[0-9a-f]{{16}}\.dispose$")
+
+
+def dispose_owned_name_at(
+    directory_fd: int,
+    name: str,
+    identity: FileIdentity,
+    *,
+    recovery_name: str,
+) -> DisposalResult:
+    """Move a source to recoverable random disposal before deleting it."""
+
+    safe_source = _safe_basename(name)
+    safe_recovery = _safe_basename(recovery_name)
     try:
-        disposal = _fresh_disposal_name(directory_fd)
-        os.rename(name, disposal, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        disposal = _fresh_disposal_name(directory_fd, safe_recovery)
+        os.rename(safe_source, disposal, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
     except OSError:
-        return False
-    descriptor = -1
+        return DisposalResult("restored")
+    bound = _bound_regular_identity(directory_fd, disposal)
+    if bound != identity:
+        _restore_disposal(directory_fd, disposal, safe_source, bound)
+        return DisposalResult("restored")
+    if not _same_regular_identity(directory_fd, disposal, identity):
+        _restore_current_disposal(directory_fd, disposal, safe_source)
+        return DisposalResult("restored")
+    return DisposalResult("deleted" if _unlink_disposal(directory_fd, disposal, identity) else "pending")
+
+
+def recover_disposal_at(directory_fd: int, disposal: str, recovery_name: str) -> DisposalResult:
+    """Restore one interrupted disposal and finish its randomized-name unlink."""
+
+    safe_disposal = _safe_basename(disposal)
+    safe_recovery = _safe_basename(recovery_name)
+    if not disposal_pattern(safe_recovery).fullmatch(safe_disposal):
+        return DisposalResult("pending")
+    identity = _bound_regular_identity(directory_fd, safe_disposal)
+    if identity is None:
+        return DisposalResult("pending")
     try:
-        descriptor = os.open(disposal, _IDENTITY_OPEN_FLAGS, dir_fd=directory_fd)
-        value = os.fstat(descriptor)
-        bound = FileIdentity.from_stat(value)
-        if not stat.S_ISREG(value.st_mode) or bound != identity:
-            _restore_disposal(directory_fd, disposal, name, bound)
-            return False
-        if not _same_regular_identity(directory_fd, disposal, identity):
-            _restore_current_disposal(directory_fd, disposal, name)
-            return False
+        current = os.stat(safe_recovery, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
         try:
-            os.unlink(disposal, dir_fd=directory_fd)
-            os.fsync(directory_fd)
-            return True
+            os.link(
+                safe_disposal,
+                safe_recovery,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
         except OSError:
-            _restore_disposal(directory_fd, disposal, name, identity)
-            return False
+            return DisposalResult("pending")
     except OSError:
-        _restore_current_disposal(directory_fd, disposal, name)
-        return False
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+        return DisposalResult("pending")
+    if not _same_regular_identity(directory_fd, safe_recovery, identity):
+        return DisposalResult("pending")
+    if not _same_regular_identity(directory_fd, safe_disposal, identity):
+        return DisposalResult("pending")
+    return DisposalResult("deleted" if _unlink_disposal(directory_fd, safe_disposal, identity) else "pending")
 
 
 def same_regular_identity_at(directory_fd: int, name: str, identity: FileIdentity) -> bool:
     return _same_regular_identity(directory_fd, name, identity)
 
 
-def _fresh_disposal_name(directory_fd: int) -> str:
+def _fresh_disposal_name(directory_fd: int, recovery_name: str) -> str:
     for _ in range(8):
-        candidate = f"{_DISPOSAL_PREFIX}{secrets.token_hex(16)}"
+        candidate = f".{recovery_name}.{secrets.token_hex(8)}.dispose"
         try:
             os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -78,25 +111,20 @@ def _fresh_disposal_name(directory_fd: int) -> str:
     raise OSError("could not allocate a fresh disposal name")
 
 
-def _restore_current_disposal(directory_fd: int, disposal: str, name: str) -> bool:
+def _bound_regular_identity(directory_fd: int, name: str) -> FileIdentity | None:
+    descriptor = -1
     try:
-        value = os.stat(disposal, dir_fd=directory_fd, follow_symlinks=False)
+        descriptor = os.open(name, _IDENTITY_OPEN_FLAGS, dir_fd=directory_fd)
+        value = os.fstat(descriptor)
+        return FileIdentity.from_stat(value) if stat.S_ISREG(value.st_mode) else None
     except OSError:
-        return False
-    if not stat.S_ISREG(value.st_mode):
-        return False
-    return _restore_disposal(directory_fd, disposal, name, FileIdentity.from_stat(value))
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
-def _restore_disposal(
-    directory_fd: int, disposal: str, name: str, identity: FileIdentity
-) -> bool:
-    try:
-        os.link(disposal, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-    except OSError:
-        return False
-    if not _same_regular_identity(directory_fd, name, identity):
-        return False
+def _unlink_disposal(directory_fd: int, disposal: str, identity: FileIdentity) -> bool:
     if not _same_regular_identity(directory_fd, disposal, identity):
         return False
     try:
@@ -107,9 +135,37 @@ def _restore_disposal(
         return False
 
 
+def _restore_current_disposal(directory_fd: int, disposal: str, name: str) -> bool:
+    identity = _bound_regular_identity(directory_fd, disposal)
+    return identity is not None and _restore_disposal(directory_fd, disposal, name, identity)
+
+
+def _restore_disposal(
+    directory_fd: int,
+    disposal: str,
+    name: str,
+    identity: FileIdentity | None,
+) -> bool:
+    if identity is None:
+        return False
+    try:
+        os.link(disposal, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if not _same_regular_identity(directory_fd, name, identity):
+        return False
+    return _unlink_disposal(directory_fd, disposal, identity)
+
+
 def _same_regular_identity(directory_fd: int, name: str, identity: FileIdentity) -> bool:
     try:
         current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except OSError:
         return False
     return stat.S_ISREG(current.st_mode) and FileIdentity.from_stat(current) == identity
+
+
+def _safe_basename(value: str) -> str:
+    if not value or value in {".", ".."} or Path(value).name != value or Path(value).is_absolute():
+        raise OSError("artifact name must be a basename")
+    return value

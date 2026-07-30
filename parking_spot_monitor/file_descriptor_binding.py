@@ -104,7 +104,7 @@ def unlink_owned_path(path: Path, identity: FileIdentity) -> bool:
 
 
 def recover_quarantined_path(path: Path) -> int:
-    """Restore a deferred cleanup quarantine once its original name is free."""
+    """Restore bounded deferred quarantine/disposal state for one owned path."""
     try:
         with RootedDirectoryOwner(path.parent, create=False) as owner:
             return recover_quarantined_at(owner.fd, path.name)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -13,6 +14,8 @@ import httpx
 from PIL import Image
 
 import parking_spot_monitor.matrix_snapshots as matrix_snapshots
+import parking_spot_monitor.matrix_snapshot_storage as matrix_snapshot_storage
+import parking_spot_monitor.matrix_upload_derivatives as matrix_upload_derivatives
 import parking_monitor.matrix_outbox_snapshots as matrix_outbox_snapshots
 from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery, MatrixOutboxDrainResult
 from parking_monitor.outbox import LocalOutbox
@@ -463,6 +466,63 @@ def test_snapshot_retention_keeps_pending_derivative_then_prunes_terminal_pair(t
     assert not derivative.exists()
 
 
+def test_new_derivative_directory_fsyncs_root_before_open_and_outbox_attach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "latest.jpg"
+    Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    root = tmp_path / "snapshots"
+    events: list[str] = []
+    real_mkdir, real_open, real_fsync = os.mkdir, os.open, os.fsync
+    real_attach = delivery.outbox.attach_upload_derivative
+
+    def tracking_mkdir(path: object, *args: object, **kwargs: object) -> None:
+        real_mkdir(path, *args, **kwargs)
+        if path == matrix_upload_derivatives.DERIVATIVE_DIRECTORY:
+            events.append("mkdir-child")
+
+    def tracking_open(path: object, *args: object, **kwargs: object) -> int:
+        descriptor = real_open(path, *args, **kwargs)
+        if path == matrix_upload_derivatives.DERIVATIVE_DIRECTORY:
+            events.append("open-child")
+        return descriptor
+
+    def tracking_fsync(descriptor: int) -> None:
+        if Path(f"/proc/self/fd/{descriptor}").resolve() == root.resolve():
+            events.append("fsync-root")
+        real_fsync(descriptor)
+
+    def tracking_attach(*args: object, **kwargs: object) -> object:
+        events.append("attach-outbox")
+        return real_attach(*args, **kwargs)
+
+    monkeypatch.setattr(matrix_snapshot_storage.os, "mkdir", tracking_mkdir)
+    monkeypatch.setattr(matrix_snapshot_storage.os, "open", tracking_open)
+    monkeypatch.setattr(matrix_snapshot_storage.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(delivery.outbox, "attach_upload_derivative", tracking_attach)
+
+    delivery.enqueue_open_spot_alert(open_event(source))
+
+    mkdir_index = events.index("mkdir-child")
+    assert events[mkdir_index : mkdir_index + 4] == [
+        "mkdir-child",
+        "fsync-root",
+        "open-child",
+        "attach-outbox",
+    ]
+
+    events.clear()
+    derivative_payload = jpeg_bytes(size=(8, 6))
+    matrix_upload_derivatives.publish_upload_derivative(
+        root,
+        "existing-child.jpg",
+        data=derivative_payload,
+        info={"mimetype": "image/jpeg", "size": len(derivative_payload), "w": 8, "h": 6},
+    )
+    assert "fsync-root" not in events
+
+
 def test_legacy_upload_regenerates_and_persists_derivative_before_network(tmp_path: Path) -> None:
     source = tmp_path / "latest.jpg"
     Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
@@ -888,6 +948,37 @@ def test_retention_keeps_raw_when_derivative_cleanup_transiently_fails(
 
     result = matrix_snapshots.prune_event_snapshots(root, retention_count=1, logger=None, current_snapshot=None)
     assert result.pruned_count == 0
+    assert raw.exists()
+    assert derivative.exists()
+
+
+def test_retention_typed_derivative_failure_keeps_pair_and_reports_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    raw = root / "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg"
+    newer = root / "occupancy-open-event-left-spot-2026-05-18t20-02-02z.jpg"
+    write_jpeg(raw)
+    write_jpeg(newer, color=(90, 20, 120))
+    derivative = root / ".upload-derivatives" / raw.name
+    derivative.parent.mkdir()
+    write_jpeg(derivative)
+
+    monkeypatch.setattr(
+        matrix_snapshots,
+        "delete_upload_derivative",
+        lambda *_args, **_kwargs: matrix_snapshot_storage.OwnedArtifactDeleteResult(
+            status="failed", bytes_deleted=0
+        ),
+    )
+
+    result = matrix_snapshots.prune_event_snapshots(root, retention_count=1, logger=None)
+
+    assert result.pruned_count == 0
+    assert result.pruned_bytes == 0
+    assert result.failed_count == 1
+    assert result.retained_count == 2
     assert raw.exists()
     assert derivative.exists()
 

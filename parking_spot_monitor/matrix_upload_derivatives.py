@@ -12,6 +12,7 @@ from types import MappingProxyType
 
 from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, jpeg_bytes_dimensions
 from parking_spot_monitor.matrix_snapshot_storage import (
+    OwnedArtifactDeleteResult,
     artifact_path,
     delete_owned_artifact,
     publish_owned_bytes,
@@ -130,7 +131,7 @@ def validate_retained_snapshot_path(snapshot_root: Path, filename: str, persiste
         raise JpegDecodeError("read_failed", source_error_type=exc.__class__.__name__) from exc
 
 
-def delete_upload_derivative(snapshot_root: Path, filename: str) -> int:
+def delete_upload_derivative(snapshot_root: Path, filename: str) -> OwnedArtifactDeleteResult:
     return delete_owned_artifact(snapshot_root, DERIVATIVE_DIRECTORY, filename)
 
 

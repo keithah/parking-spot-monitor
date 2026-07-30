@@ -313,19 +313,18 @@ def prune_event_snapshots(
         if _path_in_resolved_set(path, protected):
             continue
         try:
-            derivative_bytes = delete_upload_derivative(root, path.name)
-        except OSError as exc:
-            failed_count += 1
-            _log_retention_failure(logger, root=root, trigger=trigger, error_type=type(exc).__name__, message=str(exc))
-            continue
-        try:
-            byte_size = delete_owned_artifact(root, None, path.name)
+            derivative_result = delete_upload_derivative(root, path.name)
+            if derivative_result.status == "failed":
+                raise OSError("upload derivative cleanup failed")
+            raw_result = delete_owned_artifact(root, None, path.name)
+            if raw_result.status == "failed":
+                raise OSError("retained snapshot cleanup failed")
         except OSError as exc:
             failed_count += 1
             _log_retention_failure(logger, root=root, trigger=trigger, error_type=type(exc).__name__, message=str(exc))
             continue
         pruned_count += 1
-        pruned_bytes += byte_size + derivative_bytes
+        pruned_bytes += raw_result.bytes_deleted + derivative_result.bytes_deleted
 
     if pruned_count:
         _log_retention_pruned(

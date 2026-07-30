@@ -17,7 +17,7 @@ No inbound application port is published. The service makes outbound connections
 
 The current image runs as root inside the container so it can use the configured bind mounts and render device. Treat the repository, `config.yaml`, `.env`, `/dev/dri`, and `data/` as trusted operator surfaces; this Compose setup is not a hardened multi-tenant isolation boundary.
 
-Keep application-owned artifact directories under `data/` writable only by the service and trusted operators. Cleanup binds and rechecks inodes after moving them to cryptographically random disposal names, but Linux does not provide an inode-conditional unlink: a noncooperating writer with simultaneous directory-write access can still race the final randomized-name check and unlink. The ownership checks minimize that window; they do not make a shared hostile directory safe.
+Keep application-owned artifact directories under `data/` writable only by the service and trusted operators. Cleanup binds and rechecks inodes after moving them to exact `.<basename>.<16-lowercase-hex>.dispose` names; startup/next-cleanup recovery scans at most 256 combined quarantine/disposal entries and resumes an interrupted unlink without multiplying hardlinks. Linux does not provide an inode-conditional unlink: a noncooperating writer with simultaneous directory-write access can still race the final randomized-name check and unlink. The ownership checks minimize that window; they do not make a shared hostile directory safe.
 
 ## Host prerequisites
 

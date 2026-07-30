@@ -1151,6 +1151,30 @@ def test_rooted_storage_rejects_dot_artifact_names(
     assert parent_artifact.read_bytes() == b"parent-owned"
 
 
+def test_owned_artifact_delete_result_distinguishes_deleted_missing_and_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "snapshots"
+    root.mkdir()
+
+    missing = matrix_snapshot_storage.delete_owned_artifact(root, None, "missing.jpg")
+    assert (missing.status, missing.bytes_deleted) == ("missing", 0)
+
+    failed_path = root / "failed.jpg"
+    failed_path.write_bytes(b"failed")
+    monkeypatch.setattr(matrix_snapshot_storage, "unlink_owned_at", lambda *_args: False)
+    failed = matrix_snapshot_storage.delete_owned_artifact(root, None, failed_path.name)
+    assert (failed.status, failed.bytes_deleted) == ("failed", 0)
+    assert failed_path.read_bytes() == b"failed"
+
+    monkeypatch.undo()
+    deleted_path = root / "deleted.jpg"
+    deleted_path.write_bytes(b"deleted")
+    deleted = matrix_snapshot_storage.delete_owned_artifact(root, None, deleted_path.name)
+    assert (deleted.status, deleted.bytes_deleted) == ("deleted", len(b"deleted"))
+    assert not deleted_path.exists()
+
+
 def test_rooted_jpeg_evidence_exposes_only_upload_bytes_and_info(tmp_path: Path) -> None:
     retained = tmp_path / "retained.jpg"
     payload = write_jpeg(retained, size=(8, 6))

@@ -10,6 +10,7 @@ from pathlib import Path
 import secrets
 import stat
 from types import MappingProxyType
+from typing import Literal
 
 from parking_spot_monitor.bounded_descriptor_io import descriptor_signature, read_descriptor_exact
 from parking_spot_monitor.file_descriptor_binding import (
@@ -32,6 +33,12 @@ class RootedJpegEvidence:
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", bytes(self.data))
         object.__setattr__(self, "info", MappingProxyType(dict(self.info)))
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedArtifactDeleteResult:
+    status: Literal["deleted", "missing", "failed"]
+    bytes_deleted: int = 0
 
 
 def absolute_snapshot_root(path: Path) -> Path:
@@ -188,21 +195,26 @@ def delete_owned_artifact(
     filename: str,
     *,
     expected_identity: FileIdentity | None = None,
-) -> int:
+) -> OwnedArtifactDeleteResult:
+    safe_name = safe_artifact_name(filename)
+    safe_directory = safe_artifact_name(directory) if directory is not None else None
     try:
-        context = _artifact_directory(snapshot_root, directory, create=False)
+        context = _artifact_directory(snapshot_root, safe_directory, create=False)
         with context as (directory_fd, _parent):
-            safe_name = safe_artifact_name(filename)
             try:
                 value = os.stat(safe_name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
-                return 0
+                return OwnedArtifactDeleteResult("missing")
             if directory is None and not stat.S_ISREG(value.st_mode):
-                raise OSError("retained snapshot is not a regular file")
+                return OwnedArtifactDeleteResult("failed")
             intended_identity = expected_identity or FileIdentity.from_stat(value)
-            return value.st_size if unlink_owned_at(directory_fd, safe_name, intended_identity) else 0
+            if unlink_owned_at(directory_fd, safe_name, intended_identity):
+                return OwnedArtifactDeleteResult("deleted", value.st_size)
+            return OwnedArtifactDeleteResult("failed")
     except FileNotFoundError:
-        return 0
+        return OwnedArtifactDeleteResult("missing")
+    except OSError:
+        return OwnedArtifactDeleteResult("failed")
 
 
 def secure_snapshot_candidates(snapshot_root: Path) -> list[Path]:
@@ -228,10 +240,14 @@ def _artifact_directory(
             return
         safe_directory = safe_artifact_name(directory)
         if create:
+            created = False
             try:
                 os.mkdir(safe_directory, 0o700, dir_fd=root_fd)
+                created = True
             except FileExistsError:
                 pass
+            if created:
+                os.fsync(root_fd)
         child_fd = os.open(safe_directory, _DIRECTORY_FLAGS, dir_fd=root_fd)
         try:
             yield child_fd, root / safe_directory

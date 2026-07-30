@@ -18,6 +18,7 @@ from parking_spot_monitor import (
     file_descriptor_binding,
     jpeg_artifacts,
     owned_file_cleanup,
+    owned_file_disposal,
     vehicle_history_corrections,
     vehicle_history_images,
     vehicle_history_storage,
@@ -1350,7 +1351,7 @@ def test_owned_cleanup_preserves_disposal_transition_swap(
     def swap_disposal(source: object, destination: object, *args: object, **kwargs: object) -> None:
         nonlocal transitioned
         real_rename(source, destination, *args, **kwargs)
-        if ".dispose." in str(destination) and not transitioned:
+        if str(destination).endswith(".dispose") and not transitioned:
             transitioned = True
             directory_fd = int(kwargs["dst_dir_fd"])
             disposal_path = Path(f"/proc/self/fd/{directory_fd}") / str(destination)
@@ -1406,6 +1407,52 @@ def test_owned_cleanup_recovery_consumes_at_most_scan_cap_entries(
     assert next_calls == max_entries
 
 
+def test_owned_cleanup_recovers_interrupted_exact_disposal(tmp_path: Path) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    disposal = tmp_path / ".owned.jpg.0123456789abcdef.dispose"
+    os.rename(target, disposal)
+
+    assert file_descriptor_binding.recover_quarantined_path(target) == 1
+
+    assert target.read_bytes() == b"owned"
+    assert not disposal.exists()
+
+
+def test_owned_cleanup_persistent_disposal_failure_stays_bounded_then_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    expected = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    real_unlink = os.unlink
+    fail_disposal = True
+
+    def fail_disposal_unlink(path: object, *args: object, **kwargs: object) -> None:
+        if fail_disposal and (str(path).endswith(".dispose") or ".dispose." in str(path)):
+            raise OSError("persistent disposal unlink failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", fail_disposal_unlink)
+
+    for _ in range(3):
+        assert file_descriptor_binding.unlink_owned_path(target, expected) is False
+        quarantines = list(tmp_path.glob(".*.quarantine"))
+        disposals = [path for path in tmp_path.iterdir() if path.name.endswith(".dispose") or ".dispose." in path.name]
+        assert quarantines == []
+        assert len(disposals) == 1
+        matching = [path for path in (target, disposals[0]) if path.exists() and path.stat().st_ino == expected.ino]
+        assert 1 <= len(matching) <= 2
+        assert all(path.read_bytes() == b"owned" for path in matching)
+
+    fail_disposal = False
+    assert file_descriptor_binding.recover_quarantined_path(target) == 1
+
+    assert target.read_bytes() == b"owned"
+    assert not list(tmp_path.glob(".*.quarantine"))
+    assert not [path for path in tmp_path.iterdir() if path.name.endswith(".dispose") or ".dispose." in path.name]
+
+
 @pytest.mark.parametrize(
     "token",
     [
@@ -1453,7 +1500,7 @@ def test_owned_cleanup_recovery_retries_transient_hardlink_unlink(
 
     def fail_once(path: object, *args: object, **kwargs: object) -> None:
         nonlocal failed
-        if ".dispose." in str(path) and kwargs.get("dir_fd") is not None and not failed:
+        if str(path).endswith(".dispose") and kwargs.get("dir_fd") is not None and not failed:
             failed = True
             raise OSError("transient unlink failure")
         real_unlink(path, *args, **kwargs)
@@ -1461,9 +1508,10 @@ def test_owned_cleanup_recovery_retries_transient_hardlink_unlink(
     monkeypatch.setattr(owned_file_cleanup.os, "unlink", fail_once)
 
     assert file_descriptor_binding.recover_quarantined_path(target) == 0
-    assert quarantine.exists()
-    assert file_descriptor_binding.recover_quarantined_path(target) == 1
     assert not quarantine.exists()
+    assert len(list(tmp_path.glob(".*.dispose"))) == 1
+    assert file_descriptor_binding.recover_quarantined_path(target) == 1
+    assert not list(tmp_path.glob(".*.dispose"))
 
 
 def test_owned_cleanup_recovery_selects_exact_candidates_deterministically(tmp_path: Path) -> None:
