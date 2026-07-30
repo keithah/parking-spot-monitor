@@ -374,6 +374,64 @@ def test_constructor_holds_memory_lock_across_load_and_signature_capture(
     ]
 
 
+def test_constructor_reconciles_noncooperating_replacement_before_immediate_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = decision_memory_path(tmp_path)
+    assert append_decision_memory_record(path, _record("alert", None, "baseline"))
+    real_load = decision_memory.load_decision_memory
+
+    def racing_load(*args, **kwargs):
+        loaded = real_load(*args, **kwargs)
+        decision_memory._write_memory(
+            path,
+            (*loaded.records, _record("alert", None, "external")),
+        )
+        return loaded
+
+    with monkeypatch.context() as context:
+        context.setattr(decision_memory, "load_decision_memory", racing_load)
+        store = _store(path, monotonic=lambda: 0)
+
+    assert store.append(
+        _record("miss", "left_spot", "local"), durability="immediate"
+    )
+    assert [record.summary for record in load_decision_memory(path).records] == [
+        "baseline",
+        "external",
+        "local",
+    ]
+
+
+def test_constructor_reconciles_false_missing_when_source_appears_during_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = decision_memory_path(tmp_path)
+    real_load = decision_memory.load_decision_memory
+
+    def racing_missing_load(*args, **kwargs):
+        loaded = real_load(*args, **kwargs)
+        decision_memory._write_memory(
+            path,
+            (_record("alert", None, "external"),),
+        )
+        return loaded
+
+    with monkeypatch.context() as context:
+        context.setattr(decision_memory, "load_decision_memory", racing_missing_load)
+        store = _store(path, monotonic=lambda: 0)
+
+    assert store.append(
+        _record("miss", "left_spot", "local"), durability="immediate"
+    )
+    assert [record.summary for record in load_decision_memory(path).records] == [
+        "external",
+        "local",
+    ]
+
+
 def test_external_signature_change_during_reconciliation_defers_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

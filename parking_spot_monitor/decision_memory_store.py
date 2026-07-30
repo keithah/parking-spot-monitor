@@ -11,6 +11,7 @@ from typing import Literal
 
 import parking_spot_monitor.operator_decision_memory as _memory
 from parking_spot_monitor.decision_memory_reconciliation import (
+    decision_memory_load_is_consistent,
     decision_memory_source_snapshot,
     deduplicated_decision_memory_tail,
 )
@@ -48,13 +49,14 @@ class DecisionMemoryStore:
         self._monotonic = monotonic
         self._logger = logger
         with _memory._MEMORY_WRITE_LOCK:
+            before = decision_memory_source_snapshot(self.path)
             loaded = _memory.load_decision_memory(
                 self.path,
                 max_records=self.max_records,
                 max_file_bytes=MAX_MEMORY_FILE_BYTES,
                 logger=logger,
             )
-            source = decision_memory_source_snapshot(self.path)
+            after = decision_memory_source_snapshot(self.path)
         self._records: deque[DecisionMemoryRecord] = deque(
             loaded.records,
             maxlen=self.max_records,
@@ -64,8 +66,10 @@ class DecisionMemoryStore:
         self._pending_count = 0
         now = self._monotonic()
         self._next_checkpoint_at = now + self.checkpoint_interval_seconds
-        self._signature = source.signature
-        self._reconcile_required = loaded.state not in {"available", "missing"}
+        self._signature = after.signature
+        self._reconcile_required = not decision_memory_load_is_consistent(
+            loaded.state, before, after
+        )
 
     @property
     def records(self) -> tuple[DecisionMemoryRecord, ...]:
@@ -151,8 +155,7 @@ class DecisionMemoryStore:
                     )
                 if not after.available or after.signature != before.signature:
                     return self._defer_reconciliation("source-changed-during-load")
-                expected_state = "missing" if before.signature is None else "available"
-                if external.state != expected_state:
+                if not decision_memory_load_is_consistent(external.state, before, after):
                     return self._defer_reconciliation("source-state-signature-mismatch")
                 if external.state == "available":
                     candidate = deduplicated_decision_memory_tail(

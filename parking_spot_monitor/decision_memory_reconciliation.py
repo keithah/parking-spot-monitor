@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from parking_spot_monitor.operator_decision_memory import DecisionMemoryRecord
+from parking_spot_monitor.operator_decision_memory import DecisionMemoryRecord, LoadState
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +24,17 @@ def decision_memory_source_snapshot(path: Path) -> DecisionMemorySourceSnapshot:
     except OSError:
         return DecisionMemorySourceSnapshot(None, False)
     return DecisionMemorySourceSnapshot((stat_result.st_mtime_ns, stat_result.st_size), True)
+
+
+def decision_memory_load_is_consistent(
+    state: LoadState,
+    before: DecisionMemorySourceSnapshot,
+    after: DecisionMemorySourceSnapshot,
+) -> bool:
+    if not before.available or not after.available or before.signature != after.signature:
+        return False
+    expected_state = "missing" if before.signature is None else "available"
+    return state == expected_state
 
 
 def deduplicated_decision_memory_tail(

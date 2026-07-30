@@ -5519,7 +5519,8 @@ def test_runtime_transition_decision_memory_is_immediately_durable(
     config_path.write_text(
         Path("config.yaml.example")
         .read_text(encoding="utf-8")
-        .replace("confirm_frames: 3", "confirm_frames: 1"),
+        .replace("confirm_frames: 3", "confirm_frames: 1")
+        .replace("health_file: health.json", f"health_file: {tmp_path / 'health.json'}"),
         encoding="utf-8",
     )
     calls: list[tuple[str, tuple[DecisionMemoryRecord, ...]]] = []
@@ -5574,6 +5575,13 @@ def test_runtime_checkpoints_decision_memory_once_per_success_and_failed_iterati
     from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 
     settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={"health_file": tmp_path / "health.json"}
+            )
+        }
+    )
     store = DecisionMemoryStore(
         tmp_path / "operator-decision-memory.json",
         checkpoint_interval_seconds=300,
