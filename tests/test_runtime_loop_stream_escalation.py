@@ -13,6 +13,7 @@ from parking_spot_monitor.capture_loop import run_capture_loop
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.detection import DetectionError, VehicleDetection
 from parking_spot_monitor.detector_adapter import adapt_detector
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
 from parking_spot_monitor.runtime_frame import capture_and_detect_runtime_frame
@@ -366,6 +367,11 @@ def test_runtime_loop_transition_verification_resets_periodic_deadline(
         sleep=lambda _seconds: None,
         max_iterations=12,
         monotonic=lambda: next(timestamps),
+        decision_memory_store=DecisionMemoryStore(
+            tmp_path / "operator-decision-memory.json",
+            checkpoint_interval_seconds=300,
+            checkpoint_max_pending_records=50,
+        ),
     )
 
     assert exit_code == 0
@@ -455,6 +461,11 @@ def test_disabled_adaptive_polling_keeps_fixed_cadence_and_periodic_verification
         sleep=sleeps.append,
         max_iterations=4,
         monotonic=lambda: next(monotonic_values),
+        decision_memory_store=DecisionMemoryStore(
+            tmp_path / "operator-decision-memory.json",
+            checkpoint_interval_seconds=300,
+            checkpoint_max_pending_records=50,
+        ),
     )
 
     assert exit_code == 0

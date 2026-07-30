@@ -338,9 +338,10 @@ def _write_memory(path: Path, records: Sequence[DecisionMemoryRecord]) -> None:
             json.dump(payload, handle, sort_keys=True, separators=(",", ":"), allow_nan=False)
             handle.write("\n")
             handle.flush()
+            os.fchmod(handle.fileno(), 0o644)
             os.fsync(handle.fileno())
-        os.chmod(temp_path, 0o644)
         os.replace(temp_path, path)
+        _fsync_directory(path.parent)
     except Exception:
         if temp_path is not None:
             try:
@@ -348,6 +349,16 @@ def _write_memory(path: Path, records: Sequence[DecisionMemoryRecord]) -> None:
             except OSError:
                 pass
         raise
+
+
+def _fsync_directory(path: Path) -> None:
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    file_descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
 
 
 def _records_from_payload(payload: Any) -> list[DecisionMemoryRecord]:

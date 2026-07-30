@@ -69,7 +69,7 @@ def run_capture_loop(
     matrix_command_poll_state = runtime_matrix_commands.MatrixCommandPollState()
     capture_failure_count = 0
     log_aggregator = RuntimeLogAggregator(settings.runtime.log_summary_interval_seconds, 0)
-    decision_memory_store = decision_memory_store or runtime_decision_memory_store(settings.runtime, runtime_paths.decision_memory_file, monotonic=time.monotonic, logger=logger)
+    decision_memory_store = decision_memory_store or runtime_decision_memory_store(settings.runtime, runtime_paths.decision_memory_file, monotonic=monotonic, logger=logger)
     shutdown_state = shutdown_state if shutdown_state is not None else ShutdownState()
     if wait is not None:
         wait_for_shutdown = wait

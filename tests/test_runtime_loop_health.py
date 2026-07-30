@@ -10,6 +10,7 @@ from parking_spot_monitor.__main__ import _main
 from parking_spot_monitor.capture_loop import run_capture_loop
 from parking_spot_monitor.capture import DecodeMode, FrameCaptureResult, FrameGeometry
 from parking_spot_monitor.detection import DetectionError, VehicleDetection
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
 from parking_spot_monitor.state import RuntimeState, save_runtime_state
 from parking_spot_monitor.runtime_reconnect import capture_reconnect_delay
@@ -137,6 +138,11 @@ def test_runtime_loop_emits_bounded_summary_instead_of_per_frame_info(
         sleep=lambda _seconds: None,
         max_iterations=1,
         monotonic=lambda: next(monotonic_values),
+        decision_memory_store=DecisionMemoryStore(
+            tmp_path / "operator-decision-memory.json",
+            checkpoint_interval_seconds=300,
+            checkpoint_max_pending_records=50,
+        ),
     ) == 0
 
     output = combined_output(capsys)

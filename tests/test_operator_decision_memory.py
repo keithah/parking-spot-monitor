@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -147,6 +148,73 @@ def test_batch_append_persists_multiple_records_once(tmp_path: Path) -> None:
 
     assert write.call_count == 1
     assert [record.summary for record in load_decision_memory(path).records] == ["first", "second"]
+
+
+def test_atomic_write_orders_permissions_file_fsync_replace_and_directory_fsync(
+    tmp_path: Path,
+) -> None:
+    path = decision_memory_path(tmp_path)
+    operations: list[str] = []
+    directory_fds: set[int] = set()
+    real_open = os.open
+    real_close = os.close
+    real_fchmod = os.fchmod
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracked_open(target, flags, *args, **kwargs):
+        file_descriptor = real_open(target, flags, *args, **kwargs)
+        if (
+            isinstance(target, (str, bytes, os.PathLike))
+            and Path(target) == path.parent
+            and flags & os.O_DIRECTORY
+        ):
+            directory_fds.add(file_descriptor)
+            operations.append("open-directory")
+        return file_descriptor
+
+    def tracked_close(file_descriptor: int) -> None:
+        if file_descriptor in directory_fds:
+            operations.append("close-directory")
+            directory_fds.remove(file_descriptor)
+        real_close(file_descriptor)
+
+    def tracked_fchmod(file_descriptor: int, mode: int) -> None:
+        operations.append("permissions")
+        real_fchmod(file_descriptor, mode)
+
+    def tracked_fsync(file_descriptor: int) -> None:
+        operations.append(
+            "fsync-directory" if file_descriptor in directory_fds else "fsync-file"
+        )
+        real_fsync(file_descriptor)
+
+    def tracked_replace(source, destination) -> None:
+        operations.append("replace")
+        real_replace(source, destination)
+
+    with (
+        patch.object(os, "open", side_effect=tracked_open),
+        patch.object(os, "close", side_effect=tracked_close),
+        patch.object(os, "fchmod", side_effect=tracked_fchmod),
+        patch.object(os, "fsync", side_effect=tracked_fsync),
+        patch.object(os, "replace", side_effect=tracked_replace),
+    ):
+        assert append_decision_memory_record(
+            path, _record("command_outcome", None, "durable")
+        )
+
+    assert operations == [
+        "permissions",
+        "fsync-file",
+        "replace",
+        "open-directory",
+        "fsync-directory",
+        "close-directory",
+    ]
+    assert [record.summary for record in load_decision_memory(path).records] == [
+        "durable"
+    ]
 
 
 def test_concurrent_batch_append_preserves_both_writers(tmp_path: Path) -> None:

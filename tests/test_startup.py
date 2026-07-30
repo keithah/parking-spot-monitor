@@ -303,6 +303,16 @@ def noop_detector_factory(_settings: object) -> NoopDetector:
     return NoopDetector()
 
 
+def independent_decision_memory_store(tmp_path: Path) -> Any:
+    from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
+
+    return DecisionMemoryStore(
+        tmp_path / "operator-decision-memory.json",
+        checkpoint_interval_seconds=300,
+        checkpoint_max_pending_records=50,
+    )
+
+
 class FakeMatrixClient:
     def __init__(self) -> None:
         self.texts: list[dict[str, Any]] = []
@@ -3780,6 +3790,7 @@ def test_runtime_loop_equal_active_and_stable_intervals_preserve_fixed_cadence(
         sleep=sleeps.append,
         max_iterations=2,
         monotonic=lambda: next(monotonic_values),
+        decision_memory_store=independent_decision_memory_store(tmp_path),
     )
 
     assert exit_code == 0
@@ -3843,6 +3854,7 @@ def test_runtime_loop_paces_successful_noop_matrix_command_polls_with_monotonic_
         sleep=sleeps.append,
         max_iterations=3,
         monotonic=lambda: next(monotonic_values),
+        decision_memory_store=independent_decision_memory_store(tmp_path),
     )
 
     output = combined_output(capsys)
@@ -4077,6 +4089,7 @@ def test_runtime_loop_open_matrix_command_circuit_skips_polls_without_sleeping_o
         sleep=sleeps.append,
         max_iterations=4,
         monotonic=lambda: next(monotonic_values),
+        decision_memory_store=independent_decision_memory_store(tmp_path),
     )
 
     health = health_payload(tmp_path / "health.json")
@@ -4144,6 +4157,7 @@ def test_runtime_loop_stable_cadence_starts_after_settle_threshold(
         sleep=sleeps.append,
         max_iterations=3,
         monotonic=lambda: next(monotonic_values),
+        decision_memory_store=independent_decision_memory_store(tmp_path),
     )
 
     assert exit_code == 0
@@ -4191,6 +4205,7 @@ def test_runtime_loop_deadline_pacing_subtracts_processing_time_and_clamps_overr
         sleep=sleeps.append,
         max_iterations=1,
         monotonic=lambda: next(monotonic_values),
+        decision_memory_store=independent_decision_memory_store(tmp_path),
     )
 
     assert exit_code == 0
@@ -4264,6 +4279,7 @@ def test_runtime_loop_overlay_cadence_skips_stable_frames_and_writes_on_transiti
         sleep=sleeps.append,
         max_iterations=5,
         monotonic=lambda: next(monotonic_values),
+        decision_memory_store=independent_decision_memory_store(tmp_path),
     )
 
     assert exit_code == 0
@@ -5623,6 +5639,112 @@ def test_runtime_checkpoints_decision_memory_once_per_success_and_failed_iterati
         decision_memory_store=store,
     ) == 0
     assert checkpoint_calls == 2
+
+
+@pytest.mark.parametrize("first_capture_fails", [False, True])
+def test_runtime_fallback_decision_store_uses_injected_checkpoint_clock(
+    tmp_path: Path,
+    first_capture_fails: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import parking_spot_monitor.capture_loop as capture_loop_module
+    from parking_spot_monitor.decision_memory_runtime import (
+        runtime_decision_memory_store as real_store_factory,
+    )
+    from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
+    from parking_spot_monitor.operator_decision_memory import make_decision_memory_record
+
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "frame_interval_seconds": 10,
+                    "stable_frame_interval_seconds": 10,
+                    "adaptive_polling_enabled": False,
+                    "decision_memory_checkpoint_interval_seconds": 5,
+                }
+            ),
+            "stream": settings.stream.model_copy(
+                update={
+                    "reconnect_seconds": 10,
+                    "reconnect_max_seconds": 10,
+                    "reconnect_jitter_ratio": 0,
+                }
+            ),
+        }
+    )
+    save_runtime_state(
+        tmp_path / "state.json",
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(
+                    status=OccupancyStatus.EMPTY, miss_streak=3
+                ),
+                "right_spot": SpotOccupancyState(
+                    status=OccupancyStatus.EMPTY, miss_streak=3
+                ),
+            }
+        ),
+    )
+    clock = [0.0]
+    stores: list[DecisionMemoryStore] = []
+    captures = 0
+
+    def store_factory(*args, **kwargs) -> DecisionMemoryStore:
+        store = real_store_factory(*args, **kwargs)
+        stores.append(store)
+        return store
+
+    monkeypatch.setattr(
+        capture_loop_module, "runtime_decision_memory_store", store_factory
+    )
+
+    def capture(
+        _settings: object, data_dir: str | Path, **_kwargs: object
+    ) -> FrameCaptureResult:
+        nonlocal captures
+        captures += 1
+        if captures == 1:
+            assert stores[0].append(
+                make_decision_memory_record("miss", summary="fallback clock probe"),
+                durability="routine",
+            )
+            if first_capture_fails:
+                raise CaptureError(
+                    reason="ffmpeg_error",
+                    mode=DecodeMode.SOFTWARE,
+                    output_path=Path(data_dir) / "latest.jpg",
+                    message="capture unavailable",
+                )
+        else:
+            assert any(
+                record.summary == "fallback clock probe"
+                for record in load_decision_memory(
+                    tmp_path / "operator-decision-memory.json"
+                ).records
+            )
+        return captured_frame(Path(data_dir), timestamp="2026-05-19T19:00:00Z")
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    assert run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=capture,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        sleep=sleep,
+        max_iterations=2,
+        now=lambda: datetime(2026, 5, 19, 19, 0, tzinfo=timezone.utc),
+        monotonic=lambda: clock[0],
+        random_unit=lambda: 0.5,
+    ) == 0
+    assert captures == 2
 
 
 @pytest.mark.parametrize("capture_fails", [False, True])

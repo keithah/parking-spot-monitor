@@ -95,6 +95,43 @@ def test_failed_immediate_write_retains_dirty_state_for_retry(tmp_path: Path) ->
     assert [record.summary for record in load_decision_memory(path).records] == ["retry me"]
 
 
+def test_directory_fsync_failure_retries_without_duplicates_or_lost_external_records(
+    tmp_path: Path,
+) -> None:
+    path = decision_memory_path(tmp_path)
+    store = _store(path, monotonic=lambda: 0)
+    real_fsync = decision_memory.os.fsync
+    fsync_calls = 0
+
+    def fail_first_directory_fsync(file_descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("directory unavailable")
+        real_fsync(file_descriptor)
+
+    with patch.object(
+        decision_memory.os,
+        "fsync",
+        side_effect=fail_first_directory_fsync,
+    ):
+        assert store.append(
+            _record("alert", "left_spot", "local"), durability="immediate"
+        ) is False
+
+    assert [record.summary for record in load_decision_memory(path).records] == [
+        "local"
+    ]
+    assert append_decision_memory_record(
+        path, _record("alert", "left_spot", "external")
+    )
+    assert store.flush() is True
+    assert [record.summary for record in load_decision_memory(path).records] == [
+        "local",
+        "external",
+    ]
+
+
 def test_failed_deadline_checkpoint_retries_at_next_iteration_boundary(
     tmp_path: Path,
 ) -> None:
