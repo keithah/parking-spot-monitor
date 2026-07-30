@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import math
 import os
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+import secrets
 from typing import Sequence
 
 from PIL import Image
 
-from parking_spot_monitor.file_descriptor_binding import unlink_owned_path
-from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, JpegPublication, open_decoded_rgb_jpeg, publish_canonical_jpeg
+from parking_spot_monitor.file_descriptor_binding import OwnedFile, RootedDirectoryOwner, descriptor_identity, open_owned_at
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, JpegPublication, open_decoded_rgb_jpeg_stream, publish_canonical_jpeg_to_owner
 
 BBoxInput = Sequence[float]
 
@@ -60,26 +60,65 @@ def capture_occupied_images(
     full_frame_path = root / "images" / "occupied-full" / f"{session_id}.jpg"
     crop_path = root / "images" / "occupied-crops" / f"{session_id}.jpg"
 
-    publication: JpegPublication | None = None
+    with RootedDirectoryOwner(root, create=True) as archive_owner:
+        with archive_owner.open_child("images", create=True) as images_owner:
+            with images_owner.open_child("occupied-full", create=True) as full_owner:
+                with images_owner.open_child("occupied-crops", create=True) as crop_owner:
+                    _capture_owned_images(
+                        source_frame_path=source_frame_path,
+                        bbox=bbox,
+                        full_path=full_frame_path,
+                        crop_path=crop_path,
+                        owners=(archive_owner, images_owner, full_owner, crop_owner),
+                    )
+
+    return OccupiedImageCaptureResult(full_frame_path=full_frame_path, crop_path=crop_path)
+
+
+def _capture_owned_images(
+    *,
+    source_frame_path: str | os.PathLike[str],
+    bbox: BBoxInput,
+    full_path: Path,
+    crop_path: Path,
+    owners: tuple[RootedDirectoryOwner, RootedDirectoryOwner, RootedDirectoryOwner, RootedDirectoryOwner],
+) -> None:
+    archive_owner, images_owner, full_owner, crop_owner = owners
+    full_publication = crop_publication = None
     try:
-        publication = publish_canonical_jpeg(source_frame_path, full_frame_path)
-        with open_decoded_rgb_jpeg(
-            full_frame_path, initial_max_dimension=2**31 - 1, expected_identity=publication.identity
-        ) as decoded:
-            crop_box = clamp_crop_box(bbox, decoded.image.size)
-            with decoded.image.crop(crop_box.as_pillow_box) as crop:
-                _write_jpeg_atomic(crop_path, crop)
+        full_publication = publish_canonical_jpeg_to_owner(source_frame_path, full_path, full_owner)
+        with open_owned_at(full_owner, full_path.name, full_publication.identity) as source:
+            with open_decoded_rgb_jpeg_stream(source, initial_max_dimension=2**31 - 1) as decoded:
+                crop_box = clamp_crop_box(bbox, decoded.image.size)
+                with decoded.image.crop(crop_box.as_pillow_box) as crop:
+                    crop_publication = _write_jpeg_atomic(crop_path, crop, owner=crop_owner)
+        if not all(owner.is_still_bound() for owner in owners):
+            raise OSError("vehicle image archive binding changed")
+        if not full_owner.matches(full_path.name, full_publication.identity):
+            raise OSError("vehicle full-frame binding changed")
+        if not crop_owner.matches(crop_path.name, crop_publication.identity):
+            raise OSError("vehicle crop binding changed")
     except JpegDecodeError as exc:
-        if publication is not None:
-            unlink_owned_path(full_frame_path, publication.identity)
+        _cleanup_owned_images(full_owner, full_path, full_publication, crop_owner, crop_path, crop_publication)
         message = "source occupied frame must be a JPEG" if exc.code == "unidentified" else "source occupied frame is missing or unreadable"
         raise VehicleHistoryImageError(message) from exc
     except (VehicleHistoryImageError, OSError, ValueError) as exc:
-        if publication is not None:
-            unlink_owned_path(full_frame_path, publication.identity)
+        _cleanup_owned_images(full_owner, full_path, full_publication, crop_owner, crop_path, crop_publication)
         raise VehicleHistoryImageError(str(exc) or exc.__class__.__name__) from exc
 
-    return OccupiedImageCaptureResult(full_frame_path=full_frame_path, crop_path=crop_path)
+
+def _cleanup_owned_images(
+    full_owner: RootedDirectoryOwner,
+    full_path: Path,
+    full_publication: JpegPublication | None,
+    crop_owner: RootedDirectoryOwner,
+    crop_path: Path,
+    crop_publication: OwnedFile | None,
+) -> None:
+    if crop_publication is not None:
+        crop_owner.unlink_if_matches(crop_path.name, crop_publication.identity)
+    if full_publication is not None:
+        full_owner.unlink_if_matches(full_path.name, full_publication.identity)
 
 
 def clamp_crop_box(bbox: BBoxInput, image_size: tuple[int, int]) -> ClampedCropBox:
@@ -107,27 +146,34 @@ def clamp_crop_box(bbox: BBoxInput, image_size: tuple[int, int]) -> ClampedCropB
     return ClampedCropBox(left=left, top=top, right=right, bottom=bottom)
 
 
-def _write_jpeg_atomic(path: Path, image: Image.Image) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path: Path | None = None
+def _write_jpeg_atomic(path: Path, image: Image.Image, *, owner: RootedDirectoryOwner) -> OwnedFile:
+    temporary_name = f".{path.name}.{secrets.token_hex(8)}.tmp"
+    temporary_fd = -1
+    identity = None
+    replaced = False
     try:
-        with tempfile.NamedTemporaryFile(
-            "wb",
-            delete=False,
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-        ) as handle:
-            temp_path = Path(handle.name)
+        temporary_fd = owner.open_file(temporary_name, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(os.dup(temporary_fd), "wb") as handle:
             image.save(handle, format="JPEG")
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temp_path, 0o644)
-        os.replace(temp_path, path)
+        os.fchmod(temporary_fd, 0o644)
+        os.fsync(temporary_fd)
+        identity = descriptor_identity(temporary_fd)
+        owner.replace(temporary_name, path.name)
+        replaced = True
+        if not owner.matches(path.name, identity):
+            raise OSError("vehicle crop changed during publication")
+        owner.fsync()
+        if not owner.matches(path.name, identity) or not owner.is_still_bound():
+            raise OSError("vehicle crop binding changed")
+        return OwnedFile(path, identity)
     except Exception:
-        if temp_path is not None:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        if replaced and identity is not None:
+            owner.unlink_if_matches(path.name, identity)
         raise
+    finally:
+        if not replaced and temporary_fd >= 0:
+            owner.unlink_if_matches(temporary_name, descriptor_identity(temporary_fd))
+        if temporary_fd >= 0:
+            os.close(temporary_fd)

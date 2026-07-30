@@ -960,6 +960,7 @@ git commit -m "perf: reuse loaded profile history"
 
 **Interfaces:**
 - Produces: `JpegPublication(path: Path, strategy: Literal["reflink", "copy"], identity: FileIdentity)` and `publish_canonical_jpeg(source, destination) -> JpegPublication`. The `(dev, ino)` identity is an ownership token: immediate consumers must bind an `O_NOFOLLOW` descriptor to it, and failure cleanup may remove only that exact published inode.
+- Preserves a 32 MiB `MAX_CANONICAL_JPEG_BYTES` ceiling: source size is checked before hashing or destination creation, bounded copy writes exactly the preflight size and probes once for growth, and reflink/copy temporaries must retain that size and validated source evidence.
 - Produces: `JpegDecodeError(code: Literal["unidentified", "decompression_bomb", "invalid_dimensions", "read_failed"])` and `open_decoded_rgb_jpeg(path: Path, *, initial_max_dimension: int) -> ContextManager[DecodedRgbJpeg]`, where `DecodedRgbJpeg(image: Image.Image, source_width: int, source_height: int)` owns bounded draft, decode, RGB conversion, and deterministic closure.
 - Produces: immutable `MatrixUploadDerivative(path: Path, info: Mapping[str, int | str])` and `prepare_upload_derivative(snapshot: MatrixSnapshot, *, destination: Path) -> MatrixUploadDerivative`.
 - Adds outbox intent metadata `upload_derivative_path` and `upload_derivative_info`; both are optional, sanitized schema-v1 metadata.
@@ -1003,6 +1004,8 @@ Expected: FAIL because full frames are decoded/re-encoded and upload derivatives
 Open the source once, validate JPEG format/dimensions from that descriptor, and bind stable dev/inode/size/mtime/ctime plus SHA-256 evidence to publication. Create a temporary destination in the target directory, try Linux `FICLONE` via `fcntl.ioctl`, and otherwise stream a descriptor-bound copy in 1 MiB chunks. Validate the independent temporary artifact against the digest before and after file `fsync`, atomically replace the destination, and fsync its directory. Preserve source mode on the independently owned reflink/copy destination. Generic mutable sources must never use hardlinks because later source writes would mutate a successfully returned publication.
 
 `capture_occupied_images` publishes the full frame with this helper, then opens the canonical path once through its returned identity to create only the crop. A pathname or parent-root replacement must fail without decoding or deleting the replacement.
+
+Full-frame publication, identity-bound decode, and crop staging/commit retain archive, images, full-frame, and crop directory descriptors for the whole transaction. Failure cleanup operates only through those held descriptors. Identity cleanup first rejects stable non-regular or mismatched targets, then uses a random same-directory quarantine to close the check/unlink race. A raced mismatch is restored with atomic no-clobber hardlink/unlink semantics; if a new original-name blocker prevents immediate restore, both unrelated files are preserved. The next cleanup attempt performs an exact-name recovery scan capped at 256 directory entries before its ownership check, and `recover_quarantined_path()` exposes the same bounded sweep explicitly.
 
 - [ ] **Step 4: Share one full JPEG decode lifecycle**
 

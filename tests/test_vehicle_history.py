@@ -852,6 +852,71 @@ def test_canonical_jpeg_rechecks_integrity_after_temporary_fsync(
     assert list(destination.parent.glob(".*.tmp")) == []
 
 
+def test_canonical_jpeg_rejects_oversized_source_before_creating_destination(tmp_path: Path) -> None:
+    source = write_test_jpeg(tmp_path / "padded.jpg")
+    with source.open("r+b") as handle:
+        handle.seek(32 * 1024 * 1024)
+        handle.write(b"x")
+    destination = tmp_path / "archive" / "full.jpg"
+
+    with pytest.raises(JpegDecodeError, match="read_failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert not destination.parent.exists()
+
+
+def test_canonical_copy_growth_never_writes_beyond_preflight_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    source_size = source.stat().st_size
+    source_identity = (source.stat().st_dev, source.stat().st_ino)
+    destination = tmp_path / "archive" / "full.jpg"
+    real_copy = jpeg_artifacts._copy_file
+    real_read = os.read
+    real_unlink = file_descriptor_binding.RootedDirectoryOwner.unlink_if_matches
+    discarded_sizes: list[int] = []
+    appended = False
+
+    def unsupported_reflink(*args: object) -> None:
+        raise OSError(errno.EOPNOTSUPP, "unsupported")
+
+    def append_during_copy(*args: object, **kwargs: object) -> None:
+        def growing_read(descriptor: int, size: int) -> bytes:
+            nonlocal appended
+            chunk = real_read(descriptor, size)
+            value = os.fstat(descriptor)
+            if chunk and not appended and (value.st_dev, value.st_ino) == source_identity:
+                appended = True
+                with source.open("ab") as handle:
+                    handle.write(b"x" * 4096)
+            return chunk
+
+        monkeypatch.setattr(jpeg_artifacts.os, "read", growing_read)
+        real_copy(*args, **kwargs)
+
+    def record_discarded_size(
+        owner: file_descriptor_binding.RootedDirectoryOwner,
+        name: str,
+        identity: file_descriptor_binding.FileIdentity,
+    ) -> bool:
+        if name.endswith(".tmp"):
+            discarded_sizes.append(os.stat(name, dir_fd=owner.fd, follow_symlinks=False).st_size)
+        return real_unlink(owner, name, identity)
+
+    monkeypatch.setattr(jpeg_artifacts, "_reflink", unsupported_reflink)
+    monkeypatch.setattr(jpeg_artifacts, "_copy_file", append_during_copy)
+    monkeypatch.setattr(file_descriptor_binding.RootedDirectoryOwner, "unlink_if_matches", record_discarded_size)
+
+    with pytest.raises(JpegDecodeError, match="read_failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert appended is True
+    assert discarded_sizes == [source_size]
+    assert not destination.exists()
+    assert list(destination.parent.glob(".*.tmp")) == []
+
+
 def test_canonical_jpeg_rejects_validated_temporary_swap_before_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -889,7 +954,7 @@ def test_canonical_jpeg_rejects_validated_temporary_swap_before_replace(
     assert list(destination.parent.glob(".*.tmp")) == []
 
 
-def test_canonical_jpeg_removes_swapped_temporary_symlink_without_touching_target(
+def test_canonical_jpeg_preserves_swapped_temporary_symlink_without_touching_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = write_test_jpeg(tmp_path / "latest.jpg")
@@ -919,7 +984,7 @@ def test_canonical_jpeg_removes_swapped_temporary_symlink_without_touching_targe
         publish_canonical_jpeg(source, destination)
 
     assert swapped is True
-    assert not os.path.lexists(destination)
+    assert os.path.islink(destination)
     assert outside.read_bytes() == b"unrelated target"
 
 
@@ -1063,13 +1128,13 @@ def test_vehicle_crop_rejects_replacement_of_published_full_frame(
     replacement_bytes = replacement.read_bytes()
     full_path = tmp_path / "archive" / "images" / "occupied-full" / "session.jpg"
     crop_path = tmp_path / "archive" / "images" / "occupied-crops" / "session.jpg"
-    real_open = vehicle_history_images.open_decoded_rgb_jpeg
+    real_open = vehicle_history_images.open_owned_at
 
-    def swap_then_open(path: Path, **kwargs: object) -> object:
-        os.replace(replacement, path)
-        return real_open(path, **kwargs)
+    def swap_then_open(owner: object, name: str, identity: object) -> object:
+        os.replace(replacement, full_path)
+        return real_open(owner, name, identity)
 
-    monkeypatch.setattr(vehicle_history_images, "open_decoded_rgb_jpeg", swap_then_open)
+    monkeypatch.setattr(vehicle_history_images, "open_owned_at", swap_then_open)
 
     with pytest.raises(VehicleHistoryImageError):
         capture_occupied_images(
@@ -1120,6 +1185,55 @@ def test_owned_path_cleanup_quarantines_before_identity_check(
     assert list(tmp_path.glob(".*.quarantine")) == []
 
 
+def test_owned_cleanup_leaves_stable_mismatched_directory_untouched(tmp_path: Path) -> None:
+    expected_file = tmp_path / "expected.jpg"
+    expected_file.write_bytes(b"expected")
+    expected = file_descriptor_binding.FileIdentity.from_stat(expected_file.stat())
+    target = tmp_path / "target.jpg"
+    target.mkdir()
+
+    assert file_descriptor_binding.unlink_owned_path(target, expected) is False
+
+    assert target.is_dir()
+    assert list(tmp_path.glob(".*.quarantine")) == []
+
+
+def test_owned_cleanup_recovers_quarantined_mismatch_after_name_blocker_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    expected = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    replacement = tmp_path / "replacement.txt"
+    replacement_bytes = b"replacement caught by quarantine"
+    replacement.write_bytes(replacement_bytes)
+    blocker_bytes = b"new original-name blocker"
+    real_rename, real_replace = os.rename, os.replace
+    injected = False
+
+    def swap_then_block(source: object, quarantine: object, *args: object, **kwargs: object) -> None:
+        nonlocal injected
+        if source == target.name and kwargs.get("src_dir_fd") is not None and not injected:
+            injected = True
+            real_replace(replacement, target)
+            real_rename(source, quarantine, *args, **kwargs)
+            target.write_bytes(blocker_bytes)
+            return
+        real_rename(source, quarantine, *args, **kwargs)
+
+    monkeypatch.setattr(file_descriptor_binding.os, "rename", swap_then_block)
+
+    assert file_descriptor_binding.unlink_owned_path(target, expected) is False
+    assert target.read_bytes() == blocker_bytes
+    quarantines = list(tmp_path.glob(".*.quarantine"))
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == replacement_bytes
+    target.unlink()
+    assert file_descriptor_binding.unlink_owned_path(target, expected) is False
+    assert target.read_bytes() == replacement_bytes
+    assert list(tmp_path.glob(".*.quarantine")) == []
+
+
 def test_vehicle_failure_cleanup_preserves_swap_at_delete_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1165,6 +1279,68 @@ def test_vehicle_failure_cleanup_preserves_swap_at_delete_boundary(
     assert swapped is True
     assert full_path.read_bytes() == replacement_bytes
     assert list(full_path.parent.glob(".*.quarantine")) == []
+
+
+def test_vehicle_transaction_rejects_archive_root_swap_without_path_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "source.jpg", size=(8, 6))
+    archive = tmp_path / "archive"
+    moved_archive = tmp_path / "archive-held"
+    real_write = vehicle_history_images._write_jpeg_atomic
+
+    def swap_root_then_write(path: Path, image: Image.Image, **kwargs: object) -> object:
+        os.replace(archive, moved_archive)
+        archive.mkdir()
+        return real_write(path, image, **kwargs)
+
+    monkeypatch.setattr(vehicle_history_images, "_write_jpeg_atomic", swap_root_then_write)
+
+    with pytest.raises(VehicleHistoryImageError):
+        capture_occupied_images(
+            archive_root=archive,
+            session_id="session",
+            source_frame_path=source,
+            bbox=(0, 0, 8, 6),
+        )
+
+    assert list(archive.rglob("*")) == []
+    assert not list(moved_archive.rglob("*.jpg"))
+    assert not list(moved_archive.rglob("*.tmp"))
+    assert not list(moved_archive.rglob("*.quarantine"))
+
+
+def test_vehicle_transaction_rejects_crop_replacement_and_preserves_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "source.jpg", size=(8, 6))
+    archive = tmp_path / "archive"
+    full_path = archive / "images" / "occupied-full" / "session.jpg"
+    crop_path = archive / "images" / "occupied-crops" / "session.jpg"
+    replacement = tmp_path / "replacement.txt"
+    replacement_bytes = b"unrelated crop replacement"
+    replacement.write_bytes(replacement_bytes)
+    real_write = vehicle_history_images._write_jpeg_atomic
+
+    def write_then_swap(path: Path, image: Image.Image, **kwargs: object) -> object:
+        result = real_write(path, image, **kwargs)
+        os.replace(replacement, crop_path)
+        return result
+
+    monkeypatch.setattr(vehicle_history_images, "_write_jpeg_atomic", write_then_swap)
+
+    with pytest.raises(VehicleHistoryImageError):
+        capture_occupied_images(
+            archive_root=archive,
+            session_id="session",
+            source_frame_path=source,
+            bbox=(0, 0, 8, 6),
+        )
+
+    assert not full_path.exists()
+    assert crop_path.read_bytes() == replacement_bytes
+    assert not list(archive.rglob("*.tmp"))
+    assert not list(archive.rglob("*.quarantine"))
 
 
 def test_canonical_jpeg_prefers_reflink_without_attempting_hardlink(
@@ -1272,11 +1448,13 @@ def test_canonical_copy_fallback_never_reopens_replaced_source_path(
     def unavailable(*args: object, **kwargs: object) -> None:
         raise OSError(errno.EXDEV, "fallback required")
 
-    def replace_path_during_copy(source_handle: int, owner: Any, temporary_name: str, source_mode: int) -> None:
+    def replace_path_during_copy(
+        source_handle: int, owner: Any, temporary_name: str, source_mode: int, source_size: int
+    ) -> None:
         os.replace(source, original_away)
         os.replace(replacement, source)
         try:
-            real_copy(source_handle, owner, temporary_name, source_mode)
+            real_copy(source_handle, owner, temporary_name, source_mode, source_size)
         finally:
             os.replace(source, replacement)
             os.replace(original_away, source)
@@ -1332,11 +1510,13 @@ def test_canonical_jpeg_rejects_in_place_mutation_during_fallback_publication(
     def unavailable(*args: object, **kwargs: object) -> None:
         raise OSError(errno.EXDEV, "fallback required")
 
-    def publish_then_mutate(source_fd: int, owner: Any, temporary_name: str, source_mode: int) -> None:
+    def publish_then_mutate(
+        source_fd: int, owner: Any, temporary_name: str, source_mode: int, source_size: int | None = None
+    ) -> None:
         if strategy == "reflink":
             write_owned_temporary(owner, temporary_name, source_fd, source_mode)
         else:
-            real_copy(source_fd, owner, temporary_name, source_mode)
+            real_copy(source_fd, owner, temporary_name, source_mode, int(source_size))
         source.write_bytes(b"changed during publication")
 
     monkeypatch.setattr(jpeg_artifacts, "_reflink", publish_then_mutate if strategy == "reflink" else unavailable)

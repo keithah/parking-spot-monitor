@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 import errno
 import fcntl
 import hashlib
-from io import BytesIO
 import os
 from pathlib import Path
 import secrets
@@ -18,10 +15,19 @@ import warnings
 
 from PIL import Image, UnidentifiedImageError
 
-from parking_spot_monitor.file_descriptor_binding import FileIdentity, RootedDirectoryOwner, descriptor_identity, open_owned_path
+from parking_spot_monitor.file_descriptor_binding import FileIdentity, RootedDirectoryOwner, descriptor_identity
+from parking_spot_monitor.jpeg_decoding import (
+    DecodedRgbJpeg,
+    JpegDecodeError,
+    jpeg_bytes_dimensions,
+    open_decoded_rgb_jpeg,
+    open_decoded_rgb_jpeg_bytes,
+    open_decoded_rgb_jpeg_stream,
+)
 
 _FICLONE = 0x40049409
 _COPY_CHUNK_BYTES = 1024 * 1024
+MAX_CANONICAL_JPEG_BYTES = 32 * 1024 * 1024
 _FALLBACK_ERRNOS = frozenset(
     error
     for error in (
@@ -44,179 +50,84 @@ class JpegPublication:
 
 
 @dataclass(frozen=True, slots=True)
-class DecodedRgbJpeg:
-    image: Image.Image
-    source_width: int
-    source_height: int
-
-
-@dataclass(frozen=True, slots=True)
 class _SourceEvidence:
     signature: tuple[int, int, int, int, int]
     digest: bytes
     mode: int
 
 
-class JpegDecodeError(RuntimeError):
-    def __init__(
-        self,
-        code: Literal["unidentified", "decompression_bomb", "invalid_dimensions", "read_failed"],
-        *,
-        source_error_type: str | None = None,
-    ) -> None:
-        super().__init__(code)
-        self.code = code
-        self.source_error_type = source_error_type
-
-
 def publish_canonical_jpeg(source: str | Path, destination: str | Path) -> JpegPublication:
-    source_path = Path(source)
     destination_path = Path(destination)
-    source_fd = _open_source_descriptor(source_path)
+    source_fd = _open_source_descriptor(Path(source))
     try:
         evidence = _validated_source_evidence(source_fd)
         with RootedDirectoryOwner(destination_path.parent, create=True) as owner:
-            temporary_name = f".{destination_path.name}.{secrets.token_hex(8)}.tmp"
-            replaced = False
-            temporary_fd = committed_identity_fd = committed_fd = -1
-            try:
-                try:
-                    _reflink(source_fd, owner, temporary_name, evidence.mode)
-                    strategy: Literal["reflink", "copy"] = "reflink"
-                except OSError as reflink_exc:
-                    if reflink_exc.errno not in _FALLBACK_ERRNOS:
-                        raise
-                    _copy_file(source_fd, owner, temporary_name, evidence.mode)
-                    strategy = "copy"
-                temporary_fd = _open_artifact(owner, temporary_name)
-                temporary_identity = descriptor_identity(temporary_fd)
-                _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
-                os.fsync(temporary_fd)
-                _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
-                owner.replace(temporary_name, destination_path.name)
-                replaced = True
-                try:
-                    committed_identity_fd = owner.open_identity(destination_path.name)
-                    committed_identity = descriptor_identity(committed_identity_fd)
-                    if committed_identity != temporary_identity:
-                        raise JpegDecodeError("read_failed")
-                    committed_fd = _open_artifact(owner, destination_path.name)
-                    _validate_artifact_descriptor(committed_fd, source_fd, evidence)
-                    if descriptor_identity(committed_fd) != temporary_identity:
-                        raise JpegDecodeError("read_failed")
-                    if not owner.matches(destination_path.name, committed_identity):
-                        raise JpegDecodeError("read_failed")
-                except (JpegDecodeError, OSError):
-                    cleanup_identity = (
-                        descriptor_identity(committed_identity_fd)
-                        if committed_identity_fd >= 0
-                        else temporary_identity
-                    )
-                    owner.unlink_if_matches(destination_path.name, cleanup_identity)
-                    raise JpegDecodeError("read_failed") from None
-                owner.fsync()
-                try:
-                    _validate_artifact_descriptor(committed_fd, source_fd, evidence)
-                    if not owner.matches(destination_path.name, committed_identity) or not owner.is_still_bound():
-                        raise JpegDecodeError("read_failed")
-                except JpegDecodeError:
-                    owner.unlink_if_matches(destination_path.name, committed_identity)
-                    raise
-                return JpegPublication(path=destination_path, strategy=strategy, identity=committed_identity)
-            finally:
-                if not replaced and temporary_fd >= 0:
-                    owner.unlink_if_matches(temporary_name, descriptor_identity(temporary_fd))
-                for descriptor in (committed_fd, committed_identity_fd, temporary_fd):
-                    if descriptor >= 0:
-                        os.close(descriptor)
+            return _publish_validated_to_owner(source_fd, evidence, destination_path, owner)
     finally:
         os.close(source_fd)
 
 
-def open_decoded_rgb_jpeg(path: Path, *, initial_max_dimension: int, expected_identity: FileIdentity | None = None) -> AbstractContextManager[DecodedRgbJpeg]:
-    if expected_identity is None:
-        return _decoded_rgb_jpeg(Path(path), initial_max_dimension=initial_max_dimension)
-    return _decoded_owned_rgb_jpeg(Path(path), expected_identity, initial_max_dimension=initial_max_dimension)
-
-
-def open_decoded_rgb_jpeg_bytes(payload: bytes, *, initial_max_dimension: int) -> AbstractContextManager[DecodedRgbJpeg]:
-    return _decoded_rgb_jpeg_bytes(bytes(payload), initial_max_dimension=initial_max_dimension)
-
-
-@contextmanager
-def _decoded_owned_rgb_jpeg(path: Path, identity: FileIdentity, *, initial_max_dimension: int) -> Iterator[DecodedRgbJpeg]:
-    with open_owned_path(path, identity) as source, _decoded_rgb_jpeg(source, initial_max_dimension=initial_max_dimension) as decoded:
-        yield decoded
-
-
-def jpeg_bytes_dimensions(payload: bytes) -> tuple[int, int]:
+def publish_canonical_jpeg_to_owner(
+    source: str | Path, destination: Path, owner: RootedDirectoryOwner
+) -> JpegPublication:
+    source_fd = _open_source_descriptor(Path(source))
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(BytesIO(payload)) as image:
-                if image.format != "JPEG":
-                    raise JpegDecodeError("unidentified")
-                if image.width <= 0 or image.height <= 0:
-                    raise JpegDecodeError("invalid_dimensions")
-                dimensions = image.size
-                image.verify()
-                return dimensions
-    except JpegDecodeError:
-        raise
-    except UnidentifiedImageError as exc:
-        raise JpegDecodeError("unidentified", source_error_type=exc.__class__.__name__) from exc
-    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
-        raise JpegDecodeError("decompression_bomb", source_error_type=exc.__class__.__name__) from exc
-    except (OSError, ValueError) as exc:
-        raise JpegDecodeError("read_failed", source_error_type=exc.__class__.__name__) from exc
+        evidence = _validated_source_evidence(source_fd)
+        return _publish_validated_to_owner(source_fd, evidence, destination, owner)
+    finally:
+        os.close(source_fd)
 
 
-@contextmanager
-def _decoded_rgb_jpeg_bytes(payload: bytes, *, initial_max_dimension: int) -> Iterator[DecodedRgbJpeg]:
-    with BytesIO(payload) as source:
-        with _decoded_rgb_jpeg(source, initial_max_dimension=initial_max_dimension) as decoded:
-            yield decoded
-
-
-@contextmanager
-def _decoded_rgb_jpeg(path: Path | BytesIO, *, initial_max_dimension: int) -> Iterator[DecodedRgbJpeg]:
-    opened: Image.Image | None = None
-    working: Image.Image | None = None
+def _publish_validated_to_owner(
+    source_fd: int, evidence: _SourceEvidence, destination: Path, owner: RootedDirectoryOwner
+) -> JpegPublication:
+    temporary_name = f".{destination.name}.{secrets.token_hex(8)}.tmp"
+    replaced = False
+    temporary_fd = committed_identity_fd = committed_fd = -1
     try:
         try:
-            if initial_max_dimension <= 0:
-                raise JpegDecodeError("invalid_dimensions")
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                opened = Image.open(path)
-                if opened.format != "JPEG":
-                    raise JpegDecodeError("unidentified")
-                width, height = opened.size
-                if width <= 0 or height <= 0:
-                    raise JpegDecodeError("invalid_dimensions")
-                bounded_dimension = min(max(width, height), initial_max_dimension)
-                bounded_size = (
-                    (bounded_dimension, max(1, height * bounded_dimension // width))
-                    if width >= height
-                    else (max(1, width * bounded_dimension // height), bounded_dimension)
-                )
-                opened.draft("RGB", bounded_size)
-                opened.load()
-                working = opened if opened.mode == "RGB" else opened.convert("RGB")
+            _reflink(source_fd, owner, temporary_name, evidence.mode)
+            strategy: Literal["reflink", "copy"] = "reflink"
+        except OSError as reflink_exc:
+            if reflink_exc.errno not in _FALLBACK_ERRNOS:
+                raise
+            _copy_file(source_fd, owner, temporary_name, evidence.mode, evidence.signature[2])
+            strategy = "copy"
+        temporary_fd = _open_artifact(owner, temporary_name)
+        temporary_identity = descriptor_identity(temporary_fd)
+        _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
+        os.fsync(temporary_fd)
+        _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
+        owner.replace(temporary_name, destination.name)
+        replaced = True
+        try:
+            committed_identity_fd = owner.open_identity(destination.name)
+            committed_identity = descriptor_identity(committed_identity_fd)
+            if committed_identity != temporary_identity:
+                raise JpegDecodeError("read_failed") from None
+            committed_fd = _open_artifact(owner, destination.name)
+            _validate_artifact_descriptor(committed_fd, source_fd, evidence)
+            if descriptor_identity(committed_fd) != temporary_identity or not owner.matches(destination.name, committed_identity):
+                raise JpegDecodeError("read_failed")
+        except (JpegDecodeError, OSError):
+            cleanup_identity = descriptor_identity(committed_identity_fd) if committed_identity_fd >= 0 else temporary_identity
+            owner.unlink_if_matches(destination.name, cleanup_identity)
+            raise JpegDecodeError("read_failed") from None
+        owner.fsync()
+        try:
+            _validate_artifact_descriptor(committed_fd, source_fd, evidence)
+            if not owner.matches(destination.name, committed_identity) or not owner.is_still_bound():
+                raise JpegDecodeError("read_failed")
         except JpegDecodeError:
+            owner.unlink_if_matches(destination.name, committed_identity)
             raise
-        except UnidentifiedImageError as exc:
-            raise JpegDecodeError("unidentified", source_error_type=exc.__class__.__name__) from exc
-        except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
-            raise JpegDecodeError("decompression_bomb", source_error_type=exc.__class__.__name__) from exc
-        except (OSError, ValueError) as exc:
-            raise JpegDecodeError("read_failed", source_error_type=exc.__class__.__name__) from exc
-        yield DecodedRgbJpeg(working, width, height)
+        return JpegPublication(path=destination, strategy=strategy, identity=committed_identity)
     finally:
-        if working is not None and working is not opened:
-            working.close()
-        if opened is not None:
-            opened.close()
+        if not replaced and temporary_fd >= 0:
+            owner.unlink_if_matches(temporary_name, descriptor_identity(temporary_fd))
+        for descriptor in (committed_fd, committed_identity_fd, temporary_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 def _validate_jpeg_descriptor(source_fd: int) -> None:
@@ -260,12 +171,25 @@ def _reflink(source_fd: int, owner: RootedDirectoryOwner, temporary_name: str, s
             os.close(destination_fd)
 
 
-def _copy_file(source_fd: int, owner: RootedDirectoryOwner, temporary_name: str, source_mode: int) -> None:
+def _copy_file(
+    source_fd: int,
+    owner: RootedDirectoryOwner,
+    temporary_name: str,
+    source_mode: int,
+    source_size: int,
+) -> None:
     destination_fd = owner.open_file(temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode)
     try:
         os.lseek(source_fd, 0, os.SEEK_SET)
-        while chunk := os.read(source_fd, _COPY_CHUNK_BYTES):
+        remaining = source_size
+        while remaining:
+            chunk = os.read(source_fd, min(_COPY_CHUNK_BYTES, remaining))
+            if not chunk:
+                raise JpegDecodeError("read_failed")
             _write_all(destination_fd, chunk)
+            remaining -= len(chunk)
+        if os.read(source_fd, 1):
+            raise JpegDecodeError("read_failed")
         os.fchmod(destination_fd, source_mode)
     except Exception:
         identity = descriptor_identity(destination_fd)
@@ -286,10 +210,10 @@ def _open_source_descriptor(path: Path) -> int:
 
 
 def _validated_source_evidence(source_fd: int) -> _SourceEvidence:
-    before = _descriptor_signature(source_fd)
     value = os.fstat(source_fd)
-    if not stat.S_ISREG(value.st_mode):
+    if not stat.S_ISREG(value.st_mode) or not 0 < value.st_size <= MAX_CANONICAL_JPEG_BYTES:
         raise JpegDecodeError("read_failed")
+    before = _stat_signature(value)
     digest_before = _digest_descriptor(source_fd)
     _validate_jpeg_descriptor(source_fd)
     digest_after = _digest_descriptor(source_fd)
@@ -307,7 +231,7 @@ def _open_artifact(owner: RootedDirectoryOwner, name: str) -> int:
 
 def _validate_artifact_descriptor(descriptor: int, source_fd: int, evidence: _SourceEvidence) -> None:
     signature = _descriptor_signature(descriptor)
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode) or _digest_descriptor(descriptor) != evidence.digest:
+    if signature[2] != evidence.signature[2] or not stat.S_ISREG(os.fstat(descriptor).st_mode) or _digest_descriptor(descriptor) != evidence.digest:
         raise JpegDecodeError("read_failed")
     _validate_jpeg_descriptor(descriptor)
     if (

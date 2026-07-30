@@ -14,9 +14,10 @@ from parking_spot_monitor.file_descriptor_binding import (
     descriptor_identity,
     safe_basename,
 )
+from parking_spot_monitor.jpeg_artifacts import MAX_CANONICAL_JPEG_BYTES
 
 _COPY_CHUNK_BYTES = 1024 * 1024
-MAX_RETAINED_JPEG_BYTES = 32 * 1024 * 1024
+MAX_RETAINED_JPEG_BYTES = MAX_CANONICAL_JPEG_BYTES
 
 
 def publish_retained_snapshot(source: Path, snapshot_root: Path, filename: str) -> OwnedFile:

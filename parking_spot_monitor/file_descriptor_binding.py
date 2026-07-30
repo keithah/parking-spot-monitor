@@ -8,20 +8,11 @@ from dataclasses import dataclass
 from io import BufferedReader
 import os
 from pathlib import Path
-import secrets
 import stat
 
+from parking_spot_monitor.owned_file_cleanup import FileIdentity, recover_quarantined_at, unlink_owned_at
+
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-
-
-@dataclass(frozen=True, slots=True)
-class FileIdentity:
-    dev: int
-    ino: int
-
-    @classmethod
-    def from_stat(cls, value: os.stat_result) -> FileIdentity:
-        return cls(value.st_dev, value.st_ino)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +34,20 @@ class RootedDirectoryOwner:
 
     def __exit__(self, *args: object) -> None:
         os.close(self.fd)
+
+    def open_child(self, name: str, *, create: bool) -> RootedDirectoryOwner:
+        safe_name = safe_basename(name)
+        if create:
+            try:
+                os.mkdir(safe_name, 0o755, dir_fd=self.fd)
+                os.fsync(self.fd)
+            except FileExistsError:
+                pass
+        child = object.__new__(RootedDirectoryOwner)
+        child.path = self.path / safe_name
+        child.fd = os.open(safe_name, _DIRECTORY_FLAGS, dir_fd=self.fd)
+        child.identity = FileIdentity.from_stat(os.fstat(child.fd))
+        return child
 
     def open_file(self, name: str, flags: int, mode: int = 0o666) -> int:
         return os.open(safe_basename(name), flags | getattr(os, "O_NOFOLLOW", 0), mode, dir_fd=self.fd)
@@ -90,26 +95,6 @@ def descriptor_identity(descriptor: int) -> FileIdentity:
     return FileIdentity.from_stat(os.fstat(descriptor))
 
 
-def unlink_owned_at(directory_fd: int, name: str, identity: FileIdentity) -> bool:
-    safe_name = safe_basename(name)
-    quarantine = f".{safe_name}.{secrets.token_hex(8)}.quarantine"
-    try:
-        os.rename(safe_name, quarantine, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-    except FileNotFoundError:
-        return False
-    try:
-        quarantined = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
-        if FileIdentity.from_stat(quarantined) != identity:
-            _restore_quarantined(directory_fd, quarantine, safe_name)
-            return False
-        os.unlink(quarantine, dir_fd=directory_fd)
-        os.fsync(directory_fd)
-        return True
-    except OSError:
-        _restore_quarantined(directory_fd, quarantine, safe_name)
-        return False
-
-
 def unlink_owned_path(path: Path, identity: FileIdentity) -> bool:
     try:
         with RootedDirectoryOwner(path.parent, create=False) as owner:
@@ -118,39 +103,44 @@ def unlink_owned_path(path: Path, identity: FileIdentity) -> bool:
         return False
 
 
+def recover_quarantined_path(path: Path) -> int:
+    """Restore a deferred cleanup quarantine once its original name is free."""
+    try:
+        with RootedDirectoryOwner(path.parent, create=False) as owner:
+            return recover_quarantined_at(owner.fd, path.name)
+    except OSError:
+        return 0
+
+
 @contextmanager
 def open_owned_path(path: Path, identity: FileIdentity) -> Iterator[BufferedReader]:
     with RootedDirectoryOwner(path.parent, create=False) as owner:
-        descriptor = owner.open_file(path.name, os.O_RDONLY)
-        try:
-            if descriptor_identity(descriptor) != identity or not owner.matches(path.name, identity):
-                raise OSError("artifact identity changed")
-            if not owner.is_still_bound():
-                raise OSError("artifact parent changed")
-            with os.fdopen(descriptor, "rb") as handle:
-                descriptor = -1
-                yield handle
-                if not owner.matches(path.name, identity) or not owner.is_still_bound():
-                    raise OSError("artifact binding changed")
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+        with open_owned_at(owner, path.name, identity) as handle:
+            yield handle
+
+
+@contextmanager
+def open_owned_at(owner: RootedDirectoryOwner, name: str, identity: FileIdentity) -> Iterator[BufferedReader]:
+    descriptor = owner.open_file(name, os.O_RDONLY)
+    try:
+        if descriptor_identity(descriptor) != identity or not owner.matches(name, identity):
+            raise OSError("artifact identity changed")
+        if not owner.is_still_bound():
+            raise OSError("artifact parent changed")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            yield handle
+            if not owner.matches(name, identity) or not owner.is_still_bound():
+                raise OSError("artifact binding changed")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def safe_basename(value: str) -> str:
     if not value or value in {".", ".."} or Path(value).name != value or Path(value).is_absolute():
         raise OSError("artifact name must be a basename")
     return value
-
-
-def _restore_quarantined(directory_fd: int, quarantine: str, name: str) -> bool:
-    try:
-        os.link(quarantine, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-        os.unlink(quarantine, dir_fd=directory_fd)
-        os.fsync(directory_fd)
-        return True
-    except OSError:
-        return False
 
 
 def _open_directory(path: Path, *, create: bool) -> int:
