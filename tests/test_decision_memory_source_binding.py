@@ -21,11 +21,12 @@ def _record(summary: str):
     )
 
 
-def _store(path: Path) -> DecisionMemoryStore:
+def _store(path: Path, *, max_records: int = 200) -> DecisionMemoryStore:
     return DecisionMemoryStore(
         path,
         checkpoint_interval_seconds=300,
         checkpoint_max_pending_records=50,
+        max_records=max_records,
         monotonic=lambda: 0,
     )
 
@@ -182,5 +183,64 @@ def test_missing_source_creation_race_is_never_overwritten(
     assert store.flush()
     assert [item.summary for item in load_decision_memory(path).records] == [
         "external",
+        "local___",
+    ]
+
+
+def test_confirmed_local_records_do_not_displace_newer_external_history(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    store = _store(path, max_records=3)
+    assert store.append(_record("local-old-1"), durability="immediate")
+    assert store.append(_record("local-old-2"), durability="immediate")
+    _write_memory(
+        path,
+        (_record("external-1"), _record("external-2"), _record("external-3")),
+    )
+    assert store.append(_record("local-new"), durability="routine")
+
+    assert store.flush()
+    assert [item.summary for item in load_decision_memory(path).records] == [
+        "external-2",
+        "external-3",
+        "local-new",
+    ]
+
+
+def test_rollback_restores_newer_canonical_writer_without_stranding_temp(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_exchange = memory._conditional_exchange
+    exchange_count = 0
+
+    def replace_around_exchange(source: Path, destination: Path) -> None:
+        nonlocal exchange_count
+        exchange_count += 1
+        if exchange_count == 1:
+            _write_memory(path, (_record("external-before"),))
+            real_exchange(source, destination)
+            _write_memory(path, (_record("external-newer"),))
+            return
+        real_exchange(source, destination)
+
+    monkeypatch.setattr(memory, "_conditional_exchange", replace_around_exchange)
+
+    assert store.flush() is False
+    assert [item.summary for item in load_decision_memory(path).records] == [
+        "external-newer"
+    ]
+    assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
+    monkeypatch.undo()
+    assert store.flush()
+    assert [item.summary for item in load_decision_memory(path).records] == [
+        "external-newer",
         "local___",
     ]

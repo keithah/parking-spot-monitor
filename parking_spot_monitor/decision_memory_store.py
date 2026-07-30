@@ -62,7 +62,7 @@ class DecisionMemoryStore:
             loaded.records if load_is_consistent else (),
             maxlen=self.max_records,
         )
-        self._local_records: deque[DecisionMemoryRecord] = deque(maxlen=self.max_records)
+        self._dirty_records: deque[DecisionMemoryRecord] = deque(maxlen=self.max_records)
         self._dirty = False
         self._pending_count = 0
         now = self._monotonic()
@@ -96,7 +96,7 @@ class DecisionMemoryStore:
             return True
         with _memory._MEMORY_WRITE_LOCK:
             self._records.extend(sanitized)
-            self._local_records.extend(sanitized)
+            self._dirty_records.extend(sanitized)
             self._dirty = True
             self._pending_count += len(sanitized)
             if durability == "immediate" or self._pending_count >= self.checkpoint_max_pending_records:
@@ -160,12 +160,11 @@ class DecisionMemoryStore:
                     return self._defer_reconciliation("source-state-signature-mismatch")
                 if external.state == "available":
                     candidate = deduplicated_decision_memory_tail(
-                        (*external.records, *self._local_records),
+                        (*external.records, *self._dirty_records),
                         max_records=self.max_records,
                     )
             publication = _memory._write_memory(
-                self.path, candidate, expected_signature=before.signature
-            )
+                self.path, candidate, expected_signature=before.signature)
         except Exception as exc:
             _memory._log(
                 self._logger,
@@ -185,6 +184,7 @@ class DecisionMemoryStore:
             return self._defer_reconciliation("written-source-stat-unavailable")
         self._records = deque(candidate, maxlen=self.max_records)
         self._signature = publication.signature
+        self._dirty_records.clear()
         self._reconcile_required = False
         self._dirty = False
         self._pending_count = 0

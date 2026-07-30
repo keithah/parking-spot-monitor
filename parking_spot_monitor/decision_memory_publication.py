@@ -18,6 +18,7 @@ ExclusiveLink = Callable[[Path, Path], None]
 
 _AT_FDCWD = -100
 _RENAME_EXCHANGE = 2
+_MAX_ROLLBACK_EXCHANGES = 8
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _LIBC.renameat2.argtypes = [
     ctypes.c_int,
@@ -66,11 +67,19 @@ def publish_decision_memory_bytes(
                 cleanup_temporary = False
                 raise
             if not _same_content_identity(displaced, expected_signature):
-                exchange(temporary, path)
-                _fsync_directory(path.parent)
-                restored_temporary = read_source_signature(temporary, max_file_bytes)
-                if not _same_content_identity(restored_temporary, candidate):
+                try:
+                    restored = _restore_latest_canonical(
+                        temporary,
+                        path,
+                        desired=displaced,
+                        current=candidate,
+                        max_file_bytes=max_file_bytes,
+                        exchange=exchange,
+                    )
+                except (FileNotFoundError, OSError, OverflowError):
                     cleanup_temporary = False
+                    raise
+                cleanup_temporary = restored
                 return ConditionalPublication(False)
         _fsync_directory(path.parent)
         published = read_source_signature(path, max_file_bytes)
@@ -153,6 +162,28 @@ def _write_temporary(path: Path, payload: bytes) -> Path:
 
 def _same_content_identity(left: SourceSignature, right: SourceSignature) -> bool:
     return left[:3] == right[:3] and left[5] == right[5]
+
+
+def _restore_latest_canonical(
+    temporary: Path,
+    path: Path,
+    *,
+    desired: SourceSignature,
+    current: SourceSignature,
+    max_file_bytes: int,
+    exchange: Exchange,
+) -> bool:
+    canonical = read_source_signature(path, max_file_bytes)
+    if not _same_content_identity(canonical, current):
+        return True
+    for _attempt in range(_MAX_ROLLBACK_EXCHANGES):
+        exchange(temporary, path)
+        _fsync_directory(path.parent)
+        swapped_out = read_source_signature(temporary, max_file_bytes)
+        if _same_content_identity(swapped_out, current):
+            return True
+        current, desired = desired, swapped_out
+    return False
 
 
 def _source_stat_fields(value: os.stat_result) -> tuple[int, int, int, int, int]:
