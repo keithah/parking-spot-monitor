@@ -958,9 +958,14 @@ git commit -m "perf: reuse loaded profile history"
 - Create: `parking_spot_monitor/bounded_descriptor_io.py`
 - Create: `parking_spot_monitor/owned_file_cleanup.py`
 - Create: `parking_spot_monitor/owned_file_disposal.py`
+- Create: `parking_spot_monitor/owned_disposal_manifest.py`
+- Create: `parking_spot_monitor/owned_file_recovery.py`
+- Create: `parking_spot_monitor/owned_directory_durability.py`
 - Create: `parking_spot_monitor/matrix_retained_publication.py`
 - Create: `parking_spot_monitor/matrix_snapshot_storage.py`
 - Create: `parking_spot_monitor/matrix_upload_derivatives.py`
+- Create: `parking_spot_monitor/matrix_retention_logging.py`
+- Modify: `parking_spot_monitor/__main__.py`
 - Modify: `parking_spot_monitor/file_descriptor_binding.py`
 - Modify: `parking_spot_monitor/vehicle_history_images.py`
 - Modify: `parking_spot_monitor/vehicle_history_sessions.py`
@@ -973,7 +978,9 @@ git commit -m "perf: reuse loaded profile history"
 - Modify: `tests/test_image_budget.py`
 - Modify: `tests/test_operator_cockpit.py`
 - Modify: `tests/test_matrix.py`
+- Modify: `tests/test_startup.py`
 - Modify: `tests/test_module_decomposition.py`
+- Modify: `docs/deployment.md`
 
 **Interfaces:**
 - Produces: `JpegPublication(path: Path, strategy: Literal["reflink", "copy"], identity: FileIdentity)` and `publish_canonical_jpeg(source, destination) -> JpegPublication`. The `(dev, ino)` identity is an ownership token: immediate consumers must bind an `O_NOFOLLOW` descriptor to it, and failure cleanup may remove only that exact published inode.
@@ -981,10 +988,12 @@ git commit -m "perf: reuse loaded profile history"
 - Produces: `JpegDecodeError(code: Literal["unidentified", "decompression_bomb", "invalid_dimensions", "read_failed"])` and `open_decoded_rgb_jpeg(path: Path, *, initial_max_dimension: int, expected_identity: FileIdentity | None = None) -> ContextManager[DecodedRgbJpeg]`, plus byte and stream variants. `DecodedRgbJpeg(image: Image.Image, source_width: int, source_height: int)` owns bounded draft, decode, RGB conversion, and deterministic closure.
 - Produces: `read_descriptor_exact(fd, expected_signature, *, capture_bytes=False, destination_fd=None) -> BoundedDescriptorRead`, which consumes exactly the captured size, fails short reads, probes one growth byte, verifies the post-read descriptor signature, and resets the source offset.
 - Produces: `publish_retained_snapshot(source: Path, snapshot_root: Path, filename: str) -> OwnedFile` and rooted `read_owned_jpeg_evidence(snapshot_root, filename, *, max_bytes, expected_identity=None) -> RootedJpegEvidence`.
-- Produces: `OwnedArtifactDeleteResult(status: Literal["deleted", "missing", "failed"], bytes_deleted: int)` from both `delete_owned_artifact()` and `delete_upload_derivative()`; retention proceeds from derivative to canonical raw, counts only deleted/confirmed-missing pairs, and treats typed failure as retained retryable evidence.
+- Produces: `OwnedArtifactDeleteResult(status: Literal["deleted", "missing", "failed"], bytes_deleted: int, durable: bool)` from both `delete_owned_artifact()` and `delete_upload_derivative()`. A successful namespace unlink followed by failed directory fsync is `status="deleted", durable=False`, never an ordinary retry failure against an absent target. Retention proceeds from derivative to canonical raw, counts deleted/confirmed-missing pairs, logs and counts durability uncertainty separately, and treats typed failure as retained retryable evidence.
 - Produces: immutable `MatrixUploadDerivative(path: Path, info: Mapping[str, int | str])`; `publish_upload_derivative(snapshot_root, filename, *, data, info)`, `load_upload_derivative(snapshot_root, filename, *, persisted_path, info)`, and `read_upload_derivative_bytes(snapshot_root, derivative)` are the durable derivative APIs.
-- Produces: `recover_quarantined_path(path: Path) -> int`; one scan consumes at most 256 directory entries and accepts only `.<safe_basename>.<16 lowercase hex>.quarantine` and `.<safe_basename>.<16 lowercase hex>.dispose`. It deterministically restores an interrupted disposal to an absent target, finishes a same-inode target/disposal unlink, and leaves one retryable state on persistent failure without generating another quarantine, disposal, or hardlink.
-- Preserves: a newly created derivative child directory is fsynced through the held snapshot-root dirfd before the child is opened or any derivative/outbox attachment becomes visible; an existing child requires no extra root fsync.
+- Produces: a bounded, versioned `.owned-disposals.json` index written durably before the source-to-disposal rename. Each entry binds the exact disposal/recovery basenames to the expected `(dev, ino)` identity; at most 256 entries and 256 KiB are accepted. Successful durable deletion removes its entry atomically, while uncertain durability leaves it for a later reconciliation pass.
+- Produces: `recover_quarantined_path(path: Path) -> int`, targeted `recover_owned_at()`, and directory-wide `recover_owned_directory_at()`. Indexed work is handled before the at-most-256-entry legacy scan, indexed names are excluded from legacy reprocessing, and only exact `.<safe_basename>.<16 lowercase hex>.quarantine|dispose` forms are accepted. Startup recovers the Matrix root, `.upload-derivatives`, and vehicle full/crop directories; the next retention or vehicle capture repeats the applicable recovery.
+- Preserves: derivative-child durability is cached by verified root/child `(dev, ino)` identity under a thread-safe, 256-entry process-local bound. First use in each process fsyncs the held snapshot-root dirfd before opening the child; the identity is cached only after successful fsync. A failed fsync is retried on the next use, and a process restart or directory replacement requires a fresh parent fsync.
+- Produces: focused retention telemetry through `matrix_retention_logging.py`, including `snapshot-retention-durability-uncertain` without converting a completed namespace deletion into `failed_count`.
 - Adds outbox intent metadata `upload_derivative_path` and `upload_derivative_info`; both are optional, sanitized schema-v1 metadata.
 - Preserves: `SessionRecord.occupied_snapshot_path` as the canonical archive full JPEG and `occupied_crop_path` as its crop; no session schema change.
 
@@ -1027,7 +1036,7 @@ Open the source once, validate JPEG format/dimensions from that descriptor, and 
 
 `capture_occupied_images` publishes the full frame with this helper, then opens the canonical path once through its returned identity to create only the crop. A pathname or parent-root replacement must fail without decoding or deleting the replacement.
 
-Full-frame publication, identity-bound decode, and crop staging/commit retain archive, images, full-frame, and crop directory descriptors for the whole transaction. Failure cleanup operates only through those held descriptors. Identity cleanup first rejects stable non-regular or mismatched targets, then uses a random same-directory quarantine followed by exact `.<basename>.<16 lowercase hex>.dispose` randomization. Disposal binds and rechecks the regular-file identity; a raced mismatch is restored with no-clobber hardlink/unlink semantics, and a new original-name blocker preserves both unrelated files. One recovery scan consumes at most 256 combined quarantine/disposal entries. An interrupted disposal is restored no-clobber to an absent target or recognized as its same-inode hardlink before the disposal unlink resumes; persistent unlink failure remains one bounded retryable state and blocks fresh cleanup work. Linux has no inode-conditional unlink, so the final randomized-path check/unlink window assumes these application-owned directories exclude noncooperating writers; this mechanism minimizes that window and does not claim safety for hostile shared directories.
+Full-frame publication, identity-bound decode, and crop staging/commit retain archive, images, full-frame, and crop directory descriptors for the whole transaction. Failure cleanup operates only through those held descriptors. Identity cleanup first rejects stable non-regular or mismatched targets, then uses a random same-directory quarantine followed by exact `.<basename>.<16 lowercase hex>.dispose` randomization. Before that rename, a bounded manifest entry is durably published with exact recovery name and inode identity. Disposal binds and rechecks the regular-file identity; a raced mismatch is restored with no-clobber hardlink/unlink semantics, and a new original-name blocker preserves both unrelated files. Manifest recovery gives current interrupted work direct reachability even behind more than 256 unrelated directory entries; one legacy fallback scan still consumes at most 256 combined quarantine/disposal entries. An interrupted disposal is restored no-clobber to an absent target or recognized as its same-inode hardlink before the disposal unlink resumes. Linux has no inode-conditional unlink, so the final randomized-path check/unlink window assumes these application-owned directories exclude noncooperating writers; this mechanism minimizes that window and does not claim safety for hostile shared directories.
 
 - [ ] **Step 4: Share one full JPEG decode lifecycle**
 
