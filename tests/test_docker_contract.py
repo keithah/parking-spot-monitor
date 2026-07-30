@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import fnmatch
 import importlib.util
+import json
 import re
+import shlex
 import sys
 import tomllib
 from pathlib import Path
@@ -17,28 +19,12 @@ PYTHON_BASE_IMAGE = (
 )
 
 
-def _docker_stages(dockerfile: str) -> list[tuple[str, str, str]]:
-    matches = list(
-        re.finditer(
-            r"^[ \t]*FROM[ \t]+([^\s]+)[ \t]+AS[ \t]+([A-Za-z0-9._-]+)[ \t]*$",
-            dockerfile,
-            flags=re.IGNORECASE | re.MULTILINE,
-        )
-    )
-    return [
-        (
-            match.group(1),
-            match.group(2),
-            dockerfile[match.end() : matches[index + 1].start()]
-            if index + 1 < len(matches)
-            else dockerfile[match.end() :],
-        )
-        for index, match in enumerate(matches)
-    ]
+DockerInstruction = tuple[str, str]
+DockerStage = tuple[tuple[str, ...], str, str | None, list[DockerInstruction]]
 
 
-def _docker_instruction_arguments(source: str, instruction: str) -> list[str]:
-    logical_lines: list[str] = []
+def _tokenize_dockerfile(source: str) -> list[DockerInstruction]:
+    instructions: list[DockerInstruction] = []
     continued: list[str] = []
     for raw_line in source.splitlines():
         stripped = raw_line.strip()
@@ -46,17 +32,61 @@ def _docker_instruction_arguments(source: str, instruction: str) -> list[str]:
             continue
         continued.append(stripped.removesuffix("\\").rstrip())
         if not stripped.endswith("\\"):
-            logical_lines.append(" ".join(continued))
+            logical_line = " ".join(continued)
             continued = []
+            match = re.fullmatch(r"([A-Za-z]+)(?:[ \t]+(.*))?", logical_line)
+            assert match is not None, logical_line
+            instructions.append(
+                (match.group(1).casefold(), (match.group(2) or "").strip())
+            )
     if continued:
-        logical_lines.append(" ".join(continued))
+        raise AssertionError("unterminated Dockerfile continuation")
+    return instructions
 
-    parsed: list[str] = []
-    for logical_line in logical_lines:
-        directive, separator, arguments = logical_line.partition(" ")
-        if separator and directive.casefold() == instruction.casefold():
-            parsed.append(arguments.strip())
-    return parsed
+
+def _parse_from(arguments: str) -> tuple[tuple[str, ...], str, str | None]:
+    words = shlex.split(arguments)
+    flags: list[str] = []
+    while words and words[0].startswith("--"):
+        flags.append(words.pop(0))
+    assert words
+    base = words.pop(0)
+    alias: str | None = None
+    if words:
+        assert len(words) == 2 and words[0].casefold() == "as"
+        alias = words[1]
+    return tuple(flags), base, alias
+
+
+def _docker_stages(dockerfile: str) -> list[DockerStage]:
+    instructions = _tokenize_dockerfile(dockerfile)
+    from_indexes = [
+        index
+        for index, (instruction, _arguments) in enumerate(instructions)
+        if instruction == "from"
+    ]
+    stages: list[DockerStage] = []
+    for stage_index, instruction_index in enumerate(from_indexes):
+        flags, base, alias = _parse_from(instructions[instruction_index][1])
+        next_index = (
+            from_indexes[stage_index + 1]
+            if stage_index + 1 < len(from_indexes)
+            else len(instructions)
+        )
+        stages.append(
+            (flags, base, alias, instructions[instruction_index + 1 : next_index])
+        )
+    return stages
+
+
+def _instruction_arguments(
+    instructions: list[DockerInstruction], instruction: str
+) -> list[str]:
+    return [
+        arguments
+        for actual_instruction, arguments in instructions
+        if actual_instruction == instruction.casefold()
+    ]
 
 
 def _docker_context_path_is_allowed(path: str, patterns: list[str]) -> bool:
@@ -83,19 +113,43 @@ def _docker_context_path_is_allowed(path: str, patterns: list[str]) -> bool:
     return allowed
 
 
-def _assert_exact_docker_stage_graph(dockerfile: str) -> None:
+def _assert_exact_docker_stage_graph(dockerfile: str) -> list[DockerStage]:
     stages = _docker_stages(dockerfile)
-    assert [(base, alias) for base, alias, _body in stages] == [
-        (PYTHON_BASE_IMAGE, "python-base"),
-        ("python-base", "tooling"),
-        ("python-base", "capture-base"),
-        ("capture-base", "runtime-app"),
-        ("capture-base", "runtime-detector"),
+    assert [(flags, base, alias) for flags, base, alias, _body in stages] == [
+        ((), PYTHON_BASE_IMAGE, "python-base"),
+        ((), "python-base", "tooling"),
+        ((), "python-base", "capture-base"),
+        ((), "capture-base", "runtime-app"),
+        ((), "capture-base", "runtime-detector"),
     ]
+    return stages
+
+
+def _run_words(arguments: str) -> list[str]:
+    if arguments.startswith("["):
+        command = json.loads(arguments)
+        assert isinstance(command, list) and all(
+            isinstance(argument, str) for argument in command
+        )
+        return command
+    return shlex.split(arguments)
+
+
+def _compileall_words(arguments: str) -> list[str] | None:
+    words = _run_words(arguments)
+    for index in range(len(words) - 2):
+        if words[index : index + 3] == ["python", "-m", "compileall"]:
+            return words[index + 3 :]
+    return None
 
 
 def _assert_exact_final_source_contract(dockerfile: str) -> None:
-    stages = {alias: body for _base, alias, body in _docker_stages(dockerfile)}
+    parsed_stages = _assert_exact_docker_stage_graph(dockerfile)
+    stages = {
+        alias: instructions
+        for _flags, _base, alias, instructions in parsed_stages
+        if alias is not None
+    }
     expected_copies = {
         "python-base": ["requirements-runtime.lock ./"],
         "tooling": [],
@@ -113,18 +167,22 @@ def _assert_exact_final_source_contract(dockerfile: str) -> None:
         ],
     }
     assert {
-        alias: _docker_instruction_arguments(body, "COPY")
-        for alias, body in stages.items()
+        alias: _instruction_arguments(instructions, "COPY")
+        for alias, instructions in stages.items()
     } == expected_copies
 
-    compileall = "python -m compileall -q /app/parking_spot_monitor /app/src"
-    for alias, body in stages.items():
+    required_arguments = {"-q", "/app/parking_spot_monitor", "/app/src"}
+    for alias, instructions in stages.items():
         compileall_runs = [
-            run
-            for run in _docker_instruction_arguments(body, "RUN")
-            if "python -m compileall" in run
+            compileall_arguments
+            for run in _instruction_arguments(instructions, "RUN")
+            if (compileall_arguments := _compileall_words(run)) is not None
         ]
-        assert compileall_runs == ([compileall] if alias.startswith("runtime-") else [])
+        if alias.startswith("runtime-"):
+            assert len(compileall_runs) == 1
+            assert required_arguments.issubset(compileall_runs[0])
+        else:
+            assert compileall_runs == []
 
 
 SECRET_LIKE_STRINGS = [
@@ -222,26 +280,53 @@ def test_lowercase_from_cannot_hide_a_sixth_stage() -> None:
         _assert_exact_docker_stage_graph(mutated)
 
 
+@pytest.mark.parametrize(
+    "extra_stage",
+    [
+        "FROM capture-base",
+        "FROM --platform=linux/amd64 capture-base AS sixth",
+        "FROM \\\n    capture-base AS sixth",
+        "\tFrOm\tcapture-base\tAs\tsixth",
+    ],
+)
+def test_alternate_from_forms_cannot_hide_an_extra_stage(extra_stage: str) -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+
+    with pytest.raises(AssertionError):
+        _assert_exact_docker_stage_graph(dockerfile + "\n" + extra_stage + "\n")
+
+
 def test_lock_installs_are_exactly_owned_by_their_intended_stages() -> None:
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
-    stages = {alias: body for _base, alias, body in _docker_stages(dockerfile)}
+    stages = {
+        alias: instructions
+        for _flags, _base, alias, instructions in _docker_stages(dockerfile)
+        if alias is not None
+    }
     cache_mount = "--mount=type=cache,target=/root/.cache/pip,sharing=locked"
+    stage_text = {
+        alias: "\n".join(
+            f"{instruction} {arguments}"
+            for instruction, arguments in instructions
+        )
+        for alias, instructions in stages.items()
+    }
 
     assert dockerfile.count(cache_mount) == 2
-    assert stages["python-base"].count(cache_mount) == 1
-    assert stages["python-base"].count("COPY requirements-runtime.lock ./") == 1
-    assert stages["python-base"].count(
+    assert stage_text["python-base"].count(cache_mount) == 1
+    assert stage_text["python-base"].count("copy requirements-runtime.lock ./") == 1
+    assert stage_text["python-base"].count(
         "pip install --require-hashes -r requirements-runtime.lock"
     ) == 1
-    assert stages["runtime-detector"].count(cache_mount) == 1
-    assert stages["runtime-detector"].count("COPY requirements-detector.lock ./") == 1
-    assert stages["runtime-detector"].count(
+    assert stage_text["runtime-detector"].count(cache_mount) == 1
+    assert stage_text["runtime-detector"].count("copy requirements-detector.lock ./") == 1
+    assert stage_text["runtime-detector"].count(
         "pip install --require-hashes -r requirements-detector.lock"
     ) == 1
     for alias in ("tooling", "capture-base", "runtime-app"):
-        assert "requirements-runtime.lock" not in stages[alias]
-        assert "requirements-detector.lock" not in stages[alias]
-        assert cache_mount not in stages[alias]
+        assert "requirements-runtime.lock" not in stage_text[alias]
+        assert "requirements-detector.lock" not in stage_text[alias]
+        assert cache_mount not in stage_text[alias]
 
 
 def test_dockerfile_has_lightweight_tooling_and_capture_stage_boundary() -> None:
@@ -274,6 +359,52 @@ def test_lowercase_copy_cannot_hide_source_in_an_intermediate_stage() -> None:
 
     with pytest.raises(AssertionError):
         _assert_exact_final_source_contract(mutated)
+
+
+@pytest.mark.parametrize(
+    "copy_instruction",
+    [
+        "\tCoPy\tsrc\t./shadow-src",
+        '\tCOPY\t["src", "./shadow-src"]',
+        "\tCOPY\t--chown=0:0 \\\n    src \\\n    ./shadow-src",
+    ],
+)
+def test_alternate_copy_forms_cannot_hide_intermediate_source_copy(
+    copy_instruction: str,
+) -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    mutated = dockerfile.replace(
+        "FROM capture-base AS runtime-app",
+        copy_instruction + "\n\nFROM capture-base AS runtime-app",
+        1,
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_exact_final_source_contract(mutated)
+
+
+def test_exec_form_compileall_cannot_hide_in_an_intermediate_stage() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    mutated = dockerfile.replace(
+        "FROM capture-base AS runtime-app",
+        'RUN ["python", "-m", "compileall", "-q", "/app/src"]\n\n'
+        "FROM capture-base AS runtime-app",
+        1,
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_exact_final_source_contract(mutated)
+
+
+def test_exec_form_compileall_satisfies_each_final_stage_requirement() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    mutated = dockerfile.replace(
+        "RUN python -m compileall -q /app/parking_spot_monitor /app/src",
+        'RUN ["python", "-m", "compileall", "-q", '
+        '"/app/parking_spot_monitor", "/app/src"]',
+    )
+
+    _assert_exact_final_source_contract(mutated)
 
 
 def test_dockerignore_default_deny_excludes_non_build_context_paths() -> None:
@@ -323,10 +454,13 @@ def test_dockerignore_default_deny_excludes_non_build_context_paths() -> None:
         "parking_spot_monitor/temp/session/state.json",
         "src/parking_monitor/.cache/pip/wheel",
         "src/parking_monitor/cache/frames/frame.bin",
-        "parking_spot_monitor/tmp",
-        "parking_spot_monitor/temp",
-        "src/parking_monitor/.cache",
-        "src/parking_monitor/cache",
+        "parking_spot_monitor/private/.envrc",
+        "parking_spot_monitor/private/runtime.log.1",
+        "parking_spot_monitor/evidence/CAMERA.JPG",
+        "src/parking_monitor/models/detector.safetensors",
+        "parking_spot_monitor/private/credentials.json",
+        "src/parking_monitor/.tox/pyvenv.cfg",
+        "src/parking_monitor/private/arbitrary.extension",
     ]:
         assert _docker_context_path_is_allowed(excluded, patterns) is False
 
@@ -341,9 +475,7 @@ def test_dockerignore_allows_every_consumed_build_input() -> None:
         "requirements-detector.lock",
         "parking_spot_monitor/__main__.py",
         "src/parking_monitor/__init__.py",
-        "parking_spot_monitor/config/defaults.yaml",
-        "src/parking_monitor/assets/schema.json",
-        "src/parking_monitor/py.typed",
+        "src/parking_monitor/outbox.py",
         "main.py",
         "config.yaml.example",
     ]:
@@ -360,58 +492,15 @@ def test_dockerignore_is_exact_default_deny_build_input_allowlist() -> None:
         "!requirements-runtime.lock",
         "!requirements-detector.lock",
         "!parking_spot_monitor/",
-        "!parking_spot_monitor/**",
+        "parking_spot_monitor/**",
+        "!parking_spot_monitor/*.py",
         "!src/",
-        "!src/**",
+        "src/**",
+        "!src/parking_monitor/",
+        "src/parking_monitor/**",
+        "!src/parking_monitor/*.py",
         "!main.py",
         "!config.yaml.example",
-        "**/__pycache__/",
-        "**/__pycache__/**",
-        "**/*.py[cod]",
-        "**/*.tmp",
-        "**/.env",
-        "**/.env.*",
-        "**/*.log",
-        "**/*.png",
-        "**/*.jpg",
-        "**/*.jpeg",
-        "**/*.gif",
-        "**/*.webp",
-        "**/*.bmp",
-        "**/*.tif",
-        "**/*.tiff",
-        "**/*.heic",
-        "**/*.heif",
-        "**/*.avif",
-        "**/*.mp4",
-        "**/*.mov",
-        "**/*.m4v",
-        "**/*.avi",
-        "**/*.mkv",
-        "**/*.webm",
-        "**/*.pt",
-        "**/*.pth",
-        "**/*.onnx",
-        "**/.pytest_cache/",
-        "**/.pytest_cache/**",
-        "**/.ruff_cache/",
-        "**/.ruff_cache/**",
-        "**/.mypy_cache/",
-        "**/.mypy_cache/**",
-        "**/.cache/",
-        "**/.cache/**",
-        "**/cache/",
-        "**/cache/**",
-        "**/tmp/",
-        "**/tmp/**",
-        "**/temp/",
-        "**/temp/**",
-        "**/.venv/",
-        "**/.venv/**",
-        "**/venv/",
-        "**/venv/**",
-        "**/env/",
-        "**/env/**",
     ]
     assert not any(
         forbidden in pattern
