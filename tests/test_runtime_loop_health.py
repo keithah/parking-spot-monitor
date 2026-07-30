@@ -28,6 +28,13 @@ def fake_environ(**overrides: str) -> dict[str, str]:
     return environ
 
 
+def runtime_config_text() -> str:
+    return Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "model: /models/yolov8n.pt",
+        "model: yolov8n.pt",
+    )
+
+
 def combined_output(capsys: pytest.CaptureFixture[str]) -> str:
     captured = capsys.readouterr()
     return captured.out + captured.err
@@ -71,9 +78,10 @@ def test_runtime_loop_detector_failure_logs_and_continues(
     sleeps: list[float] = []
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        Path("config.yaml.example")
-        .read_text(encoding="utf-8")
-        .replace("adaptive_polling_enabled: true", "adaptive_polling_enabled: false"),
+        runtime_config_text().replace(
+            "adaptive_polling_enabled: true",
+            "adaptive_polling_enabled: false",
+        ),
         encoding="utf-8",
     )
 
@@ -130,6 +138,8 @@ def test_runtime_loop_detector_failure_logs_and_continues(
 def test_runtime_loop_detection_failure_updates_health_without_advancing_state(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(runtime_config_text(), encoding="utf-8")
     state_path = tmp_path / "state.json"
     save_runtime_state(
         state_path,
@@ -152,7 +162,7 @@ def test_runtime_loop_detection_failure_updates_health_without_advancing_state(
             )
 
     exit_code = _main(
-        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
         environ=fake_environ(),
         capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
@@ -176,6 +186,8 @@ def test_runtime_loop_detection_failure_updates_health_without_advancing_state(
 def test_runtime_loop_detector_factory_failure_updates_detection_health(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(runtime_config_text(), encoding="utf-8")
     state_path = tmp_path / "state.json"
     save_runtime_state(
         state_path,
@@ -196,7 +208,7 @@ def test_runtime_loop_detector_factory_failure_updates_detection_health(
         )
 
     exit_code = _main(
-        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
         environ=fake_environ(),
         capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T19:30:00Z"),
         overlay=noop_overlay,

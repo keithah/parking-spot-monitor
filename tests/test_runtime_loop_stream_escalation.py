@@ -39,6 +39,13 @@ def fake_environ(**overrides: str) -> dict[str, str]:
     return environ
 
 
+def runtime_config_text() -> str:
+    return Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "model: /models/yolov8n.pt",
+        "model: yolov8n.pt",
+    )
+
+
 def combined_output(capsys: pytest.CaptureFixture[str]) -> str:
     captured = capsys.readouterr()
     return captured.out + captured.err
@@ -67,7 +74,7 @@ def test_runtime_loop_escalates_weak_primary_detection_and_uses_primary_artifact
 ) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        runtime_config_text().replace(
             "  reconnect_seconds: 5\n",
             "  reconnect_seconds: 5\n"
             "  profiles:\n"
@@ -533,7 +540,7 @@ def test_runtime_loop_failed_escalation_records_capture_success_without_processe
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(Path("config.yaml.example").read_text(encoding="utf-8"), encoding="utf-8")
+    config_path.write_text(runtime_config_text(), encoding="utf-8")
     primary_path = tmp_path / "latest-primary.jpg"
     capture_profiles: list[str | None] = []
 
@@ -591,7 +598,7 @@ def test_runtime_loop_failed_high_resolution_detection_records_high_resolution_c
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(Path("config.yaml.example").read_text(encoding="utf-8"), encoding="utf-8")
+    config_path.write_text(runtime_config_text(), encoding="utf-8")
     capture_profiles: list[str | None] = []
     primary_path = tmp_path / "latest-primary.jpg"
     high_path = tmp_path / "latest-high.jpg"
