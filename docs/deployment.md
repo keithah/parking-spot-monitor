@@ -37,30 +37,33 @@ The tracked service limits the container to 2 CPUs, 4 GiB of memory, and 512 pro
 
 ## Dependency lock maintenance
 
-Container builds install reviewed, exact hashes from two generated manifests. `requirements-runtime.lock` contains the application runtime, while `requirements-detector.lock` contains the detector stack and retains the PyTorch CPU package index. Maintainers continue to edit the broad dependency bounds in `requirements.txt`, `requirements-detector.txt`, and the dependency tables in `pyproject.toml`; do not hand-edit either lock.
+Container builds install reviewed, exact hashes from two generated manifests. `requirements-runtime.lock` contains the application runtime, while `requirements-detector.lock` contains the detector stack. Both name PyPI explicitly; the detector lock also names the PyTorch CPU index. Maintainers continue to edit the broad dependency bounds in `requirements.txt`, `requirements-detector.txt`, and the matching dependency tables in `pyproject.toml`; do not hand-edit either lock.
+
+Runtime declarations in `requirements.txt` must match `project.dependencies`. Detector declarations in `requirements-detector.txt` must match `project.optional-dependencies.detector`. The generator and offline check reject drift between those pairs. The development extra is intentionally separate from container dependencies, so changes under `project.optional-dependencies.dev` do not invalidate these locks.
 
 ### Prerequisites
 
-Create a dedicated build-tool environment from the repository root. The project runtime environment does not need `pip-tools`:
+Create a new dedicated build-tool environment from the repository root for each regeneration. Do not reuse a previous tool environment; the project runtime environment does not need these packages:
 
 ```sh
-python3 -m venv /tmp/parking-lock-tools
-/tmp/parking-lock-tools/bin/python -m pip install -r requirements-build.txt
+LOCK_TOOLS_DIR="$(mktemp -d)"
+python3 -m venv "$LOCK_TOOLS_DIR"
+"$LOCK_TOOLS_DIR/bin/python" -m pip install -r requirements-build.txt
 ```
 
-The generator verifies that the installed `pip-tools` version matches the exact pin in `requirements-build.txt` before resolving anything.
+`requirements-build.txt` exactly pins the complete resolver toolchain. The generator verifies every installed tool version before resolving anything.
 
 ### Regenerate reviewed locks
 
 After changing a dependency input, run:
 
 ```sh
-/tmp/parking-lock-tools/bin/python scripts/lock_dependencies.py
+"$LOCK_TOOLS_DIR/bin/python" scripts/lock_dependencies.py
 git diff -- requirements-runtime.lock requirements-detector.lock
 python3 scripts/lock_dependencies.py --check
 ```
 
-Review unexpected additions, removals, index changes, and version jumps before committing both locks. Generation uses the backtracking resolver, exact versions, and SHA-256 hashes. It writes a shared source digest into both headers so a change to either input manifest or to a `pyproject.toml` dependency table invalidates both locks.
+Review unexpected additions, removals, index changes, and version jumps before committing both locks. Generation uses the backtracking resolver, exact versions, SHA-256 hashes, and an isolated package-index configuration. It validates both generated files before publishing either one. A shared source digest covers both input manifests and the matching runtime and detector tables in `pyproject.toml`.
 
 ### Check freshness without package-index access
 
@@ -71,14 +74,15 @@ PIP_NO_INDEX=1 PYTHONNOUSERSITE=1 \
   python3 scripts/lock_dependencies.py --check
 ```
 
-Check mode reads local inputs and lock headers only. It neither imports `pip-tools`, contacts an index, nor rewrites a missing or stale lock.
+Check mode reads local inputs and lock files only. It verifies declaration synchronization, headers, approved indexes, exact pins, hash continuation syntax, hashes, and required direct dependencies. It neither imports `pip-tools`, contacts an index, nor rewrites a missing, stale, or malformed lock.
 
 ### Troubleshoot lock generation
 
-- If generation reports a missing or wrong `pip-tools` version, create a fresh isolated environment and install `requirements-build.txt` in it.
+- If generation reports a missing or wrong build-tool version, discard that environment, create a fresh one with `mktemp -d`, and install `requirements-build.txt` in it.
+- If generation or check reports an input mismatch, update both the requirements manifest and its matching `pyproject.toml` table before regenerating.
 - If `--check` reports a stale lock, regenerate both locks and review their diff; copying a digest between headers does not update resolved dependencies.
 - If resolution cannot reach PyPI or the PyTorch CPU index, verify outbound HTTPS and proxy or certificate configuration, then rerun generation. Do not remove hashes or replace the CPU index with an unreviewed source.
-- If generation is interrupted, rerun it. Each completed manifest is published from a temporary file, while check mode remains safe to run at any point.
+- If generation is interrupted or compiler output is invalid, rerun it in a fresh tool environment. Both compiler results are validated before publication, temporary files are removed on failure, and existing locks remain available.
 
 ## First deployment
 
