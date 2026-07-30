@@ -7,6 +7,7 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -19,9 +20,9 @@ PYTHON_BASE_IMAGE = (
 def _docker_stages(dockerfile: str) -> list[tuple[str, str, str]]:
     matches = list(
         re.finditer(
-            r"^FROM ([^\s]+) AS ([A-Za-z0-9._-]+)\s*$",
+            r"^[ \t]*FROM[ \t]+([^\s]+)[ \t]+AS[ \t]+([A-Za-z0-9._-]+)[ \t]*$",
             dockerfile,
-            flags=re.MULTILINE,
+            flags=re.IGNORECASE | re.MULTILINE,
         )
     )
     return [
@@ -36,6 +37,28 @@ def _docker_stages(dockerfile: str) -> list[tuple[str, str, str]]:
     ]
 
 
+def _docker_instruction_arguments(source: str, instruction: str) -> list[str]:
+    logical_lines: list[str] = []
+    continued: list[str] = []
+    for raw_line in source.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or (not continued and stripped.startswith("#")):
+            continue
+        continued.append(stripped.removesuffix("\\").rstrip())
+        if not stripped.endswith("\\"):
+            logical_lines.append(" ".join(continued))
+            continued = []
+    if continued:
+        logical_lines.append(" ".join(continued))
+
+    parsed: list[str] = []
+    for logical_line in logical_lines:
+        directive, separator, arguments = logical_line.partition(" ")
+        if separator and directive.casefold() == instruction.casefold():
+            parsed.append(arguments.strip())
+    return parsed
+
+
 def _docker_context_path_is_allowed(path: str, patterns: list[str]) -> bool:
     allowed = True
     for pattern in patterns:
@@ -48,11 +71,60 @@ def _docker_context_path_is_allowed(path: str, patterns: list[str]) -> bool:
                 matches = True
         elif candidate.endswith("/"):
             directory = candidate.rstrip("/")
-            if path == directory or path.startswith(directory + "/"):
+            if (
+                fnmatch.fnmatchcase(path, directory)
+                or fnmatch.fnmatchcase(path, directory + "/**")
+                or path == directory
+                or path.startswith(directory + "/")
+            ):
                 matches = True
         if matches:
             allowed = negated
     return allowed
+
+
+def _assert_exact_docker_stage_graph(dockerfile: str) -> None:
+    stages = _docker_stages(dockerfile)
+    assert [(base, alias) for base, alias, _body in stages] == [
+        (PYTHON_BASE_IMAGE, "python-base"),
+        ("python-base", "tooling"),
+        ("python-base", "capture-base"),
+        ("capture-base", "runtime-app"),
+        ("capture-base", "runtime-detector"),
+    ]
+
+
+def _assert_exact_final_source_contract(dockerfile: str) -> None:
+    stages = {alias: body for _base, alias, body in _docker_stages(dockerfile)}
+    expected_copies = {
+        "python-base": ["requirements-runtime.lock ./"],
+        "tooling": [],
+        "capture-base": [],
+        "runtime-app": [
+            "parking_spot_monitor ./parking_spot_monitor",
+            "src ./src",
+            "main.py config.yaml.example ./",
+        ],
+        "runtime-detector": [
+            "requirements-detector.lock ./",
+            "parking_spot_monitor ./parking_spot_monitor",
+            "src ./src",
+            "main.py config.yaml.example ./",
+        ],
+    }
+    assert {
+        alias: _docker_instruction_arguments(body, "COPY")
+        for alias, body in stages.items()
+    } == expected_copies
+
+    compileall = "python -m compileall -q /app/parking_spot_monitor /app/src"
+    for alias, body in stages.items():
+        compileall_runs = [
+            run
+            for run in _docker_instruction_arguments(body, "RUN")
+            if "python -m compileall" in run
+        ]
+        assert compileall_runs == ([compileall] if alias.startswith("runtime-") else [])
 
 
 SECRET_LIKE_STRINGS = [
@@ -139,15 +211,15 @@ def test_dockerfile_uses_buildkit_cache_hash_locks_and_compileall() -> None:
 
 def test_dockerfile_has_exact_ordered_stage_graph_and_pinned_base() -> None:
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
-    stages = _docker_stages(dockerfile)
+    _assert_exact_docker_stage_graph(dockerfile)
 
-    assert [(base, alias) for base, alias, _body in stages] == [
-        (PYTHON_BASE_IMAGE, "python-base"),
-        ("python-base", "tooling"),
-        ("python-base", "capture-base"),
-        ("capture-base", "runtime-app"),
-        ("capture-base", "runtime-detector"),
-    ]
+
+def test_lowercase_from_cannot_hide_a_sixth_stage() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    mutated = dockerfile + "\nfrom capture-base as sixth\n"
+
+    with pytest.raises(AssertionError):
+        _assert_exact_docker_stage_graph(mutated)
 
 
 def test_lock_installs_are_exactly_owned_by_their_intended_stages() -> None:
@@ -189,22 +261,19 @@ def test_dockerfile_has_lightweight_tooling_and_capture_stage_boundary() -> None
 
 def test_each_final_docker_stage_copies_source_once_and_compiles_it() -> None:
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
-    stages = {alias: body for _base, alias, body in _docker_stages(dockerfile)}
-    app_stage = stages["runtime-app"]
-    detector_stage = stages["runtime-detector"]
+    _assert_exact_final_source_contract(dockerfile)
 
-    for stage in (app_stage, detector_stage):
-        assert stage.count("COPY parking_spot_monitor ./parking_spot_monitor") == 1
-        assert stage.count("COPY src ./src") == 1
-        assert stage.count("COPY main.py config.yaml.example ./") == 1
-        assert stage.count(
-            "python -m compileall -q /app/parking_spot_monitor /app/src"
-        ) == 1
-    for alias in ("python-base", "tooling", "capture-base"):
-        assert "COPY parking_spot_monitor" not in stages[alias]
-        assert "COPY src" not in stages[alias]
-        assert "COPY main.py" not in stages[alias]
-        assert "COPY config.yaml.example" not in stages[alias]
+
+def test_lowercase_copy_cannot_hide_source_in_an_intermediate_stage() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    mutated = dockerfile.replace(
+        "FROM capture-base AS runtime-app",
+        "copy src ./shadow-src\n\nFROM capture-base AS runtime-app",
+        1,
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_exact_final_source_contract(mutated)
 
 
 def test_dockerignore_default_deny_excludes_non_build_context_paths() -> None:
@@ -227,6 +296,37 @@ def test_dockerignore_default_deny_excludes_non_build_context_paths() -> None:
         "parking_spot_monitor/debug.tmp",
         "parking_spot_monitor/__pycache__/config.cpython-312.pyc",
         "src/parking_monitor/__pycache__/outbox.cpython-312.pyc",
+        "parking_spot_monitor/.env",
+        "src/parking_monitor/.env.local",
+        "parking_spot_monitor/private/capture.log",
+        "parking_spot_monitor/evidence/camera.jpg",
+        "parking_spot_monitor/evidence/camera.png",
+        "src/parking_monitor/evidence/frame.jpeg",
+        "src/parking_monitor/evidence/frame.gif",
+        "src/parking_monitor/evidence/frame.webp",
+        "src/parking_monitor/evidence/frame.bmp",
+        "src/parking_monitor/evidence/frame.tif",
+        "src/parking_monitor/evidence/frame.tiff",
+        "src/parking_monitor/evidence/frame.heic",
+        "src/parking_monitor/evidence/frame.heif",
+        "src/parking_monitor/evidence/frame.avif",
+        "parking_spot_monitor/evidence/camera.mp4",
+        "parking_spot_monitor/evidence/camera.mov",
+        "parking_spot_monitor/evidence/camera.m4v",
+        "src/parking_monitor/evidence/camera.avi",
+        "src/parking_monitor/evidence/camera.mkv",
+        "src/parking_monitor/evidence/camera.webm",
+        "parking_spot_monitor/models/detector.pt",
+        "parking_spot_monitor/models/detector.pth",
+        "src/parking_monitor/models/detector.onnx",
+        "parking_spot_monitor/tmp/session/state.json",
+        "parking_spot_monitor/temp/session/state.json",
+        "src/parking_monitor/.cache/pip/wheel",
+        "src/parking_monitor/cache/frames/frame.bin",
+        "parking_spot_monitor/tmp",
+        "parking_spot_monitor/temp",
+        "src/parking_monitor/.cache",
+        "src/parking_monitor/cache",
     ]:
         assert _docker_context_path_is_allowed(excluded, patterns) is False
 
@@ -241,6 +341,9 @@ def test_dockerignore_allows_every_consumed_build_input() -> None:
         "requirements-detector.lock",
         "parking_spot_monitor/__main__.py",
         "src/parking_monitor/__init__.py",
+        "parking_spot_monitor/config/defaults.yaml",
+        "src/parking_monitor/assets/schema.json",
+        "src/parking_monitor/py.typed",
         "main.py",
         "config.yaml.example",
     ]:
@@ -263,8 +366,52 @@ def test_dockerignore_is_exact_default_deny_build_input_allowlist() -> None:
         "!main.py",
         "!config.yaml.example",
         "**/__pycache__/",
+        "**/__pycache__/**",
         "**/*.py[cod]",
         "**/*.tmp",
+        "**/.env",
+        "**/.env.*",
+        "**/*.log",
+        "**/*.png",
+        "**/*.jpg",
+        "**/*.jpeg",
+        "**/*.gif",
+        "**/*.webp",
+        "**/*.bmp",
+        "**/*.tif",
+        "**/*.tiff",
+        "**/*.heic",
+        "**/*.heif",
+        "**/*.avif",
+        "**/*.mp4",
+        "**/*.mov",
+        "**/*.m4v",
+        "**/*.avi",
+        "**/*.mkv",
+        "**/*.webm",
+        "**/*.pt",
+        "**/*.pth",
+        "**/*.onnx",
+        "**/.pytest_cache/",
+        "**/.pytest_cache/**",
+        "**/.ruff_cache/",
+        "**/.ruff_cache/**",
+        "**/.mypy_cache/",
+        "**/.mypy_cache/**",
+        "**/.cache/",
+        "**/.cache/**",
+        "**/cache/",
+        "**/cache/**",
+        "**/tmp/",
+        "**/tmp/**",
+        "**/temp/",
+        "**/temp/**",
+        "**/.venv/",
+        "**/.venv/**",
+        "**/venv/",
+        "**/venv/**",
+        "**/env/",
+        "**/env/**",
     ]
     assert not any(
         forbidden in pattern
