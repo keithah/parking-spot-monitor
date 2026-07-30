@@ -22,7 +22,7 @@ def test_deployment_runbook_is_discoverable_and_actionable() -> None:
         "docker stats --no-stream",
         "$(docker compose ps -q parking-spot-monitor)",
         "docker compose config --quiet",
-        "git pull --ff-only",
+        'git checkout --detach "$REVIEWED_REVISION"',
         "docker compose up -d --no-build --force-recreate parking-spot-monitor",
         "data/health.json",
         "data/state.json",
@@ -149,13 +149,13 @@ def test_custom_model_directory_flows_through_stage_backup_and_rollback() -> Non
     assert 'test -f "$model_dir/yolov8n.pt"' in staging
     assert 'sha256sum "$model_dir/yolov8n.pt"' in staging
     assert 'test -f "$model_dir/yolov8n.pt"' in backup
-    assert 'cp -- "$model_dir/yolov8n.pt" "$BACKUP_DIR/yolov8n.pt"' in backup
-    assert 'sha256sum "$model_dir/yolov8n.pt"' in backup
+    assert 'install -m 0600 -- "$model_dir/yolov8n.pt" "$staging_dir/yolov8n.pt"' in backup
+    assert "sha256sum yolov8n.pt > yolov8n.pt.sha256" in backup
     assert 'mkdir -p "$model_dir"' in rollback
-    assert 'cp -f -- "$ROLLBACK_DIR/yolov8n.pt" "$model_dir/yolov8n.pt"' in rollback
+    assert 'install_atomic "$stage_dir/models/yolov8n.pt" "$model_dir/yolov8n.pt" 0644' in rollback
     assert "models/yolov8n.pt" not in staging
     assert "models/yolov8n.pt" not in backup
-    assert "models/yolov8n.pt" not in rollback
+    assert "./models/yolov8n.pt" not in rollback
 
 
 def test_custom_model_restore_precedes_container_validation_and_recreation() -> None:
@@ -166,13 +166,19 @@ def test_custom_model_restore_precedes_container_validation_and_recreation() -> 
     workflow = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)[0]
 
     resolve = workflow.index('model_dir="${MODEL_DIR:-./models}"')
-    restore = workflow.index(
-        'cp -f -- "$ROLLBACK_DIR/yolov8n.pt" "$model_dir/yolov8n.pt"'
+    stage = workflow.index(
+        'install -m 0644 -- "$ROLLBACK_DIR/yolov8n.pt" "$stage_dir/models/yolov8n.pt"'
     )
     validate = workflow.index("--validate-config")
-    recreate = workflow.index("docker compose up -d --no-build --force-recreate")
+    stop = workflow.index("docker compose stop parking-spot-monitor", validate)
+    restore = workflow.index(
+        'install_atomic "$stage_dir/models/yolov8n.pt" "$model_dir/yolov8n.pt" 0644'
+    )
+    recreate = workflow.index(
+        "docker compose up -d --no-build --force-recreate", restore
+    )
 
-    assert resolve < restore < validate < recreate
+    assert resolve < stage < validate < stop < restore < recreate
 
 
 @pytest.mark.parametrize(
@@ -204,14 +210,26 @@ def test_rollback_restores_and_validates_model_pair_before_recreate() -> None:
     )[0]
     workflow = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)[0]
 
-    restore_config = workflow.index('cp -- "$ROLLBACK_DIR/config.yaml" config.yaml')
-    restore_model = workflow.index(
-        'cp -f -- "$ROLLBACK_DIR/yolov8n.pt" "$model_dir/yolov8n.pt"'
+    stage_config = workflow.index(
+        'install -m 0600 -- "$ROLLBACK_DIR/config.yaml" "$stage_dir/config.yaml"'
     )
     validate = workflow.index("--validate-config")
-    recreate = workflow.index("docker compose up -d --no-build --force-recreate")
+    stop = workflow.index("docker compose stop parking-spot-monitor", validate)
+    restore_config = workflow.index(
+        'install_atomic "$stage_dir/config.yaml" config.yaml 0600'
+    )
+    restore_model = workflow.index(
+        'install_atomic "$stage_dir/models/yolov8n.pt" "$model_dir/yolov8n.pt" 0644'
+    )
+    recreate = workflow.index(
+        "docker compose up -d --no-build --force-recreate",
+        max(restore_config, restore_model),
+    )
 
-    assert max(restore_config, restore_model) < validate < recreate
+    assert stage_config < validate < stop < min(restore_config, restore_model) < recreate
+    assert "recover_failed_rollback" in workflow
+    assert 'docker image tag "$active_image_id" parking-spot-monitor:local' in workflow
+    assert 'require_fresh_frame "$started_at"' in workflow
     syntax = subprocess.run(
         ["bash", "-n"], input=workflow, text=True, capture_output=True, check=False
     )
@@ -237,17 +255,83 @@ def test_backup_workflow_captures_model_checksum_config_data_and_image_identity(
     workflow = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)[0]
 
     for required in [
-        "cp -- config.yaml",
-        'cp -- "$model_dir/yolov8n.pt"',
-        'sha256sum "$model_dir/yolov8n.pt"',
-        "docker image inspect parking-spot-monitor:local",
-        "cp -a -- data",
+        'install -m 0600 -- config.yaml "$staging_dir/config.yaml"',
+        'install -m 0600 -- "$env_file" "$staging_dir/.env"',
+        'install -m 0600 -- "$model_dir/yolov8n.pt" "$staging_dir/yolov8n.pt"',
+        "sha256sum yolov8n.pt > yolov8n.pt.sha256",
+        "docker image inspect \"$ROLLBACK_TAG\"",
+        'tar --format=pax -C data -cpf "$staging_dir/data.tar" .',
+        "sha256sum data.tar > data.tar.sha256",
     ]:
         assert required in workflow
     syntax = subprocess.run(
         ["bash", "-n"], input=workflow, text=True, capture_output=True, check=False
     )
     assert syntax.returncode == 0, syntax.stderr
+
+
+def test_backup_is_private_retry_safe_and_restarts_when_stop_is_interrupted() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+    section = runbook.split("## Backup and recovery", 1)[1].split(
+        "## Safe upgrade", 1
+    )[0]
+    workflow = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)[0]
+
+    assert "umask 077" in workflow
+    assert 'mkdir -m 0700 -- "$staging_dir"' in workflow
+    assert 'chmod 0600 "$staging_dir"/* "$staging_dir/.env"' in workflow
+    assert workflow.index("trap restart_after_backup EXIT") < workflow.index(
+        "docker compose stop parking-spot-monitor"
+    )
+    assert "backup finished but the service did not restart" in workflow
+    assert "docker compose start parking-spot-monitor >/dev/null 2>&1 || true" not in workflow
+    assert workflow.index('mv -- "$staging_dir" "$BACKUP_DIR"') > workflow.index(
+        "sha256sum -c bundle-files.sha256"
+    )
+
+
+def test_upgrade_checks_out_and_tests_exact_reviewed_revision_before_recreate() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+    section = runbook.split("## Safe upgrade", 1)[1].split("## Rollback", 1)[0]
+    workflow = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)[0]
+
+    clean = workflow.index('test -z "$(git status --porcelain)"')
+    fetch = workflow.index("git fetch --prune origin")
+    checkout = workflow.index('git checkout --detach "$REVIEWED_REVISION"')
+    tests = workflow.index("python3 -m pytest -q")
+    build = workflow.index("docker compose build parking-spot-monitor")
+    validate = workflow.index("--validate-config")
+    recreate = workflow.index("docker compose up -d --no-build --force-recreate")
+
+    assert clean < fetch < checkout < tests < build < validate < recreate
+    assert 'docker image inspect "$ROLLBACK_TAG"' in workflow
+    assert "last_frame_at" in workflow
+    assert "no successful frame newer than this container start" in workflow
+
+
+def test_data_restore_verifies_archive_and_preserves_current_tree() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+    section = runbook.split("### Restore the complete data archive", 1)[1].split(
+        "## Troubleshooting deployment failures", 1
+    )[0]
+    workflow = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)[0]
+
+    checksum = workflow.index("sha256sum -c data.tar.sha256")
+    extract = workflow.index('tar --no-same-owner -C "$restore_dir" -xpf')
+    stop = workflow.index("docker compose stop parking-spot-monitor")
+    preserve = workflow.index('mv -- "$data_dir" "$preserved_dir"')
+    activate = workflow.index('mv -- "$restore_dir" "$data_dir"')
+
+    assert checksum < extract < stop < preserve < activate
+    assert "restore_on_failure" in workflow
+    assert 'mv -- "$data_dir" "$failed_dir"' in workflow
+    assert 'mv -- "$preserved_dir" "$data_dir"' in workflow
+    assert 'require_fresh_frame "$started_at"' in workflow
+    assert workflow.index('require_fresh_frame "$started_at"') < workflow.index(
+        "trap - EXIT HUP INT TERM"
+    )
+    assert "preserved service did not restart" in workflow
+    assert "rm -rf" not in workflow
 
 
 def test_deployment_docs_do_not_embed_live_secret_or_traceback_markers() -> None:

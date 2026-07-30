@@ -14,6 +14,18 @@ Matrix delivery has two paths. Open-spot alerts created by the runtime frame loo
 
 The Docker build has five responsibility-focused stages. `python-base` installs `requirements-runtime.lock`; `tooling` exposes that lightweight dependency layer without capture packages; `capture-base` adds FFmpeg, the Intel media driver, and timezone data; and the final `runtime-app` and `runtime-detector` stages copy and precompile the application. `runtime-detector` additionally installs `requirements-detector.lock` and remains the default live-monitor image. Build `runtime-app` when you need an application image without YOLO, and use the default detector image for normal camera monitoring.
 
+## Resource, durability, and shutdown behavior
+
+The tracked Docker Compose service is the complete deployment: one container owns capture, the shared lazy detector, occupancy decisions, Matrix command fetching and delivery, durable local state, health reporting, and artifact retention. Operator configuration, secrets, model weights, and `/data` remain host-owned bind mounts. The container uses `init: true`, receives `SIGTERM`, and has a two-minute stop grace period so waits are interrupted, cleanup runs, and the shutdown lifecycle notice is durably queued before exit.
+
+Resource-sensitive work is deliberately paced and bounded. RTSP reconnects use capped exponential backoff with jitter. Matrix command reads run in one capacity-one background worker with a short request policy, while cursor writes, archive changes, detector calls, and replies remain on the capture thread. Routine per-frame diagnostics are DEBUG; INFO receives a bounded aggregate summary every 900 seconds by default. Matrix outbox retry eligibility and due times survive restart, and each successful delivery phase still publishes one complete schema-version-1 outbox document so text/upload/image restart semantics remain intact.
+
+Operator decision memory has a service-scoped bounded store. Transitions, alerts, command outcomes, feedback/corrections, and lifecycle records request an immediate flush. Routine diagnostics trigger a checkpoint after 300 seconds or when the pending count reaches 50 by default. Those are checkpoint triggers under successful persistence, not a hard crash-loss ceiling: a failed publication remains dirty and a multi-record batch can cross the count boundary. Vehicle-history profile summaries reuse their already-loaded effective records, while the existing streamed revision/TTL health cache remains authoritative; no archive index or second durable cache was added.
+
+Vehicle-history full-frame evidence is one independently owned canonical JPEG created by copy-on-write reflink when available or an exact bounded copy otherwise; the source is never hardlinked. Matrix and operator image paths share the bounded decoder, and Matrix retries reuse a validated persisted upload derivative. Interrupted owned-artifact cleanup is indexed and recovered from application-owned directories. Keep those directories single-writer and do not manually remove hidden disposal manifests.
+
+Ultralytics writes settings beneath `/data/ultralytics`, not the container home directory. Production remains on the configured `.pt` detector. The ONNX/TorchScript harness is offline and benchmark-only; a backend switch requires parity, a material resource improvement, and a separate reviewed deployment. See [Docker deployment and operations](docs/deployment.md) for timing controls, backup, upgrade, observation, and rollback, and [Final audit remediation report](docs/final-audit-remediation-report.md) for the verification and acceptance matrix.
+
 ## Local configuration
 
 Start from the tracked example and keep real secrets out of YAML and committed files:
@@ -782,7 +794,7 @@ The structured JSON-line output should include capture attempt/write events, sel
 
 ## Vehicle-history retention, export, and prune
 
-Vehicle-history sessions, profile metadata, correction events, and archive-owned occupied JPEG artifacts are retained indefinitely under the effective data directory at `vehicle-history/`. Matrix alert snapshot retention remains separate: `storage.snapshot_retention_count` bounds event-delivery snapshots in `snapshots/`, but it does not prune vehicle-history records or archive-owned occupied images.
+Vehicle-history sessions, profile metadata, and archive-owned occupied JPEG artifacts are retained indefinitely under the effective data directory at `vehicle-history/`. The correction ledger is resource-bounded: replay admits at most 10,000 valid events, 200 invalid lines, and 16 MiB, and append attempts compact away invalid input after 12 MiB before rejecting safely at a hard bound. Matrix alert snapshot retention remains separate: `storage.snapshot_retention_count` bounds event-delivery snapshots in `snapshots/`, but it does not prune vehicle-history records or archive-owned occupied images.
 
 Inspect `health.json` or `VehicleHistoryArchive.health_snapshot()` for operator-visible archive signals before opening files. The vehicle-history health fields include `retention_policy: "indefinite"`, `management_capabilities: ["export", "prune"]`, archive file/byte counts, oldest retained session timestamp, missing occupied-image reference count, and sanitized `last_maintenance_metadata` from the latest export/prune manifest.
 
@@ -877,7 +889,7 @@ M001 keeps the container running as root to avoid ambiguous host bind-mount owne
 Use this final local verification contract for Docker/operator changes:
 
 ```sh
-python -m pytest tests/test_config.py tests/test_docker_contract.py -q
+python -m pytest tests/test_config_*.py tests/test_docker_contract.py -q
 python -m pytest -q
 docker build -t parking-spot-monitor:test .
 docker compose config --no-interpolate

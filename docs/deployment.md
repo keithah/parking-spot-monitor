@@ -45,6 +45,8 @@ ls -ld /dev/dri
 
 The tracked service limits the container to 2 CPUs, 4 GiB of memory, and 512 processes. Docker JSON logs rotate at 10 MiB with three retained files.
 
+The container is the complete runtime, not only a detector sidecar. It includes capture, inference, state transitions, Matrix delivery, command polling, health, decision memory, vehicle history, and artifact recovery. The image remains disposable; the bind-mounted configuration, model, and `/data` tree are the recovery authority.
+
 ## Dependency lock maintenance
 
 All three generated manifests contain reviewed, exact hashes. `requirements-build.lock` authenticates the resolver toolchain, `requirements-runtime.lock` contains the application runtime, and `requirements-detector.lock` contains the detector stack. Every lock names PyPI explicitly; the detector lock also names the PyTorch CPU index. Maintainers continue to edit the broad dependency bounds in `requirements.txt`, `requirements-detector.txt`, and the matching dependency tables in `pyproject.toml`; do not hand-edit generated locks.
@@ -305,11 +307,35 @@ Matrix timing and outage controls use these production defaults:
 | `matrix.command_poll_interval_seconds` | `60` | `0` restores polling on every capture-loop iteration. |
 | `matrix.command_failure_cooldown_seconds` | `60` | Must remain positive. Keep `60` for the documented compatibility baseline. |
 | `matrix.command_failure_max_cooldown_seconds` | `900` | Set equal to the initial cooldown (`60`) to disable exponential cooldown growth while retaining failure pacing. |
+| `matrix.command_request_timeout_seconds` | `2` | Increase only for a known slow homeserver; command lag can then increase by the same amount. |
+| `matrix.command_retry_attempts` | `1` | Keep `1` to avoid a command sync monopolizing the worker; alert delivery keeps its separate policy. |
 | `matrix.unauthorized_reply_cooldown_seconds` | `300` | `0` restores a rejection reply for every unauthorized command. |
 | `matrix.retry_jitter_ratio` | `0.2` | `0` disables locally calculated retry jitter; server `Retry-After` remains authoritative. |
 | `matrix.outbox_retry_interval_seconds` | `60` | Must remain positive. Use explicit drain tooling for immediate troubleshooting, or restore the rollback image for the prior delivery implementation. |
+| `matrix.outbox_retry_max_seconds` | `900` | Set equal to the initial interval (`60`) to disable exponential growth while retaining due-time persistence. |
+
+Capture and observability controls use these defaults:
+
+| Key | Default | Operational effect |
+| --- | ---: | --- |
+| `stream.reconnect_seconds` | `5` | Initial capture reconnect delay. |
+| `stream.reconnect_max_seconds` | `60` | Hard post-jitter reconnect ceiling; must cover the initial delay. |
+| `stream.reconnect_jitter_ratio` | `0.2` | Local reconnect jitter; set `0` for deterministic delay. |
+| `runtime.log_summary_interval_seconds` | `900` | Bounded aggregate INFO cadence. Routine frame detail remains DEBUG. |
+| `runtime.decision_memory_checkpoint_interval_seconds` | `300` | Maximum routine-record checkpoint time under normal iteration progress. |
+| `runtime.decision_memory_checkpoint_max_pending_records` | `50` | Count boundary that checkpoints routine records sooner. |
 
 Successful command polls wait for the poll interval. Failed half-open probes double the cooldown up to the maximum, and a successful probe resets it. Capture continues while command polling is in cooldown; the loop does not sleep for the Matrix failure interval.
+
+Command fetching is background-only. The single worker may hold one request and one result; a slow homeserver therefore delays operator commands without moving cursor persistence, archive mutations, replies, or detector work off the capture thread. The first successful result is applied at a later capture-loop boundary, so expected command visibility is the configured poll interval plus the bounded request and capture scheduling delay.
+
+Outbox retries are selected from their persisted UTC due time. Pending work is considered before legacy retries without a due time, followed by scheduled retries in due order. A restart before the due time does not deliver early. The optional retry and upload-derivative fields remain in outbox schema version 1. One complete atomic JSON publication after each durable text, upload, image, retry, or terminal phase is intentionally retained; removing that bounded write amplification would require a separately reviewed storage migration.
+
+Decision-memory durability has two classes. State transitions, alerts, command outcomes, feedback and corrections, and startup/shutdown lifecycle decisions request an immediate flush. Routine diagnostics request a checkpoint at the first configured time or pending-count boundary. At the defaults, 300 seconds and 50 pending records are checkpoint triggers under successful persistence, not a hard crash-loss ceiling: a failed publication remains dirty, and a multi-record append can cross the count boundary before the checkpoint attempt. A normal Compose stop calls close and attempts the pending flush. The persisted decision-memory JSON schema and retention bound are unchanged.
+
+Vehicle-history health remains a streamed archive reconciliation behind the existing revision/TTL cache. In-process mutations invalidate it immediately; external filesystem replacement may remain stale only until the TTL expires. Profile summaries reuse the effective closed records already loaded for that request. Full archive reconciliation and on-demand analytics scans remain bounded and intentionally unchanged because there is no current recent-session hot-path consumer.
+
+Canonical vehicle-history full JPEGs are published without re-encoding: copy-on-write reflink is preferred, with an exact bounded descriptor copy as fallback. Both yield an inode independently owned from the writable capture source; hardlinks are not used. Matrix retry evidence stores the exact validated derivative bytes selected for upload. Startup and the next applicable retention/capture operation recover indexed interrupted cleanup. Preserve `.owned-disposals.json` and `.upload-derivatives`, and keep these application-owned directories free of concurrent noncooperating writers.
 
 To restore the former faster active polling, set `frame_interval_seconds` to 15 and restart. To disable adaptive cadence entirely, set `adaptive_polling_enabled: false`. Keep the stable interval greater than or equal to the active interval.
 
@@ -317,7 +343,7 @@ To restore the former faster active polling, set `frame_interval_seconds` to 15 
 
 The resource-hardening image was built with `--pull`, validated against the production bind mounts, and recreated with the existing operator configuration, data, and authenticated model. Docker reported the service healthy, the explicit in-container healthcheck passed, and the restart count remained zero through the bounded observation. The previous immutable image remained tagged for rollback, and the pre-deployment configuration and model remained in a protected host backup.
 
-The following evidence compares the redaction-safe baseline in `data/resource-hardening-prechange-baseline.md` with the first production observation. Neither side is a controlled benchmark: Docker statistics, thread count, outbox size, and health-snapshot duration are point samples under different live workloads.
+The following evidence compares the tracked, redaction-safe [pre-change baseline](resource-hardening-prechange-baseline.md) with the first production observation. Neither side is a controlled benchmark: Docker statistics, thread count, outbox size, and health-snapshot duration are point samples under different live workloads.
 
 | Measurement | Pre-change baseline | Post-deployment evidence |
 | --- | ---: | ---: |
@@ -334,6 +360,88 @@ The bounded steady log window ran from `2026-07-30T06:11:40Z` through `2026-07-3
 A synthetic scheduler trace, without a Matrix network request, confirmed the documented failure pacing: a first failed poll retried after `60` seconds, a second consecutive failure doubled the wait to `120` seconds, and a success cleared the failure count and resumed the normal `60`-second interval. This demonstrates scheduler behavior only; it is not evidence of homeserver availability or end-to-end delivery.
 
 These measurements establish a healthy, rollback-ready deployment, not a performance win. Network and block I/O are cumulative from container creation and reset on recreation, while memory and CPU can vary substantially with capture and inference timing. Keep the rollback image and backup until a representative observation period confirms acceptable behavior and resource use.
+
+### 2026-07-30 initial final-audit deployment evidence
+
+The final audited image `sha256:9a5e648eb77dff516c53041fd7c9e3c5d0297f2c5bff0e1f5bee3ca1cbfa542e` was recreated against the existing operator configuration, data, and read-only `.pt` model mounts in `10.465s`. Compose reported the service healthy immediately, the explicit in-container healthcheck passed, and the restart count remained zero. An explicit Compose stop completed in `1.189s` with exit code zero, no OOM condition, and no forced-kill evidence. A later quiesced-backup stop completed successfully in `5.260s`; the same image restarted healthy with zero restarts and final `StartedAt=2026-07-30T22:02:08.764320862Z`.
+
+The first live archive attempt detected concurrent `/data` changes and was not accepted as the full backup. The service was then stopped and the complete quiesced data tree, including hidden recovery metadata, was archived at `/home/keith/backups/parking-spot-monitor/task11-20260730-dUwuRu/data.tar`. The archive is `1,166,182,400` bytes with mode `0600` and SHA-256 `6dce07d6d53ba1b5c89e6bf4ded1680c4821b1b02376ec41c0d76c2df58a10ca`; the protected directory remains mode `0700` and all files remain `0600`. The bundle includes the matched `.env`, config, model, full image metadata, `data.tar.sha256`, `yolov8n.pt.sha256`, and bundle manifest, and all checks pass. Its executable `rollback-image-*` fields now select the immediate predecessor of the final deployment: `parking-spot-monitor:rollback-pre-final-fixes-bed302f-20260730` at `sha256:d90baee2d3154c2262d55741ee2ca3d657efa1bcacb956c0c40800dc04f8910f`. The older fallback `parking-spot-monitor:rollback-pre-final-audit-b67f99c-20260730` remains at `sha256:9a5e648eb77dff516c53041fd7c9e3c5d0297f2c5bff0e1f5bee3ca1cbfa542e`. Keep both until a representative observation closes the resource acceptance gate.
+
+| Measurement | Prior deployed warm sample | Final short warm evidence |
+| --- | ---: | ---: |
+| Docker CPU | `0.00%` point sample | `0.00%` in two initial samples and the post-backup sample |
+| Docker memory | `246.3 MiB` | `373.1 MiB`, then `374.4 MiB`; post-backup restart `355.3 MiB` |
+| Docker PIDs / Python threads | `14` / `14` | `16` / `15`, including one `docker-init` process |
+| Docker block I/O | Container-lifetime value not comparable | `0 B / 3.56 MB`, then `0 B / 5.3 MB`; post-backup restart `71.8 MB / 2.63 MB` |
+| INFO records | `346` over the preceding 30 minutes | `63` in an initial 10 minutes containing two startups and one stop; `6` in a later 45-second steady sample |
+| Lifecycle event-name counts | Not collected | Across all final operations: `startup=3`, `shutdown-requested=2`, `outbox-enqueued=5` |
+| Capture duration | Not measured | Six captures averaged `1.176850s`; maximum `1.194097s` |
+| Outbox / decision / health bytes | `1,173,077` / `96,975` / `1,866` | Final post-backup `1,176,396` / `97,261` / `1,863` |
+| Data files / upload derivatives | `4,124` / `0` | `4,126` / `0` |
+
+The final `3,319`-byte outbox growth accompanies five durable lifecycle enqueues across three starts and two stops, including the quiesced backup cycle. No live Matrix outage was induced, so the final window does not measure outage retry latency; the controlled scheduler trace and serial tests remain the evidence for `60s -> 120s -> success/reset` backoff. No ONNX or TorchScript switch occurred; production continues to use `.pt`.
+
+These measurements are not like-for-like. The initial final `373.1–374.4 MiB` points are roughly `11–12 MiB` above the original `362.2 MiB` point, while the post-backup restart point was `355.3 MiB`; all are below the earlier first-hardened `577.5–624.4 MiB` samples and above the immediately prior `246.3 MiB` warm point. None is peak RSS. The block-I/O values cover short restart/backup-adjacent windows, the 45-second INFO sample is too short to extrapolate strongly, capture duration was measured only after the final deployment, and transition/high-resolution/Matrix workloads were not matched. The deployment is healthy and rollback-ready; peak-RSS and production resource-improvement acceptance remain pending a representative equal-window observation.
+
+### 2026-07-30 residual re-audit deployment evidence
+
+After every independent re-audit finding was remediated, runtime source boundary `bed302f2317f467206db2de308012eb25ad0753b` passed `1,681` serial tests in `45.38s`, compileall, dependency-lock validation, Compose rendering, and production-mount config validation. The detector image rebuilt as `sha256:2e6624ada3f196372a863c7899bb688cad5034bf17d5c7a8ef29007b72e75227` and is retained as `parking-spot-monitor:release-final-fixes-bed302f-20260730`. Recreation took `5.61s`. The container became healthy and wrote a successful frame newer than its `StartedAt`; a later graceful stop took `1.05s`, exited zero without OOM or forced-kill evidence, and the same container restarted healthy with `StartedAt=2026-07-30T23:20:22.357413802Z`, restart count zero, and another post-start successful frame.
+
+Five 10-second-spaced final warm samples reported `0.00%` CPU; RSS was `442.8`, `462.4`, `462.4`, `462.4`, and `467.4 MiB`. A point five seconds after the graceful restart was `0.01%` CPU and `355.8 MiB` RSS. Docker reported 16 PIDs; the monitor Python process had 15 threads plus `docker-init` (the sampling command briefly added a shell process). Final artifact metadata was outbox `1,181,748 B`, decision memory `96,283 B`, and health `1,863 B`.
+
+The new samples again vary materially by capture/inference and restart phase. They are neither peak RSS nor a workload-matched comparison, and the block-I/O counters changed across restart. The final state is healthy, rollback-ready, and bounded by stronger persistence/recovery controls; production resource-improvement acceptance remains pending a representative equal-window observation.
+
+### Comparable post-upgrade observation
+
+Use equal healthy and Matrix-outage windows and record only aggregate, redaction-safe evidence. Do not print environment values, config bodies, health/outbox/decision payloads, raw log lines, camera images, or Matrix responses.
+
+```sh
+container_id="$(docker compose ps -q parking-spot-monitor)"
+docker stats --no-stream "$container_id"
+docker compose top parking-spot-monitor
+docker compose logs --since 30m --no-log-prefix parking-spot-monitor \
+  | awk -F'"level":"' 'NF>1 {split($2,a,"\""); count[a[1]]++} END {for (k in count) print k, count[k]}'
+docker compose exec -T parking-spot-monitor sh -c \
+  'wc -c /data/matrix-outbox.json /data/operator-decision-memory.json /data/health.json; find /data -xdev -type f | wc -l'
+```
+
+Sample CPU/RSS/threads repeatedly at the same points in the capture cadence. Compare Docker block-write deltas over equal wall-clock windows, not cumulative totals from differently aged containers. From structured events, retain aggregate counts and durations only: successful/failed captures, Matrix command fetches, outbox retry latency and publication counts, decision-memory publications, JPEG publication strategies and encode attempts, INFO/WARNING/ERROR counts, and shutdown seconds. State workload differences, including transitions, high-resolution escalation, Matrix availability, and outbox depth, before drawing conclusions. The checked audit matrix and measurement template are in `docs/final-audit-remediation-report.md`.
+
+### Graceful-stop verification
+
+Normal upgrades and backups must preserve `init: true`, `stop_signal: SIGTERM`, and `stop_grace_period: 2m`. Verify the stop path after the new image is healthy:
+
+```sh
+start_seconds="$(date +%s)"
+docker compose stop parking-spot-monitor
+end_seconds="$(date +%s)"
+echo "graceful_stop_seconds=$((end_seconds - start_seconds))"
+docker compose up -d --no-build parking-spot-monitor
+container_id="$(docker compose ps -q parking-spot-monitor)"
+started_at="$(docker inspect "$container_id" --format '{{.State.StartedAt}}')"
+docker compose exec -T parking-spot-monitor \
+  python -m parking_spot_monitor.healthcheck \
+  --health-file /data/health.json --max-age-seconds 120
+docker compose exec -T parking-spot-monitor python - "$started_at" <<'PY'
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+started_at = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+health_path = Path("/data/health.json")
+payload = json.loads(health_path.read_text(encoding="utf-8"))
+last_frame = payload.get("last_frame_at")
+if health_path.stat().st_mtime_ns <= int(started_at.timestamp() * 1_000_000_000):
+    raise SystemExit("health artifact predates this container start")
+if not isinstance(last_frame, str):
+    raise SystemExit("new container has not recorded a successful frame")
+if datetime.fromisoformat(last_frame.replace("Z", "+00:00")) <= started_at:
+    raise SystemExit("last successful frame predates this container start")
+PY
+```
+
+The stop must complete without Docker reporting a forced kill. Retry the final freshness check until the configured startup/capture allowance expires; never accept the persistent file solely because it is younger than the generic healthcheck limit. After restart, the durable shutdown lifecycle record may drain once; it must not be duplicated. Inspect only aggregate event counts when preserving verification evidence.
 
 ## Offline detector backend benchmark (no automatic switch)
 
@@ -390,7 +498,7 @@ root.joinpath("manifest.json").write_text(
 PY
 ```
 
-Run the three heavy backends serially. The harness gives `.pt`, ONNX, and TorchScript separate spawned processes, performs three warmup passes and twenty measured passes by default, and writes aggregate evidence to the requested output. It caps the manifest at 1 MiB and 256 frames, each frame at 32 MiB, the complete corpus at 512 MiB, the calculated readiness/warmup/measured workload at 64 GiB, warmup at 20 passes, measured iterations at 100, and each model at 2 GiB. The per-worker deadline defaults to 1,800 seconds and is capped at 3,600 seconds. Each worker atomically writes bounded JSON into its private temporary spool; the parent never waits on a partially written pipe message. A timed-out worker is terminated, killed if necessary, and reaped before the command stops; its spool is removed and the next backend is not started. Do not run multiple copies concurrently, do not add `pytest-xdist`, and run the related tests without `-n`; minimizing peak host CPU and memory is more important than test throughput.
+Run the three heavy backends serially. The harness gives `.pt`, ONNX, and TorchScript separate spawned processes, performs three warmup passes and twenty measured passes by default, and writes aggregate evidence to the requested output. It caps the manifest at 1 MiB and 256 frames, each frame at 32 MiB, the complete corpus at 512 MiB, the combined readiness/warmup/measured workload across all three backends at 64 GiB, warmup at 20 passes, measured iterations at 100, and each model at 2 GiB. The report distinguishes the calculated per-backend workload from the enforced global workload. The per-worker deadline defaults to 1,800 seconds and is capped at 3,600 seconds. Each worker atomically writes bounded JSON into its private temporary spool; the parent never waits on a partially written pipe message. A timed-out worker is terminated, killed if necessary, and reaped before the command stops; its spool is removed and the next backend is not started. Do not run multiple copies concurrently, do not add `pytest-xdist`, and run the related tests without `-n`; minimizing peak host CPU and memory is more important than test throughput.
 
 ```sh
 YOLO_CONFIG_DIR=data/detector-benchmark/ultralytics \
@@ -408,7 +516,7 @@ python -m json.tool data/detector-benchmark/evidence/backends.json
 python -m pytest tests/test_detector_backend_benchmark.py -q
 ```
 
-A completed benchmark exits zero even when no alternative is eligible. Missing models or frames, a malformed manifest, a failed backend worker, a worker timeout, or malformed/non-finite evidence exits two. Preflight reads the manifest and every ordered frame from bounded `O_NOFOLLOW|O_NONBLOCK` descriptors, captures device/inode/size/mtime/ctime and SHA-256 identities, and creates one private read-only manifest snapshot plus ordered frame snapshots from those exact bytes before any worker starts. Every backend receives the same frame snapshot paths. FIFOs, sockets, devices, directories, symlinks, empty files, and oversized files are rejected as inputs without waiting for a writer. The report records equal original/snapshot manifest hashes, equal ordered original/snapshot frame hashes, the corpus digest, frame count, corpus size, and calculated workload. Immediately before and after every worker and immediately before publication, the harness rechecks the full identity and digest of the original manifest, every original frame, the manifest snapshot, every frame snapshot, every original model, and every model snapshot. A worker changing its own snapshot or any sibling snapshot exits two before another backend starts and publishes no report.
+A completed benchmark exits zero even when no alternative is eligible. Missing models or frames, a malformed manifest, a failed backend worker, a worker timeout, or malformed/non-finite evidence exits two. Preflight reads the manifest and every ordered frame from bounded `O_NOFOLLOW|O_NONBLOCK` descriptors, captures device/inode/size/mtime/ctime and SHA-256 identities, and creates one private read-only manifest snapshot plus ordered frame snapshots from those exact bytes before any worker starts. Every backend receives the same frame snapshot paths. FIFOs, sockets, devices, directories, symlinks, empty files, and oversized files are rejected as inputs without waiting for a writer. The report records equal original/snapshot manifest hashes, equal ordered original/snapshot frame hashes, the corpus digest, frame count, corpus size, and calculated workload. Immediately before and after every worker, the harness performs cheap device/inode/size/mtime/ctime checks and hashes only an input whose metadata identity changed. Immediately before publication it comprehensively rehashes every original and snapshot once. A worker changing its own snapshot or any sibling snapshot exits two before another backend starts and publishes no report.
 
 Model preflight accepts only non-symlink regular files with the documented `.pt`, `.onnx`, and `.torchscript` suffixes; all three must have distinct resolved paths, inodes, and content. It streams each original from one bounded `O_NOFOLLOW|O_NONBLOCK` descriptor into a suffix-preserving private read-only snapshot, then captures and verifies the snapshot's device, inode, size, mtime, ctime, and SHA-256 before starting workers. Workers receive only those snapshots. Evidence records the original model's bounded size and SHA-256 plus the equal snapshot SHA-256. Original and snapshot revalidation includes ctime, so same-size mutate-and-restore attempts still invalidate the run; all snapshot directories are removed on every exit path.
 
@@ -418,20 +526,25 @@ Create the output parent directory before starting the benchmark, as shown above
 
 ## Backup and recovery
 
-The minimum recovery set is:
+The canonical recovery bundle is one protected directory containing:
 
 - `config.yaml`, stored with restricted permissions.
 - The approved detector weight file and its trusted-source checksum record.
-- `.env`, stored in an approved secret backup rather than ordinary source archives.
+- `.env`, copied only into this restricted recovery bundle or supplied from an associated approved secret backup.
 - `data/state.json` and `data/matrix-outbox.json` for runtime continuity and durable pending delivery.
+- `data/operator-decision-memory.json`, including any uncheckpointed routine tail flushed by a normal stop.
 - `data/vehicle-history/`, snapshots, timeline frames, feedback labels, and decision memory according to retention and recovery needs.
+- Hidden `.owned-disposals.json` manifests and `.upload-derivatives` inside owned data directories; copy the complete `/data` tree rather than selecting around them.
 
-Set `BACKUP_DIR` to a new protected destination, then run this block from the repository root. It stops the service for a consistent copy and restarts it on success, failure, or interruption:
+Set `BACKUP_DIR` to a new, timestamp-qualified destination and `ROLLBACK_TAG` to a new timestamp/revision-qualified local image tag. This block refuses to overwrite either, sets the restart trap before stopping, stages into a unique private partial directory so an interruption does not block a retry, archives the complete stopped `/data` tree as `data.tar`, and restarts on success, failure, or interruption. Run it from the repository root:
 
 ```sh
 (
   set -eu
+  umask 077
   : "${BACKUP_DIR:?set BACKUP_DIR to a new protected backup directory}"
+  : "${ROLLBACK_TAG:?set ROLLBACK_TAG to a new timestamp/revision-qualified image tag}"
+  env_file="${ENV_FILE:-.env}"
   if [ -z "${MODEL_DIR+x}" ]; then
     compose_environment="$(docker compose config --environment)"
     MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
@@ -442,81 +555,89 @@ Set `BACKUP_DIR` to a new protected destination, then run this block from the re
     echo "backup destination already exists" >&2
     exit 1
   fi
-  mkdir -p "$BACKUP_DIR"
-  docker compose stop parking-spot-monitor
-  trap 'docker compose start parking-spot-monitor' EXIT
+  if docker image inspect "$ROLLBACK_TAG" >/dev/null 2>&1; then
+    echo "refusing to overwrite rollback tag" >&2
+    exit 1
+  fi
+  test -f config.yaml
+  test -f "$env_file"
+  test -f "$model_dir/yolov8n.pt"
+  staging_dir="${BACKUP_DIR}.partial.$(date -u +%Y%m%dT%H%M%SZ).$$"
+  mkdir -m 0700 -- "$staging_dir"
+  restart_after_backup() {
+    backup_status="$?"
+    trap - EXIT
+    if ! docker compose start parking-spot-monitor; then
+      echo "backup finished but the service did not restart" >&2
+      exit 1
+    fi
+    exit "$backup_status"
+  }
+  trap restart_after_backup EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
-  cp -- config.yaml "$BACKUP_DIR/config.yaml"
-  test -f "$model_dir/yolov8n.pt"
-  model_checksum="$(sha256sum "$model_dir/yolov8n.pt" | awk '{print $1}')"
-  cp -- "$model_dir/yolov8n.pt" "$BACKUP_DIR/yolov8n.pt"
+  docker image tag parking-spot-monitor:local "$ROLLBACK_TAG"
+  rollback_image_id="$(docker image inspect "$ROLLBACK_TAG" --format '{{.Id}}')"
+  docker compose stop parking-spot-monitor
+
+  install -m 0600 -- config.yaml "$staging_dir/config.yaml"
+  install -m 0600 -- "$env_file" "$staging_dir/.env"
+  install -m 0600 -- "$model_dir/yolov8n.pt" "$staging_dir/yolov8n.pt"
+  tar --format=pax -C data -cpf "$staging_dir/data.tar" .
+  chmod 0600 "$staging_dir/data.tar"
   (
-    cd "$BACKUP_DIR"
-    printf '%s  %s\n' "$model_checksum" yolov8n.pt > yolov8n.pt.sha256
+    cd "$staging_dir"
+    printf 'source-revision=%s\nrollback-image-tag=%s\nrollback-image-id=%s\nenvironment-copy=.env\n' \
+      "$(git rev-parse HEAD)" "$ROLLBACK_TAG" "$rollback_image_id" > image-id.txt
+    chmod 0600 image-id.txt
+    sha256sum yolov8n.pt > yolov8n.pt.sha256
+    sha256sum data.tar > data.tar.sha256
+    sha256sum config.yaml .env image-id.txt > bundle-files.sha256
     sha256sum -c yolov8n.pt.sha256
+    sha256sum -c data.tar.sha256
+    sha256sum -c bundle-files.sha256
+    tar -tf data.tar >/dev/null
   )
-  docker image inspect parking-spot-monitor:local \
-    --format '{{.Id}}' > "$BACKUP_DIR/image-id.txt"
-  cp -a -- data "$BACKUP_DIR/data"
+  chmod 0600 "$staging_dir"/* "$staging_dir/.env"
+  mv -- "$staging_dir" "$BACKUP_DIR"
 )
 ```
 
-Store the matching `.env` separately through the approved secret-management process and associate it with this backup. Keep the image tag or an image export in the operator's protected image registry; `image-id.txt` records which local image the filesystem backup expects. Before relying on a copied backup, inspect its contents and test its checksum with `(cd "$BACKUP_DIR" && sha256sum -c yolov8n.pt.sha256)`.
+The final directory and every bundled file are mode `0700` and `0600`, respectively. A failed run leaves only a timestamp/PID-qualified `.partial.*` directory for diagnosis; the requested final destination remains available for a clean retry. Store this directory on approved protected media and retain the collision-refusing image tag or an image export. Before relying on the bundle, verify all three manifests with `(cd "$BACKUP_DIR" && sha256sum -c yolov8n.pt.sha256 && sha256sum -c data.tar.sha256 && sha256sum -c bundle-files.sha256 && tar -tf data.tar >/dev/null)` without printing `.env` or artifact contents.
 
 The runtime quarantines several malformed persisted JSON files rather than silently treating corrupt data as valid. Inspect logs and the corresponding `data/` artifacts before deleting any quarantine file.
 
 ## Safe upgrade
 
-Run repository tests before publishing a change. Before changing the deployment checkout, complete the backup workflow above with a new protected `BACKUP_DIR`; retain that directory as `ROLLBACK_DIR` until the upgrade has passed its observation window. On the deployment host, tag the rollback image and then fast-forward the checkout:
+Review and record the exact commit before publishing a change. Before changing the deployment checkout, complete the backup workflow above with a new protected `BACKUP_DIR` and immutable `ROLLBACK_TAG`; retain both until the upgrade has passed its observation window. Set `REVIEWED_REVISION` to the full reviewed commit SHA. The deployment host must have a completely clean tracked and untracked worktree; ignored operator files remain untouched. Fetch and detach at that exact commit, then run every gate against the code that will be built and deployed:
 
 ```sh
 (
 set -eu
+: "${REVIEWED_REVISION:?set REVIEWED_REVISION to the full reviewed commit SHA}"
+: "${ROLLBACK_TAG:?set ROLLBACK_TAG to the immutable tag created with the backup}"
+test -z "$(git status --porcelain)" || {
+  echo "refusing upgrade from a dirty worktree" >&2
+  exit 1
+}
+git fetch --prune origin
+git cat-file -e "${REVIEWED_REVISION}^{commit}"
+git checkout --detach "$REVIEWED_REVISION"
+test "$(git rev-parse HEAD)" = "$(git rev-parse "$REVIEWED_REVISION^{commit}")"
+docker image inspect "$ROLLBACK_TAG" >/dev/null
 if [ -z "${MODEL_DIR+x}" ]; then
   compose_environment="$(docker compose config --environment)"
   MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
 fi
 model_dir="${MODEL_DIR:-./models}"
 export MODEL_DIR="$model_dir"
-docker image tag parking-spot-monitor:local parking-spot-monitor:rollback
-git status --short
-git pull --ff-only
-docker compose config --quiet
+python3 -m compileall -q parking_spot_monitor src scripts tests
+python3 -m pytest -q
+python3 -I scripts/lock_dependencies.py --check
+docker compose config --no-interpolate >/tmp/parking-spot-monitor-compose.yaml
 docker compose build parking-spot-monitor
-docker compose up -d --no-build --force-recreate parking-spot-monitor
-docker compose ps
-docker compose logs --tail 100 parking-spot-monitor
-)
-```
-
-Do not upgrade over uncommitted tracked changes. `config.yaml`, `.env`, `models/`, and `data/` are ignored operator files and remain on the host across a normal pull and container recreation. Authenticate replacement weights before recreating the service, and retain the previous approved weight file with the rollback image when an upgrade changes models.
-
-After the new service becomes healthy, repeat the health, artifact, cadence, and resource checks above. Keep the rollback tag until the deployment has completed a representative observation window.
-
-## Rollback
-
-To return to the image, configuration, and model saved immediately before an upgrade, set `ROLLBACK_DIR` to that protected backup. Restore the matching `.env` through the approved secret-backup process before validation. Then run this complete workflow from the repository root:
-
-```sh
-(
-set -eu
-: "${ROLLBACK_DIR:?set ROLLBACK_DIR to the protected rollback backup}"
-if [ -z "${MODEL_DIR+x}" ]; then
-  compose_environment="$(docker compose config --environment)"
-  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
-fi
-model_dir="${MODEL_DIR:-./models}"
-export MODEL_DIR="$model_dir"
-docker compose stop parking-spot-monitor
-docker image tag parking-spot-monitor:rollback parking-spot-monitor:local
-cp -- "$ROLLBACK_DIR/config.yaml" config.yaml
-mkdir -p "$model_dir"
-(cd "$ROLLBACK_DIR" && sha256sum -c yolov8n.pt.sha256)
-cp -f -- "$ROLLBACK_DIR/yolov8n.pt" "$model_dir/yolov8n.pt"
-chmod 0644 "$model_dir/yolov8n.pt"
 docker compose run --rm parking-spot-monitor \
   python -m parking_spot_monitor \
   --config /config/config.yaml \
@@ -524,11 +645,281 @@ docker compose run --rm parking-spot-monitor \
   --validate-config
 docker compose up -d --no-build --force-recreate parking-spot-monitor
 docker compose ps
-docker compose logs --tail 100 parking-spot-monitor
+container_id="$(docker compose ps -q parking-spot-monitor)"
+started_at="$(docker inspect "$container_id" --format '{{.State.StartedAt}}')"
+docker compose exec -T parking-spot-monitor \
+  python -m parking_spot_monitor.healthcheck \
+  --health-file /data/health.json --max-age-seconds 120
+docker compose exec -T parking-spot-monitor python - "$started_at" <<'PY'
+import json
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+started_at = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+health_path = Path("/data/health.json")
+deadline = time.monotonic() + 180
+while time.monotonic() < deadline:
+    try:
+        payload = json.loads(health_path.read_text(encoding="utf-8"))
+        last_frame = payload.get("last_frame_at")
+        artifact_is_new = (
+            health_path.stat().st_mtime_ns
+            > int(started_at.timestamp() * 1_000_000_000)
+        )
+        frame_is_new = isinstance(last_frame, str) and (
+            datetime.fromisoformat(last_frame.replace("Z", "+00:00")) > started_at
+        )
+        if artifact_is_new and frame_is_new:
+            break
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+    time.sleep(2)
+else:
+    raise SystemExit("no successful frame newer than this container start")
+PY
 )
 ```
 
-The checksum check authenticates the backed-up model before it is restored. Within this explicit rollback workflow, `cp -f` intentionally replaces the active weight with the compatible backed-up file; it never copies the model directory itself. The one-shot command then validates that the rollback image can read the restored configuration and model through the same exported bind mount before Compose recreates the service. The persistent `data/` bind mount remains in place.
+Do not add `-n` or install `pytest-xdist`; the release gate deliberately minimizes peak host CPU and RSS. The commands stay inside the exact-revision upgrade block so the tested checkout and deployed checkout cannot diverge. If you run them earlier for convenience, run them again after checking out `REVIEWED_REVISION`.
+
+```sh
+REVIEWED_REVISION="$(git rev-parse HEAD)"
+printf 'review candidate: %s\n' "$REVIEWED_REVISION"
+```
+
+Do not upgrade over uncommitted tracked changes. `config.yaml`, `.env`, `models/`, and `data/` are ignored operator files and remain on the host across a normal pull and container recreation. Authenticate replacement weights before recreating the service, and retain the previous approved weight file with the rollback image when an upgrade changes models.
+
+After the new service becomes healthy, repeat the health, artifact, cadence, and resource checks above. Keep the rollback tag until the deployment has completed a representative observation window.
+
+Record the immutable rollback tag or digest, protected backup location, new image ID, container creation time, observation start/end, health result, restart count, and aggregate resource results in the remediation report. Never record resolved secrets or artifact payloads.
+
+## Rollback
+
+To return to the image, configuration, environment, and model saved immediately before an upgrade, set `ROLLBACK_DIR` to that protected bundle. Verify the bundle and resolve its immutable image reference before stopping the service. Then run this workflow from the repository root:
+
+```sh
+(
+set -eu
+umask 077
+: "${ROLLBACK_DIR:?set ROLLBACK_DIR to the protected rollback backup}"
+test -f "$ROLLBACK_DIR/.env"
+(cd "$ROLLBACK_DIR" && \
+  sha256sum -c yolov8n.pt.sha256 && \
+  sha256sum -c data.tar.sha256 && \
+  sha256sum -c bundle-files.sha256 && \
+  tar -tf data.tar >/dev/null)
+rollback_tag="$(sed -n 's/^rollback-image-tag=//p' "$ROLLBACK_DIR/image-id.txt")"
+rollback_image_id="$(sed -n 's/^rollback-image-id=//p' "$ROLLBACK_DIR/image-id.txt")"
+test -n "$rollback_tag"
+test -n "$rollback_image_id"
+test "$(docker image inspect "$rollback_tag" --format '{{.Id}}')" = "$rollback_image_id"
+if [ -z "${MODEL_DIR+x}" ]; then
+  compose_environment="$(docker compose config --environment)"
+  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
+fi
+model_dir="${MODEL_DIR:-./models}"
+export MODEL_DIR="$model_dir"
+mkdir -p "$model_dir"
+stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/parking-rollback.XXXXXXXX")"
+mkdir -m 0700 -- "$stage_dir/models"
+install -m 0600 -- "$ROLLBACK_DIR/config.yaml" "$stage_dir/config.yaml"
+install -m 0600 -- "$ROLLBACK_DIR/.env" "$stage_dir/.env"
+install -m 0644 -- "$ROLLBACK_DIR/yolov8n.pt" "$stage_dir/models/yolov8n.pt"
+install -m 0600 -- config.yaml "$stage_dir/active-config.yaml"
+install -m 0600 -- .env "$stage_dir/active.env"
+install -m 0644 -- "$model_dir/yolov8n.pt" "$stage_dir/active-yolov8n.pt"
+container_id="$(docker compose ps -q parking-spot-monitor)"
+active_image_id="$(docker inspect "$container_id" --format '{{.Image}}')"
+data_path="$(realpath data)"
+
+# Validate the staged rollback set before stopping or changing active files.
+docker run --rm --env-file "$stage_dir/.env" \
+  --mount "type=bind,src=$stage_dir/config.yaml,dst=/config/config.yaml,readonly" \
+  --mount "type=bind,src=$stage_dir/models,dst=/models,readonly" \
+  --mount "type=bind,src=$data_path,dst=/data" \
+  "$rollback_image_id" \
+  python -m parking_spot_monitor \
+  --config /config/config.yaml \
+  --data-dir /data \
+  --validate-config
+
+install_atomic() {
+  source_path="$1"
+  target_path="$2"
+  target_mode="$3"
+  temporary_path="${target_path}.rollback-new.$$"
+  install -m "$target_mode" -- "$source_path" "$temporary_path"
+  mv -f -- "$temporary_path" "$target_path"
+}
+require_fresh_frame() {
+  started_at="$1"
+  docker compose exec -T parking-spot-monitor python - "$started_at" <<'PY'
+import json
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+started = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+path = Path("/data/health.json")
+deadline = time.monotonic() + 180
+while time.monotonic() < deadline:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        frame = payload.get("last_frame_at")
+        if path.stat().st_mtime_ns > int(started.timestamp() * 1_000_000_000) and isinstance(frame, str) and datetime.fromisoformat(frame.replace("Z", "+00:00")) > started:
+            break
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+    time.sleep(2)
+else:
+    raise SystemExit("no successful frame newer than rollback container start")
+PY
+}
+rollback_finished=0
+service_stopped=0
+recover_failed_rollback() {
+  rollback_status="$?"
+  trap - EXIT
+  if [ "$rollback_finished" -eq 0 ] && [ "$service_stopped" -eq 1 ]; then
+    docker compose stop parking-spot-monitor >/dev/null 2>&1 || true
+    install_atomic "$stage_dir/active-config.yaml" config.yaml 0600
+    install_atomic "$stage_dir/active.env" .env 0600
+    install_atomic "$stage_dir/active-yolov8n.pt" "$model_dir/yolov8n.pt" 0644
+    docker image tag "$active_image_id" parking-spot-monitor:local
+    if ! docker compose up -d --no-build --force-recreate parking-spot-monitor; then
+      echo "rollback failed and the prior deployment could not be recovered" >&2
+      exit 1
+    fi
+  fi
+  rm -rf -- "$stage_dir"
+  exit "$rollback_status"
+}
+trap recover_failed_rollback EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+service_stopped=1
+docker compose stop parking-spot-monitor
+install_atomic "$stage_dir/config.yaml" config.yaml 0600
+install_atomic "$stage_dir/.env" .env 0600
+install_atomic "$stage_dir/models/yolov8n.pt" "$model_dir/yolov8n.pt" 0644
+docker image tag "$rollback_image_id" parking-spot-monitor:local
+docker compose up -d --no-build --force-recreate parking-spot-monitor
+container_id="$(docker compose ps -q parking-spot-monitor)"
+started_at="$(docker inspect "$container_id" --format '{{.State.StartedAt}}')"
+docker compose exec -T parking-spot-monitor \
+  python -m parking_spot_monitor.healthcheck \
+  --health-file /data/health.json --max-age-seconds 120
+require_fresh_frame "$started_at"
+rollback_finished=1
+trap - EXIT HUP INT TERM
+rm -rf -- "$stage_dir"
+docker compose ps
+)
+```
+
+The checksum checks authenticate the model, data archive, configuration/environment metadata, and exact full image ID before the service is stopped. The complete rollback set is staged and validated against the current data directory first. Active bind artifacts are preserved, replacements use same-directory atomic renames, and the EXIT/signal trap restores the prior image/config/environment/model and recreates the prior service on any post-stop failure. Acceptance requires a health artifact and successful frame newer than the rollback container's `StartedAt`; a merely young persistent `health.json` is insufficient. The persistent `data/` bind mount remains in place unless the deliberate recovery procedure below is also required.
+
+### Restore the complete data archive
+
+Restore `data.tar` only for deliberate recovery, not for an ordinary image/config rollback. This procedure verifies and extracts into a private sibling directory before downtime, stops the service, preserves the current data directory instead of deleting it, atomically swaps the restored directory into place, and restarts. Set `DATA_DIR` if the Compose bind source is not `./data`:
+
+```sh
+(
+set -eu
+umask 077
+: "${ROLLBACK_DIR:?set ROLLBACK_DIR to the protected rollback backup}"
+data_dir="${DATA_DIR:-data}"
+test -d "$data_dir"
+test ! -L "$data_dir"
+(cd "$ROLLBACK_DIR" && sha256sum -c data.tar.sha256 && tar -tf data.tar >/dev/null)
+python3 - "$ROLLBACK_DIR/data.tar" <<'PY'
+import sys
+import tarfile
+from pathlib import PurePosixPath
+
+with tarfile.open(sys.argv[1], "r:") as archive:
+    for member in archive:
+        path = PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts:
+            raise SystemExit("data archive contains an unsafe path")
+        if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
+            raise SystemExit("data archive contains a link or special file")
+PY
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+restore_dir="${data_dir}.restore.${stamp}.$$"
+preserved_dir="${data_dir}.pre-restore.${stamp}"
+test ! -e "$restore_dir"
+test ! -e "$preserved_dir"
+mkdir -m 0700 -- "$restore_dir"
+tar --no-same-owner -C "$restore_dir" -xpf "$ROLLBACK_DIR/data.tar"
+
+require_fresh_frame() {
+  started_at="$1"
+  docker compose exec -T parking-spot-monitor python - "$started_at" <<'PY'
+import json
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+started = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+path = Path("/data/health.json")
+deadline = time.monotonic() + 180
+while time.monotonic() < deadline:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        frame = payload.get("last_frame_at")
+        if path.stat().st_mtime_ns > int(started.timestamp() * 1_000_000_000) and isinstance(frame, str) and datetime.fromisoformat(frame.replace("Z", "+00:00")) > started:
+            break
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+    time.sleep(2)
+else:
+    raise SystemExit("no successful frame newer than restored container start")
+PY
+}
+restore_on_failure() {
+  restore_status="$?"
+  trap - EXIT
+  if [ -d "$preserved_dir" ]; then
+    docker compose stop parking-spot-monitor >/dev/null 2>&1 || true
+    if [ -e "$data_dir" ]; then
+      failed_dir="${data_dir}.failed-restore.${stamp}.$$"
+      mv -- "$data_dir" "$failed_dir"
+    fi
+    mv -- "$preserved_dir" "$data_dir"
+  fi
+  if ! docker compose start parking-spot-monitor; then
+    echo "data restore failed and the preserved service did not restart" >&2
+    exit 1
+  fi
+  exit "$restore_status"
+}
+trap restore_on_failure EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+docker compose stop parking-spot-monitor
+mv -- "$data_dir" "$preserved_dir"
+mv -- "$restore_dir" "$data_dir"
+docker compose start parking-spot-monitor
+container_id="$(docker compose ps -q parking-spot-monitor)"
+started_at="$(docker inspect "$container_id" --format '{{.State.StartedAt}}')"
+docker compose exec -T parking-spot-monitor \
+  python -m parking_spot_monitor.healthcheck \
+  --health-file /data/health.json --max-age-seconds 120
+require_fresh_frame "$started_at"
+trap - EXIT HUP INT TERM
+printf 'preserved pre-restore data at %s\n' "$preserved_dir"
+)
+```
+
+Keep the preserved pre-restore directory until health freshness, a successful post-start frame, Matrix outbox continuity, and application-owned recovery metadata have been checked. Never merge two live data trees or extract an archive over an active data directory.
 
 For a configuration-only rollback, restore the previous local `config.yaml` and `.env`, validate them with the one-shot Compose command, then restart the service. Never copy secrets into Git history or terminal output captured for tickets.
 

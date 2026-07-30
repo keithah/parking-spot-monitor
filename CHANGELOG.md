@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-07-30
+
+### Changed
+
+- Split structural hot spots behind compatibility facades, removed confirmed dead pass-throughs, and replaced per-frame detector capability inspection with one shared, retry-safe lazy detector adapter.
+- Bounded owner-registry reads and diagnostics, preserved the last known-good registry across invalid replacement files, and made runtime and Matrix snapshot providers explicit.
+- Made cadence and reconnect waits interruptible, queued lifecycle notices durably, added cooperative Matrix cancellation, isolated cleanup failures, and configured Compose for `SIGTERM` with a two-minute grace period.
+- Moved Matrix command fetches to one capacity-one background worker, added capped/jittered reconnect and retry controls, and replaced routine per-frame INFO records with bounded 15-minute aggregate summaries.
+- Persisted per-record Matrix outbox retry due times within schema version 1 and cached compact summaries. Complete atomic outbox publication after each durable delivery phase remains intentionally unchanged to preserve restart semantics.
+- Added a service-scoped decision-memory store: transition, alert, command, correction, feedback, and lifecycle decisions request an immediate flush; routine records trigger a checkpoint after 300 seconds or at 50 pending records by default. Failed publications remain dirty and retry.
+- Reused already-loaded vehicle-history records for profile summaries and retained the existing streamed revision/TTL health cache without adding an archive index or secondary durable format.
+- Reused one canonical full JPEG through reflink or bounded copy, shared bounded JPEG decoding, persisted exact Matrix upload derivatives for retry/restart reuse, and added indexed recovery for interrupted owned-artifact cleanup.
+- Routed Ultralytics settings to `/data/ultralytics` and added a serial, isolated `.pt`/ONNX/TorchScript benchmark harness. Production remains on `.pt`; the harness cannot switch the live backend.
+- Added a final remediation report and expanded Docker backup, upgrade, observation, graceful-stop, rollback, and aggregate-log guidance.
+- Bound correction replay to 10,000 valid events, 200 invalid lines, and 16 MiB with compaction beginning at 12 MiB and safe rejection at the hard bounds; made legacy owned-file recovery advance across bounded scans; reduced benchmark rehashing and canonical JPEG validation reads; hardened file-signature caches and decision-memory reconciliation; and added indexed outbox lookups.
+- Split eight oversized test monoliths into 46 focused modules plus shared support, preserved 797-case collection parity, and enforced a 999-line ceiling for these suites.
+- Deployed the final remediated detector image `sha256:2e6624ada3f196372a863c7899bb688cad5034bf17d5c7a8ef29007b72e75227` with the existing operator bind mounts. Compose recreation took `5.61s`; fresh post-start frame evidence passed, the service stopped gracefully in `1.05s`, and it restarted healthy with zero restarts and no OOM. Five short samples ranged `442.8–467.4 MiB`, while a post-restart point was `355.8 MiB`; unequal windows and workloads make these health observations, not a peak-memory or resource-improvement claim.
+
+### Compatibility
+
+- Existing YAML, CLI, Matrix command text, occupancy thresholds, service topology, and durable schema versions are retained. New timing fields have validated defaults, and new outbox fields are optional schema-version-1 metadata.
+- Verification is intentionally serial; `pytest-xdist` is not used because minimizing peak host CPU and memory takes priority over test throughput.
+
 ## 2026-07-28
 
 ### Changed

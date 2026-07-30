@@ -414,12 +414,14 @@ parking-spot-monitor/
       outbox.py
       matrix_outbox_delivery.py
   tests/
-    test_config.py
+    test_config_*.py
     test_docker_contract.py
     test_detection.py
-    test_matrix.py
-    test_matrix_outbox_delivery.py
-    test_startup.py
+    test_matrix_*.py
+    test_operator_feedback_*.py
+    test_outbox_persistence_*.py
+    test_startup_*.py
+    test_vehicle_history_*.py
   README.md
   docs/outbox.md
 ```
