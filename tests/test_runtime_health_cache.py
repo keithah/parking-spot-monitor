@@ -37,6 +37,19 @@ def _cache(archive: FakeArchive, clock: FakeClock, ttl_seconds: int = 300) -> Ve
     return VehicleHistoryHealthSnapshotCache(archive, now=clock, ttl_seconds=ttl_seconds)
 
 
+class FileBackedArchive:
+    def __init__(self, source_path: Path) -> None:
+        self.source_path = source_path
+        self.snapshot_calls = 0
+
+    def health_snapshot(self) -> Mapping[str, Any]:
+        self.snapshot_calls += 1
+        return {"source_value": self.source_path.read_text(encoding="utf-8")}
+
+    def mutation_revision(self) -> int:
+        return 0
+
+
 def test_snapshot_is_memoized_within_ttl_and_revision() -> None:
     archive = FakeArchive()
     clock = FakeClock(datetime(2026, 6, 10, tzinfo=timezone.utc))
@@ -71,6 +84,26 @@ def test_snapshot_recomputes_after_ttl_even_without_writes() -> None:
     clock.advance(301)
     cache.snapshot()
 
+    assert archive.snapshot_calls == 2
+
+
+def test_external_source_change_stays_cached_only_until_exact_ttl_boundary(tmp_path: Path) -> None:
+    source_path = tmp_path / "external-health-source.txt"
+    source_path.write_text("before", encoding="utf-8")
+    archive = FileBackedArchive(source_path)
+    clock = FakeClock(datetime(2026, 6, 10, tzinfo=timezone.utc))
+    cache = VehicleHistoryHealthSnapshotCache(archive, now=clock, ttl_seconds=300)
+
+    first = cache.snapshot()
+    source_path.write_text("after", encoding="utf-8")
+    clock.advance(299)
+    still_cached = cache.snapshot()
+    clock.advance(1)
+    refreshed = cache.snapshot()
+
+    assert first == {"source_value": "before"}
+    assert still_cached == first
+    assert refreshed == {"source_value": "after"}
     assert archive.snapshot_calls == 2
 
 

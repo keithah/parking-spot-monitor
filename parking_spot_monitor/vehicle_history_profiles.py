@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,9 @@ from parking_spot_monitor.vehicle_history_models import (
     SCHEMA_VERSION,
     ArchiveSchemaError,
     ArchiveWriteError,
+    CorrectionReplayState,
     ProfileAssignment,
+    SessionRecord,
     StoredVehicleProfile,
     _bounded_string,
     _safe_error_message,
@@ -240,10 +243,27 @@ class VehicleHistoryProfileMixin:
         """Estimate repeat-vehicle history from closed sessions for a profile id."""
 
         state = self.correction_replay_state()
-        canonical_profile_id = self.resolve_profile_id(profile_id, merges=state.merges)
-        return estimate_vehicle_history(
-            canonical_profile_id,
+        return self._estimate_for_profile_records(
+            profile_id,
             self._effective_sessions(self.list_closed_sessions(), state=state),
+            state=state,
+            min_samples=min_samples,
+            min_profile_confidence=min_profile_confidence,
+        )
+
+    def _estimate_for_profile_records(
+        self,
+        profile_id: str | None,
+        records: Sequence[SessionRecord],
+        *,
+        state: CorrectionReplayState,
+        min_samples: int,
+        min_profile_confidence: float,
+    ) -> VehicleHistoryEstimate:
+        canonical = self.resolve_profile_id(profile_id, merges=state.merges)
+        return estimate_vehicle_history(
+            canonical,
+            records,
             min_samples=min_samples,
             min_profile_confidence=min_profile_confidence,
         )

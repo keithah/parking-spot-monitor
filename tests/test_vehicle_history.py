@@ -1388,6 +1388,37 @@ def test_profile_corrections_rename_merge_summary_and_wrong_match_are_derived_on
     assert "descriptor" not in rendered_summary
 
 
+def test_profile_summary_scans_closed_sessions_once_and_preserves_estimate_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    first = archive.start_session(occupied_event(spot_id="profile-a", observed_at="2026-05-18T08:00:00Z"))
+    archive.close_session(open_event(spot_id="profile-a", observed_at="2026-05-18T09:00:00Z"))
+    set_session_profile(tmp_path, archive_state="closed", session_id=first.session_id, profile_id="prof_a", profile_confidence=0.96)
+    second = archive.start_session(occupied_event(spot_id="profile-b", observed_at="2026-05-19T08:10:00Z"))
+    archive.close_session(open_event(spot_id="profile-b", observed_at="2026-05-19T09:15:00Z"))
+    set_session_profile(tmp_path, archive_state="closed", session_id=second.session_id, profile_id="prof_a", profile_confidence=0.92)
+    expected = archive.estimate_for_profile("prof_a")
+    original_list_closed_sessions = archive.list_closed_sessions
+    closed_session_scans = 0
+
+    def counted_list_closed_sessions() -> list[Any]:
+        nonlocal closed_session_scans
+        closed_session_scans += 1
+        return original_list_closed_sessions()
+
+    monkeypatch.setattr(archive, "list_closed_sessions", counted_list_closed_sessions)
+
+    summary = archive.profile_summary("prof_a")
+
+    assert closed_session_scans == 1
+    assert summary["estimate_status"] == expected.status == "estimated"
+    assert summary["estimate_reason"] == expected.reason is None
+    assert summary["estimate_sample_count"] == expected.sample_count == 2
+    assert summary["estimate_confidence"] == expected.confidence
+
+
 def test_correction_validation_rejects_unknown_ids_oversized_labels_and_merge_cycles_without_appending(tmp_path: Path) -> None:
     archive = VehicleHistoryArchive(tmp_path)
     source = archive.start_session(occupied_event(spot_id="known-source", observed_at="2026-05-18T08:00:00Z"))

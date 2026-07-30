@@ -33,13 +33,20 @@ from parking_spot_monitor.vehicle_history_models import (
 )
 from parking_spot_monitor.vehicle_history_profile_utils import _session_with_profile
 
+_CorrectionValidationRecords = tuple[CorrectionReplayState, Sequence[SessionRecord], Sequence[SessionRecord]]
+
 
 class VehicleHistoryCorrectionMixin:
     def append_correction(self, event: ProfileCorrectionEvent) -> ProfileCorrectionEvent:
+        return self._append_correction(event)
+
+    def _append_correction(
+        self, event: ProfileCorrectionEvent, *, validation_records: _CorrectionValidationRecords | None = None
+    ) -> ProfileCorrectionEvent:
         """Persist a validated correction event without rewriting archive records."""
 
         event = ProfileCorrectionEvent.from_json_dict(event.to_json_dict())
-        self._validate_correction_against_archive(event)
+        self._validate_correction_against_archive(event, records=validation_records)
         line = json.dumps(event.to_json_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
         if len(line.encode("utf-8")) > MAX_CORRECTION_LINE_BYTES:
             raise ArchiveSchemaError("correction event exceeds maximum size")
@@ -231,8 +238,14 @@ class VehicleHistoryCorrectionMixin:
         closed_session_count, closed_excluded = _profile_session_counts(closed, profile_id=canonical, wrong_matches=state.wrong_match_session_ids)
         active_session_count, active_excluded = _profile_session_counts(active, profile_id=canonical, wrong_matches=state.wrong_match_session_ids)
         excluded_count = closed_excluded + active_excluded
-        estimate = self.estimate_for_profile(canonical)
-        self.append_correction(
+        estimate = self._estimate_for_profile_records(
+            canonical,
+            self._effective_sessions(closed, state=state),
+            state=state,
+            min_samples=2,
+            min_profile_confidence=0.76,
+        )
+        self._append_correction(
             ProfileCorrectionEvent(
                 schema_version=SCHEMA_VERSION,
                 correction_id=_correction_id(CORRECTION_ACTION_PROFILE_SUMMARY_REQUESTED),
@@ -242,7 +255,8 @@ class VehicleHistoryCorrectionMixin:
                 matrix_sender=_optional_bounded_string(matrix_sender, "matrix_sender", max_length=160),
                 matrix_room_id=_optional_bounded_string(matrix_room_id, "matrix_room_id", max_length=160),
                 profile_id=canonical,
-            )
+            ),
+            validation_records=(state, active, closed),
         )
         return {
             "profile_id": canonical,
@@ -314,9 +328,15 @@ class VehicleHistoryCorrectionMixin:
                 effective.append(_session_with_profile(record, profile_id=canonical, confidence=record.profile_confidence or 0.0))
         return effective
 
-    def _validate_correction_against_archive(self, event: ProfileCorrectionEvent) -> None:
-        state = self.correction_replay_state()
-        active_records, closed_records, active_profiles = self.load_active_sessions(), self.list_closed_sessions(), self.load_active_profiles()
+    def _validate_correction_against_archive(
+        self, event: ProfileCorrectionEvent, *, records: _CorrectionValidationRecords | None = None
+    ) -> None:
+        if records is None:
+            state = self.correction_replay_state()
+            active_records, closed_records = self.load_active_sessions(), self.list_closed_sessions()
+        else:
+            state, active_records, closed_records = records
+        active_profiles = self.load_active_profiles()
         session_by_id = {record.session_id: record for record in chain(active_records, closed_records)}
         profile_ids = self._known_profile_ids(state=state, active_records=active_records, closed_records=closed_records, active_profiles=active_profiles)
         if event.action == CORRECTION_ACTION_RENAME_PROFILE:
