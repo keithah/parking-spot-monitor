@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import inspect
 import tempfile
 from contextlib import closing
 from pathlib import Path
 from typing import Any
-from weakref import ReferenceType, ref
 
 from parking_spot_monitor.capture import FrameGeometry
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.detection import (
     DetectionError,
     DetectionFilterResult,
-    InMemoryDetector,
     crop_region_for_polygon,
     filter_spot_detections,
     translate_crop_detection,
@@ -20,6 +17,11 @@ from parking_spot_monitor.detection import (
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import append_decision_memory_records
 from parking_spot_monitor.runtime_decision_memory import build_detection_memory_records
+from parking_spot_monitor.runtime_detector_capabilities import (
+    _DETECT_CAPABILITY_CACHE,
+    compatible_detect_image as _compatible_detect_image,
+    detect_accepts_inference_image_size as _detect_accepts_inference_image_size,
+)
 from parking_spot_monitor.runtime_detection_support import (
     _candidate_summary,
     accepted_by_spot as _accepted_by_spot,
@@ -32,9 +34,6 @@ from parking_spot_monitor.runtime_detection_support import (
     scaled_min_bbox_area as _scaled_min_bbox_area,
     stringify_rejection_counts as _stringify_rejection_counts,
 )
-
-
-_DETECT_CAPABILITY_CACHE: dict[int, tuple[ReferenceType[Any], bool]] = {}
 
 
 def _process_detection_for_capture(
@@ -149,7 +148,8 @@ def _detect_spot_crop_vehicles_for_frame(
     spot_polygons = _configured_spot_polygons(settings, scale=scale)
     translated: list[Any] = []
     try:
-        if isinstance(detector, InMemoryDetector):
+        detect_image = _compatible_detect_image(detector)
+        if detect_image is not None:
             for spot_id, polygon in spot_polygons.items():
                 region = crop_region_for_polygon(
                     polygon,
@@ -158,7 +158,7 @@ def _detect_spot_crop_vehicles_for_frame(
                     spot_id=spot_id,
                 )
                 with closing(image.crop((region.left, region.top, region.right, region.bottom))) as crop:
-                    detections = detector.detect_image(
+                    detections = detect_image(
                         crop,
                         confidence_threshold=_detector_confidence_threshold(settings),
                         inference_image_size=settings.detection.inference_image_size,
@@ -202,40 +202,4 @@ def _detector_confidence_threshold(settings: RuntimeSettings) -> float:
     return min(
         settings.detection.confidence_threshold,
         settings.detection.open_suppression_min_confidence,
-    )
-
-
-def _detect_accepts_inference_image_size(detector: Any) -> bool:
-    detector_id = id(detector)
-    cached = _DETECT_CAPABILITY_CACHE.get(detector_id)
-    if cached is not None and cached[0]() is detector:
-        return cached[1]
-
-    accepts_inference_image_size = _inspect_detect_accepts_inference_image_size(detector)
-    try:
-        detector_reference = ref(
-            detector,
-            lambda expired, detector_id=detector_id: _expire_detector_capability(detector_id, expired),
-        )
-    except TypeError:
-        return accepts_inference_image_size
-    _DETECT_CAPABILITY_CACHE[detector_id] = (detector_reference, accepts_inference_image_size)
-    return accepts_inference_image_size
-
-
-def _expire_detector_capability(detector_id: int, expired: ReferenceType[Any]) -> None:
-    cached = _DETECT_CAPABILITY_CACHE.get(detector_id)
-    if cached is not None and cached[0] is expired:
-        del _DETECT_CAPABILITY_CACHE[detector_id]
-
-
-def _inspect_detect_accepts_inference_image_size(detector: Any) -> bool:
-    detect = getattr(detector, "detect", None)
-    try:
-        signature = inspect.signature(detect)
-    except (TypeError, ValueError):
-        return False
-    return any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD or name == "inference_image_size"
-        for name, parameter in signature.parameters.items()
     )

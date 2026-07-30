@@ -673,10 +673,104 @@ def test_process_detection_uses_no_temporary_files_for_in_memory_crop_detector(
             crop.getpixel((0, 0))
 
 
+def test_incompatible_detect_image_uses_temporary_jpeg_fallback(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("spot_crop_inference: false", "spot_crop_inference: true"),
+        encoding="utf-8",
+    )
+    frame = tmp_path / "latest.jpg"
+    Image.new("RGB", (1458, 806), (20, 30, 40)).save(frame, format="JPEG")
+
+    class IncidentalDetectImageDetector:
+        def __init__(self) -> None:
+            self.path_calls: list[tuple[Path, tuple[int, int]]] = []
+            self.image_calls = 0
+
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            path = Path(frame_path)
+            with Image.open(path) as image:
+                size = image.size
+            self.path_calls.append((path, size))
+            if size == (531, 296):
+                return [VehicleDetection(class_name="car", confidence=0.88, bbox=(98, 93, 483, 233))]
+            return []
+
+        def detect_image(self, image: Image.Image) -> list[VehicleDetection]:
+            self.image_calls += 1
+            return []
+
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    detector = IncidentalDetectImageDetector()
+    result = runtime_detection._process_detection_for_capture(
+        load_settings(config_path, environ=fake_environ()),
+        detector,
+        frame,
+        logger=StructuredLogger(),
+        mode="test",
+        frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
+    )
+
+    assert detector.image_calls == 0
+    assert [size for _path, size in detector.path_calls] == [(1458, 806), (526, 276), (531, 296)]
+    assert all(not path.exists() for path, _size in detector.path_calls[1:])
+    assert result.by_spot["right_spot"].accepted is not None
+
+
+def test_compatible_detect_image_internal_type_error_propagates(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("spot_crop_inference: false", "spot_crop_inference: true"),
+        encoding="utf-8",
+    )
+    frame = tmp_path / "latest.jpg"
+    Image.new("RGB", (1458, 806), (20, 30, 40)).save(frame, format="JPEG")
+    sentinel = TypeError("detector inference failed internally")
+
+    class FailingInMemoryDetector:
+        def detect(self, frame_path: str | Path, **kwargs: object) -> list[VehicleDetection]:
+            return []
+
+        def detect_image(
+            self,
+            image: Image.Image,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            raise sentinel
+
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    with pytest.raises(TypeError) as exc_info:
+        runtime_detection._process_detection_for_capture(
+            load_settings(config_path, environ=fake_environ()),
+            FailingInMemoryDetector(),
+            frame,
+            logger=StructuredLogger(),
+            mode="test",
+            frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
+        )
+
+    assert exc_info.value is sentinel
+
+
 def test_detector_signature_capability_is_cached_without_retaining_detector(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import parking_spot_monitor.runtime_detection as runtime_detection
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
 
     class Detector:
         def detect(
@@ -688,7 +782,7 @@ def test_detector_signature_capability_is_cached_without_retaining_detector(
         ) -> list[VehicleDetection]:
             return []
 
-    real_signature = runtime_detection.inspect.signature
+    real_signature = detector_capabilities.inspect.signature
     signature_calls = 0
 
     def counting_signature(callable_object: object) -> object:
@@ -696,17 +790,21 @@ def test_detector_signature_capability_is_cached_without_retaining_detector(
         signature_calls += 1
         return real_signature(callable_object)
 
-    monkeypatch.setattr(runtime_detection.inspect, "signature", counting_signature)
+    monkeypatch.setattr(detector_capabilities.inspect, "signature", counting_signature)
+    gc.collect()
+    cache_size_before = len(runtime_detection._DETECT_CAPABILITY_CACHE)
     detector = Detector()
     detector_reference = weakref.ref(detector)
 
     assert runtime_detection._detect_accepts_inference_image_size(detector) is True
     assert runtime_detection._detect_accepts_inference_image_size(detector) is True
     assert signature_calls == 1
+    assert len(runtime_detection._DETECT_CAPABILITY_CACHE) == cache_size_before + 1
 
     del detector
     gc.collect()
     assert detector_reference() is None
+    assert len(runtime_detection._DETECT_CAPABILITY_CACHE) == cache_size_before
 
 
 def test_spot_crop_image_size_failure_closes_open_source(
@@ -756,6 +854,7 @@ def test_non_weakrefable_detector_recomputes_signature_without_being_retained(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import parking_spot_monitor.runtime_detection as runtime_detection
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
 
     class NonWeakrefableDetector:
         __slots__ = ()
@@ -769,7 +868,7 @@ def test_non_weakrefable_detector_recomputes_signature_without_being_retained(
         ) -> list[VehicleDetection]:
             return []
 
-    real_signature = runtime_detection.inspect.signature
+    real_signature = detector_capabilities.inspect.signature
     signature_calls = 0
 
     def counting_signature(callable_object: object) -> object:
@@ -777,12 +876,147 @@ def test_non_weakrefable_detector_recomputes_signature_without_being_retained(
         signature_calls += 1
         return real_signature(callable_object)
 
-    monkeypatch.setattr(runtime_detection.inspect, "signature", counting_signature)
+    monkeypatch.setattr(detector_capabilities.inspect, "signature", counting_signature)
     detector = NonWeakrefableDetector()
 
     assert runtime_detection._detect_accepts_inference_image_size(detector) is True
     assert runtime_detection._detect_accepts_inference_image_size(detector) is True
     assert signature_calls == 2
+
+
+def test_weakrefable_unhashable_detector_caches_signature_by_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import parking_spot_monitor.runtime_detection as runtime_detection
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class UnhashableDetector:
+        __hash__ = None
+
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    real_signature = detector_capabilities.inspect.signature
+    signature_calls = 0
+
+    def counting_signature(callable_object: object) -> object:
+        nonlocal signature_calls
+        signature_calls += 1
+        return real_signature(callable_object)
+
+    monkeypatch.setattr(detector_capabilities.inspect, "signature", counting_signature)
+    detector = UnhashableDetector()
+
+    assert runtime_detection._detect_accepts_inference_image_size(detector) is True
+    assert runtime_detection._detect_accepts_inference_image_size(detector) is True
+    assert signature_calls == 1
+
+
+def test_detector_signature_cache_invalidates_when_class_method_changes() -> None:
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    class MutableDetector:
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    detector = MutableDetector()
+    assert runtime_detection._detect_accepts_inference_image_size(detector) is True
+
+    def detect_without_image_size(
+        self: MutableDetector,
+        frame_path: str | Path,
+        *,
+        confidence_threshold: float | None = None,
+    ) -> list[VehicleDetection]:
+        return []
+
+    MutableDetector.detect = detect_without_image_size  # type: ignore[assignment]
+
+    assert runtime_detection._detect_accepts_inference_image_size(detector) is False
+
+
+def test_in_memory_capability_cache_invalidates_when_class_method_changes() -> None:
+    import parking_spot_monitor.runtime_detector_capabilities as detector_capabilities
+
+    class MutableDetector:
+        def detect_image(self, image: Image.Image) -> list[VehicleDetection]:
+            return []
+
+    detector = MutableDetector()
+    assert detector_capabilities.compatible_detect_image(detector) is None
+
+    def compatible_detect_image(
+        self: MutableDetector,
+        image: Image.Image,
+        *,
+        confidence_threshold: float | None = None,
+        inference_image_size: int | None = None,
+    ) -> list[VehicleDetection]:
+        return []
+
+    MutableDetector.detect_image = compatible_detect_image  # type: ignore[assignment]
+
+    assert detector_capabilities.compatible_detect_image(detector) is not None
+
+
+def test_detector_signature_fingerprint_does_not_retain_replaced_method_closure() -> None:
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    class MutableDetector:
+        def detect(self, frame_path: str | Path, **kwargs: object) -> list[VehicleDetection]:
+            return []
+
+    detector = MutableDetector()
+    detector_reference = weakref.ref(detector)
+
+    def build_capturing_detect(captured: MutableDetector) -> object:
+        def capturing_detect(
+            self: MutableDetector,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            assert captured is not None
+            return []
+
+        return capturing_detect
+
+    capturing_detect = build_capturing_detect(detector)
+    MutableDetector.detect = capturing_detect  # type: ignore[assignment]
+    gc.collect()
+    cache_size_before = len(runtime_detection._DETECT_CAPABILITY_CACHE)
+
+    assert runtime_detection._detect_accepts_inference_image_size(detector) is True
+    assert len(runtime_detection._DETECT_CAPABILITY_CACHE) == cache_size_before + 1
+
+    def replacement_detect(
+        self: MutableDetector,
+        frame_path: str | Path,
+        *,
+        confidence_threshold: float | None = None,
+    ) -> list[VehicleDetection]:
+        return []
+
+    MutableDetector.detect = replacement_detect  # type: ignore[assignment]
+    del capturing_detect
+    del detector
+    gc.collect()
+
+    assert detector_reference() is None
+    assert len(runtime_detection._DETECT_CAPABILITY_CACHE) == cache_size_before
 
 
 def test_detector_signature_cache_uses_identity_not_custom_equality() -> None:
