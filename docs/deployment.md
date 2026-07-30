@@ -130,7 +130,7 @@ docker compose config --quiet
 docker compose build parking-spot-monitor
 ```
 
-The resulting local image is `parking-spot-monitor:local`. The Dockerfile also has a smaller `runtime-base` target for config and non-detector tooling, but it is not the live camera-monitor image.
+The resulting local image is `parking-spot-monitor:local`. The Dockerfile also has a smaller `runtime-app` target with the application and capture stack but without the YOLO detector packages; it is not the complete live camera-monitor image. The dependency-only `tooling` target omits both application source and capture packages and is intended for build-layer validation.
 
 The default model name may cause Ultralytics to download weights on the first live run. Allow outbound model-download access for that initial start, or pre-stage a model and enable the documented read-only model mount. Container recreation discards an unmounted container-local model cache.
 

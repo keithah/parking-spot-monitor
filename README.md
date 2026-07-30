@@ -12,7 +12,7 @@ The service is intentionally split into focused runtime modules. The package ent
 
 Matrix delivery has two paths. Open-spot alerts created by the runtime frame loop are persisted to the local Matrix outbox before Matrix network I/O and are drained at startup and at the beginning of later capture-loop iterations. Occupied-spot alerts, quiet-window notices, owner-vehicle quiet-window alerts, lifecycle notices, and live-proof messages remain direct Matrix delivery paths. The outbox contract is documented in [`docs/outbox.md`](docs/outbox.md).
 
-The Docker build has two targets. `runtime-base` installs the shared runtime dependencies used by config validation, operator helpers, and non-detector tooling. `runtime-detector` extends that image with `requirements-detector.txt`, including pinned Ultralytics detector dependencies, and is the default final image for the live monitor. Use the base target when you need a smaller image that will not run YOLO inference; use the default detector image for normal camera monitoring.
+The Docker build has five responsibility-focused stages. `python-base` installs `requirements-runtime.lock`; `tooling` exposes that lightweight dependency layer without capture packages; `capture-base` adds FFmpeg, the Intel media driver, and timezone data; and the final `runtime-app` and `runtime-detector` stages copy and precompile the application. `runtime-detector` additionally installs `requirements-detector.lock` and remains the default live-monitor image. Build `runtime-app` when you need an application image without YOLO, and use the default detector image for normal camera monitoring.
 
 ## Local configuration
 
@@ -181,7 +181,7 @@ The Compose service is named `parking-spot-monitor`. It builds the local Dockerf
 
 ```sh
 docker build -t parking-spot-monitor:test .
-docker build --target runtime-base -t parking-spot-monitor:base .
+docker build --target runtime-app -t parking-spot-monitor:app .
 docker compose config --no-interpolate
 ```
 
@@ -812,7 +812,7 @@ Use `--older-than ISO_TIMESTAMP` when you need an explicit cutoff instead of a r
 
 ## Local YOLO detection and Model storage policy
 
-The detector dependency set pins Ultralytics and CPU-only PyTorch wheels so the local detector can load YOLO nano from the configured `detection.model` value, for example `yolov8n.pt`, without surprise detector-image dependency drift or GPU wheel downloads. Docker uses `requirements-detector.txt`; local editable installs should use the PyTorch CPU wheel index too, for example `pip install --extra-index-url https://download.pytorch.org/whl/cpu '.[detector]'`. The Dockerfile has a digest-pinned `runtime-base` target with only the shared runtime dependencies and a `runtime-detector` target that adds the detector requirements; the default final image is `runtime-detector` for the live monitor, while tooling that only needs config parsing or operator helpers can build `--target runtime-base`. `detection.model` accepts local model names and local POSIX paths only: use package/Ultralytics names such as `yolov8n.pt`, repo-relative operator paths such as `models/custom-detector.pt`, or mounted Docker paths such as `/models/yolov8n.pt`. Config validation rejects URL-like values (`https://...`, `s3://...`) and path traversal (`../...` or `/models/../...`) before runtime so model configuration failures are clear and do not leak secrets.
+The detector dependency set pins Ultralytics and CPU-only PyTorch wheels so the local detector can load YOLO nano from the configured `detection.model` value, for example `yolov8n.pt`, without surprise detector-image dependency drift or GPU wheel downloads. Docker uses `requirements-runtime.lock` for shared application packages and `requirements-detector.lock` for the detector layer; local editable installs should use the PyTorch CPU wheel index too, for example `pip install --extra-index-url https://download.pytorch.org/whl/cpu '.[detector]'`. The digest-pinned `python-base` and lightweight `tooling` stages omit capture packages, `capture-base` adds the live-capture system dependencies, `runtime-app` packages the application without YOLO, and the default `runtime-detector` final stage adds the detector lock for live monitoring. `detection.model` accepts local model names and local POSIX paths only: use package/Ultralytics names such as `yolov8n.pt`, repo-relative operator paths such as `models/custom-detector.pt`, or mounted Docker paths such as `/models/yolov8n.pt`. Config validation rejects URL-like values (`https://...`, `s3://...`) and path traversal (`../...` or `/models/../...`) before runtime so model configuration failures are clear and do not leak secrets.
 
 First-run Ultralytics downloads are allowed for local names such as `yolov8n.pt`, but they can block startup and require network access. For predictable Docker startup, pre-stage the model file on the host and set `detection.model: /models/yolov8n.pt`, then uncomment the optional read-only Compose mount:
 
@@ -829,7 +829,7 @@ Build and inspect the Docker runtime contract. If your shell has real live secre
 
 ```sh
 docker build -t parking-spot-monitor:test .
-docker build --target runtime-base -t parking-spot-monitor:base .
+docker build --target runtime-app -t parking-spot-monitor:app .
 docker compose config --no-interpolate
 ```
 

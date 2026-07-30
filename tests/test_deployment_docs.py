@@ -34,6 +34,20 @@ def test_deployment_runbook_is_discoverable_and_actionable() -> None:
         assert required in runbook
 
 
+def test_operator_docs_name_current_locked_docker_stages() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+
+    for stage in ("python-base", "tooling", "capture-base", "runtime-app", "runtime-detector"):
+        assert f"`{stage}`" in readme
+    assert "Docker uses `requirements-runtime.lock`" in readme
+    assert "`requirements-detector.lock`" in readme
+    assert "smaller `runtime-app` target" in runbook
+    assert "`runtime-base` target" not in readme
+    assert "--target runtime-base" not in readme
+    assert "`runtime-base` target" not in runbook
+
+
 def test_environment_template_names_only_supported_compose_variables() -> None:
     template = Path(".env.example").read_text(encoding="utf-8")
     assignments = {

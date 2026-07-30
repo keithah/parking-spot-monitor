@@ -55,10 +55,11 @@ def test_dockerfile_installs_runtime_and_defaults_to_package_entrypoint() -> Non
     assert "vainfo" not in dockerfile
     assert "LIBVA_DRIVER_NAME=iHD" in dockerfile
     assert "FROM python:3.12-slim@sha256:" in dockerfile or "FROM python:3.11-slim@sha256:" in dockerfile
-    assert " AS runtime-base" in dockerfile
-    assert "FROM runtime-base AS runtime-detector" in dockerfile
-    assert "COPY requirements.txt ./" in dockerfile
-    assert "pip install --no-cache-dir -r requirements.txt" in dockerfile
+    assert " AS python-base" in dockerfile
+    assert "FROM capture-base AS runtime-app" in dockerfile
+    assert "FROM capture-base AS runtime-detector" in dockerfile
+    assert "COPY requirements-runtime.lock ./" in dockerfile
+    assert "pip install --require-hashes -r requirements-runtime.lock" in dockerfile
     assert "ultralytics>=8" not in requirements
     assert "ultralytics==" in detector_requirements
     assert "--extra-index-url https://download.pytorch.org/whl/cpu" in detector_requirements
@@ -71,12 +72,53 @@ def test_dockerfile_installs_runtime_and_defaults_to_package_entrypoint() -> Non
     ]
     assert detector_extra == ["torch==2.7.1+cpu", "torchvision==0.22.1+cpu", "ultralytics==8.4.60"]
     assert "ultralytics==8.4.60" in detector_requirement_packages
-    base_stage, detector_stage = dockerfile.split("FROM runtime-base AS runtime-detector", 1)
-    assert "requirements-detector.txt" not in base_stage
-    assert "COPY requirements-detector.txt ./" in detector_stage
-    assert "pip install --no-cache-dir -r requirements-detector.txt" in detector_stage
+    base_stage, detector_stage = dockerfile.split("FROM capture-base AS runtime-detector", 1)
+    assert "requirements-detector.lock" not in base_stage
+    assert "COPY requirements-detector.lock ./" in detector_stage
+    assert "pip install --require-hashes -r requirements-detector.lock" in detector_stage
     assert "COPY parking_spot_monitor ./parking_spot_monitor" in dockerfile
     assert 'CMD ["python", "-m", "parking_spot_monitor", "--config", "/config/config.yaml"]' in dockerfile
+
+
+def test_dockerfile_uses_buildkit_cache_hash_locks_and_compileall() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+
+    assert dockerfile.startswith("# syntax=docker/dockerfile:1.7\n")
+    assert "--mount=type=cache,target=/root/.cache/pip" in dockerfile
+    assert "pip install --require-hashes -r requirements-runtime.lock" in dockerfile
+    assert "pip install --require-hashes -r requirements-detector.lock" in dockerfile
+    assert "python -m compileall -q /app/parking_spot_monitor /app/src" in dockerfile
+
+
+def test_dockerfile_has_lightweight_tooling_and_capture_stage_boundary() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+
+    assert " AS python-base" in dockerfile
+    assert "FROM python-base AS tooling" in dockerfile
+    assert "FROM python-base AS capture-base" in dockerfile
+    assert "FROM capture-base AS runtime-app" in dockerfile
+    assert "FROM capture-base AS runtime-detector" in dockerfile
+    tooling = dockerfile.split("FROM python-base AS tooling", 1)[1].split(
+        "FROM python-base AS capture-base", 1
+    )[0]
+    assert "ffmpeg" not in tooling
+    assert "intel-media-va-driver" not in tooling
+
+
+def test_each_final_docker_stage_copies_source_once_and_compiles_it() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    app_stage = dockerfile.split("FROM capture-base AS runtime-app", 1)[1].split(
+        "FROM capture-base AS runtime-detector", 1
+    )[0]
+    detector_stage = dockerfile.split("FROM capture-base AS runtime-detector", 1)[1]
+
+    for stage in (app_stage, detector_stage):
+        assert stage.count("COPY parking_spot_monitor ./parking_spot_monitor") == 1
+        assert stage.count("COPY src ./src") == 1
+        assert stage.count("COPY main.py config.yaml.example ./") == 1
+        assert stage.count(
+            "python -m compileall -q /app/parking_spot_monitor /app/src"
+        ) == 1
 
 
 def test_dockerignore_excludes_runtime_artifacts_and_python_caches() -> None:
@@ -92,6 +134,35 @@ def test_dockerignore_excludes_runtime_artifacts_and_python_caches() -> None:
         "*.log",
     ]:
         assert required in dockerignore
+
+
+def test_dockerignore_excludes_review_build_and_local_model_artifacts() -> None:
+    dockerignore = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
+
+    for required in [
+        "tests/",
+        "docs/superpowers/",
+        ".worktrees/",
+        ".superpowers/",
+        "coverage/",
+        ".cache/",
+        "models/",
+        "*.pt",
+        "config.yaml",
+        ".env",
+        ".env.*",
+        "!.env.example",
+    ]:
+        assert required in dockerignore
+    for required_input in [
+        "parking_spot_monitor/",
+        "src/",
+        "requirements-runtime.lock",
+        "requirements-detector.lock",
+        "main.py",
+        "config.yaml.example",
+    ]:
+        assert required_input not in dockerignore
 
 
 def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
@@ -199,7 +270,9 @@ def test_readme_documents_local_yolo_detection_and_deferred_live_tuning() -> Non
 
     assert "## Local YOLO detection" in readme
     assert "pins Ultralytics" in readme
-    assert "runtime-base" in readme
+    assert "python-base" in readme
+    assert "capture-base" in readme
+    assert "runtime-app" in readme
     assert "runtime-detector" in readme
     assert "YOLO nano" in readme
     assert "detection-frame-processed" in readme
