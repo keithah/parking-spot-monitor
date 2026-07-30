@@ -30,6 +30,9 @@ def test_deployment_runbook_is_discoverable_and_actionable() -> None:
         "/dev/dri",
         "frame_interval_seconds",
         "stable_frame_interval_seconds",
+        "mkdir -p models",
+        "sha256sum models/yolov8n.pt",
+        "trusted artifact source",
     ]:
         assert required in runbook
 
@@ -61,10 +64,32 @@ def test_environment_template_names_only_supported_compose_variables() -> None:
         "RTSP_URL_4K",
         "RTSP_URL_360P",
         "MATRIX_ACCESS_TOKEN",
+        "MODEL_DIR",
     }
     assert "rtsp://" not in template
     assert "Bearer " not in template
     assert "syt_" not in template
+
+
+def test_compose_mounts_read_only_model_directory() -> None:
+    compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+    config = Path("config.yaml.example").read_text(encoding="utf-8")
+    template = Path(".env.example").read_text(encoding="utf-8")
+
+    assert "${MODEL_DIR:-./models}:/models:ro" in compose
+    assert "model: /models/yolov8n.pt" in config
+    assert "MODEL_DIR=./models" in template
+
+
+def test_deployment_documents_model_preflight_before_start() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+
+    checksum = runbook.index("sha256sum models/yolov8n.pt")
+    validation = runbook.index("--validate-config", checksum)
+    deployment = runbook.index("docker compose up -d", validation)
+
+    assert checksum < validation < deployment
+    assert "compare" in runbook[checksum:validation].lower()
 
 
 def test_deployment_docs_do_not_embed_live_secret_or_traceback_markers() -> None:

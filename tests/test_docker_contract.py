@@ -613,7 +613,7 @@ def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
     assert service["devices"] == ["/dev/dri:/dev/dri"]
     assert service["restart"] == "unless-stopped"
     assert "/dev/dri:/dev/dri" in compose_text
-    assert "#   - ./models:/models:ro" in compose_text
+    assert "${MODEL_DIR:-./models}:/models:ro" in service["volumes"]
 
 
 def test_readme_documents_final_operator_verification_contract() -> None:

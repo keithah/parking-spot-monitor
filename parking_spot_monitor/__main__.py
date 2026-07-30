@@ -120,6 +120,7 @@ def _main(
         settings = load_settings(config_path, environ=os.environ if environ is None else environ)
         paths = resolve_runtime_paths(settings, data_dir)
         settings = _with_effective_runtime_paths(settings, paths)
+        validate_model_path(settings.detection.model)
     except ConfigError as exc:
         _log_config_error(logger, exc, config_path=config_path)
         return 2
@@ -257,6 +258,19 @@ def _close_if_available(resource: Any | None) -> None:
 
 def _default_detector_factory(settings: RuntimeSettings) -> UltralyticsVehicleDetector:
     return UltralyticsVehicleDetector(settings.detection.model)
+
+
+def validate_model_path(model: str) -> None:
+    """Fail early for explicit model paths while preserving bare Ultralytics names."""
+    path = Path(model)
+    is_explicit = path.is_absolute() or path.name != model
+    if is_explicit and not path.is_file():
+        raise ConfigError(
+            "configured model file does not exist",
+            path=model,
+            phase="model",
+            fields=("detection.model",),
+        )
 
 
 class _LazyIncidentReplayDetector:

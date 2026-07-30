@@ -31,7 +31,7 @@ spots:
       - [960, 250]
 
 detection:
-  model: yolov8n.pt
+  model: /models/yolov8n.pt
   confidence_threshold: 0.35
   inference_image_size: 1280
   spot_crop_inference: false

@@ -177,8 +177,6 @@ class DetectionConfig(StrictModel):
         if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value):
             raise ValueError("detection.model must be a local model name or mounted file path, not a URL")
         path = PurePosixPath(value)
-        if path.is_absolute():
-            raise ValueError("detection.model must use a relative local model path, not an absolute path")
         if ".." in path.parts:
             raise ValueError("detection.model must not contain path traversal")
         return value

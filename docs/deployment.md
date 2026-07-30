@@ -9,6 +9,7 @@ The default Docker build produces the complete live-monitor image. It contains P
 The image is disposable. Operator-owned state is deliberately outside it:
 
 - `config.yaml` is mounted read-only at `/config/config.yaml`.
+- The host model directory is mounted read-only at `/models`; the tracked default is `./models`.
 - `data/` is mounted read-write at `/data` and contains health, state, images, snapshots, the Matrix outbox, vehicle history, and decision memory.
 - Camera and Matrix credentials come from the host environment or the ignored `.env` file.
 
@@ -22,6 +23,7 @@ Provide:
 
 - A Linux host with Docker Engine and the Docker Compose plugin.
 - Enough storage for the Docker image and the operator-selected retention period.
+- A detector weight file obtained from an approved, trusted artifact source, plus that source's published SHA-256 checksum.
 - Network access to the RTSP camera streams and Matrix homeserver.
 - Intel `/dev/dri` access for VAAPI/QSV hardware decoding, or a local Compose adjustment that removes the device mapping and uses software fallback.
 
@@ -114,7 +116,7 @@ From the repository root:
 ```sh
 cp config.yaml.example config.yaml
 cp .env.example .env
-mkdir -p data
+mkdir -p data models
 chmod 700 data
 chmod 600 config.yaml .env
 ```
@@ -123,7 +125,18 @@ Edit `config.yaml` for the real Matrix endpoint, room, authorized senders, spot 
 
 Compose reads `.env` automatically for variable interpolation even though the service has no `env_file` entry. Values already exported in the invoking shell take precedence according to normal Compose rules.
 
-### 2. Build the complete detector image
+### 2. Stage and authenticate the detector weights
+
+Obtain `yolov8n.pt` through the operator-approved artifact channel and place it in the host model directory. Do not rely on an unreviewed first-run download for production. Check the local digest:
+
+```sh
+mkdir -p models
+sha256sum models/yolov8n.pt
+```
+
+Compare the printed checksum with the SHA-256 checksum published by the trusted artifact source before continuing. This runbook intentionally does not embed a checksum because the artifact owner is the authority for the exact approved file. Keep `detection.model: /models/yolov8n.pt` in `config.yaml`. If the trusted directory is elsewhere, set `MODEL_DIR` in `.env`; Compose mounts that directory read-only at `/models`.
+
+### 3. Build the complete detector image
 
 ```sh
 docker compose config --quiet
@@ -132,9 +145,9 @@ docker compose build parking-spot-monitor
 
 The resulting local image is `parking-spot-monitor:local`. The Dockerfile also has a smaller `runtime-app` target with the application and capture stack but without the YOLO detector packages; it is not the complete live camera-monitor image. The dependency-only `tooling` target omits both application source and capture packages and is intended for build-layer validation.
 
-The default model name may cause Ultralytics to download weights on the first live run. Allow outbound model-download access for that initial start, or pre-stage a model and enable the documented read-only model mount. Container recreation discards an unmounted container-local model cache.
+The model is not copied into the image. Container recreation reuses the authenticated host file through the read-only mount.
 
-### 3. Validate configuration inside the image
+### 4. Validate configuration and the mounted model
 
 ```sh
 docker compose run --rm parking-spot-monitor \
@@ -144,9 +157,9 @@ docker compose run --rm parking-spot-monitor \
   --validate-config
 ```
 
-Validation should name missing environment variables or invalid fields without printing resolved secrets.
+Validation should name missing environment variables or invalid fields without printing resolved secrets. It also verifies that the explicit `/models/yolov8n.pt` path is a file inside the container. A missing or misnamed weight file fails here, before detector construction or the capture loop.
 
-### 4. Start and verify the service
+### 5. Start and verify the service
 
 ```sh
 docker compose up -d --build parking-spot-monitor
@@ -241,7 +254,7 @@ docker compose ps
 docker compose logs --tail 100 parking-spot-monitor
 ```
 
-Do not upgrade over uncommitted tracked changes. `config.yaml`, `.env`, and `data/` are ignored operator files and remain on the host across a normal pull and container recreation.
+Do not upgrade over uncommitted tracked changes. `config.yaml`, `.env`, `models/`, and `data/` are ignored operator files and remain on the host across a normal pull and container recreation. Authenticate replacement weights before recreating the service, and retain the previous approved weight file with the rollback image when an upgrade changes models.
 
 After the new service becomes healthy, repeat the health, artifact, cadence, and resource checks above. Keep the rollback tag until the deployment has completed a representative observation window.
 
@@ -257,7 +270,7 @@ docker compose ps
 docker compose logs --tail 100 parking-spot-monitor
 ```
 
-This replaces the container but reuses the same read-only `config.yaml` mount and persistent `data/` bind mount.
+This replaces the container but reuses the same read-only `config.yaml` and model mounts plus the persistent `data/` bind mount. If the rollback image expects a different model, restore its authenticated weight file and matching `detection.model` configuration, run the one-shot validation command, and only then recreate the service.
 
 For a configuration-only rollback, restore the previous local `config.yaml` and `.env`, validate them with the one-shot Compose command, then restart the service. Never copy secrets into Git history or terminal output captured for tickets.
 
@@ -266,6 +279,7 @@ For a configuration-only rollback, restore the previous local `config.yaml` and 
 The minimum recovery set is:
 
 - `config.yaml`, stored with restricted permissions.
+- The approved detector weight file and its trusted-source checksum record.
 - `.env`, stored in an approved secret backup rather than ordinary source archives.
 - `data/state.json` and `data/matrix-outbox.json` for runtime continuity and durable pending delivery.
 - `data/vehicle-history/`, snapshots, timeline frames, feedback labels, and decision memory according to retention and recovery needs.
@@ -284,7 +298,7 @@ docker compose ps -a
 docker compose logs --tail 200 parking-spot-monitor
 ```
 
-Check missing environment variables, invalid YAML, config validation errors, unavailable `/dev/dri`, and host permissions on `config.yaml` or `data/`.
+Check missing environment variables, invalid YAML, config validation errors, unavailable `/dev/dri`, and host permissions on `config.yaml`, `models/`, or `data/`. If validation reports that the configured model file does not exist, confirm `MODEL_DIR`, the host filename, the `/models` read-only mount in `docker compose config`, and `detection.model` before retrying.
 
 ### Container is running but unhealthy
 

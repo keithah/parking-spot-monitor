@@ -51,6 +51,62 @@ def fake_environ(**overrides: str) -> dict[str, str]:
     return environ
 
 
+@pytest.fixture(autouse=True)
+def mounted_example_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model the production Compose mount used by config.yaml.example."""
+    original_is_file = Path.is_file
+
+    def is_file(path: Path) -> bool:
+        if str(path) == "/models/yolov8n.pt":
+            return True
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+
+
+def test_explicit_missing_model_path_fails_before_runtime_loop(tmp_path: Path) -> None:
+    from parking_spot_monitor import __main__ as cli
+
+    missing = tmp_path / "models" / "yolov8n.pt"
+
+    with pytest.raises(ConfigError, match="configured model file does not exist"):
+        cli.validate_model_path(str(missing))
+
+
+def test_explicit_relative_missing_model_path_fails_before_runtime_loop() -> None:
+    from parking_spot_monitor import __main__ as cli
+
+    with pytest.raises(ConfigError, match="configured model file does not exist"):
+        cli.validate_model_path("models/yolov8n.pt")
+
+
+def test_legacy_bare_model_name_does_not_require_local_file() -> None:
+    from parking_spot_monitor import __main__ as cli
+
+    cli.validate_model_path("yolov8n.pt")
+
+
+def test_validate_config_rejects_explicit_missing_model_before_ready(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "models" / "yolov8n.pt"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("/models/yolov8n.pt", str(missing)),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["--config", str(config_path), "--validate-config"], environ=fake_environ())
+
+    output = combined_output(capsys)
+    assert exit_code == 2
+    assert "configured model file does not exist" in output
+    assert '"phase":"model"' in output
+    assert '"event":"startup-ready"' not in output
+
+
 def combined_output(capsys: pytest.CaptureFixture[str]) -> str:
     captured = capsys.readouterr()
     return captured.out + captured.err
@@ -3189,7 +3245,7 @@ def test_capture_once_success_writes_debug_overlay_then_spot_filtered_detection(
     output = combined_output(capsys)
     assert exit_code == 0
     assert latest_path.exists()
-    assert constructed == ["yolov8n.pt"]
+    assert constructed == ["/models/yolov8n.pt"]
     assert calls == [("capture", latest_path), ("overlay", latest_path), ("detect", latest_path)]
     assert '"event":"capture-once-complete"' in output
     assert '"event":"debug-overlay-written"' in output

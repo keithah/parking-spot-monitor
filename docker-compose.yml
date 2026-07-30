@@ -12,8 +12,7 @@ services:
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ./data:/data
-      # Optional read-only model mount for operators who pre-stage YOLO weights.
-      #   - ./models:/models:ro
+      - ${MODEL_DIR:-./models}:/models:ro
     restart: unless-stopped
     mem_limit: 4g
     cpus: 2.0

@@ -274,9 +274,11 @@ def test_stream_profile_names_with_same_sanitized_destination_are_rejected(tmp_p
     assert "same capture filename" in message
 
 
-@pytest.mark.parametrize("model_value", ["yolov8n.pt", "models/custom-detector.pt"])
+@pytest.mark.parametrize("model_value", ["yolov8n.pt", "models/custom-detector.pt", "/models/yolov8n.pt"])
 def test_detection_model_accepts_local_model_names_and_relative_paths(tmp_path: Path, model_value: str) -> None:
-    config = Path("config.yaml.example").read_text(encoding="utf-8").replace("model: yolov8n.pt", f"model: {model_value}")
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "model: /models/yolov8n.pt", f"model: {model_value}"
+    )
     path = write_config(tmp_path, config)
 
     settings = load_settings(path, environ=fake_environ())
@@ -290,14 +292,15 @@ def test_detection_model_accepts_local_model_names_and_relative_paths(tmp_path: 
         "https://example.org/yolov8n.pt",
         "http://example.org/yolov8n.pt",
         "s3://bucket/yolov8n.pt",
-        "/models/yolov8n.pt",
         "../models/yolov8n.pt",
         "/models/../secret.pt",
         "models/../../secret.pt",
     ],
 )
 def test_detection_model_rejects_urls_and_path_traversal(tmp_path: Path, model_value: str) -> None:
-    config = Path("config.yaml.example").read_text(encoding="utf-8").replace("model: yolov8n.pt", f"model: {model_value}")
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "model: /models/yolov8n.pt", f"model: {model_value}"
+    )
     path = write_config(tmp_path, config)
 
     with pytest.raises(ConfigError) as exc_info:

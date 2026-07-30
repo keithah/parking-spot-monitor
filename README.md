@@ -191,9 +191,9 @@ Use `docker compose config --no-interpolate` for structure-only inspection becau
 - Runtime command: `python -m parking_spot_monitor --config /config/config.yaml --data-dir /data`.
 - Config mount: `./config.yaml:/config/config.yaml:ro`.
 - Data mount: `./data:/data`.
+- Model mount: `${MODEL_DIR:-./models}:/models:ro`; its default expansion is `./models:/models:ro`.
 - Environment names passed through by name: `RTSP_URL`, `RTSP_URL_4K`, and `MATRIX_ACCESS_TOKEN`.
 - No `env_file` contract in `docker-compose.yml`.
-- Optional model mount shown as a commented example: `./models:/models:ro`.
 
 ### 4. Launch, inspect, restart, and stop the service
 
@@ -814,14 +814,14 @@ Use `--older-than ISO_TIMESTAMP` when you need an explicit cutoff instead of a r
 
 The detector dependency set pins Ultralytics and CPU-only PyTorch wheels so the local detector can load YOLO nano from the configured `detection.model` value, for example `yolov8n.pt`, without surprise detector-image dependency drift or GPU wheel downloads. Docker uses `requirements-runtime.lock` for shared application packages and `requirements-detector.lock` for the detector layer; local editable installs should use the PyTorch CPU wheel index too, for example `pip install --extra-index-url https://download.pytorch.org/whl/cpu '.[detector]'`. The digest-pinned `python-base` and lightweight `tooling` stages omit capture packages, `capture-base` adds the live-capture system dependencies, `runtime-app` packages the application without YOLO, and the default `runtime-detector` final stage adds the detector lock for live monitoring. `detection.model` accepts local model names and local POSIX paths only: use package/Ultralytics names such as `yolov8n.pt`, repo-relative operator paths such as `models/custom-detector.pt`, or mounted Docker paths such as `/models/yolov8n.pt`. Config validation rejects URL-like values (`https://...`, `s3://...`) and path traversal (`../...` or `/models/../...`) before runtime so model configuration failures are clear and do not leak secrets.
 
-First-run Ultralytics downloads are allowed for local names such as `yolov8n.pt`, but they can block startup and require network access. For predictable Docker startup, pre-stage the model file on the host and set `detection.model: /models/yolov8n.pt`, then uncomment the optional read-only Compose mount:
+First-run Ultralytics downloads are allowed for legacy bare local names such as `yolov8n.pt`, but they can block startup and require network access. The documented production default avoids that dependency: obtain `yolov8n.pt` from a trusted artifact source, place it under `${MODEL_DIR:-./models}`, compare `sha256sum models/yolov8n.pt` with the trusted source's published checksum, and keep `detection.model: /models/yolov8n.pt`. Compose enables the read-only mount by default:
 
 ```yaml
 volumes:
-  - ./models:/models:ro
+  - ${MODEL_DIR:-./models}:/models:ro
 ```
 
-A missing mounted model is treated as a detector/model-load runtime failure, not as a secret-bearing config error. Detector failure diagnostics are intentionally safe for JSON-line logs: they include the phase, model path, frame path when applicable, error type, and a sanitized message only. They must not include RTSP URLs, Matrix tokens, image payload bytes, full FFmpeg argv, or traceback spam.
+Run the documented container `--validate-config` command before deployment. An explicit absolute or directory-qualified model path must name an existing file; otherwise startup fails before detector construction or the runtime loop. Bare names retain Ultralytics resolution for compatibility. Detector failure diagnostics are intentionally safe for JSON-line logs: they include the phase, model path, frame path when applicable, error type, and a sanitized message only. They must not include RTSP URLs, Matrix tokens, image payload bytes, full FFmpeg argv, or traceback spam. See [Docker deployment and operations](docs/deployment.md) for trusted-weight staging, validation, deployment, and rollback.
 
 The detector adapter imports Ultralytics lazily when the model object is constructed, reuses that single model for subsequent frame predictions, passes the configured `detection.inference_image_size` as Ultralytics `imgsz` when set, and normalizes model output into detector-neutral vehicle records before the spot filtering rules run. When `detection.spot_crop_inference` is enabled, the runtime also crops each configured spot with `detection.spot_crop_margin_px` padding, runs the same detector on those crops, translates crop-relative boxes back into full-frame coordinates, and sends the merged detections through the same spot geometry filter. Unit tests use fake YOLO result objects, so normal test runs do not download weights or run real inference. They prove deterministic class, confidence, area, centroid, overlap, adapter, and failure-path behavior without network access. Live camera accuracy proof remains operator evidence collected through the live-proof commands; the earlier detection.model allowlisting item is now implemented, while model-threshold tuning and non-root container hardening remain future hardening work after M001 (previously deferred to S07).
 
