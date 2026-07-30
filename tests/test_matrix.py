@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 import parking_spot_monitor.matrix_snapshots as matrix_snapshots
+import parking_spot_monitor.matrix_snapshot_storage as matrix_snapshot_storage
 from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult
 from parking_spot_monitor.logging import StructuredLogger
@@ -1363,6 +1364,43 @@ def test_prepare_event_snapshot_rejects_non_image_bytes_without_claiming_jpeg_me
     assert exc_info.value.diagnostics["source_path"] == str(source)
     assert not (tmp_path / "snapshots" / "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg").exists()
     assert "mimetype" not in exc_info.value.diagnostics
+
+
+@pytest.mark.parametrize(
+    "bomb",
+    [
+        Image.DecompressionBombError("oversized image"),
+        Image.DecompressionBombWarning("oversized image warning"),
+    ],
+)
+def test_prepare_event_snapshot_maps_decompression_bombs_and_deletes_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bomb: BaseException,
+) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    destination = tmp_path / "snapshots" / "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg"
+
+    def raise_bomb(*args: object, **kwargs: object) -> None:
+        raise bomb
+
+    monkeypatch.setattr(matrix_snapshot_storage.Image, "open", raise_bomb)
+
+    with pytest.raises(MatrixError) as exc_info:
+        prepare_event_snapshot(
+            source_path=source,
+            data_dir=tmp_path,
+            snapshots_dir=tmp_path / "snapshots",
+            event_type="occupancy-open-event",
+            event_id="event-1",
+            spot_id="left_spot",
+            observed_at="2026-05-18T20:01:02Z",
+        )
+
+    assert exc_info.value.diagnostics["error_type"] == "snapshot_metadata_failed"
+    assert source.exists()
+    assert not destination.exists()
 
 
 def test_quiet_notice_text_is_deterministic_and_contextual() -> None:

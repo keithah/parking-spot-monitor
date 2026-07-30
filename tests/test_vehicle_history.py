@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from parking_spot_monitor import vehicle_history_corrections, vehicle_history_storage
+from parking_spot_monitor import jpeg_artifacts, vehicle_history_corrections, vehicle_history_storage
 from parking_spot_monitor.logging import setup_logging
 from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, publish_canonical_jpeg
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
@@ -757,9 +757,9 @@ def test_canonical_jpeg_falls_back_from_cross_device_link_to_reflink(
         calls.append("hardlink")
         raise OSError(errno.EXDEV, "cross-device")
 
-    def reflink(source_path: Path, temporary: Path, source_mode: int) -> None:
+    def reflink(source_fd: int, temporary: Path, source_mode: int) -> None:
         calls.append("reflink")
-        temporary.write_bytes(source_path.read_bytes())
+        temporary.write_bytes(os.pread(source_fd, os.fstat(source_fd).st_size, 0))
 
     monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts.os.link", cross_device)
     monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts._reflink", reflink)
@@ -832,6 +832,97 @@ def test_canonical_jpeg_rejects_source_replaced_after_validation(
     with pytest.raises(JpegDecodeError, match="read_failed"):
         publish_canonical_jpeg(source, destination)
 
+    assert not destination.exists()
+    assert list(destination.parent.glob(".*.tmp")) == []
+
+
+def test_canonical_copy_fallback_never_reopens_replaced_source_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    expected = source.read_bytes()
+    replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (8, 6), (200, 20, 20)).save(replacement, "PNG")
+    original_away = tmp_path / "validated-source-away.jpg"
+    destination = tmp_path / "archive" / "full.jpg"
+    real_copy = jpeg_artifacts._copy_file
+
+    def unavailable(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "fallback required")
+
+    def replace_path_during_copy(source_handle: object, temporary: Path, source_mode: int) -> None:
+        os.replace(source, original_away)
+        os.replace(replacement, source)
+        try:
+            real_copy(source_handle, temporary, source_mode)
+        finally:
+            os.replace(source, replacement)
+            os.replace(original_away, source)
+
+    monkeypatch.setattr(jpeg_artifacts.os, "link", unavailable)
+    monkeypatch.setattr(jpeg_artifacts, "_reflink", unavailable)
+    monkeypatch.setattr(jpeg_artifacts, "_copy_file", replace_path_during_copy)
+
+    publication = publish_canonical_jpeg(source, destination)
+
+    assert publication.strategy == "copy"
+    assert destination.read_bytes() == expected
+    assert destination.read_bytes() != replacement.read_bytes()
+    assert source.read_bytes() == expected
+    assert list(destination.parent.glob(".*.tmp")) == []
+
+
+def test_canonical_jpeg_rejects_in_place_mutation_during_descriptor_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    expected = source.read_bytes()
+    destination = tmp_path / "archive" / "full.jpg"
+    real_validate = jpeg_artifacts._validate_jpeg_descriptor
+
+    def mutate_during_validation(source_fd: int) -> None:
+        real_validate(source_fd)
+        source.write_bytes(b"not validated")
+
+    monkeypatch.setattr(jpeg_artifacts, "_validate_jpeg_descriptor", mutate_during_validation)
+
+    with pytest.raises(JpegDecodeError, match="read_failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert source.read_bytes() != expected
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("strategy", ["reflink", "copy"])
+def test_canonical_jpeg_rejects_in_place_mutation_during_fallback_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    strategy: str,
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    expected = source.read_bytes()
+    destination = tmp_path / "archive" / "full.jpg"
+    real_copy = jpeg_artifacts._copy_file
+
+    def unavailable(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "fallback required")
+
+    def publish_then_mutate(source_fd: int, temporary: Path, source_mode: int) -> None:
+        if strategy == "reflink":
+            temporary.write_bytes(os.pread(source_fd, os.fstat(source_fd).st_size, 0))
+        else:
+            real_copy(source_fd, temporary, source_mode)
+        source.write_bytes(b"changed during publication")
+
+    monkeypatch.setattr(jpeg_artifacts.os, "link", unavailable)
+    monkeypatch.setattr(jpeg_artifacts, "_reflink", publish_then_mutate if strategy == "reflink" else unavailable)
+    if strategy == "copy":
+        monkeypatch.setattr(jpeg_artifacts, "_copy_file", publish_then_mutate)
+
+    with pytest.raises(JpegDecodeError, match="read_failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert source.read_bytes() != expected
     assert not destination.exists()
     assert list(destination.parent.glob(".*.tmp")) == []
 

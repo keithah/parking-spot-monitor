@@ -192,7 +192,12 @@ def prepare_event_snapshot(
     try:
         byte_size = owned_file_size(snapshot_root, filename)
         width, height = owned_jpeg_dimensions(snapshot_root, filename)
-    except (OSError, UnidentifiedImageError) as exc:
+    except (
+        OSError,
+        UnidentifiedImageError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ) as exc:
         if copied_snapshot:
             try:
                 delete_owned_artifact(snapshot_root, None, filename)
