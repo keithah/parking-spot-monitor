@@ -14,15 +14,15 @@ from types import MappingProxyType
 
 from parking_spot_monitor.file_descriptor_binding import (
     FileIdentity,
-    OwnedFile,
     RootedDirectoryOwner,
     descriptor_identity,
+    unlink_owned_at,
 )
 from parking_spot_monitor.jpeg_artifacts import jpeg_bytes_dimensions
+from parking_spot_monitor.matrix_retained_publication import MAX_RETAINED_JPEG_BYTES, publish_retained_snapshot
 
 _COPY_CHUNK_BYTES = 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-MAX_RETAINED_JPEG_BYTES = 32 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +122,7 @@ def read_owned_jpeg_evidence(
     filename: str,
     *,
     max_bytes: int = MAX_RETAINED_JPEG_BYTES,
+    expected_identity: FileIdentity | None = None,
 ) -> RootedJpegEvidence:
     """Capture validated JPEG bytes and metadata from one rooted descriptor."""
 
@@ -133,6 +134,8 @@ def read_owned_jpeg_evidence(
         )
         try:
             before = _descriptor_signature(file_fd)
+            if expected_identity is not None and descriptor_identity(file_fd) != expected_identity:
+                raise OSError("snapshot identity changed")
             if not stat.S_ISREG(os.fstat(file_fd).st_mode) or not 0 < before[2] <= max_bytes:
                 raise OSError("snapshot is not a bounded regular file")
             payload = _read_exact(file_fd, before[2])
@@ -177,56 +180,12 @@ def delete_owned_artifact(
                 value = os.stat(safe_name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
                 return 0
-            if expected_identity is not None and FileIdentity.from_stat(value) != expected_identity:
-                return 0
             if directory is None and not stat.S_ISREG(value.st_mode):
                 raise OSError("retained snapshot is not a regular file")
-            os.unlink(safe_name, dir_fd=directory_fd)
-            os.fsync(directory_fd)
-            return value.st_size
+            intended_identity = expected_identity or FileIdentity.from_stat(value)
+            return value.st_size if unlink_owned_at(directory_fd, safe_name, intended_identity) else 0
     except FileNotFoundError:
         return 0
-
-
-def publish_retained_snapshot(source: Path, snapshot_root: Path, filename: str) -> OwnedFile:
-    source_fd = _open_source_file(source)
-    safe_name = safe_artifact_name(filename)
-    try:
-        source_before = _descriptor_signature(source_fd)
-        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
-            raise OSError("snapshot source is not a regular file")
-        with _artifact_directory(snapshot_root, None, create=True) as (root_fd, root):
-            temporary_name = f".{safe_name}.{secrets.token_hex(8)}.tmp"
-            temporary_fd = -1
-            replaced = False
-            try:
-                temporary_fd = os.open(
-                    temporary_name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o644,
-                    dir_fd=root_fd,
-                )
-                while chunk := os.read(source_fd, _COPY_CHUNK_BYTES):
-                    _write_all(temporary_fd, chunk)
-                if _descriptor_signature(source_fd) != source_before:
-                    raise OSError("snapshot source changed while copying")
-                os.fchmod(temporary_fd, 0o644)
-                os.fsync(temporary_fd)
-                published_identity = descriptor_identity(temporary_fd)
-                os.replace(temporary_name, safe_name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
-                replaced = True
-                value = os.stat(safe_name, dir_fd=root_fd, follow_symlinks=False)
-                if not stat.S_ISREG(value.st_mode) or FileIdentity.from_stat(value) != published_identity:
-                    raise OSError("retained snapshot changed during publication")
-                os.fsync(root_fd)
-                return OwnedFile(root / safe_name, published_identity)
-            finally:
-                if temporary_fd >= 0:
-                    os.close(temporary_fd)
-                if not replaced:
-                    _unlink_best_effort(root_fd, temporary_name)
-    finally:
-        os.close(source_fd)
 
 
 def secure_snapshot_candidates(snapshot_root: Path) -> list[Path]:
@@ -267,13 +226,11 @@ def _artifact_directory(
 def _directory(path: Path, *, create: bool) -> Iterator[tuple[int, Path]]:
     absolute = absolute_snapshot_root(path)
     with RootedDirectoryOwner(absolute, create=create) as owner:
+        if not owner.is_still_bound():
+            raise OSError("snapshot root changed")
         yield owner.fd, absolute
-
-
-def _open_source_file(path: Path) -> int:
-    absolute = absolute_snapshot_root(path)
-    with _directory(absolute.parent, create=False) as (parent_fd, _parent):
-        return os.open(absolute.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+        if not owner.is_still_bound():
+            raise OSError("snapshot root changed")
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:

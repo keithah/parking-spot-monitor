@@ -223,6 +223,7 @@ def test_matrix_module_is_a_small_compatibility_shim() -> None:
         "parking_spot_monitor/jpeg_artifacts.py": 350,
         "parking_spot_monitor/matrix_upload_derivatives.py": 400,
         "parking_spot_monitor/matrix_snapshot_storage.py": 320,
+        "parking_spot_monitor/matrix_retained_publication.py": 180,
         "parking_spot_monitor/matrix_snapshot_naming.py": 80,
         "parking_spot_monitor/matrix_models.py": 100,
         "parking_spot_monitor/matrix_snapshots.py": 430,
@@ -258,12 +259,15 @@ def test_matrix_snapshot_artifact_ownership_is_layered() -> None:
     storage_imports = _imported_module_names("parking_spot_monitor/matrix_snapshot_storage.py")
     derivative_imports = _imported_module_names("parking_spot_monitor/matrix_upload_derivatives.py")
     snapshot_imports = _imported_module_names("parking_spot_monitor/matrix_snapshots.py")
+    publication_imports = _imported_module_names("parking_spot_monitor/matrix_retained_publication.py")
 
     assert "parking_spot_monitor.matrix_snapshots" not in storage_imports
     assert "parking_spot_monitor.matrix_upload_derivatives" not in storage_imports
     assert "os" not in derivative_imports
     assert "parking_spot_monitor.matrix_snapshot_storage" in derivative_imports
     assert "parking_spot_monitor.matrix_snapshot_storage" in snapshot_imports
+    assert "parking_spot_monitor.matrix_snapshot_storage" not in publication_imports
+    assert "parking_spot_monitor.matrix_retained_publication" in storage_imports
     assert "parking_spot_monitor.matrix_snapshot_naming" in snapshot_imports
 
 

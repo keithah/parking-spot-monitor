@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from io import BufferedReader
 import os
 from pathlib import Path
+import secrets
 import stat
 
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -66,14 +70,7 @@ class RootedDirectoryOwner:
         return (not regular or stat.S_ISREG(value.st_mode)) and FileIdentity.from_stat(value) == identity
 
     def unlink_if_matches(self, name: str, identity: FileIdentity) -> bool:
-        if not self.matches(name, identity, regular=False):
-            return False
-        try:
-            os.unlink(safe_basename(name), dir_fd=self.fd)
-            os.fsync(self.fd)
-            return True
-        except OSError:
-            return False
+        return unlink_owned_at(self.fd, name, identity)
 
     def fsync(self) -> None:
         os.fsync(self.fd)
@@ -93,6 +90,26 @@ def descriptor_identity(descriptor: int) -> FileIdentity:
     return FileIdentity.from_stat(os.fstat(descriptor))
 
 
+def unlink_owned_at(directory_fd: int, name: str, identity: FileIdentity) -> bool:
+    safe_name = safe_basename(name)
+    quarantine = f".{safe_name}.{secrets.token_hex(8)}.quarantine"
+    try:
+        os.rename(safe_name, quarantine, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    except FileNotFoundError:
+        return False
+    try:
+        quarantined = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
+        if FileIdentity.from_stat(quarantined) != identity:
+            _restore_quarantined(directory_fd, quarantine, safe_name)
+            return False
+        os.unlink(quarantine, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        return True
+    except OSError:
+        _restore_quarantined(directory_fd, quarantine, safe_name)
+        return False
+
+
 def unlink_owned_path(path: Path, identity: FileIdentity) -> bool:
     try:
         with RootedDirectoryOwner(path.parent, create=False) as owner:
@@ -101,10 +118,39 @@ def unlink_owned_path(path: Path, identity: FileIdentity) -> bool:
         return False
 
 
+@contextmanager
+def open_owned_path(path: Path, identity: FileIdentity) -> Iterator[BufferedReader]:
+    with RootedDirectoryOwner(path.parent, create=False) as owner:
+        descriptor = owner.open_file(path.name, os.O_RDONLY)
+        try:
+            if descriptor_identity(descriptor) != identity or not owner.matches(path.name, identity):
+                raise OSError("artifact identity changed")
+            if not owner.is_still_bound():
+                raise OSError("artifact parent changed")
+            with os.fdopen(descriptor, "rb") as handle:
+                descriptor = -1
+                yield handle
+                if not owner.matches(path.name, identity) or not owner.is_still_bound():
+                    raise OSError("artifact binding changed")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
 def safe_basename(value: str) -> str:
     if not value or value in {".", ".."} or Path(value).name != value or Path(value).is_absolute():
         raise OSError("artifact name must be a basename")
     return value
+
+
+def _restore_quarantined(directory_fd: int, quarantine: str, name: str) -> bool:
+    try:
+        os.link(quarantine, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+        os.unlink(quarantine, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        return True
+    except OSError:
+        return False
 
 
 def _open_directory(path: Path, *, create: bool) -> int:

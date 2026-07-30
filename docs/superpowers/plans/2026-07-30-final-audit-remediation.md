@@ -959,7 +959,7 @@ git commit -m "perf: reuse loaded profile history"
 - Modify: `tests/test_operator_cockpit.py`
 
 **Interfaces:**
-- Produces: `JpegPublication(path: Path, strategy: Literal["reflink", "copy"])` and `publish_canonical_jpeg(source, destination) -> JpegPublication`.
+- Produces: `JpegPublication(path: Path, strategy: Literal["reflink", "copy"], identity: FileIdentity)` and `publish_canonical_jpeg(source, destination) -> JpegPublication`. The `(dev, ino)` identity is an ownership token: immediate consumers must bind an `O_NOFOLLOW` descriptor to it, and failure cleanup may remove only that exact published inode.
 - Produces: `JpegDecodeError(code: Literal["unidentified", "decompression_bomb", "invalid_dimensions", "read_failed"])` and `open_decoded_rgb_jpeg(path: Path, *, initial_max_dimension: int) -> ContextManager[DecodedRgbJpeg]`, where `DecodedRgbJpeg(image: Image.Image, source_width: int, source_height: int)` owns bounded draft, decode, RGB conversion, and deterministic closure.
 - Produces: immutable `MatrixUploadDerivative(path: Path, info: Mapping[str, int | str])` and `prepare_upload_derivative(snapshot: MatrixSnapshot, *, destination: Path) -> MatrixUploadDerivative`.
 - Adds outbox intent metadata `upload_derivative_path` and `upload_derivative_info`; both are optional, sanitized schema-v1 metadata.
@@ -1002,7 +1002,7 @@ Expected: FAIL because full frames are decoded/re-encoded and upload derivatives
 
 Open the source once, validate JPEG format/dimensions from that descriptor, and bind stable dev/inode/size/mtime/ctime plus SHA-256 evidence to publication. Create a temporary destination in the target directory, try Linux `FICLONE` via `fcntl.ioctl`, and otherwise stream a descriptor-bound copy in 1 MiB chunks. Validate the independent temporary artifact against the digest before and after file `fsync`, atomically replace the destination, and fsync its directory. Preserve source mode on the independently owned reflink/copy destination. Generic mutable sources must never use hardlinks because later source writes would mutate a successfully returned publication.
 
-`capture_occupied_images` publishes the full frame with this helper, then opens the canonical path once to create only the crop.
+`capture_occupied_images` publishes the full frame with this helper, then opens the canonical path once through its returned identity to create only the crop. A pathname or parent-root replacement must fail without decoding or deleting the replacement.
 
 - [ ] **Step 4: Share one full JPEG decode lifecycle**
 

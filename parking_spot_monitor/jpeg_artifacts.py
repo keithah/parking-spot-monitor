@@ -18,11 +18,7 @@ import warnings
 
 from PIL import Image, UnidentifiedImageError
 
-from parking_spot_monitor.file_descriptor_binding import (
-    FileIdentity,
-    RootedDirectoryOwner,
-    descriptor_identity,
-)
+from parking_spot_monitor.file_descriptor_binding import FileIdentity, RootedDirectoryOwner, descriptor_identity, open_owned_path
 
 _FICLONE = 0x40049409
 _COPY_CHUNK_BYTES = 1024 * 1024
@@ -137,14 +133,20 @@ def publish_canonical_jpeg(source: str | Path, destination: str | Path) -> JpegP
         os.close(source_fd)
 
 
-def open_decoded_rgb_jpeg(path: Path, *, initial_max_dimension: int) -> AbstractContextManager[DecodedRgbJpeg]:
-    return _decoded_rgb_jpeg(Path(path), initial_max_dimension=initial_max_dimension)
+def open_decoded_rgb_jpeg(path: Path, *, initial_max_dimension: int, expected_identity: FileIdentity | None = None) -> AbstractContextManager[DecodedRgbJpeg]:
+    if expected_identity is None:
+        return _decoded_rgb_jpeg(Path(path), initial_max_dimension=initial_max_dimension)
+    return _decoded_owned_rgb_jpeg(Path(path), expected_identity, initial_max_dimension=initial_max_dimension)
 
 
-def open_decoded_rgb_jpeg_bytes(
-    payload: bytes, *, initial_max_dimension: int
-) -> AbstractContextManager[DecodedRgbJpeg]:
+def open_decoded_rgb_jpeg_bytes(payload: bytes, *, initial_max_dimension: int) -> AbstractContextManager[DecodedRgbJpeg]:
     return _decoded_rgb_jpeg_bytes(bytes(payload), initial_max_dimension=initial_max_dimension)
+
+
+@contextmanager
+def _decoded_owned_rgb_jpeg(path: Path, identity: FileIdentity, *, initial_max_dimension: int) -> Iterator[DecodedRgbJpeg]:
+    with open_owned_path(path, identity) as source, _decoded_rgb_jpeg(source, initial_max_dimension=initial_max_dimension) as decoded:
+        yield decoded
 
 
 def jpeg_bytes_dimensions(payload: bytes) -> tuple[int, int]:

@@ -14,7 +14,13 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from parking_spot_monitor import jpeg_artifacts, vehicle_history_corrections, vehicle_history_storage
+from parking_spot_monitor import (
+    file_descriptor_binding,
+    jpeg_artifacts,
+    vehicle_history_corrections,
+    vehicle_history_images,
+    vehicle_history_storage,
+)
 from parking_spot_monitor.logging import setup_logging
 from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, publish_canonical_jpeg
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
@@ -1047,6 +1053,118 @@ def test_vehicle_image_failure_preserves_replacement_after_canonical_publication
         )
 
     assert full_path.read_bytes() == replacement_bytes
+
+
+def test_vehicle_crop_rejects_replacement_of_published_full_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "source.jpg", size=(8, 6), color=(10, 20, 30))
+    replacement = write_test_jpeg(tmp_path / "replacement.jpg", size=(8, 6), color=(200, 10, 5))
+    replacement_bytes = replacement.read_bytes()
+    full_path = tmp_path / "archive" / "images" / "occupied-full" / "session.jpg"
+    crop_path = tmp_path / "archive" / "images" / "occupied-crops" / "session.jpg"
+    real_open = vehicle_history_images.open_decoded_rgb_jpeg
+
+    def swap_then_open(path: Path, **kwargs: object) -> object:
+        os.replace(replacement, path)
+        return real_open(path, **kwargs)
+
+    monkeypatch.setattr(vehicle_history_images, "open_decoded_rgb_jpeg", swap_then_open)
+
+    with pytest.raises(VehicleHistoryImageError):
+        capture_occupied_images(
+            archive_root=tmp_path / "archive",
+            session_id="session",
+            source_frame_path=source,
+            bbox=(0, 0, 8, 6),
+        )
+
+    assert full_path.read_bytes() == replacement_bytes
+    assert not crop_path.exists()
+
+
+def test_owned_path_cleanup_quarantines_before_identity_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owned = tmp_path / "owned.jpg"
+    owned.write_bytes(b"owned bytes")
+    identity = file_descriptor_binding.FileIdentity.from_stat(owned.stat())
+    replacement = tmp_path / "replacement.txt"
+    replacement_bytes = b"unrelated replacement"
+    replacement.write_bytes(replacement_bytes)
+    real_unlink, real_rename, real_replace = os.unlink, os.rename, os.replace
+    swapped = False
+
+    def swap_target() -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            real_replace(replacement, owned)
+
+    def swapping_unlink(path: object, *args: object, **kwargs: object) -> None:
+        if path == owned.name and kwargs.get("dir_fd") is not None:
+            swap_target()
+        real_unlink(path, *args, **kwargs)
+
+    def swapping_rename(source: object, destination: object, *args: object, **kwargs: object) -> None:
+        if source == owned.name and kwargs.get("src_dir_fd") is not None:
+            swap_target()
+        real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(file_descriptor_binding.os, "unlink", swapping_unlink)
+    monkeypatch.setattr(file_descriptor_binding.os, "rename", swapping_rename)
+
+    assert file_descriptor_binding.unlink_owned_path(owned, identity) is False
+    assert swapped is True
+    assert owned.read_bytes() == replacement_bytes
+    assert list(tmp_path.glob(".*.quarantine")) == []
+
+
+def test_vehicle_failure_cleanup_preserves_swap_at_delete_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "source.jpg", size=(8, 6))
+    full_path = tmp_path / "archive" / "images" / "occupied-full" / "session.jpg"
+    replacement = tmp_path / "replacement.txt"
+    replacement_bytes = b"unrelated vehicle replacement"
+    replacement.write_bytes(replacement_bytes)
+    real_unlink, real_rename, real_replace = os.unlink, os.rename, os.replace
+    swapped = False
+
+    def swap_target() -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            real_replace(replacement, full_path)
+
+    def swapping_unlink(path: object, *args: object, **kwargs: object) -> None:
+        if path == full_path.name and kwargs.get("dir_fd") is not None:
+            swap_target()
+        real_unlink(path, *args, **kwargs)
+
+    def swapping_rename(source_name: object, destination: object, *args: object, **kwargs: object) -> None:
+        if source_name == full_path.name and kwargs.get("src_dir_fd") is not None:
+            swap_target()
+        real_rename(source_name, destination, *args, **kwargs)
+
+    def fail_crop(*args: object) -> ClampedCropBox:
+        raise VehicleHistoryImageError("crop failed")
+
+    monkeypatch.setattr(file_descriptor_binding.os, "unlink", swapping_unlink)
+    monkeypatch.setattr(file_descriptor_binding.os, "rename", swapping_rename)
+    monkeypatch.setattr(vehicle_history_images, "clamp_crop_box", fail_crop)
+
+    with pytest.raises(VehicleHistoryImageError, match="crop failed"):
+        capture_occupied_images(
+            archive_root=tmp_path / "archive",
+            session_id="session",
+            source_frame_path=source,
+            bbox=(0, 0, 8, 6),
+        )
+
+    assert swapped is True
+    assert full_path.read_bytes() == replacement_bytes
+    assert list(full_path.parent.glob(".*.quarantine")) == []
 
 
 def test_canonical_jpeg_prefers_reflink_without_attempting_hardlink(

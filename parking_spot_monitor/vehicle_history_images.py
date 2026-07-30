@@ -63,7 +63,9 @@ def capture_occupied_images(
     publication: JpegPublication | None = None
     try:
         publication = publish_canonical_jpeg(source_frame_path, full_frame_path)
-        with open_decoded_rgb_jpeg(full_frame_path, initial_max_dimension=2**31 - 1) as decoded:
+        with open_decoded_rgb_jpeg(
+            full_frame_path, initial_max_dimension=2**31 - 1, expected_identity=publication.identity
+        ) as decoded:
             crop_box = clamp_crop_box(bbox, decoded.image.size)
             with decoded.image.crop(crop_box.as_pillow_box) as crop:
                 _write_jpeg_atomic(crop_path, crop)

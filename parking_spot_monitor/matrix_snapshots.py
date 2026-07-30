@@ -17,10 +17,10 @@ from parking_spot_monitor.matrix_snapshot_storage import (
     delete_owned_artifact,
     ensure_owned_directory,
     RootedJpegEvidence,
-    publish_retained_snapshot,
     read_owned_jpeg_evidence,
     secure_snapshot_candidates,
 )
+from parking_spot_monitor.matrix_retained_publication import publish_retained_snapshot
 from parking_spot_monitor.matrix_snapshot_naming import event_snapshot_path, snapshot_body
 from parking_spot_monitor.matrix_upload_derivatives import delete_upload_derivative
 from parking_spot_monitor.matrix_support import MatrixError, _require_non_empty, _sanitize_diagnostics
@@ -200,7 +200,7 @@ def prepare_event_snapshot(
         ) from exc
     byte_size = 0
     try:
-        evidence = read_owned_jpeg_evidence(snapshot_root, filename)
+        evidence = read_owned_jpeg_evidence(snapshot_root, filename, expected_identity=published_identity)
         byte_size = int(evidence.info["size"])
         width, height = int(evidence.info["w"]), int(evidence.info["h"])
     except (

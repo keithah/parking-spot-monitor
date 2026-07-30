@@ -13,6 +13,8 @@ from PIL import Image
 
 import parking_spot_monitor.matrix_snapshots as matrix_snapshots
 import parking_spot_monitor.matrix_snapshot_storage as matrix_snapshot_storage
+import parking_spot_monitor.matrix_retained_publication as matrix_retained_publication
+import parking_spot_monitor.file_descriptor_binding as file_descriptor_binding
 import parking_spot_monitor.jpeg_artifacts as jpeg_artifacts
 from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult
@@ -1499,6 +1501,192 @@ def test_prepare_event_snapshot_failure_preserves_replacement_of_published_evide
 
     assert exc_info.value.diagnostics["error_type"] == "snapshot_metadata_failed"
     assert destination.read_bytes() == replacement_bytes
+
+
+def test_prepare_event_snapshot_rejects_final_replacement_before_metadata_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source, size=(8, 6), color=(10, 20, 30))
+    destination = tmp_path / "snapshots" / "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg"
+    replacement = tmp_path / "replacement.jpg"
+    write_jpeg(replacement, size=(3, 2), color=(200, 10, 5))
+    replacement_bytes = replacement.read_bytes()
+    real_read = matrix_snapshot_storage.read_owned_jpeg_evidence
+
+    def swap_then_read(root: Path, filename: str, **kwargs: object) -> object:
+        os.replace(replacement, destination)
+        return real_read(root, filename, **kwargs)
+
+    monkeypatch.setattr(matrix_snapshots, "read_owned_jpeg_evidence", swap_then_read)
+
+    with pytest.raises(MatrixError) as exc_info:
+        prepare_event_snapshot(
+            source_path=source,
+            data_dir=tmp_path,
+            snapshots_dir=tmp_path / "snapshots",
+            event_type="occupancy-open-event",
+            event_id="event-1",
+            spot_id="left_spot",
+            observed_at="2026-05-18T20:01:02Z",
+        )
+
+    assert exc_info.value.diagnostics["error_type"] == "snapshot_metadata_failed"
+    assert destination.read_bytes() == replacement_bytes
+
+
+def test_read_owned_jpeg_evidence_rejects_snapshot_root_swap_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    snapshot_root = tmp_path / "snapshots"
+    publication = matrix_retained_publication.publish_retained_snapshot(source, snapshot_root, "event.jpg")
+    moved_root = tmp_path / "snapshots-held"
+    real_read_exact = matrix_snapshot_storage._read_exact
+
+    def swap_root(descriptor: int, size: int) -> bytes:
+        os.replace(snapshot_root, moved_root)
+        snapshot_root.mkdir()
+        return real_read_exact(descriptor, size)
+
+    monkeypatch.setattr(matrix_snapshot_storage, "_read_exact", swap_root)
+
+    with pytest.raises(OSError):
+        matrix_snapshot_storage.read_owned_jpeg_evidence(snapshot_root, "event.jpg")
+
+    assert publication.path.name == "event.jpg"
+    assert not (snapshot_root / "event.jpg").exists()
+    assert (moved_root / "event.jpg").exists()
+
+
+def test_matrix_metadata_cleanup_preserves_swap_at_delete_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    destination = tmp_path / "snapshots" / "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg"
+    replacement = tmp_path / "replacement.txt"
+    replacement_bytes = b"unrelated Matrix replacement"
+    replacement.write_bytes(replacement_bytes)
+    real_unlink, real_rename, real_replace = os.unlink, os.rename, os.replace
+    swapped = False
+
+    def swap_target() -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            real_replace(replacement, destination)
+
+    def swapping_unlink(path: object, *args: object, **kwargs: object) -> None:
+        if path == destination.name and kwargs.get("dir_fd") is not None:
+            swap_target()
+        real_unlink(path, *args, **kwargs)
+
+    def swapping_rename(source_name: object, target: object, *args: object, **kwargs: object) -> None:
+        if source_name == destination.name and kwargs.get("src_dir_fd") is not None:
+            swap_target()
+        real_rename(source_name, target, *args, **kwargs)
+
+    def fail_metadata(*args: object, **kwargs: object) -> object:
+        raise JpegDecodeError("read_failed")
+
+    monkeypatch.setattr(matrix_snapshot_storage.os, "unlink", swapping_unlink)
+    monkeypatch.setattr(matrix_snapshot_storage.os, "rename", swapping_rename)
+    monkeypatch.setattr(matrix_snapshots, "read_owned_jpeg_evidence", fail_metadata)
+
+    with pytest.raises(MatrixError) as exc_info:
+        prepare_event_snapshot(
+            source_path=source,
+            data_dir=tmp_path,
+            snapshots_dir=tmp_path / "snapshots",
+            event_type="occupancy-open-event",
+            event_id="event-1",
+            spot_id="left_spot",
+            observed_at="2026-05-18T20:01:02Z",
+        )
+
+    assert exc_info.value.diagnostics["error_type"] == "snapshot_metadata_failed"
+    assert swapped is True
+    assert destination.read_bytes() == replacement_bytes
+    assert list(destination.parent.glob(".*.quarantine")) == []
+
+
+def test_retained_snapshot_rejects_oversized_source_before_creating_storage(tmp_path: Path) -> None:
+    source = tmp_path / "padded.jpg"
+    write_jpeg(source)
+    with source.open("r+b") as handle:
+        handle.seek(matrix_snapshot_storage.MAX_RETAINED_JPEG_BYTES)
+        handle.write(b"x")
+    snapshot_root = tmp_path / "snapshots"
+
+    with pytest.raises(OSError, match="bounded regular file"):
+        matrix_retained_publication.publish_retained_snapshot(source, snapshot_root, "event.jpg")
+
+    assert not snapshot_root.exists()
+
+
+def test_prepare_event_snapshot_maps_oversized_source_to_copy_failure(tmp_path: Path) -> None:
+    source = tmp_path / "padded.jpg"
+    write_jpeg(source)
+    with source.open("r+b") as handle:
+        handle.seek(matrix_snapshot_storage.MAX_RETAINED_JPEG_BYTES)
+        handle.write(b"x")
+    snapshot_root = tmp_path / "snapshots"
+
+    with pytest.raises(MatrixError) as exc_info:
+        prepare_event_snapshot(
+            source_path=source,
+            data_dir=tmp_path,
+            snapshots_dir=snapshot_root,
+            event_type="occupancy-open-event",
+            event_id="event-1",
+            spot_id="left_spot",
+            observed_at="2026-05-18T20:01:02Z",
+        )
+
+    assert exc_info.value.diagnostics["error_type"] == "snapshot_copy_failed"
+    assert list(snapshot_root.glob("*.jpg")) == []
+    assert list(snapshot_root.glob(".*.tmp")) == []
+
+
+def test_retained_snapshot_growth_never_writes_beyond_preflight_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    original_size = source.stat().st_size
+    source_identity = (source.stat().st_dev, source.stat().st_ino)
+    snapshot_root = tmp_path / "snapshots"
+    real_read = os.read
+    real_unlink = file_descriptor_binding.RootedDirectoryOwner.unlink_if_matches
+    appended = False
+    discarded_sizes: list[int] = []
+
+    def append_after_first_source_read(descriptor: int, size: int) -> bytes:
+        nonlocal appended
+        chunk = real_read(descriptor, size)
+        value = os.fstat(descriptor)
+        if chunk and not appended and (value.st_dev, value.st_ino) == source_identity:
+            appended = True
+            with source.open("ab") as handle:
+                handle.write(b"x" * 4096)
+        return chunk
+
+    def record_discarded_size(owner: object, name: str, identity: object) -> bool:
+        directory_fd = owner.fd
+        discarded_sizes.append(os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_size)
+        return real_unlink(owner, name, identity)
+
+    monkeypatch.setattr(matrix_snapshot_storage.os, "read", append_after_first_source_read)
+    monkeypatch.setattr(file_descriptor_binding.RootedDirectoryOwner, "unlink_if_matches", record_discarded_size)
+
+    with pytest.raises(OSError, match="changed while copying"):
+        matrix_retained_publication.publish_retained_snapshot(source, snapshot_root, "event.jpg")
+
+    assert appended is True
+    assert discarded_sizes == [original_size]
+    assert list(snapshot_root.glob(".*.tmp")) == []
 
 
 @pytest.mark.parametrize(
