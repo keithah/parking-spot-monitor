@@ -6,6 +6,7 @@ import math
 import os
 import stat
 import tarfile
+import threading
 from io import BytesIO, StringIO
 from pathlib import Path
 from types import MappingProxyType
@@ -19,6 +20,8 @@ from parking_spot_monitor import (
     jpeg_artifacts,
     owned_file_cleanup,
     owned_file_disposal,
+    owned_disposal_manifest,
+    owned_file_recovery,
     vehicle_history_corrections,
     vehicle_history_images,
     vehicle_history_storage,
@@ -1511,6 +1514,179 @@ def test_owned_directory_manifest_rejects_replaced_disposal_identity(
     assert not target.exists()
     assert moved_owned.read_bytes() == b"owned"
     assert disposal.read_bytes() == b"unrelated"
+
+
+def test_owned_disposal_manifest_serializes_record_rename_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    identity = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    recorded = threading.Event()
+    release_producer = threading.Event()
+    recovery_started = threading.Event()
+    recovery_finished = threading.Event()
+    producer_result: list[bool] = []
+    recovery_result: list[owned_file_recovery.RecoveryResult] = []
+    real_record = owned_file_disposal.record_disposal_at
+    real_unlink = owned_file_disposal.os.unlink
+
+    def pause_after_record(*args: object, **kwargs: object) -> bool:
+        result = real_record(*args, **kwargs)
+        if threading.current_thread().name == "disposal-producer":
+            recorded.set()
+            assert release_producer.wait(2)
+        return result
+
+    def interrupt_producer_unlink(name: object, *args: object, **kwargs: object) -> None:
+        if threading.current_thread().name == "disposal-producer" and str(name).endswith(".dispose"):
+            raise OSError("simulated crash")
+        real_unlink(name, *args, **kwargs)
+
+    def produce() -> None:
+        producer_result.append(file_descriptor_binding.unlink_owned_path(target, identity))
+
+    def recover() -> None:
+        recovery_started.set()
+        with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as owner:
+            recovery_result.append(owner.recover_owned())
+        recovery_finished.set()
+
+    monkeypatch.setattr(owned_file_disposal, "record_disposal_at", pause_after_record)
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", interrupt_producer_unlink)
+    producer = threading.Thread(target=produce, name="disposal-producer", daemon=True)
+    producer.start()
+    assert recorded.wait(2)
+    recovery = threading.Thread(target=recover, name="disposal-recovery", daemon=True)
+    recovery.start()
+    assert recovery_started.wait(2)
+    assert not recovery_finished.wait(0.1)
+    release_producer.set()
+    producer.join(2)
+    recovery.join(2)
+
+    assert not producer.is_alive()
+    assert not recovery.is_alive()
+    assert producer_result == [False]
+    assert len(recovery_result) == 1
+    assert recovery_result[0].recovered == 1
+    assert target.read_bytes() == b"owned"
+    with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as owner:
+        assert owned_disposal_manifest.manifest_entries_at(owner.fd) == []
+
+
+def test_owned_disposal_manifest_transient_stat_error_preserves_pending_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    identity = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    real_unlink = owned_file_disposal.os.unlink
+
+    def interrupt_disposal(name: object, *args: object, **kwargs: object) -> None:
+        if str(name).endswith(".dispose"):
+            raise OSError("simulated crash")
+        real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", interrupt_disposal)
+    assert file_descriptor_binding.unlink_owned_path(target, identity) is False
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", real_unlink)
+    disposal = next(path.name for path in tmp_path.iterdir() if path.name.endswith(".dispose"))
+    real_stat = owned_file_recovery.os.stat
+
+    def fail_disposal_stat(name: object, *args: object, **kwargs: object) -> os.stat_result:
+        if name == disposal:
+            raise OSError(errno.EIO, "simulated storage error")
+        return real_stat(name, *args, **kwargs)
+
+    monkeypatch.setattr(owned_file_recovery.os, "stat", fail_disposal_stat)
+    with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as owner:
+        result = owner.recover_owned()
+        entries = owned_disposal_manifest.manifest_entries_at(owner.fd)
+
+    assert result.pending is True
+    assert [entry.disposal for entry in entries] == [disposal]
+
+
+def test_owned_disposal_manifest_transaction_is_reentrant(tmp_path: Path) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    identity = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    entry = owned_disposal_manifest.DisposalManifestEntry(
+        ".owned.jpg.0123456789abcdef.dispose", target.name, identity.dev, identity.ino
+    )
+    finished = threading.Event()
+    failures: list[BaseException] = []
+
+    def nested_transaction() -> None:
+        try:
+            with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as owner:
+                with owned_disposal_manifest.disposal_manifest_transaction(owner.fd):
+                    assert owned_disposal_manifest.record_disposal_at(owner.fd, entry)
+                    assert owned_disposal_manifest.manifest_entries_at(owner.fd) == [entry]
+                    assert owned_disposal_manifest.forget_disposal_at(owner.fd, entry.disposal)
+        except Exception as exc:
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=nested_transaction, daemon=True)
+    worker.start()
+    assert finished.wait(2), "nested manifest transaction deadlocked"
+    assert failures == []
+
+
+def test_owned_disposal_transactions_do_not_block_unrelated_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = first_dir / "first.jpg"
+    second = second_dir / "second.jpg"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    first_identity = file_descriptor_binding.FileIdentity.from_stat(first.stat())
+    second_identity = file_descriptor_binding.FileIdentity.from_stat(second.stat())
+    first_recorded = threading.Event()
+    release_first = threading.Event()
+    second_finished = threading.Event()
+    real_record = owned_file_disposal.record_disposal_at
+
+    def pause_first(*args: object, **kwargs: object) -> bool:
+        result = real_record(*args, **kwargs)
+        if threading.current_thread().name == "first-disposal":
+            first_recorded.set()
+            assert release_first.wait(2)
+        return result
+
+    monkeypatch.setattr(owned_file_disposal, "record_disposal_at", pause_first)
+    first_thread = threading.Thread(
+        target=lambda: file_descriptor_binding.unlink_owned_path(first, first_identity),
+        name="first-disposal",
+        daemon=True,
+    )
+    second_thread = threading.Thread(
+        target=lambda: (
+            file_descriptor_binding.unlink_owned_path(second, second_identity),
+            second_finished.set(),
+        ),
+        name="second-disposal",
+        daemon=True,
+    )
+    first_thread.start()
+    assert first_recorded.wait(2)
+    second_thread.start()
+    assert second_finished.wait(2)
+    release_first.set()
+    first_thread.join(2)
+    second_thread.join(2)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert not first.exists()
+    assert not second.exists()
 
 
 def test_vehicle_capture_recovers_owned_full_and_crop_directories(

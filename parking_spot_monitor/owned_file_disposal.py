@@ -19,6 +19,7 @@ from typing import Literal
 from parking_spot_monitor.owned_disposal_manifest import (
     DisposalManifestEntry,
     forget_disposal_at,
+    manifest_transaction,
     record_disposal_at,
 )
 
@@ -46,6 +47,7 @@ def disposal_pattern(name: str) -> re.Pattern[str]:
     return re.compile(rf"^\.{re.escape(safe_name)}\.[0-9a-f]{{16}}\.dispose$")
 
 
+@manifest_transaction
 def dispose_owned_name_at(
     directory_fd: int,
     name: str,
@@ -169,10 +171,7 @@ def _restore_current_disposal(directory_fd: int, disposal: str, name: str) -> bo
 
 
 def _restore_disposal(
-    directory_fd: int,
-    disposal: str,
-    name: str,
-    identity: FileIdentity | None,
+    directory_fd: int, disposal: str, name: str, identity: FileIdentity | None
 ) -> bool:
     if identity is None:
         return False

@@ -1,8 +1,11 @@
-"""Bounded durable index for interrupted owned-file disposal transitions."""
+"""Bounded durable index and in-process transactions for owned disposal."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from functools import wraps
 import json
 import os
 from pathlib import Path
@@ -13,7 +16,14 @@ import threading
 _MANIFEST_NAME = ".owned-disposals.json"
 _MAX_ENTRIES = 256
 _MAX_BYTES = 262_144
-_LOCK = threading.RLock()
+_LOCK_GUARD = threading.Lock()
+_DIRECTORY_LOCKS: dict[tuple[int, int], _ManifestLock] = {}
+
+
+@dataclass(slots=True)
+class _ManifestLock:
+    lock: threading.RLock
+    references: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,14 +34,39 @@ class DisposalManifestEntry:
     ino: int
 
 
+@contextmanager
+def disposal_manifest_transaction(directory_fd: int) -> Iterator[None]:
+    value = os.fstat(directory_fd)
+    key = (value.st_dev, value.st_ino)
+    with _LOCK_GUARD:
+        entry = _DIRECTORY_LOCKS.setdefault(key, _ManifestLock(threading.RLock()))
+        entry.references += 1
+    try:
+        with entry.lock:
+            yield
+    finally:
+        with _LOCK_GUARD:
+            entry.references -= 1
+            if entry.references == 0:
+                _DIRECTORY_LOCKS.pop(key, None)
+
+
+def manifest_transaction(operation):
+    @wraps(operation)
+    def serialized(directory_fd: int, *args: object, **kwargs: object):
+        with disposal_manifest_transaction(directory_fd):
+            return operation(directory_fd, *args, **kwargs)
+    return serialized
+
+
 def manifest_entries_at(directory_fd: int, *, limit: int = _MAX_ENTRIES) -> list[DisposalManifestEntry]:
-    with _LOCK:
+    with disposal_manifest_transaction(directory_fd):
         return _read_manifest(directory_fd)[: max(0, min(limit, _MAX_ENTRIES))]
 
 
 def record_disposal_at(directory_fd: int, entry: DisposalManifestEntry) -> bool:
     _validate_entry(entry)
-    with _LOCK:
+    with disposal_manifest_transaction(directory_fd):
         try:
             entries = _read_manifest(directory_fd)
             entries = [item for item in entries if item.disposal != entry.disposal]
@@ -46,7 +81,7 @@ def record_disposal_at(directory_fd: int, entry: DisposalManifestEntry) -> bool:
 
 def forget_disposal_at(directory_fd: int, disposal: str) -> bool:
     safe_disposal = _safe_basename(disposal)
-    with _LOCK:
+    with disposal_manifest_transaction(directory_fd):
         try:
             entries = _read_manifest(directory_fd)
             retained = [entry for entry in entries if entry.disposal != safe_disposal]

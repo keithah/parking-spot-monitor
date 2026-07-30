@@ -11,6 +11,7 @@ import stat
 
 from parking_spot_monitor.owned_disposal_manifest import (
     DisposalManifestEntry,
+    disposal_manifest_transaction,
     forget_disposal_at,
     manifest_entries_at,
 )
@@ -48,6 +49,11 @@ def recover_owned_directory_at(
 
 
 def _recover(directory_fd: int, selected: str | None, *, max_entries: int) -> RecoveryResult:
+    with disposal_manifest_transaction(directory_fd):
+        return _recover_locked(directory_fd, selected, max_entries=max_entries)
+
+
+def _recover_locked(directory_fd: int, selected: str | None, *, max_entries: int) -> RecoveryResult:
     budget = max(0, min(max_entries, MAX_RECOVERY_SCAN_ENTRIES))
     recovered = 0
     pending = False
@@ -93,7 +99,11 @@ def restore_quarantined_at(directory_fd: int, quarantine: str, name: str) -> boo
 def _recover_manifest_entry(directory_fd: int, entry: DisposalManifestEntry) -> RecoveryResult:
     if not disposal_pattern(entry.recovery).fullmatch(entry.disposal):
         return RecoveryResult(pending=True)
-    if not _name_exists(directory_fd, entry.disposal):
+    try:
+        disposal_exists = _name_exists(directory_fd, entry.disposal)
+    except OSError:
+        return RecoveryResult(pending=True)
+    if not disposal_exists:
         return RecoveryResult(pending=not forget_disposal_at(directory_fd, entry.disposal))
     result = recover_disposal_at(
         directory_fd,
@@ -131,7 +141,7 @@ def _name_exists(directory_fd: int, name: str) -> bool:
     try:
         os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         return True
-    except OSError:
+    except FileNotFoundError:
         return False
 
 

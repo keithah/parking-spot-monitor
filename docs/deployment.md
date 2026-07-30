@@ -21,6 +21,8 @@ Keep application-owned artifact directories under `data/` writable only by the s
 
 An unlink can remove a filename before the following directory `fsync` reports an error. Retention treats that namespace deletion as complete, leaves its manifest record for reconciliation, and emits `snapshot-retention-durability-uncertain` instead of retrying the now-absent target as an ordinary deletion failure. A later startup or retention pass reconciles the record. Repeated `snapshot-retention-failed` events with `error_type` set to `RecoveryPending` indicate that the data mount cannot complete recovery and should be checked for write errors, permissions, or exhausted storage before manually touching hidden artifacts.
 
+Manifest transition locking is process-local and keyed by the owned directory identity. The supported deployment model has exactly one `parking-spot-monitor` service process owning these artifact directories; do not run a second container, maintenance process, or cleanup command that mutates the same directories concurrently. Recovery and disposal for the same directory serialize across manifest record, rename, classification, and reconciliation, while unrelated owned directories remain concurrent.
+
 ## Host prerequisites
 
 Provide:
