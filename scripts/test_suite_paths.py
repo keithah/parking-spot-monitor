@@ -10,8 +10,10 @@ CONFIG_TEST_MODULES = (
 MATRIX_TEST_MODULES = (
     "tests/test_matrix_client_and_delivery.py",
     "tests/test_matrix_command_service_analytics.py",
-    "tests/test_matrix_command_service_core.py",
+    "tests/test_matrix_command_service_authorization.py",
+    "tests/test_matrix_command_service_feedback.py",
     "tests/test_matrix_command_service_media.py",
+    "tests/test_matrix_command_service_profiles.py",
     "tests/test_matrix_messages_and_parsing.py",
     "tests/test_matrix_snapshot_retention.py",
     "tests/test_matrix_snapshot_upload.py",
