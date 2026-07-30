@@ -320,6 +320,9 @@ def test_runtime_modules_stay_decomposed() -> None:
         "parking_spot_monitor/runtime_commands.py": 120,
         "parking_spot_monitor/runtime_decision_memory.py": 240,
         "parking_spot_monitor/runtime_detection.py": 250,
+        # Focused detector helpers get only small local growth budgets.
+        "parking_spot_monitor/runtime_detector_capabilities.py": 200,
+        "parking_spot_monitor/runtime_detection_support.py": 110,
         "parking_spot_monitor/runtime_frame.py": 90,
         "parking_spot_monitor/runtime_frame_outcome.py": 90,
         "parking_spot_monitor/runtime_frame_plan.py": 160,
