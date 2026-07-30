@@ -9,7 +9,7 @@ from PIL import Image
 from parking_spot_monitor import jpeg_artifacts
 
 
-def test_canonical_publication_reads_and_parses_each_boundary_once(
+def test_canonical_publication_reads_each_boundary_once_and_parses_source_once(
     tmp_path: Path, monkeypatch
 ) -> None:
     source = tmp_path / "source.jpg"
@@ -46,5 +46,5 @@ def test_canonical_publication_reads_and_parses_each_boundary_once(
     assert publication.strategy == "copy"
     assert bytes_read[source_identity] == source.stat().st_size
     assert bytes_read[destination_identity] == destination.stat().st_size
-    assert opens == 2
+    assert opens == 1
     assert destination.read_bytes() == source.read_bytes()

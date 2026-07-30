@@ -204,7 +204,7 @@ def _validated_source_evidence(source_fd: int) -> _SourceEvidence:
     if not stat.S_ISREG(value.st_mode) or not 0 < value.st_size <= MAX_CANONICAL_JPEG_BYTES:
         raise JpegDecodeError("read_failed")
     before = _stat_signature(value)
-    captured = _bounded_capture(source_fd, before)
+    captured = _bounded_read(source_fd, before, capture_bytes=True)
     if captured.data is None:
         raise JpegDecodeError("read_failed")
     _validate_jpeg_bytes(captured.data)
@@ -224,10 +224,9 @@ def _validate_artifact_descriptor(descriptor: int, source_fd: int, evidence: _So
     signature = _descriptor_signature(descriptor)
     if signature[2] != evidence.signature[2] or not stat.S_ISREG(os.fstat(descriptor).st_mode):
         raise JpegDecodeError("read_failed")
-    captured = _bounded_capture(descriptor, signature)
-    if captured.digest != evidence.digest or captured.data is None:
+    captured = _bounded_read(descriptor, signature, capture_bytes=False)
+    if captured.digest != evidence.digest:
         raise JpegDecodeError("read_failed")
-    _validate_jpeg_bytes(captured.data)
     if (
         _descriptor_signature(descriptor) != signature
         or _descriptor_signature(source_fd) != evidence.signature
@@ -235,11 +234,18 @@ def _validate_artifact_descriptor(descriptor: int, source_fd: int, evidence: _So
         raise JpegDecodeError("read_failed")
 
 
-def _bounded_capture(
-    descriptor: int, signature: tuple[int, int, int, int, int]
+def _bounded_read(
+    descriptor: int,
+    signature: tuple[int, int, int, int, int],
+    *,
+    capture_bytes: bool,
 ) -> BoundedDescriptorRead:
     try:
-        return read_descriptor_exact(descriptor, signature, capture_bytes=True)
+        return read_descriptor_exact(
+            descriptor,
+            signature,
+            capture_bytes=capture_bytes,
+        )
     except OSError as exc:
         raise JpegDecodeError("read_failed") from exc
 
