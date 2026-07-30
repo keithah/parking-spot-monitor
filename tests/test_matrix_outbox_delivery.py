@@ -4,7 +4,7 @@ import json
 import threading
 import time
 from datetime import datetime, timezone
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,19 @@ def write_jpeg(path: Path, *, size: tuple[int, int] = (8, 6), color: tuple[int, 
     image = Image.new("RGB", size, color=color)
     image.save(path, format="JPEG")
     return path.read_bytes()
+
+
+def jpeg_bytes(*, size: tuple[int, int], color: tuple[int, int, int] = (25, 50, 75)) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", size, color=color).save(output, format="JPEG")
+    return output.getvalue()
+
+
+def rewrite_first_outbox_metadata(path: Path, transform: Any) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    metadata = payload["items"][0]["intent"].setdefault("metadata", {})
+    transform(metadata)
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def open_event(snapshot_path: Path) -> dict[str, Any]:
@@ -317,10 +330,11 @@ def test_oversized_outbox_snapshot_preserves_upload_and_persisted_info_schema(
     source = tmp_path / "latest.jpg"
     Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
     assert source.stat().st_size > matrix_snapshots.MAX_MATRIX_UPLOAD_IMAGE_BYTES
+    resized_payload = jpeg_bytes(size=(640, 360))
     monkeypatch.setattr(
         matrix_snapshots,
         "encode_jpeg_under_budget",
-        lambda image, **kwargs: JpegBudgetResult(b"jpeg", 640, 360, 65, 6),
+        lambda image, **kwargs: JpegBudgetResult(resized_payload, 640, 360, 65, 6),
     )
     client = FakeMatrixClient()
 
@@ -332,17 +346,19 @@ def test_oversized_outbox_snapshot_preserves_upload_and_persisted_info_schema(
     assert client.calls[1] == {
         "kind": "upload",
         "filename": "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg",
-        "data": b"jpeg",
+        "data": resized_payload,
         "content_type": "image/jpeg",
     }
     assert client.calls[2]["body"] == "Raw full-frame snapshot for left_spot at 2026-05-18T20:01:02+00:00"
-    assert client.calls[2]["info"] == {"mimetype": "image/jpeg", "size": 4, "w": 640, "h": 360}
+    assert client.calls[2]["info"] == {
+        "mimetype": "image/jpeg", "size": len(resized_payload), "w": 640, "h": 360,
+    }
     [persisted] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
     assert persisted.phase_results["upload"] == {
         "content_uri": "mxc://example.org/open",
         "filename": "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg",
         "body": "Raw full-frame snapshot for left_spot at 2026-05-18T20:01:02+00:00",
-        "info": {"mimetype": "image/jpeg", "size": 4, "w": 640, "h": 360},
+        "info": {"mimetype": "image/jpeg", "size": len(resized_payload), "w": 640, "h": 360},
     }
 
 
@@ -408,12 +424,13 @@ def test_upload_retry_reuses_persisted_derivative_after_restart(tmp_path: Path) 
     assert delivered.delivered_count == 1
     assert [call for call in second_client.calls if call["kind"] == "upload"][0]["data"] == before
     assert derivative.read_bytes() == before
-    assert info == {
+    assert {key: info[key] for key in ("mimetype", "size", "w", "h")} == {
         "mimetype": "image/jpeg",
         "size": len(before),
         "w": 960,
         "h": 540,
     }
+    assert isinstance(info["sha256"], str) and len(info["sha256"]) == 64
 
 
 def test_snapshot_retention_keeps_pending_derivative_then_prunes_terminal_pair(tmp_path: Path) -> None:
@@ -455,16 +472,22 @@ def test_legacy_upload_regenerates_and_persists_derivative_before_network(tmp_pa
     old_derivative = Path(str(legacy_metadata.pop("upload_derivative_path")))
     legacy_metadata.pop("upload_derivative_info")
     old_derivative.unlink()
-    first.outbox.update_intent_metadata(record.id, legacy_metadata)
+    rewrite_first_outbox_metadata(store_path, lambda metadata: metadata.update(legacy_metadata))
+    rewrite_first_outbox_metadata(
+        store_path,
+        lambda metadata: (metadata.pop("upload_derivative_path", None), metadata.pop("upload_derivative_info", None)),
+    )
 
     class InspectingClient(FakeMatrixClient):
         def upload_image(self, *, filename: str, data: bytes, content_type: str) -> str:
             [persisted] = LocalOutbox(store_path).list_records()
             path = Path(str(persisted.intent.metadata["upload_derivative_path"]))
             assert path.read_bytes() == data
-            assert persisted.intent.metadata["upload_derivative_info"] == {
+            derivative_info = persisted.intent.metadata["upload_derivative_info"]
+            assert {key: derivative_info[key] for key in ("mimetype", "size", "w", "h")} == {
                 "mimetype": "image/jpeg", "size": len(data), "w": 960, "h": 540,
             }
+            assert isinstance(derivative_info["sha256"], str) and len(derivative_info["sha256"]) == 64
             return super().upload_image(filename=filename, data=data, content_type=content_type)
 
     restarted = MatrixOutboxDelivery(
@@ -485,7 +508,11 @@ def test_upload_rejects_out_of_contract_derivative_path_without_reading_it(tmp_p
     outside.write_bytes(b"must not be uploaded")
     metadata = dict(record.intent.metadata)
     metadata["upload_derivative_path"] = str(outside)
-    delivery.outbox.update_intent_metadata(record.id, metadata)
+    rewrite_first_outbox_metadata(store_path, lambda persisted: persisted.update(metadata))
+    delivery = MatrixOutboxDelivery(
+        client=delivery.client, room_id=ROOM_ID, data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots", outbox=LocalOutbox(store_path),
+    )
 
     result = delivery.drain_outbox(record_id=record.id)
 
@@ -510,6 +537,184 @@ def test_duplicate_enqueue_does_not_replace_immutable_upload_derivative(tmp_path
 
     assert duplicate.id == first.id
     assert derivative.read_bytes() == selected
+
+
+def test_concurrent_duplicate_enqueue_publishes_canonical_and_derivative_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source, size=(640, 360))
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    original = delivery._snapshot_artifacts.prepare_retained_snapshot
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def blocked_prepare(**kwargs: Any) -> Any:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        (first_entered if call_number == 1 else second_entered).set()
+        assert release.wait(2)
+        return original(**kwargs)
+
+    monkeypatch.setattr(delivery._snapshot_artifacts, "prepare_retained_snapshot", blocked_prepare)
+    results: list[Any] = []
+    threads = [threading.Thread(target=lambda: results.append(delivery.enqueue_open_spot_alert(open_event(source)))) for _ in range(2)]
+    threads[0].start()
+    assert first_entered.wait(2)
+    threads[1].start()
+    try:
+        assert not second_entered.wait(0.1), "duplicate publication entered concurrently"
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(2)
+
+    assert calls == 1
+    assert len(results) == 2
+    assert results[0].id == results[1].id
+    [persisted] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
+    derivative = Path(str(persisted.intent.metadata["upload_derivative_path"]))
+    assert derivative.exists()
+    assert persisted.intent.metadata["upload_derivative_info"]["size"] == derivative.stat().st_size
+
+
+def test_restart_rejects_same_size_corrupt_derivative_by_digest(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)
+    store_path = tmp_path / "matrix-outbox.json"
+    first = make_delivery(tmp_path, FakeMatrixClient(fail={"upload": MatrixError("timeout", error_type="timeout")}))
+    first.send_open_spot_alert(open_event(source))
+    [record] = LocalOutbox(store_path).list_records()
+    info = record.intent.metadata["upload_derivative_info"]
+    assert isinstance(info, dict)
+    assert isinstance(info["sha256"], str) and len(info["sha256"]) == 64
+    derivative = Path(str(record.intent.metadata["upload_derivative_path"]))
+    payload = bytearray(derivative.read_bytes())
+    payload[len(payload) // 2] ^= 1
+    derivative.write_bytes(payload)
+    client = FakeMatrixClient()
+    restarted = MatrixOutboxDelivery(
+        client=client, room_id=ROOM_ID, data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots", outbox=LocalOutbox(store_path), utc_now=lambda: RETRY_DUE_NOW,
+    )
+
+    result = restarted.drain_outbox(record_id=record.id)
+
+    assert result.retrying_count == 0
+    assert not [call for call in client.calls if call["kind"] == "upload"]
+    [dead] = LocalOutbox(store_path).list_records()
+    assert dead.state == "dead_lettered"
+
+
+def test_restart_rejects_persisted_derivative_without_digest(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    store_path = tmp_path / "matrix-outbox.json"
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    record = delivery.enqueue_open_spot_alert(open_event(source))
+    rewrite_first_outbox_metadata(
+        store_path,
+        lambda metadata: metadata["upload_derivative_info"].pop("sha256"),
+    )
+    client = FakeMatrixClient()
+    restarted = MatrixOutboxDelivery(
+        client=client,
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(store_path),
+    )
+
+    result = restarted.drain_outbox(record_id=record.id)
+
+    assert result.retrying_count == 0
+    assert not [call for call in client.calls if call["kind"] == "upload"]
+    [dead] = LocalOutbox(store_path).list_records()
+    assert dead.state == "dead_lettered"
+
+
+def test_persisted_paths_cannot_redirect_upload_outside_configured_snapshot_root(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    store_path = tmp_path / "matrix-outbox.json"
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    record = delivery.enqueue_open_spot_alert(open_event(source))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_raw = outside / "event.jpg"
+    outside_raw.write_bytes(b"outside raw")
+    outside_derivative = outside / "event-upload.jpg"
+    outside_derivative.write_bytes(b"outside derivative")
+    rewrite_first_outbox_metadata(
+        store_path,
+        lambda metadata: metadata.update(
+            {
+                "retained_snapshot_path": str(outside_raw),
+                "retained_snapshot_filename": "../outside/event.jpg",
+                "upload_derivative_path": str(outside_derivative),
+                "upload_derivative_info": {"mimetype": "image/jpeg", "size": len(b"outside derivative"), "w": 8, "h": 6},
+            }
+        ),
+    )
+    client = FakeMatrixClient()
+    restarted = MatrixOutboxDelivery(
+        client=client, room_id=ROOM_ID, data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots", outbox=LocalOutbox(store_path),
+    )
+
+    restarted.drain_outbox(record_id=record.id)
+
+    assert not [call for call in client.calls if call["kind"] == "upload"]
+    assert outside_raw.read_bytes() == b"outside raw"
+    assert outside_derivative.read_bytes() == b"outside derivative"
+
+
+def test_symlinked_derivative_parent_is_rejected_without_following(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    record = delivery.enqueue_open_spot_alert(open_event(source))
+    derivative = Path(str(record.intent.metadata["upload_derivative_path"]))
+    external = tmp_path / "external-derivatives"
+    external.mkdir()
+    moved = external / derivative.name
+    derivative.replace(moved)
+    derivative.parent.rmdir()
+    derivative.parent.symlink_to(external, target_is_directory=True)
+
+    result = delivery.drain_outbox(record_id=record.id)
+
+    assert result.retrying_count == 0
+    assert not [call for call in delivery.client.calls if call["kind"] == "upload"]
+    assert moved.exists()
+
+
+def test_retention_keeps_raw_when_derivative_cleanup_transiently_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    raw = root / "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg"
+    write_jpeg(raw)
+    newer = root / "occupancy-open-event-left-spot-2026-05-18t20-02-02z.jpg"
+    write_jpeg(newer, color=(90, 20, 120))
+    derivative = root / ".upload-derivatives" / raw.name
+    derivative.parent.mkdir()
+    write_jpeg(derivative)
+    def fail_derivative(_root: Path, _filename: str) -> int:
+        raise OSError("transient derivative cleanup failure")
+
+    monkeypatch.setattr(matrix_snapshots, "delete_upload_derivative", fail_derivative)
+
+    result = matrix_snapshots.prune_event_snapshots(root, retention_count=1, logger=None, current_snapshot=None)
+    assert result.pruned_count == 0
+    assert raw.exists()
+    assert derivative.exists()
 
 
 def test_matrix_outbox_delivery_close_closes_owned_client(tmp_path: Path) -> None:

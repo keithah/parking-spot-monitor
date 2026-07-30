@@ -1020,3 +1020,68 @@ def test_invalid_transitions_are_safe_and_do_not_mutate_store(tmp_path):
         outbox.mark_retrying("missing", reason="timeout")
 
     assert outbox.list_records() == [record]
+
+
+def test_upload_derivative_attach_is_atomic_identity_stable_and_detached(tmp_path: Path) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    record = outbox.enqueue_with_phases(
+        AlertIntent(
+            event_id="evt-derivative",
+            phase="text",
+            body="body",
+            metadata={"retained_snapshot_filename": "event.jpg"},
+        ),
+        ("text", "upload", "image"),
+    )
+    original_id = record.id
+    original_transaction = record.transaction_id
+    info = {
+        "mimetype": "image/jpeg",
+        "size": 100,
+        "w": 10,
+        "h": 5,
+        "sha256": "a" * 64,
+    }
+
+    attached = outbox.attach_upload_derivative(
+        record.id,
+        path="/data/snapshots/.upload-derivatives/event.jpg",
+        info=info,
+    )
+
+    assert attached.id == original_id
+    assert attached.transaction_id == original_transaction
+    assert attached.intent.metadata["upload_derivative_info"] == info
+    nested = attached.intent.metadata["upload_derivative_info"]
+    assert isinstance(nested, dict)
+    nested["w"] = 999
+    [stored] = outbox.list_records()
+    assert stored.intent.metadata["upload_derivative_info"]["w"] == 10
+    assert outbox.attach_upload_derivative(record.id, path=str(attached.intent.metadata["upload_derivative_path"]), info=info) == stored
+
+
+def test_upload_derivative_attach_rejects_terminal_or_conflicting_mutation(tmp_path: Path) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    record = outbox.enqueue_with_phases(
+        AlertIntent(event_id="evt-terminal-derivative", phase="text", body="body"),
+        ("text", "upload", "image"),
+    )
+    info = {"mimetype": "image/jpeg", "size": 100, "w": 10, "h": 5, "sha256": "b" * 64}
+    outbox.attach_upload_derivative(record.id, path="/data/one.jpg", info=info)
+    with pytest.raises(OutboxTransitionError, match="already_attached"):
+        outbox.attach_upload_derivative(record.id, path="/data/two.jpg", info=info)
+
+    outbox.mark_failed(record.id, reason="failed")
+    with pytest.raises(OutboxTransitionError, match="terminal"):
+        outbox.attach_upload_derivative(record.id, path="/data/one.jpg", info=info)
+
+
+def test_upload_derivative_attach_rejects_malformed_transport_evidence(tmp_path: Path) -> None:
+    outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
+    record = outbox.enqueue(AlertIntent(event_id="evt-invalid-derivative", phase="upload", body="body"))
+    malformed = {"mimetype": "image/jpeg", "size": 100, "w": 10, "h": 5}
+
+    with pytest.raises(OutboxTransitionError, match="invalid_upload_derivative"):
+        outbox.attach_upload_derivative(record.id, path="/data/event.jpg", info=malformed)
+
+    assert outbox.list_records() == [record]

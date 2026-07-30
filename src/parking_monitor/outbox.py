@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import copy
 from dataclasses import replace
 from datetime import datetime
 import hashlib
@@ -54,6 +55,7 @@ from parking_monitor.outbox_storage import (
     load_records,
     persist_records,
 )
+from parking_monitor.outbox_derivatives import OutboxDerivativeMixin
 
 # Compatibility aliases retained for callers and existing failure-injection tests.
 _SCHEMA_VERSION = SCHEMA_VERSION
@@ -65,7 +67,7 @@ _safe_reason_code = safe_reason_code
 _parse_utc_timestamp = parse_utc_timestamp
 
 
-class LocalOutbox:
+class LocalOutbox(OutboxDerivativeMixin):
     """Thread-safe JSON-file backed Matrix alert outbox."""
 
     def __init__(
@@ -127,17 +129,11 @@ class LocalOutbox:
     def list_records(self, state: OutboxState | None = None) -> list[OutboxRecord]:
         with self._lock:
             if state is None:
-                return list(self._records)
-            return [record for record in self._records if record.state == state]
+                return copy.deepcopy(self._records)
+            return copy.deepcopy([record for record in self._records if record.state == state])
 
     def list_pending(self) -> list[OutboxRecord]:
         return self.list_records("pending")
-
-    def update_intent_metadata(self, record_id: str, metadata: dict[str, JsonValue]) -> OutboxRecord:
-        with self._lock:
-            record = self._find_record(record_id)
-            intent = replace(record.intent, metadata=metadata).sanitized()
-            return self._replace_record(replace(record, intent=intent, updated_at=utc_now_text()))
 
     def next_due_record(self, now: datetime) -> OutboxRecord | None:
         records = self.due_records(now, max_records=1)
@@ -158,7 +154,8 @@ class LocalOutbox:
                 if is_record_due(record, now_utc) and (record_id is None or record.id == record_id)
             ]
             eligible.sort(key=due_record_sort_key)
-            return eligible if max_records is None else eligible[: max(0, int(max_records))]
+            selected = eligible if max_records is None else eligible[: max(0, int(max_records))]
+            return copy.deepcopy(selected)
 
     def next_retry_due_at(self) -> datetime | None:
         with self._lock:
@@ -394,7 +391,7 @@ class LocalOutbox:
 
     def _find_record(self, record_id: str) -> OutboxRecord:
         try:
-            return self._records[self._index_by_id[record_id]]
+            return copy.deepcopy(self._records[self._index_by_id[record_id]])
         except KeyError as exc:
             raise OutboxTransitionError("unknown_record") from exc
 

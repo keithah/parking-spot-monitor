@@ -198,6 +198,9 @@ def test_confirmed_dead_retry_and_replay_declarations_are_absent() -> None:
 def test_outbox_is_decomposed_behind_a_small_compatibility_facade() -> None:
     caps = {
         "src/parking_monitor/outbox.py": 450,
+        "src/parking_monitor/outbox_derivatives.py": 80,
+        "src/parking_monitor/matrix_outbox_delivery.py": 650,
+        "src/parking_monitor/matrix_outbox_snapshots.py": 300,
         "src/parking_monitor/outbox_models.py": 500,
         "src/parking_monitor/outbox_storage.py": 500,
     }
@@ -217,6 +220,9 @@ def test_matrix_module_is_a_small_compatibility_shim() -> None:
         "parking_spot_monitor/matrix_cockpit.py": 430,
         "parking_spot_monitor/matrix_delivery.py": 280,
         "parking_spot_monitor/jpeg_artifacts.py": 350,
+        "parking_spot_monitor/matrix_upload_derivatives.py": 400,
+        "parking_spot_monitor/matrix_snapshot_storage.py": 320,
+        "parking_spot_monitor/matrix_snapshot_naming.py": 80,
         "parking_spot_monitor/matrix_models.py": 100,
         "parking_spot_monitor/matrix_snapshots.py": 430,
         "parking_spot_monitor/matrix_sync.py": 100,
@@ -225,6 +231,28 @@ def test_matrix_module_is_a_small_compatibility_shim() -> None:
     for path, max_lines in module_caps.items():
         assert (ROOT / path).exists()
         assert _line_count(path) <= max_lines
+
+
+def test_generic_jpeg_artifacts_do_not_depend_on_matrix_derivative_types() -> None:
+    jpeg_source = (ROOT / "parking_spot_monitor/jpeg_artifacts.py").read_text(encoding="utf-8")
+    assert "MatrixUploadDerivative" not in jpeg_source
+    assert "matrix_snapshots" not in jpeg_source
+    derivative_source = (ROOT / "parking_spot_monitor/matrix_upload_derivatives.py").read_text(encoding="utf-8")
+    assert "parking_spot_monitor.matrix_snapshots" not in derivative_source
+    assert "_matrix_snapshot_upload" not in derivative_source
+
+
+def test_matrix_snapshot_artifact_ownership_is_layered() -> None:
+    storage_imports = _imported_module_names("parking_spot_monitor/matrix_snapshot_storage.py")
+    derivative_imports = _imported_module_names("parking_spot_monitor/matrix_upload_derivatives.py")
+    snapshot_imports = _imported_module_names("parking_spot_monitor/matrix_snapshots.py")
+
+    assert "parking_spot_monitor.matrix_snapshots" not in storage_imports
+    assert "parking_spot_monitor.matrix_upload_derivatives" not in storage_imports
+    assert "os" not in derivative_imports
+    assert "parking_spot_monitor.matrix_snapshot_storage" in derivative_imports
+    assert "parking_spot_monitor.matrix_snapshot_storage" in snapshot_imports
+    assert "parking_spot_monitor.matrix_snapshot_naming" in snapshot_imports
 
 
 def test_runtime_resource_policy_is_small_and_has_no_runtime_side_effect_dependencies() -> None:

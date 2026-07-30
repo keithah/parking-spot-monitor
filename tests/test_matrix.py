@@ -1263,10 +1263,10 @@ def test_prune_event_snapshots_logs_safe_failure_without_raising(
     oldest.write_bytes(b"old")
     newest.write_bytes(b"new")
 
-    def fail_unlink(self: Path) -> None:
+    def fail_unlink(_root: Path, _directory: str | None, _filename: str) -> int:
         raise PermissionError("permission denied token=secret raw_image_bytes abc")
 
-    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    monkeypatch.setattr(matrix_snapshots, "delete_owned_artifact", fail_unlink)
 
     result = prune_event_snapshots(snapshot_root, retention_count=1, logger=StructuredLogger())
 

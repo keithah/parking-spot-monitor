@@ -27,14 +27,6 @@ from parking_monitor.outbox import (
     format_utc_timestamp,
 )
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
-from parking_spot_monitor.jpeg_artifacts import (
-    JpegDecodeError,
-    MatrixUploadDerivative,
-    load_upload_derivative,
-    prepare_upload_derivative,
-    read_upload_derivative_bytes,
-    upload_derivative_path,
-)
 from parking_spot_monitor.matrix_alerts import (
     LIFECYCLE_EVENT_TYPES,
     OCCUPIED_SPOT_EVENT_TYPE,
@@ -50,14 +42,12 @@ from parking_spot_monitor.matrix_alerts import (
     owner_vehicle_quiet_window_event_id,
 )
 from parking_spot_monitor.matrix_delivery import MatrixDelivery
-from parking_spot_monitor.matrix_snapshots import (
-    JPEG_MIMETYPE,
-    MatrixSnapshot,
-    prepare_event_snapshot,
+from parking_monitor.matrix_outbox_snapshots import (
+    MatrixOutboxSnapshots,
+    SNAPSHOT_ALERT_PHASES,
 )
 from parking_spot_monitor.matrix_support import MatrixError
 
-_SNAPSHOT_ALERT_PHASES = ("text", "upload", "image")
 _QUIET_WINDOW_EVENT_TYPES = frozenset({"quiet-window-upcoming", "quiet-window-started", "quiet-window-ended"})
 _WORKER_JOIN_TIMEOUT_SECONDS = 1.0
 
@@ -113,6 +103,14 @@ class MatrixOutboxDelivery:
         self._worker_last_error_type: str | None = None
         self._closing = False
         self._client_closed = False
+        self._snapshot_artifacts = MatrixOutboxSnapshots(
+            room_id=room_id,
+            data_dir=self.data_dir,
+            snapshots_dir=self.snapshots_dir,
+            outbox=outbox,
+            logger=logger,
+            retention_count=snapshot_retention_count,
+        )
         self._immediate_delivery = MatrixDelivery(
             client=client,
             room_id=room_id,
@@ -120,7 +118,7 @@ class MatrixOutboxDelivery:
             snapshots_dir=self.snapshots_dir,
             logger=logger,
             snapshot_retention_count=snapshot_retention_count,
-            protected_snapshots_provider=self._retryable_retained_snapshots,
+            protected_snapshots_provider=self._snapshot_artifacts.retryable_paths,
         )
 
     def close(self) -> None:
@@ -340,60 +338,15 @@ class MatrixOutboxDelivery:
         snapshot_source_path: str,
         snapshot_event_type: str,
     ) -> OutboxRecord:
-        existing = next(
-            (
-                record
-                for record in self.outbox.list_records()
-                if record.intent.event_id == event_id and "upload" in record.phase_states
-            ),
-            None,
-        )
-        if existing is not None:
-            return existing
-        snapshot = self._prepare_retained_snapshot(
+        record = self._snapshot_artifacts.enqueue(
             event=event,
             event_id=event_id,
+            body=body,
+            metadata=metadata,
             source_path=snapshot_source_path,
             event_type=snapshot_event_type,
         )
-        metadata.update(
-            {
-                "event_type": snapshot_event_type,
-                "retained_snapshot_path": str(snapshot.path),
-                "retained_snapshot_filename": snapshot.filename,
-                "retained_snapshot_body": snapshot.body,
-            }
-        )
-        derivative = prepare_upload_derivative(
-            snapshot,
-            destination=upload_derivative_path(snapshot.path),
-            logger=self.logger,
-        )
-        metadata.update(
-            {
-                "upload_derivative_path": str(derivative.path),
-                "upload_derivative_info": dict(derivative.info),
-            }
-        )
-        initial_phase = _SNAPSHOT_ALERT_PHASES[0]
-        intent = AlertIntent(
-            event_id=event_id,
-            phase=initial_phase,
-            room_id=self.room_id,
-            body=body,
-            metadata=metadata,
-        )
-        try:
-            record = self.outbox.enqueue_with_phases(intent, _SNAPSHOT_ALERT_PHASES)
-        except Exception:
-            committed = any(item.intent.event_id == event_id for item in self.outbox.list_records())
-            if not committed:
-                try:
-                    derivative.path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            raise
-        self._log("info", "matrix-outbox-enqueued", item_id=record.id, event_id=event_id, phase=initial_phase)
+        self._log("info", "matrix-outbox-enqueued", item_id=record.id, event_id=event_id, phase=SNAPSHOT_ALERT_PHASES[0])
         self._wake_event.set()
         return record
 
@@ -525,115 +478,30 @@ class MatrixOutboxDelivery:
         return self.outbox.mark_phase_delivered(record.id, "text", result={"matrix_event_id": event_id})
 
     def _upload_phase(self, record: OutboxRecord) -> OutboxRecord:
-        metadata = record.intent.metadata
-        retained_path = str(metadata.get("retained_snapshot_path") or metadata.get("snapshot_path", ""))
-        if not retained_path.strip() or not Path(retained_path).is_file():
-            raise MatrixError("Matrix retained snapshot evidence is missing", error_type="snapshot_missing_source")
-        derivative, metadata = self._upload_derivative(record, retained_path=Path(retained_path))
-        filename = metadata.get("retained_snapshot_filename")
-        image_body = metadata.get("retained_snapshot_body")
-        if not isinstance(filename, str) or not filename or not isinstance(image_body, str) or not image_body:
-            raise MatrixError("Matrix retained snapshot metadata is malformed", error_type="snapshot_metadata_failed")
+        prepared = self._snapshot_artifacts.prepare_upload(record)
         self._log(
             "info",
             "matrix-outbox-snapshot-prepared",
             item_id=record.id,
             phase="upload",
-            snapshot_path=retained_path,
-            byte_size=derivative.info["size"],
+            snapshot_path=prepared.snapshot_path,
+            byte_size=prepared.info["size"],
         )
-        try:
-            upload_data = read_upload_derivative_bytes(derivative)
-        except JpegDecodeError as exc:
-            raise MatrixError("Matrix upload derivative is missing", error_type="snapshot_missing_source") from exc
         content_uri = self.client.upload_image(
-            filename=filename,
-            data=upload_data,
-            content_type=JPEG_MIMETYPE,
+            filename=prepared.filename,
+            data=prepared.data,
+            content_type="image/jpeg",
         )
-        info = dict(derivative.info)
         return self.outbox.mark_phase_delivered(
             record.id,
             "upload",
             result={
                 "content_uri": content_uri,
-                "filename": filename,
-                "body": image_body,
-                "info": info,
+                "filename": prepared.filename,
+                "body": prepared.body,
+                "info": prepared.info,
             },
         )
-
-    def _upload_derivative(
-        self, record: OutboxRecord, *, retained_path: Path
-    ) -> tuple[MatrixUploadDerivative, Mapping[str, Any]]:
-        metadata = record.intent.metadata
-        derivative_path = metadata.get("upload_derivative_path")
-        derivative_info = metadata.get("upload_derivative_info")
-        expected_path = upload_derivative_path(retained_path)
-        if derivative_path is not None or derivative_info is not None:
-            if not isinstance(derivative_path, str) or not isinstance(derivative_info, Mapping):
-                raise MatrixError("Matrix upload derivative metadata is malformed", error_type="snapshot_resize_failed")
-            try:
-                path = Path(derivative_path)
-                if path.resolve(strict=False) != expected_path.resolve(strict=False):
-                    raise JpegDecodeError("read_failed")
-                return load_upload_derivative(path, derivative_info), metadata
-            except (JpegDecodeError, OSError):
-                raise MatrixError("Matrix upload derivative is invalid", error_type="snapshot_resize_failed") from None
-
-        snapshot = self._prepare_retained_snapshot(
-            event=metadata,
-            event_id=record.intent.event_id,
-            source_path=str(retained_path),
-            event_type=str(metadata.get("event_type") or OPEN_SPOT_EVENT_TYPE),
-        )
-        derivative = prepare_upload_derivative(snapshot, destination=expected_path, logger=self.logger)
-        updated_metadata = dict(metadata)
-        updated_metadata.update(
-            {
-                "retained_snapshot_filename": snapshot.filename,
-                "retained_snapshot_body": snapshot.body,
-                "upload_derivative_path": str(derivative.path),
-                "upload_derivative_info": dict(derivative.info),
-            }
-        )
-        updated = self.outbox.update_intent_metadata(record.id, updated_metadata)
-        return derivative, updated.intent.metadata
-
-    def _prepare_retained_snapshot(
-        self,
-        *,
-        event: Mapping[str, Any],
-        event_id: str,
-        source_path: str,
-        event_type: str,
-    ) -> MatrixSnapshot:
-        return prepare_event_snapshot(
-            source_path=source_path,
-            data_dir=self.data_dir,
-            snapshots_dir=self.snapshots_dir,
-            event_type=event_type,
-            event_id=event_id,
-            spot_id=str(event.get("spot_id", "")),
-            observed_at=event.get("observed_at"),
-            snapshot_retention_count=self.snapshot_retention_count,
-            logger=self.logger,
-            retention_trigger="matrix-outbox",
-            protected_snapshots=self._retryable_retained_snapshots(),
-        )
-
-    def _retryable_retained_snapshots(self) -> tuple[Path, ...]:
-        paths: list[Path] = []
-        for record in self.outbox.list_records():
-            if record.state not in {"pending", "retrying"}:
-                continue
-            retained = record.intent.metadata.get("retained_snapshot_path")
-            if isinstance(retained, str) and retained.strip():
-                paths.append(Path(retained))
-            derivative = record.intent.metadata.get("upload_derivative_path")
-            if isinstance(derivative, str) and derivative.strip():
-                paths.append(Path(derivative))
-        return tuple(paths)
 
     def _send_image_phase(self, record: OutboxRecord) -> OutboxRecord:
         upload_result = record.phase_results.get("upload")
@@ -717,7 +585,7 @@ def _transaction_id(record: OutboxRecord, phase: str) -> str:
 
 
 def _record_delivery_phases(record: OutboxRecord) -> tuple[str, ...]:
-    return tuple(phase for phase in _SNAPSHOT_ALERT_PHASES if phase in record.phase_states)
+    return tuple(phase for phase in SNAPSHOT_ALERT_PHASES if phase in record.phase_states)
 
 
 def _open_alert_metadata(event: Mapping[str, Any]) -> dict[str, str]:

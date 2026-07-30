@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,8 +12,17 @@ from PIL import Image, UnidentifiedImageError
 
 from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult, encode_jpeg_under_budget
 from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, open_decoded_rgb_jpeg
-from parking_spot_monitor.jpeg_artifacts import upload_derivative_path
-from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
+from parking_spot_monitor.logging import StructuredLogger
+from parking_spot_monitor.matrix_snapshot_storage import (
+    delete_owned_artifact,
+    ensure_owned_directory,
+    owned_file_size,
+    owned_jpeg_dimensions,
+    publish_retained_snapshot,
+    secure_snapshot_candidates,
+)
+from parking_spot_monitor.matrix_snapshot_naming import event_snapshot_path, snapshot_body
+from parking_spot_monitor.matrix_upload_derivatives import delete_upload_derivative
 from parking_spot_monitor.matrix_support import MatrixError, _require_non_empty, _sanitize_diagnostics
 from parking_spot_monitor.matrix_time import format_observed_at
 
@@ -134,14 +142,25 @@ def prepare_event_snapshot(
     event_type_text = _require_non_empty("event_type", event_type)
     event_id_text = _require_non_empty("event_id", event_id)
     observed_text = format_observed_at(observed_at)
-    snapshot_root = Path(snapshots_dir) if snapshots_dir is not None else Path(data_dir) / "snapshots"
-    filename = _snapshot_filename(
+    destination = event_snapshot_path(
+        data_dir=data_dir,
+        snapshots_dir=snapshots_dir,
         event_type=event_type_text,
-        stable_id=spot_id or event_id_text,
+        event_id=event_id_text,
+        spot_id=spot_id,
         observed_at=observed_text,
     )
-    destination = snapshot_root / filename
-
+    snapshot_root = destination.parent
+    filename = destination.name
+    try:
+        snapshot_root = ensure_owned_directory(snapshot_root)
+    except OSError as exc:
+        raise MatrixError(
+            "Matrix snapshot directory is unsafe",
+            error_type="snapshot_copy_failed",
+            snapshot_path=str(snapshot_root),
+            exception_type=exc.__class__.__name__,
+        ) from exc
     if source.name == "debug_latest.jpg":
         raise MatrixError(
             "Matrix snapshot source cannot be the local debug overlay",
@@ -154,10 +173,9 @@ def prepare_event_snapshot(
         )
 
     try:
-        snapshot_root.mkdir(parents=True, exist_ok=True)
         copied_snapshot = not _same_path(source, destination)
         if copied_snapshot:
-            shutil.copyfile(source, destination)
+            destination = publish_retained_snapshot(source, snapshot_root, filename)
     except OSError as exc:
         raise MatrixError(
             "Matrix snapshot copy failed",
@@ -170,13 +188,14 @@ def prepare_event_snapshot(
             exception_type=exc.__class__.__name__,
         ) from exc
 
-    byte_size = destination.stat().st_size
+    byte_size = 0
     try:
-        width, height = _jpeg_dimensions(destination)
+        byte_size = owned_file_size(snapshot_root, filename)
+        width, height = owned_jpeg_dimensions(snapshot_root, filename)
     except (OSError, UnidentifiedImageError) as exc:
         if copied_snapshot:
             try:
-                destination.unlink()
+                delete_owned_artifact(snapshot_root, None, filename)
             except OSError:
                 pass
         raise MatrixError(
@@ -218,7 +237,7 @@ def prepare_event_snapshot(
         path=destination,
         filename=filename,
         txn_id=f"snapshot-{Path(filename).stem}",
-        body=_snapshot_body(spot_id=spot_id, observed_at=observed_text),
+        body=snapshot_body(spot_id=spot_id, observed_at=observed_text),
         info=info,
         log_context=log_context,
     )
@@ -254,7 +273,7 @@ def prune_event_snapshots(
     if not root.exists():
         return SnapshotRetentionResult()
     try:
-        candidates = [path for path in root.iterdir() if path.is_file() and _is_event_snapshot_file(path)]
+        candidates = [path for path in secure_snapshot_candidates(root) if _is_event_snapshot_file(path)]
     except OSError as exc:
         _log_retention_failure(logger, root=root, trigger=trigger, error_type=type(exc).__name__, message=str(exc))
         return SnapshotRetentionResult(failed_count=1)
@@ -276,26 +295,19 @@ def prune_event_snapshots(
         if _path_in_resolved_set(path, protected):
             continue
         try:
-            byte_size = path.stat().st_size
-            path.unlink()
+            derivative_bytes = delete_upload_derivative(root, path.name)
+        except OSError as exc:
+            failed_count += 1
+            _log_retention_failure(logger, root=root, trigger=trigger, error_type=type(exc).__name__, message=str(exc))
+            continue
+        try:
+            byte_size = delete_owned_artifact(root, None, path.name)
         except OSError as exc:
             failed_count += 1
             _log_retention_failure(logger, root=root, trigger=trigger, error_type=type(exc).__name__, message=str(exc))
             continue
         pruned_count += 1
-        pruned_bytes += byte_size
-        derivative = upload_derivative_path(path)
-        try:
-            if derivative.is_file() and not derivative.is_symlink():
-                pruned_bytes += derivative.stat().st_size
-                derivative.unlink()
-                try:
-                    derivative.parent.rmdir()
-                except OSError:
-                    pass
-        except OSError as exc:
-            failed_count += 1
-            _log_retention_failure(logger, root=root, trigger=trigger, error_type=type(exc).__name__, message=str(exc))
+        pruned_bytes += byte_size + derivative_bytes
 
     if pruned_count:
         _log_retention_pruned(
@@ -398,25 +410,3 @@ def _log_retention_failure(
         pruned_count=pruned_count,
         pruned_bytes=pruned_bytes,
     )
-
-def _jpeg_dimensions(path: Path) -> tuple[int, int]:
-    with Image.open(path) as image:
-        if image.format != "JPEG":
-            raise OSError("snapshot is not a JPEG image")
-        width, height = image.size
-        image.verify()
-    return width, height
-
-
-def _snapshot_filename(*, event_type: str, stable_id: str, observed_at: str) -> str:
-    return f"{_path_token(event_type)}-{_path_token(stable_id)}-{_path_token(observed_at)}.jpg"
-
-
-def _path_token(value: object) -> str:
-    token = re.sub(r"[^A-Za-z0-9]+", "-", redact_diagnostic_text(value).strip().lower()).strip("-")
-    return token or "unknown"
-
-
-def _snapshot_body(*, spot_id: str | None, observed_at: str) -> str:
-    subject = redact_diagnostic_text(spot_id) if spot_id else "parking spot"
-    return f"Raw full-frame snapshot for {subject} at {observed_at.replace('Z', '+00:00')}"

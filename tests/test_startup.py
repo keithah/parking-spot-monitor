@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
+import parking_spot_monitor.matrix_snapshots as matrix_snapshots
 from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery
 from parking_monitor.outbox import AlertIntent, LocalOutbox
 from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult, FrameGeometry
@@ -3092,10 +3093,10 @@ def test_runtime_loop_startup_retention_failure_logs_and_continues(
     config_path = tmp_path / "config.yaml"
     config_path.write_text(base.replace("snapshot_retention_count: 50", "snapshot_retention_count: 1"), encoding="utf-8")
 
-    def fail_unlink(self: Path) -> None:
+    def fail_unlink(_root: Path, _directory: str | None, _filename: str) -> int:
         raise PermissionError(f"permission denied token={FAKE_MATRIX_VALUE} raw_image_bytes abc")
 
-    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    monkeypatch.setattr(matrix_snapshots, "delete_owned_artifact", fail_unlink)
 
     exit_code = _main(
         ["--config", str(config_path), "--data-dir", str(tmp_path)],
