@@ -80,6 +80,32 @@ def test_explicit_relative_missing_model_path_fails_before_runtime_loop() -> Non
         cli.validate_model_path("models/yolov8n.pt")
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        r"C:\models\yolov8n.pt",
+        r"C:yolov8n.pt",
+        r".\models\yolov8n.pt",
+        r"\models\yolov8n.pt",
+    ],
+)
+def test_windows_style_model_paths_fail_as_missing_explicit_paths(model: str) -> None:
+    from parking_spot_monitor import __main__ as cli
+
+    with pytest.raises(ConfigError, match="configured model file does not exist"):
+        cli.validate_model_path(model)
+
+
+def test_existing_explicit_posix_model_path_with_spaces_is_allowed(tmp_path: Path) -> None:
+    from parking_spot_monitor import __main__ as cli
+
+    model = tmp_path / "trusted model weights" / "yolo nano.pt"
+    model.parent.mkdir()
+    model.touch()
+
+    cli.validate_model_path(str(model))
+
+
 def test_legacy_bare_model_name_does_not_require_local_file() -> None:
     from parking_spot_monitor import __main__ as cli
 

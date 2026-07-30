@@ -23,6 +23,11 @@ config.yaml
 
 # Runtime/artifacts
 data/*
+models/
+*.[pP][tT]
+*.[pP][tT][hH]
+*.[oO][nN][nN][xX]
+*.[sS][aA][fF][eE][tT][eE][nN][sS][oO][rR][sS]
 .bg-shell/
 .gsd/runtime/
 .gsd/notifications.jsonl

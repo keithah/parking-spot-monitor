@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -263,7 +264,7 @@ def _default_detector_factory(settings: RuntimeSettings) -> UltralyticsVehicleDe
 def validate_model_path(model: str) -> None:
     """Fail early for explicit model paths while preserving bare Ultralytics names."""
     path = Path(model)
-    is_explicit = path.is_absolute() or path.name != model
+    is_explicit = "/" in model or "\\" in model or re.match(r"^[A-Za-z]:", model) is not None
     if is_explicit and not path.is_file():
         raise ConfigError(
             "configured model file does not exist",

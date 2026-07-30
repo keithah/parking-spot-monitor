@@ -275,7 +275,7 @@ def test_stream_profile_names_with_same_sanitized_destination_are_rejected(tmp_p
 
 
 @pytest.mark.parametrize("model_value", ["yolov8n.pt", "models/custom-detector.pt", "/models/yolov8n.pt"])
-def test_detection_model_accepts_local_model_names_and_relative_paths(tmp_path: Path, model_value: str) -> None:
+def test_detection_model_accepts_local_model_names_and_paths(tmp_path: Path, model_value: str) -> None:
     config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
         "model: /models/yolov8n.pt", f"model: {model_value}"
     )
@@ -284,6 +284,21 @@ def test_detection_model_accepts_local_model_names_and_relative_paths(tmp_path: 
     settings = load_settings(path, environ=fake_environ())
 
     assert settings.detection.model == model_value
+
+
+@pytest.mark.parametrize("model_literal", ['""', '"   "', '"\\t"'])
+def test_detection_model_rejects_empty_or_whitespace_only_values(
+    tmp_path: Path, model_literal: str
+) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "model: /models/yolov8n.pt", f"model: {model_literal}"
+    )
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert "detection.model" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

@@ -4,6 +4,8 @@ from pathlib import Path
 import re
 import subprocess
 
+import pytest
+
 
 def test_deployment_runbook_is_discoverable_and_actionable() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
@@ -90,6 +92,79 @@ def test_deployment_documents_model_preflight_before_start() -> None:
 
     assert checksum < validation < deployment
     assert "compare" in runbook[checksum:validation].lower()
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        "models/custom.bin",
+        "weights/yolo.pt",
+        "weights/yolo.PT",
+        "weights/yolo.pTh",
+        "weights/yolo.ONNX",
+        "weights/yolo.SafeTensors",
+    ],
+)
+def test_git_ignores_operator_model_artifacts(artifact: str) -> None:
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--quiet", "--", artifact],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert ignored.returncode == 0, artifact
+
+
+def test_rollback_restores_and_validates_model_pair_before_recreate() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+    section = runbook.split("## Rollback", 1)[1].split(
+        "## Troubleshooting deployment failures", 1
+    )[0]
+    workflow = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)[0]
+
+    restore_config = workflow.index('cp -- "$ROLLBACK_DIR/config.yaml" config.yaml')
+    restore_model = workflow.index('cp -- "$ROLLBACK_DIR/yolov8n.pt" models/yolov8n.pt')
+    validate = workflow.index("--validate-config")
+    recreate = workflow.index("docker compose up -d --no-build --force-recreate")
+
+    assert max(restore_config, restore_model) < validate < recreate
+    syntax = subprocess.run(
+        ["bash", "-n"], input=workflow, text=True, capture_output=True, check=False
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+
+def test_backup_precedes_upgrade_rollback_and_troubleshooting() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+
+    backup = runbook.index("## Backup and recovery")
+    upgrade = runbook.index("## Safe upgrade")
+    rollback = runbook.index("## Rollback")
+    troubleshooting = runbook.index("## Troubleshooting deployment failures")
+
+    assert backup < upgrade < rollback < troubleshooting
+
+
+def test_backup_workflow_captures_model_checksum_config_data_and_image_identity() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+    section = runbook.split("## Backup and recovery", 1)[1].split(
+        "## Troubleshooting deployment failures", 1
+    )[0]
+    workflow = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)[0]
+
+    for required in [
+        "cp -- config.yaml",
+        "cp -- models/yolov8n.pt",
+        "sha256sum yolov8n.pt",
+        "docker image inspect parking-spot-monitor:local",
+        "cp -a -- data",
+    ]:
+        assert required in workflow
+    syntax = subprocess.run(
+        ["bash", "-n"], input=workflow, text=True, capture_output=True, check=False
+    )
+    assert syntax.returncode == 0, syntax.stderr
 
 
 def test_deployment_docs_do_not_embed_live_secret_or_traceback_markers() -> None:

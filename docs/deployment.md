@@ -239,9 +239,52 @@ The resource controls are:
 
 To restore the former faster active polling, set `frame_interval_seconds` to 15 and restart. To disable adaptive cadence entirely, set `adaptive_polling_enabled: false`. Keep the stable interval greater than or equal to the active interval.
 
+## Backup and recovery
+
+The minimum recovery set is:
+
+- `config.yaml`, stored with restricted permissions.
+- The approved detector weight file and its trusted-source checksum record.
+- `.env`, stored in an approved secret backup rather than ordinary source archives.
+- `data/state.json` and `data/matrix-outbox.json` for runtime continuity and durable pending delivery.
+- `data/vehicle-history/`, snapshots, timeline frames, feedback labels, and decision memory according to retention and recovery needs.
+
+Set `BACKUP_DIR` to a new protected destination, then run this block from the repository root. It stops the service for a consistent copy and restarts it on success, failure, or interruption:
+
+```sh
+(
+  set -eu
+  : "${BACKUP_DIR:?set BACKUP_DIR to a new protected backup directory}"
+  if [ -e "$BACKUP_DIR" ]; then
+    echo "backup destination already exists" >&2
+    exit 1
+  fi
+  mkdir -p "$BACKUP_DIR"
+  docker compose stop parking-spot-monitor
+  trap 'docker compose start parking-spot-monitor' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  cp -- config.yaml "$BACKUP_DIR/config.yaml"
+  cp -- models/yolov8n.pt "$BACKUP_DIR/yolov8n.pt"
+  (
+    cd "$BACKUP_DIR"
+    sha256sum yolov8n.pt > yolov8n.pt.sha256
+  )
+  docker image inspect parking-spot-monitor:local \
+    --format '{{.Id}}' > "$BACKUP_DIR/image-id.txt"
+  cp -a -- data "$BACKUP_DIR/data"
+)
+```
+
+Store the matching `.env` separately through the approved secret-management process and associate it with this backup. Keep the image tag or an image export in the operator's protected image registry; `image-id.txt` records which local image the filesystem backup expects. Before relying on a copied backup, inspect its contents and test its checksum with `(cd "$BACKUP_DIR" && sha256sum -c yolov8n.pt.sha256)`.
+
+The runtime quarantines several malformed persisted JSON files rather than silently treating corrupt data as valid. Inspect logs and the corresponding `data/` artifacts before deleting any quarantine file.
+
 ## Safe upgrade
 
-Run repository tests before publishing a change. On the deployment host, keep a rollback image and then fast-forward the checkout:
+Run repository tests before publishing a change. Before changing the deployment checkout, complete the backup workflow above with a new protected `BACKUP_DIR`; retain that directory as `ROLLBACK_DIR` until the upgrade has passed its observation window. On the deployment host, tag the rollback image and then fast-forward the checkout:
 
 ```sh
 docker image tag parking-spot-monitor:local parking-spot-monitor:rollback
@@ -260,33 +303,30 @@ After the new service becomes healthy, repeat the health, artifact, cadence, and
 
 ## Rollback
 
-To return to the image saved immediately before an upgrade:
+To return to the image, configuration, and model saved immediately before an upgrade, set `ROLLBACK_DIR` to that protected backup. Restore the matching `.env` through the approved secret-backup process before validation. Then run this complete workflow from the repository root:
 
 ```sh
+set -eu
+: "${ROLLBACK_DIR:?set ROLLBACK_DIR to the protected rollback backup}"
 docker compose stop parking-spot-monitor
 docker image tag parking-spot-monitor:rollback parking-spot-monitor:local
+cp -- "$ROLLBACK_DIR/config.yaml" config.yaml
+mkdir -p models
+(cd "$ROLLBACK_DIR" && sha256sum -c yolov8n.pt.sha256)
+cp -- "$ROLLBACK_DIR/yolov8n.pt" models/yolov8n.pt
+docker compose run --rm parking-spot-monitor \
+  python -m parking_spot_monitor \
+  --config /config/config.yaml \
+  --data-dir /data \
+  --validate-config
 docker compose up -d --no-build --force-recreate parking-spot-monitor
 docker compose ps
 docker compose logs --tail 100 parking-spot-monitor
 ```
 
-This replaces the container but reuses the same read-only `config.yaml` and model mounts plus the persistent `data/` bind mount. If the rollback image expects a different model, restore its authenticated weight file and matching `detection.model` configuration, run the one-shot validation command, and only then recreate the service.
+The checksum check authenticates the backed-up model before it is restored. The one-shot command then validates that the rollback image can read the restored configuration and model through their container mounts before Compose recreates the service. The persistent `data/` bind mount remains in place.
 
 For a configuration-only rollback, restore the previous local `config.yaml` and `.env`, validate them with the one-shot Compose command, then restart the service. Never copy secrets into Git history or terminal output captured for tickets.
-
-## Backup and recovery
-
-The minimum recovery set is:
-
-- `config.yaml`, stored with restricted permissions.
-- The approved detector weight file and its trusted-source checksum record.
-- `.env`, stored in an approved secret backup rather than ordinary source archives.
-- `data/state.json` and `data/matrix-outbox.json` for runtime continuity and durable pending delivery.
-- `data/vehicle-history/`, snapshots, timeline frames, feedback labels, and decision memory according to retention and recovery needs.
-
-For a consistent filesystem backup, stop the service, copy `data/` and `config.yaml` to protected storage, then start it again. Back up `.env` separately through the operator's secret-management process.
-
-The runtime quarantines several malformed persisted JSON files rather than silently treating corrupt data as valid. Inspect logs and the corresponding `data/` artifacts before deleting any quarantine file.
 
 ## Troubleshooting deployment failures
 

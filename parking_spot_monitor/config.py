@@ -174,6 +174,8 @@ class DetectionConfig(StrictModel):
     @field_validator("model")
     @classmethod
     def model_must_be_local_without_traversal(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("detection.model must not be empty or whitespace only")
         if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value):
             raise ValueError("detection.model must be a local model name or mounted file path, not a URL")
         path = PurePosixPath(value)
