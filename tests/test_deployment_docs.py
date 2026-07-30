@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+import subprocess
 
 
 def test_deployment_runbook_is_discoverable_and_actionable() -> None:
@@ -65,3 +67,27 @@ def test_deployment_docs_do_not_embed_live_secret_or_traceback_markers() -> None
         "Traceback (most recent call last)",
     ]:
         assert forbidden not in rendered
+
+
+def test_dependency_lock_workflow_is_one_cleanup_scoped_subshell() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+    section = runbook.split("## Dependency lock maintenance", 1)[1].split(
+        "### Check freshness without package-index access", 1
+    )[0]
+    blocks = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)
+
+    assert len(blocks) == 1
+    workflow = blocks[0]
+    assert workflow.startswith("(\n")
+    assert workflow.rstrip().endswith(")")
+    assert "trap cleanup_lock_tools EXIT" in workflow
+    assert workflow.count("mktemp -d") == 2
+    assert "--stage-build-lock" in workflow
+    assert "requirements-build.next.lock" in workflow
+    assert "all three locks" in section.lower()
+    assert "two generated manifests" not in section.lower()
+    assert "both locks" not in section.lower()
+    syntax = subprocess.run(
+        ["bash", "-n"], input=workflow, text=True, capture_output=True, check=False
+    )
+    assert syntax.returncode == 0, syntax.stderr

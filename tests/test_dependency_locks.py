@@ -85,6 +85,13 @@ def _requirement_blocks(text: str) -> list[str]:
     return blocks
 
 
+def _lock_pin_versions(text: str) -> dict[str, str]:
+    return {
+        block.split("==", 1)[0]: block.split("==", 1)[1].split()[0]
+        for block in _requirement_blocks(text)
+    }
+
+
 @pytest.mark.parametrize("path", LOCK_PATHS)
 def test_lock_files_pin_and_hash_every_requirement(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
@@ -329,7 +336,7 @@ def _compiled_requirement(name: str, version: str = "1.0") -> str:
     return f"{name}=={version} \\\n    --hash=sha256:{'a' * 64}\n"
 
 
-def _valid_compiled(source: str) -> str:
+def _valid_compiled(source: str, build_pip_tools: str = "7.5.0") -> str:
     if source in {"requirements.txt", "requirements-build.txt"}:
         # pip-tools suppresses its default PyPI directive even when supplied
         # explicitly; the generator must make the reviewed install source explicit.
@@ -347,7 +354,7 @@ def _valid_compiled(source: str) -> str:
                 ("click", "8.4.2"),
                 ("packaging", "26.2"),
                 ("pip", "24.0"),
-                ("pip-tools", "7.5.0"),
+                ("pip-tools", build_pip_tools),
                 ("pyproject-hooks", "1.2.0"),
                 ("setuptools", "83.0.0"),
                 ("wheel", "0.47.0"),
@@ -366,6 +373,150 @@ def _valid_compiled(source: str) -> str:
     return directives + "".join(
         _compiled_requirement(name, version) for name, version in requirements
     )
+
+
+def test_toolchain_pin_change_uses_authenticated_two_phase_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _copy_lock_inputs(tmp_path)
+    module = _load_lock_module()
+    current_paths = [root / destination for _, destination in module.COMMANDS]
+    before = {path.name: path.read_bytes() for path in current_paths}
+    old_versions = _lock_pin_versions(before["requirements-build.lock"].decode())
+    build_input = root / "requirements-build.txt"
+    build_input.write_text(
+        build_input.read_text(encoding="utf-8").replace(
+            "pip-tools==7.5.0", "pip-tools==7.5.1"
+        ),
+        encoding="utf-8",
+    )
+
+    installed_versions = old_versions
+    monkeypatch.setattr(
+        module.importlib.metadata,
+        "version",
+        lambda name: installed_versions[module._canonical_name(name)],
+    )
+
+    def fake_run(command, *, cwd, check, env):
+        output = next(
+            argument.split("=", 1)[1]
+            for argument in command
+            if argument.startswith("--output-file=")
+        )
+        source = command[-1]
+        (root / output).write_text(
+            _valid_compiled(source, build_pip_tools="7.5.1"),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    module.stage_build_lock(root)
+
+    next_lock = root / module.NEXT_BUILD_LOCK
+    staged_text = next_lock.read_text(encoding="utf-8")
+    assert "pip-tools==7.5.1" in staged_text
+    assert {path.name: path.read_bytes() for path in current_paths} == before
+    installed_versions = _lock_pin_versions(staged_text)
+
+    module.generate_locks(root)
+
+    assert not next_lock.exists()
+    assert (root / "requirements-build.lock").read_text(encoding="utf-8") == staged_text
+    assert module.check_locks(root) == 0
+
+
+def test_stale_build_input_requires_authenticated_next_lock_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _copy_lock_inputs(tmp_path)
+    module = _load_lock_module()
+    build_input = root / "requirements-build.txt"
+    build_input.write_text(
+        build_input.read_text(encoding="utf-8").replace(
+            "pip-tools==7.5.0", "pip-tools==7.5.1"
+        ),
+        encoding="utf-8",
+    )
+    expected = {
+        module._canonical_name(line.split("==", 1)[0]): line.split("==", 1)[1]
+        for line in build_input.read_text(encoding="utf-8").splitlines()
+    }
+    monkeypatch.setattr(
+        module.importlib.metadata,
+        "version",
+        lambda name: expected[module._canonical_name(name)],
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("resolver ran before authentication"),
+    )
+
+    with pytest.raises(RuntimeError, match="stage.*build lock|next build lock"):
+        module.generate_locks(root)
+
+
+def test_build_lock_staging_rejects_unsupported_input_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _copy_lock_inputs(tmp_path)
+    module = _load_lock_module()
+    versions = _lock_pin_versions(
+        (root / "requirements-build.lock").read_text(encoding="utf-8")
+    )
+    (root / "requirements-build.txt").write_text(
+        "pip-tools @ https://untrusted.invalid/pip-tools.whl\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        module.importlib.metadata,
+        "version",
+        lambda name: versions[module._canonical_name(name)],
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("resolver ran for unsupported input"),
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported dependency requirement"):
+        module.stage_build_lock(root)
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    ["", "pip-tools>=7.5.0\n"],
+)
+def test_build_lock_staging_requires_exact_pip_tools_pin_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    root = _copy_lock_inputs(tmp_path)
+    module = _load_lock_module()
+    versions = _lock_pin_versions(
+        (root / "requirements-build.lock").read_text(encoding="utf-8")
+    )
+    build_input = root / "requirements-build.txt"
+    build_input.write_text(
+        build_input.read_text(encoding="utf-8").replace(
+            "pip-tools==7.5.0\n", replacement
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        module.importlib.metadata,
+        "version",
+        lambda name: versions[module._canonical_name(name)],
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("resolver ran without exact pip-tools pin"),
+    )
+
+    with pytest.raises(RuntimeError, match="exact.*pip-tools|pip-tools.*exact"):
+        module.stage_build_lock(root)
 
 
 def test_generation_sanitizes_indexes_and_publishes_explicit_sources(
@@ -539,7 +690,9 @@ def test_build_tool_validation_rejects_any_pinned_version_mismatch(
 ) -> None:
     root = _copy_lock_inputs(tmp_path)
     module = _load_lock_module()
-    expected = module._required_build_tool_versions(root)
+    expected = _lock_pin_versions(
+        (root / "requirements-build.lock").read_text(encoding="utf-8")
+    )
     mismatched = next(iter(expected))
 
     monkeypatch.setattr(
@@ -552,10 +705,10 @@ def test_build_tool_validation_rejects_any_pinned_version_mismatch(
         module._validate_build_tool(root)
 
 
-def test_input_requirement_name_handles_supported_compatible_release() -> None:
+def test_input_requirement_name_handles_supported_minimum_release() -> None:
     module = _load_lock_module()
 
-    assert module._input_requirement_name("Example_Package~=1.2") == "example-package"
+    assert module._input_requirement_name("Example_Package>=1.2") == "example-package"
 
 
 def test_input_requirement_rejects_markers_instead_of_misparsing_direct_name() -> None:
@@ -673,13 +826,28 @@ def test_lock_validation_rejects_direct_pin_outside_input_constraint(
         )
 
 
-def test_compatible_release_constraint_semantics() -> None:
+def test_exact_constraint_uses_pep440_local_version_semantics() -> None:
     module = _load_lock_module()
 
-    assert module._version_satisfies("1.4.9", "~=1.4.5") is True
-    assert module._version_satisfies("1.5.0", "~=1.4.5") is False
-    assert module._version_satisfies("1.9.0", "~=1.4") is True
-    assert module._version_satisfies("2.0.0", "~=1.4") is False
+    assert module._version_satisfies("2.7.1+cpu", "==2.7.1") is True
+    assert module._version_satisfies("2.7.1+cpu", "==2.7.1+cpu") is True
+    assert module._version_satisfies("2.7.1+cuda", "==2.7.1+cpu") is False
+
+
+def test_exact_constraint_rejects_noncanonical_local_candidate() -> None:
+    module = _load_lock_module()
+
+    with pytest.raises(RuntimeError, match="unsupported exact dependency version"):
+        module._version_satisfies("2.7.1+CPU", "==2.7.1+cpu")
+
+
+def test_exact_local_pin_remains_supported_by_input_grammar() -> None:
+    module = _load_lock_module()
+
+    assert (
+        module._canonical_input_requirement("Torch==2.7.1+cpu")
+        == "torch==2.7.1+cpu"
+    )
 
 
 @pytest.mark.parametrize(
@@ -689,6 +857,12 @@ def test_compatible_release_constraint_semantics() -> None:
         "example @ https://example.invalid/package.whl",
         "example^=1.2",
         "example==1.*",
+        "example!=1.2",
+        "example~=1.2",
+        "example<=1.2",
+        "example>=1.4rc1",
+        "example>=1.4.post1",
+        "example>=1.4+local",
     ],
 )
 def test_input_requirement_rejects_unsupported_constraint_forms(

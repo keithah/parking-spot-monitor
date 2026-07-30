@@ -37,48 +37,54 @@ The tracked service limits the container to 2 CPUs, 4 GiB of memory, and 512 pro
 
 ## Dependency lock maintenance
 
-Container builds install reviewed, exact hashes from two generated manifests. `requirements-runtime.lock` contains the application runtime, while `requirements-detector.lock` contains the detector stack. Both name PyPI explicitly; the detector lock also names the PyTorch CPU index. A third hash-locked manifest, `requirements-build.lock`, bootstraps the exact resolver toolchain used to regenerate them. Maintainers continue to edit the broad dependency bounds in `requirements.txt`, `requirements-detector.txt`, and the matching dependency tables in `pyproject.toml`; do not hand-edit generated locks.
+All three generated manifests contain reviewed, exact hashes. `requirements-build.lock` authenticates the resolver toolchain, `requirements-runtime.lock` contains the application runtime, and `requirements-detector.lock` contains the detector stack. Every lock names PyPI explicitly; the detector lock also names the PyTorch CPU index. Maintainers continue to edit the broad dependency bounds in `requirements.txt`, `requirements-detector.txt`, and the matching dependency tables in `pyproject.toml`; do not hand-edit generated locks.
 
 Runtime declarations in `requirements.txt` must match `project.dependencies`. Detector declarations in `requirements-detector.txt` must match `project.optional-dependencies.detector`. The generator and offline check reject drift between those pairs. The development extra is intentionally separate from container dependencies, so changes under `project.optional-dependencies.dev` do not invalidate these locks.
 
-### Prerequisites
+### Regenerate all three reviewed locks
 
-Use Python 3.12 and create a new dedicated build-tool environment from the repository root for each regeneration. The cleanup trap removes it on success, failure, or interruption. Do not reuse a previous tool environment; the project runtime environment does not need these packages:
+After changing a dependency input, run this entire block from the repository root with Python 3.12. The first environment is authenticated by the current build lock and may only stage and validate the next build lock. The second environment is authenticated by that next lock, regenerates the complete set, verifies the staged build lock is byte-identical, and publishes all three locks together. The enclosing subshell runs the cleanup trap when the block finishes successfully, fails, or is interrupted:
 
 ```sh
-LOCK_TOOLS_DIR="$(mktemp -d)"
-cleanup_lock_tools() {
-  if [ -n "${LOCK_TOOLS_DIR:-}" ] && [ -d "$LOCK_TOOLS_DIR" ]; then
+(
+  set -eu
+  LOCK_TOOLS_DIR="$(mktemp -d)"
+  NEXT_LOCK_TOOLS_DIR=""
+  cleanup_lock_tools() {
     rm -rf -- "$LOCK_TOOLS_DIR"
-  fi
-}
-trap cleanup_lock_tools EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-python3.12 -m venv "$LOCK_TOOLS_DIR"
-env -u PIP_INDEX_URL -u PIP_EXTRA_INDEX_URL -u PIP_FIND_LINKS \
-  -u PIP_NO_INDEX -u PIP_TRUSTED_HOST -u PIP_CONFIG_FILE \
-  -u PIP_REQUIREMENT -u PIP_CONSTRAINT -u PIP_BUILD_CONSTRAINT \
-  PIP_CONFIG_FILE=/dev/null \
-  "$LOCK_TOOLS_DIR/bin/python" -I -m pip --disable-pip-version-check install \
-  --index-url=https://pypi.org/simple --require-hashes \
-  -r requirements-build.lock
+    if [ -n "$NEXT_LOCK_TOOLS_DIR" ]; then
+      rm -rf -- "$NEXT_LOCK_TOOLS_DIR"
+    fi
+  }
+  trap cleanup_lock_tools EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  install_lock_tools() {
+    lock_tools_dir="$1"
+    lock_file="$2"
+    python3.12 -m venv "$lock_tools_dir"
+    env -u PIP_INDEX_URL -u PIP_EXTRA_INDEX_URL -u PIP_FIND_LINKS \
+      -u PIP_NO_INDEX -u PIP_TRUSTED_HOST -u PIP_CONFIG_FILE \
+      -u PIP_REQUIREMENT -u PIP_CONSTRAINT -u PIP_BUILD_CONSTRAINT \
+      PIP_CONFIG_FILE=/dev/null \
+      "$lock_tools_dir/bin/python" -I -m pip --disable-pip-version-check install \
+      --index-url=https://pypi.org/simple --require-hashes -r "$lock_file"
+  }
+
+  install_lock_tools "$LOCK_TOOLS_DIR" requirements-build.lock
+  "$LOCK_TOOLS_DIR/bin/python" -I scripts/lock_dependencies.py --stage-build-lock
+
+  NEXT_LOCK_TOOLS_DIR="$(mktemp -d)"
+  install_lock_tools "$NEXT_LOCK_TOOLS_DIR" requirements-build.next.lock
+  "$NEXT_LOCK_TOOLS_DIR/bin/python" -I scripts/lock_dependencies.py
+
+  git diff -- requirements-build.lock requirements-runtime.lock requirements-detector.lock
+  python3.12 -I scripts/lock_dependencies.py --check
+)
 ```
 
-`requirements-build.txt` exactly pins the complete resolver toolchain, and its generated lock authenticates every bootstrap artifact. The generator verifies Python 3.12 isolated mode and every installed tool version before resolving anything.
-
-### Regenerate reviewed locks
-
-After changing a dependency input, run:
-
-```sh
-"$LOCK_TOOLS_DIR/bin/python" -I scripts/lock_dependencies.py
-git diff -- requirements-build.lock requirements-runtime.lock requirements-detector.lock
-python3 -I scripts/lock_dependencies.py --check
-```
-
-Review unexpected additions, removals, index changes, and version jumps before committing the locks. Generation uses the backtracking resolver, exact versions, SHA-256 hashes, and an isolated package-index configuration. It stages and validates the complete generated set before publication. If publication fails partway through, previously published files are restored to their prior contents or prior absent state. A shared application digest covers both runtime input manifests and the matching project tables; the build lock has a separate digest of the exact tool input.
+`requirements-build.txt` exactly pins the complete resolver toolchain. Review unexpected additions, removals, index changes, and version jumps in all three locks before committing. Generation uses the backtracking resolver, exact versions, SHA-256 hashes, and an isolated package-index configuration. If publication fails partway through, previously published files are restored to their prior contents or prior absent state. A shared application digest covers the runtime input manifests and matching project tables; the build lock has a separate digest of the exact tool input.
 
 ### Check freshness without package-index access
 
@@ -95,7 +101,7 @@ Check mode reads local inputs and lock files only. It verifies declaration synch
 
 - If generation reports the wrong Python version, missing `-I`, or a wrong build-tool version, let the cleanup trap discard that environment and repeat the documented bootstrap with Python 3.12 and `requirements-build.lock`.
 - If generation or check reports an input mismatch, update both the requirements manifest and its matching `pyproject.toml` table before regenerating.
-- If `--check` reports a stale lock, regenerate both locks and review their diff; copying a digest between headers does not update resolved dependencies.
+- If `--check` reports a stale lock, regenerate all three locks and review their diff; copying a digest between headers does not update resolved dependencies.
 - If resolution cannot reach PyPI or the PyTorch CPU index, verify outbound HTTPS and proxy or certificate configuration, then rerun generation. Do not remove hashes or replace the CPU index with an unreviewed source.
 - If generation is interrupted or compiler output is invalid, first run the offline check. It reports a missing, stale, malformed, or mixed generated set without rewriting it. Then rerun generation in a fresh tool environment. All compiler results are validated before publication, partial publication is rolled back when possible, cleanup failures are reported without hiding the original error, and the next offline check is the recovery authority.
 
