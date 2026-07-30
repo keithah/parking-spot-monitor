@@ -7,7 +7,7 @@ import re
 import shlex
 import sys
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 import yaml
@@ -137,10 +137,20 @@ def _run_words(arguments: str) -> list[str]:
 
 def _compileall_words(arguments: str) -> list[str] | None:
     words = _run_words(arguments)
-    for index in range(len(words) - 2):
-        if words[index : index + 3] == ["python", "-m", "compileall"]:
-            return words[index + 3 :]
-    return None
+    module_indexes = [
+        index
+        for index in range(len(words) - 1)
+        if words[index : index + 2] == ["-m", "compileall"]
+    ]
+    if not module_indexes:
+        return None
+
+    assert len(module_indexes) == 1
+    module_index = module_indexes[0]
+    assert module_index > 0
+    executable = PurePosixPath(words[module_index - 1]).name
+    assert re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable) is not None
+    return words[module_index + 2 :]
 
 
 def _assert_exact_final_source_contract(dockerfile: str) -> None:
@@ -388,6 +398,41 @@ def test_exec_form_compileall_cannot_hide_in_an_intermediate_stage() -> None:
     mutated = dockerfile.replace(
         "FROM capture-base AS runtime-app",
         'RUN ["python", "-m", "compileall", "-q", "/app/src"]\n\n'
+        "FROM capture-base AS runtime-app",
+        1,
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_exact_final_source_contract(mutated)
+
+
+@pytest.mark.parametrize(
+    "run_instruction",
+    [
+        'RUN ["python3", "-m", "compileall", "-q", "/app/src"]',
+        'RUN ["python3.12", "-m", "compileall", "-q", "/app/src"]',
+        "RUN /usr/local/bin/python -m compileall -q /app/src",
+    ],
+)
+def test_python_executable_variants_cannot_hide_intermediate_compileall(
+    run_instruction: str,
+) -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    mutated = dockerfile.replace(
+        "FROM capture-base AS runtime-app",
+        run_instruction + "\n\nFROM capture-base AS runtime-app",
+        1,
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_exact_final_source_contract(mutated)
+
+
+def test_unclassifiable_compileall_module_run_fails_closed() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    mutated = dockerfile.replace(
+        "FROM capture-base AS runtime-app",
+        'RUN ["module-runner", "-m", "compileall", "-q", "/app/src"]\n\n'
         "FROM capture-base AS runtime-app",
         1,
     )
