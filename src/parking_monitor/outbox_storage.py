@@ -9,7 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
+import stat
 import tempfile
 from typing import Any, BinaryIO
 
@@ -28,6 +28,7 @@ from parking_monitor.outbox_models import (
 
 MAX_QUARANTINE_FILES = 20
 MAX_OUTBOX_FILE_BYTES = 5_000_000
+MAX_OUTBOX_RECORD_BYTES = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -79,17 +80,41 @@ def load_records(
     path: Path,
     *,
     max_bytes: int = MAX_OUTBOX_FILE_BYTES,
+    max_record_bytes: int = MAX_OUTBOX_RECORD_BYTES,
     fsync_directory: Callable[[Path], None],
 ) -> tuple[list[OutboxRecord], RecoveryResult]:
-    if not path.exists():
-        return [], RecoveryResult()
     try:
-        if path.stat().st_size > max_bytes:
-            event = _quarantine_file(path, reason="oversized_file", suffix="json", fsync_directory=fsync_directory)
-            return [], RecoveryResult().with_event(event)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+    except FileNotFoundError:
+        return [], RecoveryResult()
     except OSError as exc:
-        raise OutboxPersistenceError("failed to inspect local outbox payload") from exc
-    raw = path.read_bytes()
+        raise OutboxPersistenceError("local outbox must be a readable non-symlink regular file") from exc
+    try:
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise OutboxPersistenceError("local outbox must be a regular file")
+            if before.st_size > max_bytes:
+                event = _quarantine_file(
+                    path,
+                    descriptor,
+                    before,
+                    reason="oversized_file",
+                    suffix="json",
+                    fsync_directory=fsync_directory,
+                )
+                return [], RecoveryResult().with_event(event)
+            raw = _read_bound_descriptor(descriptor, before, max_bytes=max_bytes)
+            _require_stable_binding(path, descriptor, before)
+        except OutboxPersistenceError:
+            raise
+        except OSError as exc:
+            raise OutboxPersistenceError("failed to read local outbox payload") from exc
+    finally:
+        os.close(descriptor)
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -102,6 +127,10 @@ def load_records(
     records: list[OutboxRecord] = []
     recovery = RecoveryResult()
     for item in payload["items"]:
+        if len(_json_bytes(item)) > max_record_bytes:
+            event = _quarantine_json(path, item, reason="oversized_record", fsync_directory=fsync_directory)
+            recovery = recovery.with_event(event)
+            continue
         try:
             records.append(OutboxRecord.from_json(require_mapping(item, "record")))
         except RecordValidationError as exc:
@@ -117,23 +146,28 @@ def persist_records(
     path: Path,
     records: list[OutboxRecord],
     *,
+    max_bytes: int = MAX_OUTBOX_FILE_BYTES,
+    max_record_bytes: int = MAX_OUTBOX_RECORD_BYTES,
     fsync_directory: Callable[[Path], None],
 ) -> None:
+    serialized = _serialized_document(
+        records,
+        max_bytes=max_bytes,
+        max_record_bytes=max_record_bytes,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"schema_version": SCHEMA_VERSION, "items": [record.to_json() for record in records]}
     tmp_path: str | None = None
     replaced = False
     try:
         with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
+            "wb",
             dir=path.parent,
             prefix=f".{path.name}.",
             suffix=".tmp",
             delete=False,
         ) as handle:
             tmp_path = handle.name
-            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
@@ -229,20 +263,31 @@ def _quarantine_bytes(
 
 def _quarantine_file(
     source: Path,
+    descriptor: int,
+    source_stat: os.stat_result,
     *,
     reason: str,
     suffix: str,
     fsync_directory: Callable[[Path], None],
 ) -> RecoveryEvent:
-    stat = source.stat()
-    digest = hashlib.sha256(f"{source.name}:{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()[:16]
+    digest = hashlib.sha256(
+        f"{source.name}:{source_stat.st_dev}:{source_stat.st_ino}:{source_stat.st_size}:{source_stat.st_mtime_ns}".encode()
+    ).hexdigest()[:16]
     target = _quarantine_dir(source) / f"{reason}-{digest}.{suffix}.bad"
 
     def copy_source(handle: BinaryIO) -> None:
-        with source.open("rb") as reader:
-            shutil.copyfileobj(reader, handle, length=1024 * 1024)
+        offset = 0
+        remaining = min(source_stat.st_size, MAX_OUTBOX_FILE_BYTES)
+        while remaining:
+            chunk = os.pread(descriptor, min(1024 * 1024, remaining), offset)
+            if not chunk:
+                break
+            handle.write(chunk)
+            offset += len(chunk)
+            remaining -= len(chunk)
 
     _atomic_quarantine_write(target, copy_source, fsync_directory=fsync_directory)
+    _require_stable_binding(source, descriptor, source_stat)
     return RecoveryEvent(reason=reason, quarantine_path=str(target))
 
 
@@ -293,3 +338,55 @@ def _prune_quarantine(path: Path) -> None:
 
 def _prune_rank(record: OutboxRecord) -> int:
     return 0 if record.state in TERMINAL_STATES else 1
+
+
+def _serialized_document(
+    records: list[OutboxRecord],
+    *,
+    max_bytes: int,
+    max_record_bytes: int,
+) -> bytes:
+    items: list[bytes] = []
+    document_size = len(b'{"items":[],"schema_version":}') + len(str(SCHEMA_VERSION))
+    for record in records:
+        item = _json_bytes(record.to_json())
+        if len(item) > max_record_bytes:
+            raise OutboxPersistenceError("local outbox record exceeds byte limit")
+        document_size += len(item) + (1 if items else 0)
+        if document_size > max_bytes:
+            raise OutboxPersistenceError("local outbox document exceeds byte limit")
+        items.append(item)
+    document = b'{"items":[' + b",".join(items) + f'],"schema_version":{SCHEMA_VERSION}}}'.encode("ascii")
+    return document
+
+
+def _json_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _read_bound_descriptor(descriptor: int, before: os.stat_result, *, max_bytes: int) -> bytes:
+    payload = bytearray()
+    while len(payload) <= max_bytes:
+        chunk = os.read(descriptor, min(65_536, max_bytes + 1 - len(payload)))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    if len(payload) > max_bytes:
+        raise OutboxPersistenceError("local outbox document exceeds byte limit")
+    after = os.fstat(descriptor)
+    if _stat_signature(after) != _stat_signature(before) or len(payload) != before.st_size:
+        raise OutboxPersistenceError("local outbox changed while reading")
+    return bytes(payload)
+
+
+def _require_stable_binding(path: Path, descriptor: int, before: os.stat_result) -> None:
+    try:
+        leaf = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise OutboxPersistenceError("local outbox changed while reading") from exc
+    if _stat_signature(os.fstat(descriptor)) != _stat_signature(before) or _stat_signature(leaf) != _stat_signature(before):
+        raise OutboxPersistenceError("local outbox changed while reading")
+
+
+def _stat_signature(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns

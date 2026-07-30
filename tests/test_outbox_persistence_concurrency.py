@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import stat
+
 from tests.support._outbox_persistence import *  # noqa: F403
 
 
@@ -427,10 +430,14 @@ def test_write_failure_preserves_prior_durable_file(tmp_path, monkeypatch):
     first = outbox.enqueue(AlertIntent(event_id="evt-1", phase="text", body="ok"))
     durable_before = store_path.read_text(encoding="utf-8")
 
-    def fail_dump(*args, **kwargs):
-        raise OSError("disk full: access_token should not leak")
+    real_fsync = os.fsync
 
-    monkeypatch.setattr("parking_monitor.outbox.json.dump", fail_dump)
+    def fail_file_sync(descriptor: int) -> None:
+        if stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("disk full: access_token should not leak")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr("parking_monitor.outbox_storage.os.fsync", fail_file_sync)
 
     with pytest.raises(OutboxPersistenceError) as excinfo:
         outbox.enqueue(AlertIntent(event_id="evt-2", phase="text", body="ok"))

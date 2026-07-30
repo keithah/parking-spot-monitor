@@ -48,6 +48,7 @@ from parking_monitor.outbox_models import (
 )
 from parking_monitor.outbox_storage import (
     MAX_OUTBOX_FILE_BYTES,
+    MAX_OUTBOX_RECORD_BYTES,
     RecoveryEvent,
     RecoveryResult,
     apply_retention,
@@ -61,6 +62,7 @@ from parking_monitor.outbox_lookup import OutboxLookupMixin, build_event_index
 # Compatibility aliases retained for callers and existing failure-injection tests.
 _SCHEMA_VERSION = SCHEMA_VERSION
 _MAX_OUTBOX_FILE_BYTES = MAX_OUTBOX_FILE_BYTES
+_MAX_OUTBOX_RECORD_BYTES = MAX_OUTBOX_RECORD_BYTES
 _OutboxPostCommitPersistenceError = OutboxPostCommitPersistenceError
 _RecordValidationError = RecordValidationError
 _fsync_directory = fsync_directory
@@ -427,14 +429,12 @@ class LocalOutbox(OutboxDerivativeMixin, OutboxLookupMixin):
         return apply_retention(records, self.retention)
 
     def _load_records(self) -> tuple[list[OutboxRecord], RecoveryResult]:
-        return load_records(
-            self.path,
-            max_bytes=_MAX_OUTBOX_FILE_BYTES,
-            fsync_directory=_fsync_directory,
-        )
+        limits = {"max_bytes": _MAX_OUTBOX_FILE_BYTES, "max_record_bytes": _MAX_OUTBOX_RECORD_BYTES}
+        return load_records(self.path, **limits, fsync_directory=_fsync_directory)
 
     def _persist_records(self, records: list[OutboxRecord]) -> None:
-        persist_records(self.path, records, fsync_directory=_fsync_directory)
+        limits = {"max_bytes": _MAX_OUTBOX_FILE_BYTES, "max_record_bytes": _MAX_OUTBOX_RECORD_BYTES}
+        persist_records(self.path, records, **limits, fsync_directory=_fsync_directory)
 
 
 def derive_outbox_item_id(intent: AlertIntent) -> str:
