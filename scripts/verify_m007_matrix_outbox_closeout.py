@@ -32,6 +32,7 @@ from scripts.closeout_helpers import (
     safe_output,
     smoke_env,
 )
+from scripts.test_suite_paths import MATRIX_OUTBOX_TEST_MODULES
 
 TIMEOUT_SECONDS = 180
 DOCKER_TIMEOUT_SECONDS = 300
@@ -505,10 +506,10 @@ def _build_commands(temp_data_dir: Path) -> tuple[SmokeCommand, ...]:
                 sys.executable,
                 "-m",
                 "pytest",
-                "tests/test_matrix_outbox_delivery.py",
+                *MATRIX_OUTBOX_TEST_MODULES,
                 "tests/test_health.py",
-                "tests/test_startup.py::test_runtime_open_alert_failure_persists_retryable_matrix_outbox",
-                "tests/test_startup.py::test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_event",
+                "tests/test_startup_services_and_outbox.py::test_runtime_open_alert_failure_persists_retryable_matrix_outbox",
+                "tests/test_startup_services_and_outbox.py::test_runtime_worker_restarts_existing_matrix_outbox_without_new_occupancy_event",
                 "-q",
             ),
         ),

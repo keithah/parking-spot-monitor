@@ -21,6 +21,12 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from scripts.closeout_helpers import assert_no_forbidden_markers, bounded_text, redact_text, safe_output, smoke_env
+from scripts.test_suite_paths import (
+    MATRIX_COCKPIT_TEST_MODULES,
+    MATRIX_TEST_MODULES,
+    OPERATOR_FEEDBACK_TEST_MODULES,
+    VEHICLE_HISTORY_TEST_MODULES,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 STATUS_PATH = ROOT / "data" / "m008-closeout-status.json"
@@ -69,8 +75,8 @@ def _build_commands() -> tuple[SmokeCommand, ...]:
                 sys.executable,
                 "-m",
                 "pytest",
-                "tests/test_matrix.py",
-                "tests/test_matrix_operator_cockpit.py",
+                *MATRIX_TEST_MODULES,
+                *MATRIX_COCKPIT_TEST_MODULES,
                 "tests/test_operator_cockpit.py",
                 "tests/test_operator_docs.py",
                 "-q",
@@ -83,7 +89,7 @@ def _build_commands() -> tuple[SmokeCommand, ...]:
                 "-m",
                 "pytest",
                 "tests/test_operator_decision_memory.py",
-                "tests/test_operator_feedback.py",
+                *OPERATOR_FEEDBACK_TEST_MODULES,
                 "-q",
             ),
         ),
@@ -94,7 +100,7 @@ def _build_commands() -> tuple[SmokeCommand, ...]:
                 "-m",
                 "pytest",
                 "tests/test_occupancy_analytics.py",
-                "tests/test_vehicle_history.py",
+                *VEHICLE_HISTORY_TEST_MODULES,
                 "tests/test_vehicle_history_cli.py",
                 "tests/test_owner_vehicles.py",
                 "tests/test_vehicle_estimates.py",

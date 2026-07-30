@@ -93,10 +93,10 @@ def test_m007_command_shape_uses_built_image_compose_and_two_restart_like_contai
         module.sys.executable,
         "-m",
         "pytest",
-        "tests/test_matrix_outbox_delivery.py",
+        *module.MATRIX_OUTBOX_TEST_MODULES,
         "tests/test_health.py",
-        "tests/test_startup.py::test_runtime_open_alert_failure_persists_retryable_matrix_outbox",
-        "tests/test_startup.py::test_runtime_startup_drains_existing_matrix_outbox_without_new_occupancy_event",
+        "tests/test_startup_services_and_outbox.py::test_runtime_open_alert_failure_persists_retryable_matrix_outbox",
+        "tests/test_startup_services_and_outbox.py::test_runtime_worker_restarts_existing_matrix_outbox_without_new_occupancy_event",
         "-q",
     )
     assert commands["validate-config-entrypoint"].argv == (

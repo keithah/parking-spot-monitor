@@ -55,8 +55,8 @@ def test_m008_closeout_smoke_contract_is_bounded_redacted_and_no_shell() -> None
         module.sys.executable,
         "-m",
         "pytest",
-        "tests/test_matrix.py",
-        "tests/test_matrix_operator_cockpit.py",
+        *module.MATRIX_TEST_MODULES,
+        *module.MATRIX_COCKPIT_TEST_MODULES,
         "tests/test_operator_cockpit.py",
         "tests/test_operator_docs.py",
         "-q",
@@ -66,7 +66,7 @@ def test_m008_closeout_smoke_contract_is_bounded_redacted_and_no_shell() -> None
         "-m",
         "pytest",
         "tests/test_operator_decision_memory.py",
-        "tests/test_operator_feedback.py",
+        *module.OPERATOR_FEEDBACK_TEST_MODULES,
         "-q",
     )
     assert commands["pytest-occupancy-analytics-history"].argv == (
@@ -74,7 +74,7 @@ def test_m008_closeout_smoke_contract_is_bounded_redacted_and_no_shell() -> None
         "-m",
         "pytest",
         "tests/test_occupancy_analytics.py",
-        "tests/test_vehicle_history.py",
+        *module.VEHICLE_HISTORY_TEST_MODULES,
         "tests/test_vehicle_history_cli.py",
         "tests/test_owner_vehicles.py",
         "tests/test_vehicle_estimates.py",

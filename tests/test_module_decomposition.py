@@ -580,7 +580,9 @@ def test_stream_profile_identity_is_not_stored_in_raw_config_model() -> None:
 
 def test_matrix_command_history_changes_are_not_inferred_from_action_names() -> None:
     command_source = (ROOT / "parking_spot_monitor/matrix_commands.py").read_text(encoding="utf-8")
-    startup_source = (ROOT / "tests/test_startup.py").read_text(encoding="utf-8")
+    startup_source = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted((ROOT / "tests").glob("test_startup_*.py"))
+    )
     storage_source = (ROOT / "parking_spot_monitor/vehicle_history_storage.py").read_text(encoding="utf-8")
 
     assert "_HISTORY_MUTATING_ACTIONS" not in command_source

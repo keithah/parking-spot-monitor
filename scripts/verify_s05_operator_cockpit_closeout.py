@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from scripts.closeout_helpers import assert_no_forbidden_markers, bounded_text, redact_text, safe_output, smoke_env
+from scripts.test_suite_paths import CONFIG_TEST_MODULES, MATRIX_COCKPIT_TEST_MODULES, MATRIX_TEST_MODULES, STARTUP_TEST_MODULES
 
 ROOT = Path(__file__).resolve().parents[1]
 TIMEOUT_SECONDS = 120
@@ -55,7 +56,7 @@ class SmokeCommand:
 COMMANDS: tuple[SmokeCommand, ...] = (
     SmokeCommand(
         label="pytest-docs-matrix",
-        argv=(sys.executable, "-m", "pytest", "tests/test_operator_docs.py", "tests/test_matrix.py", "-q"),
+        argv=(sys.executable, "-m", "pytest", "tests/test_operator_docs.py", *MATRIX_TEST_MODULES, "-q"),
     ),
     SmokeCommand(
         label="pytest-cockpit-lab-memory",
@@ -63,8 +64,8 @@ COMMANDS: tuple[SmokeCommand, ...] = (
             sys.executable,
             "-m",
             "pytest",
-            "tests/test_matrix.py",
-            "tests/test_matrix_operator_cockpit.py",
+            *MATRIX_TEST_MODULES,
+            *MATRIX_COCKPIT_TEST_MODULES,
             "tests/test_detection_lab.py",
             "tests/test_operator_decision_memory.py",
             "-q",
@@ -76,9 +77,9 @@ COMMANDS: tuple[SmokeCommand, ...] = (
             sys.executable,
             "-m",
             "pytest",
-            "tests/test_startup.py",
+            *STARTUP_TEST_MODULES,
             "tests/test_docker_contract.py",
-            "tests/test_config.py",
+            *CONFIG_TEST_MODULES,
             "tests/test_health.py",
             "tests/test_state.py",
             "-q",

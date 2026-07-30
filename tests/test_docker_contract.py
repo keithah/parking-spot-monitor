@@ -845,15 +845,15 @@ def test_s05_closeout_smoke_script_contract_is_bounded_and_redacted() -> None:
         "-m",
         "pytest",
         "tests/test_operator_docs.py",
-        "tests/test_matrix.py",
+        *module.MATRIX_TEST_MODULES,
         "-q",
     )
-    assert "tests/test_matrix_operator_cockpit.py" in commands["pytest-cockpit-lab-memory"]
+    assert all(path in commands["pytest-cockpit-lab-memory"] for path in module.MATRIX_COCKPIT_TEST_MODULES)
     assert "tests/test_detection_lab.py" in commands["pytest-cockpit-lab-memory"]
     assert "tests/test_operator_decision_memory.py" in commands["pytest-cockpit-lab-memory"]
-    assert "tests/test_startup.py" in commands["pytest-runtime-docker-config-state"]
+    assert all(path in commands["pytest-runtime-docker-config-state"] for path in module.STARTUP_TEST_MODULES)
     assert "tests/test_docker_contract.py" in commands["pytest-runtime-docker-config-state"]
-    assert "tests/test_config.py" in commands["pytest-runtime-docker-config-state"]
+    assert all(path in commands["pytest-runtime-docker-config-state"] for path in module.CONFIG_TEST_MODULES)
     assert "tests/test_health.py" in commands["pytest-runtime-docker-config-state"]
     assert "tests/test_state.py" in commands["pytest-runtime-docker-config-state"]
     assert commands["validate-config-entrypoint"] == (
