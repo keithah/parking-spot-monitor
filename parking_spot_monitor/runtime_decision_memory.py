@@ -11,6 +11,7 @@ from parking_spot_monitor.operator_decision_memory import (
     append_decision_memory_record,
     make_decision_memory_record,
 )
+from parking_spot_monitor.runtime_detection_support import _candidate_summary
 from parking_spot_monitor.state import RuntimeState
 
 
@@ -21,7 +22,6 @@ def build_detection_memory_records(
     mode: str,
     iteration: int | None,
 ) -> list[DecisionMemoryRecord]:
-    from parking_spot_monitor.runtime_detection import _candidate_summary
     from parking_spot_monitor.runtime_presence import _best_rejected_detection
 
     records: list[DecisionMemoryRecord] = []

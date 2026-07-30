@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_dispatch import append_matrix_event_memory

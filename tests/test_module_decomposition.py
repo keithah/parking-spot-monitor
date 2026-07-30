@@ -160,6 +160,41 @@ def _function_calls(relative_path: str, function_name: str) -> set[str]:
     raise AssertionError(f"{function_name} not found in {relative_path}")
 
 
+def test_dependency_lock_tests_are_split_by_responsibility() -> None:
+    assert not (ROOT / "tests" / "test_dependency_locks.py").exists()
+    expected = (
+        "dependency_lock_helpers.py",
+        "test_dependency_lock_contract.py",
+        "test_dependency_lock_generation.py",
+        "test_dependency_lock_validation.py",
+    )
+    for name in expected:
+        path = ROOT / "tests" / name
+        assert path.exists(), name
+        assert len(path.read_text(encoding="utf-8").splitlines()) <= 500, name
+
+
+def test_runtime_decision_memory_does_not_import_runtime_detection() -> None:
+    imports = _imported_module_names(
+        "parking_spot_monitor/runtime_decision_memory.py"
+    )
+    assert "parking_spot_monitor.runtime_detection" not in imports
+    capture_imports = _imported_names(
+        "parking_spot_monitor/capture_loop.py",
+        "parking_spot_monitor.runtime_decision_memory",
+    )
+    assert "build_detection_memory_records" in capture_imports
+
+
+def test_confirmed_dead_retry_and_replay_declarations_are_absent() -> None:
+    assert "ReplayValidationError" not in _class_names(
+        "parking_spot_monitor/replay.py"
+    )
+    assert "_retry_reason" not in _function_names(
+        "src/parking_monitor/matrix_outbox_delivery.py"
+    )
+
+
 def test_matrix_module_is_a_small_compatibility_shim() -> None:
     assert _line_count("parking_spot_monitor/matrix.py") <= 220
     module_caps = {

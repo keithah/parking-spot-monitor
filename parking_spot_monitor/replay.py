@@ -70,24 +70,6 @@ class ReplayReportError(ValueError):
             result["path"] = self.path
         return result
 
-class ReplayValidationError(ValueError):
-    """Typed, safe replay validation error with case/path context."""
-
-    def __init__(self, message: str, *, case_id: str | None = None, path: str | None = None) -> None:
-        super().__init__(message)
-        self.message = message
-        self.case_id = case_id
-        self.path = path
-
-    def diagnostics(self) -> dict[str, str]:
-        result = {"phase": "replay_validation", "message": self.message}
-        if self.case_id is not None:
-            result["case_id"] = self.case_id
-        if self.path is not None:
-            result["path"] = self.path
-        return result
-
-
 class ReplayDetection(StrictReplayModel):
     class_name: str = Field(min_length=1)
     confidence: float = Field(ge=0, le=1)

@@ -589,10 +589,6 @@ def _record_delivery_phases(record: OutboxRecord) -> tuple[str, ...]:
     return tuple(phase for phase in _SNAPSHOT_ALERT_PHASES if phase in record.phase_states)
 
 
-def _retry_reason(exc: Exception, *, phase: str) -> str:
-    return _delivery_failure_reason(exc, phase=phase)
-
-
 def _open_alert_metadata(event: Mapping[str, Any]) -> dict[str, str]:
     return {
         "event_type": OPEN_SPOT_EVENT_TYPE,

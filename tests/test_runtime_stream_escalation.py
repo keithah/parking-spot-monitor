@@ -11,8 +11,11 @@ from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.detection import VehicleDetection
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
-from parking_spot_monitor.operator_decision_memory import load_decision_memory
-from parking_spot_monitor.runtime_detection import record_detection_memory_records
+from parking_spot_monitor.operator_decision_memory import (
+    append_decision_memory_records,
+    load_decision_memory,
+)
+from parking_spot_monitor.runtime_decision_memory import build_detection_memory_records
 from parking_spot_monitor.runtime_stream_escalation import detect_with_stream_escalation
 from parking_spot_monitor.state import RuntimeState
 
@@ -333,13 +336,16 @@ def test_escalation_returns_final_frame_for_caller_owned_memory_recording(tmp_pa
     assert frame_result.escalated is True
     assert not memory_path.exists()
 
-    record_detection_memory_records(
-        memory_path,
+    records = build_detection_memory_records(
         frame_result.detection,
         observed_at=result.timestamp,
-        logger=StructuredLogger(),
         mode="runtime-loop",
         iteration=1,
+    )
+    append_decision_memory_records(
+        memory_path,
+        records,
+        logger=StructuredLogger(),
     )
     loaded = load_decision_memory(memory_path)
     assert loaded.state == "available"

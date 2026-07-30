@@ -15,15 +15,11 @@ from parking_spot_monitor.detection import (
     translate_crop_detection,
 )
 from parking_spot_monitor.logging import StructuredLogger
-from parking_spot_monitor.operator_decision_memory import append_decision_memory_records
-from parking_spot_monitor.runtime_decision_memory import build_detection_memory_records
 from parking_spot_monitor.runtime_detector_capabilities import (
-    _DETECT_CAPABILITY_CACHE,
     compatible_detect_image as _compatible_detect_image,
     detect_accepts_inference_image_size as _detect_accepts_inference_image_size,
 )
 from parking_spot_monitor.runtime_detection_support import (
-    _candidate_summary,
     accepted_by_spot as _accepted_by_spot,
     candidate_summaries as _candidate_summaries,
     configured_spot_polygons as _configured_spot_polygons,
@@ -109,29 +105,6 @@ def _process_detection_for_capture(
         fields["iteration"] = iteration
     logger.info("detection-frame-processed", **fields)
     return result
-
-
-def record_detection_memory_records(
-    decision_memory_path: Path | None,
-    detection_result: DetectionFilterResult,
-    *,
-    observed_at: Any | None,
-    logger: StructuredLogger,
-    mode: str,
-    iteration: int | None,
-) -> None:
-    if decision_memory_path is None:
-        return
-    append_decision_memory_records(
-        decision_memory_path,
-        build_detection_memory_records(
-            detection_result,
-            observed_at=observed_at,
-            mode=mode,
-            iteration=iteration,
-        ),
-        logger=logger,
-    )
 
 
 def _detect_spot_crop_vehicles_for_frame(

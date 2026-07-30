@@ -8,7 +8,7 @@ from typing import Any
 
 from parking_spot_monitor.logging import redact_diagnostic_text
 from parking_spot_monitor.matrix_support import MatrixError, _require_non_empty
-from parking_spot_monitor.matrix_time import DISPLAY_TIMEZONE, display_observed_at, format_12_hour_time, format_observed_at
+from parking_spot_monitor.matrix_time import display_observed_at, format_12_hour_time, format_observed_at
 
 MONITOR_STARTED_EVENT_TYPE = "parking-monitor-started"
 MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE = "parking-monitor-shutdown-requested"

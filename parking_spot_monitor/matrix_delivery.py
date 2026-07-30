@@ -10,7 +10,6 @@ from parking_spot_monitor.matrix_alerts import (
     LIFECYCLE_EVENT_TYPES,
     OCCUPIED_SPOT_EVENT_TYPE,
     OPEN_SPOT_EVENT_TYPE,
-    OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
     format_lifecycle_notice,
     format_live_proof_image_body,
     format_live_proof_text,

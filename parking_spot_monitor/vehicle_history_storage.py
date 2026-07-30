@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text, redact_diagnostic_value
+from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.vehicle_history_correction_cache import CorrectionReplayCache
 from parking_spot_monitor.vehicle_history_storage_utils import _latest_session_record
 from parking_spot_monitor.vehicle_history_models import (

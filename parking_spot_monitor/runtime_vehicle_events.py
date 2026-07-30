@@ -4,7 +4,6 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 from parking_spot_monitor.detection import DetectionFilterResult
