@@ -50,7 +50,7 @@ def test_profile_corrections_rename_merge_summary_and_wrong_match_are_derived_on
         "estimate_confidence": profile_estimate.confidence,
     }
     assert raw_after == raw_before
-    assert len(event_lines) == 4
+    assert len(event_lines) == 3
     rendered_summary = json.dumps(summary)
     assert "snapshot" not in rendered_summary
     assert "crop" not in rendered_summary

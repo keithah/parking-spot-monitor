@@ -10,10 +10,10 @@ from typing import Any
 
 from parking_spot_monitor.logging import redact_diagnostic_text
 from parking_spot_monitor.vehicle_history_correction_cache import _canonical_profile_map, build_correction_replay_state
+from parking_spot_monitor.vehicle_history_correction_compaction import load_complete_correction_state
 from parking_spot_monitor.vehicle_history_correction_io import append_bounded_correction_event, load_correction_events, quarantine_correction_line
 from parking_spot_monitor.vehicle_history_models import (
     CORRECTION_ACTION_MERGE_PROFILES,
-    CORRECTION_ACTION_PROFILE_SUMMARY_REQUESTED,
     CORRECTION_ACTION_RENAME_PROFILE,
     CORRECTION_ACTION_WRONG_MATCH,
     MAX_CORRECTION_LINE_BYTES,
@@ -51,7 +51,7 @@ class VehicleHistoryCorrectionMixin:
         """Persist a validated correction event without rewriting archive records."""
 
         event = ProfileCorrectionEvent.from_json_dict(event.to_json_dict())
-        complete_state = self._complete_correction_replay_state()
+        complete_state = load_complete_correction_state(self)
         if validation_records is None:
             validation_records = (
                 complete_state,
@@ -215,12 +215,6 @@ class VehicleHistoryCorrectionMixin:
         )
         return state
 
-    def _complete_correction_replay_state(self) -> CorrectionReplayState:
-        loaded = self._load_correction_replay()
-        if not loaded.succeeded:
-            raise ArchiveSchemaError("correction replay unavailable")
-        return build_correction_replay_state(loaded.events, quarantine_count=loaded.quarantine_count)
-
     def resolve_profile_id(self, profile_id: str | None, *, merges: Mapping[str, str] | None = None) -> str | None:
         normalized = _optional_profile_id(profile_id, "profile_id")
         if normalized is None:
@@ -274,18 +268,14 @@ class VehicleHistoryCorrectionMixin:
             min_samples=2,
             min_profile_confidence=0.76,
         )
-        self._append_correction(
-            ProfileCorrectionEvent(
-                schema_version=SCHEMA_VERSION,
-                correction_id=_correction_id(CORRECTION_ACTION_PROFILE_SUMMARY_REQUESTED),
-                action=CORRECTION_ACTION_PROFILE_SUMMARY_REQUESTED,
-                created_at=_utc_now(),
-                matrix_event_id=_optional_bounded_string(matrix_event_id, "matrix_event_id", max_length=160),
-                matrix_sender=_optional_bounded_string(matrix_sender, "matrix_sender", max_length=160),
-                matrix_room_id=_optional_bounded_string(matrix_room_id, "matrix_room_id", max_length=160),
-                profile_id=canonical,
-            ),
-            validation_records=(state, active, closed),
+        self._log(
+            "info",
+            "vehicle-profile-summary-requested",
+            phase="profile-summary",
+            profile_id=canonical,
+            matrix_event_id=_optional_bounded_string(matrix_event_id, "matrix_event_id", max_length=160),
+            matrix_sender=_optional_bounded_string(matrix_sender, "matrix_sender", max_length=160),
+            matrix_room_id=_optional_bounded_string(matrix_room_id, "matrix_room_id", max_length=160),
         )
         return {
             "profile_id": canonical,

@@ -140,3 +140,33 @@ def test_replay_limit_failure_blocks_state_and_new_append(
         archive.append_correction(event)
 
     assert archive.corrections_path.read_text(encoding="utf-8") == original
+
+
+def test_legacy_summary_audit_at_event_cap_is_compacted_before_real_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    archive.corrections_path.write_text(
+        "".join(json.dumps(_event_payload(index)) + "\n" for index in range(10_000)),
+        encoding="utf-8",
+    )
+    rename_payload = _event_payload(20_000)
+    rename_payload.update(
+        action="rename_profile",
+        label="Blue hatchback",
+        matrix_event_id="$real-correction",
+    )
+    event = ProfileCorrectionEvent.from_json_dict(rename_payload)
+    monkeypatch.setattr(
+        type(archive),
+        "_validate_correction_against_archive",
+        lambda *_args, **_kwargs: None,
+    )
+
+    assert archive.append_correction(event) == event
+
+    lines = archive.corrections_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["action"] == "rename_profile"
+    assert archive.correction_replay_state().labels["prof_a"] == "Blue hatchback"
