@@ -28,6 +28,7 @@ from parking_spot_monitor.matrix import MatrixDelivery, MatrixSnapshot
 from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _main, main
 from parking_spot_monitor.runtime_presence import presence_by_spot
 from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as _matrix_outbox_health_payload
+from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache
 from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
 from parking_spot_monitor.detection import DetectionError, DetectionFilterResult, RejectedDetection, RejectionReason, SpotDetectionResult, VehicleDetection
 from parking_spot_monitor.detector_adapter import SharedLazyDetector, adapt_detector
@@ -671,6 +672,10 @@ def test_frame_update_network_delivery_runs_only_on_the_outbox_worker(tmp_path: 
             matrix_delivery=delivery,
             state_path=tmp_path / "state.json",
             configured_spot_ids=["left_spot", "right_spot"],
+            owner_vehicle_snapshot_provider=OwnerVehicleRuntimeCache(
+                tmp_path / "owner-vehicles.json",
+                logger=StructuredLogger(),
+            ),
         )
 
         assert update.matrix_errors == []
@@ -1224,8 +1229,8 @@ def test_runtime_loop_vehicle_history_confirmed_occupied_creates_one_active_sess
 def test_runtime_loop_owner_vehicle_in_quiet_window_sends_deduped_alert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    import parking_spot_monitor.capture_loop as runtime_capture_loop
     import parking_spot_monitor.runtime_owner_vehicle_cache as runtime_owner_vehicle_cache
-    import parking_spot_monitor.runtime_vehicle_events as runtime_vehicle_events
     from parking_spot_monitor.owner_vehicles import load_owner_vehicle_registry
     from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
@@ -1270,21 +1275,27 @@ def test_runtime_loop_owner_vehicle_in_quiet_window_sends_deduped_alert(
     )
     active_loads = 0
     registry_loads = 0
+    frame_providers: list[object] = []
     real_load_active_sessions = VehicleHistoryArchive.load_active_sessions
+    real_update_runtime_state = runtime_capture_loop._update_runtime_state_for_frame
 
     def counted_active_sessions(archive: VehicleHistoryArchive) -> list[object]:
         nonlocal active_loads
         active_loads += 1
         return real_load_active_sessions(archive)
 
-    def counted_registry(path: str | Path, *, raise_io_errors: bool = False) -> object:
+    def counted_registry(path: str | Path, *, strict: bool = False) -> object:
         nonlocal registry_loads
         registry_loads += 1
-        return load_owner_vehicle_registry(path, raise_io_errors=raise_io_errors)
+        return load_owner_vehicle_registry(path, strict=strict)
+
+    def record_frame_provider(**kwargs: Any) -> object:
+        frame_providers.append(kwargs["owner_vehicle_snapshot_provider"])
+        return real_update_runtime_state(**kwargs)
 
     monkeypatch.setattr(VehicleHistoryArchive, "load_active_sessions", counted_active_sessions)
     monkeypatch.setattr(runtime_owner_vehicle_cache, "load_owner_vehicle_registry", counted_registry)
-    monkeypatch.setattr(runtime_vehicle_events, "load_owner_vehicle_registry", counted_registry)
+    monkeypatch.setattr(runtime_capture_loop, "_update_runtime_state_for_frame", record_frame_provider)
 
     delivery = FakeMatrixDelivery()
 
@@ -1315,12 +1326,14 @@ def test_runtime_loop_owner_vehicle_in_quiet_window_sends_deduped_alert(
     assert state_payload["owner_quiet_window_alert_ids"] == [expected_event_id]
     assert active_loads == 1
     assert registry_loads == 1
+    assert len(frame_providers) == 2
+    assert frame_providers[0] is frame_providers[1]
     assert output.count("owner-vehicle-quiet-window-alert") >= 1
     assert_no_secret_leak(output)
 
 
 def test_owner_vehicle_quiet_window_alerts_skip_unreadable_owner_registry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     import parking_spot_monitor.runtime_vehicle_events as runtime_vehicle_events
     from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
@@ -1329,10 +1342,9 @@ def test_owner_vehicle_quiet_window_alerts_skip_unreadable_owner_registry(
         active = True
         active_window_id = "street_sweeping:2026-05-18:13:00-15:00"
 
-    def fail_registry(_path: Path) -> object:
-        raise PermissionError(f"registry denied token={SECRET_MARKER} raw_image_bytes")
-
-    monkeypatch.setattr(runtime_vehicle_events, "load_owner_vehicle_registry", fail_registry)
+    class FailingSnapshotProvider:
+        def snapshot(self, _archive: object) -> object:
+            raise PermissionError(f"registry denied token={SECRET_MARKER} raw_image_bytes")
 
     alerts = runtime_vehicle_events._owner_vehicle_quiet_window_alerts(
         VehicleHistoryArchive(tmp_path, logger=StructuredLogger()),
@@ -1341,6 +1353,7 @@ def test_owner_vehicle_quiet_window_alerts_skip_unreadable_owner_registry(
         emitted_alert_ids=set(),
         configured_spot_ids=("left_spot",),
         logger=StructuredLogger(),
+        owner_vehicle_snapshot_provider=FailingSnapshotProvider(),  # type: ignore[arg-type]
     )
 
     output = combined_output(capsys)
@@ -2228,6 +2241,7 @@ def test_runtime_loop_command_event_errors_do_not_suppress_next_healthy_poll(
         archive=CursorArchive(),  # type: ignore[arg-type]
         room_id=settings.matrix.room_id,
         authorized_senders=["@operator:example.org"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         unauthorized_reply_cooldown_seconds=0,
     )
 

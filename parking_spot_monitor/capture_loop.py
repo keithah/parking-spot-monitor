@@ -69,7 +69,7 @@ def run_capture_loop(
         ttl_seconds=VEHICLE_HISTORY_HEALTH_CACHE_SECONDS,
     )
     archive_root = Path(getattr(effective_history_archive, "root", runtime_paths.vehicle_history_dir))
-    owner_vehicle_cache = OwnerVehicleRuntimeCache(archive_root / "owner-vehicles.json")
+    owner_vehicle_cache = OwnerVehicleRuntimeCache(archive_root / "owner-vehicles.json", logger=logger)
     outbox_health_provider = getattr(matrix_delivery, "outbox_health_summary", None)
     if not callable(outbox_health_provider):
         outbox_health_provider = None
@@ -166,7 +166,7 @@ def run_capture_loop(
                         state_path=state_path,
                         configured_spot_ids=spot_ids,
                         history_archive=effective_history_archive,
-                        owner_vehicle_cache=owner_vehicle_cache,
+                        owner_vehicle_snapshot_provider=owner_vehicle_cache,
                         decision_memory_path=decision_memory_path,
                         pending_decision_records=pending_decision_records,
                     )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeAlias
 
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_cockpit import MatrixOperatorCockpitContext
@@ -45,14 +45,17 @@ class MatrixFeedbackLabeler(Protocol):
     ) -> MatrixFeedbackResult: ...
 
 
+WhoSnapshotProvider: TypeAlias = Callable[[str], str | MatrixCommandResponse]
+
+
 @dataclass(frozen=True)
 class MatrixCommandRuntime:
     archive: MatrixCommandArchive
     command_prefix: str
     help_formatter: Callable[[str], str]
+    who_snapshot_provider: WhoSnapshotProvider
     logger: StructuredLogger | None = None
     cockpit_provider: Callable[..., str | MatrixCommandResponse] | None = None
-    who_snapshot_provider: Callable[[str], str | MatrixCommandResponse] | None = None
     cockpit_context: MatrixOperatorCockpitContext | None = None
     feedback_labeler: MatrixFeedbackLabeler | None = None
 

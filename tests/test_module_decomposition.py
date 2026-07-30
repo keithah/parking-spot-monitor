@@ -286,7 +286,12 @@ def test_matrix_commands_keep_parse_data_separate_from_application() -> None:
         "parse_applied_matrix_command",
         "parse_matrix_command",
     }
-    assert command_runtime_imports <= {"MatrixCommandArchive", "MatrixCommandRuntime", "MatrixFeedbackLabeler"}
+    assert command_runtime_imports <= {
+        "MatrixCommandArchive",
+        "MatrixCommandRuntime",
+        "MatrixFeedbackLabeler",
+        "WhoSnapshotProvider",
+    }
     assert "_parse_applied_matrix_command" not in command_functions
     assert "MATRIX_COMMAND_SPECS" not in command_strings
     assert "render" not in _function_arg_names("parking_spot_monitor/matrix_command_catalog.py", "parse_applied_matrix_command")

@@ -303,9 +303,7 @@ class ActiveSpotAssignmentsCommand:
             logger=runtime.logger,
         )
         base_reply = _format_active_spot_assignments_reply(assignments)
-        if runtime.who_snapshot_provider is not None:
-            return runtime.who_snapshot_provider(base_reply)
-        return base_reply
+        return runtime.who_snapshot_provider(base_reply)
 
     def to_matrix_command(self) -> MatrixCommand:
         return MatrixCommand(action=self.action)

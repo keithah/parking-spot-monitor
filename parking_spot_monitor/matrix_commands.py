@@ -15,7 +15,12 @@ from parking_spot_monitor.matrix_command_catalog import (
     parse_applied_matrix_command,
     parse_matrix_command,
 )
-from parking_spot_monitor.matrix_command_runtime import MatrixCommandArchive, MatrixCommandRuntime, MatrixFeedbackLabeler
+from parking_spot_monitor.matrix_command_runtime import (
+    MatrixCommandArchive,
+    MatrixCommandRuntime,
+    MatrixFeedbackLabeler,
+    WhoSnapshotProvider,
+)
 from parking_spot_monitor.matrix_models import (
     MatrixCommand,
     MatrixCommandParseError,
@@ -76,13 +81,13 @@ class MatrixCommandService:
         archive: MatrixCommandServiceArchive,
         room_id: str,
         authorized_senders: list[str] | tuple[str, ...],
+        who_snapshot_provider: WhoSnapshotProvider,
         command_prefix: str = "!parking",
         bot_user_id: str | None = None,
         logger: StructuredLogger | None = None,
         sync_timeout_ms: int = 0,
         sync_limit: int = 20,
         cockpit_provider: _CockpitProvider | None = None,
-        who_snapshot_provider: Callable[[str], str | MatrixCommandResponse] | None = None,
         cockpit_context: MatrixOperatorCockpitContext | None = None,
         feedback_labeler: MatrixFeedbackLabeler | None = None,
         unauthorized_reply_cooldown_seconds: float = 300,

@@ -5,11 +5,20 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
+MAX_OWNER_REGISTRY_BYTES = 65_536
 MAX_OWNER_VEHICLES = 20
 MAX_OWNER_TEXT_LENGTH = 160
 PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+OwnerVehicleRegistryErrorCode = Literal["read_failed", "too_large", "invalid_json", "invalid_schema"]
+
+
+class OwnerVehicleRegistryError(ValueError):
+    def __init__(self, code: OwnerVehicleRegistryErrorCode, message: str) -> None:
+        super().__init__(code)
+        self.code = code
+        self.safe_message = message
 
 
 @dataclass(frozen=True)
@@ -42,22 +51,46 @@ class OwnerVehicleRegistry:
 def load_owner_vehicle_registry(
     path: str | Path,
     *,
-    raise_io_errors: bool = False,
+    strict: bool = False,
+    max_bytes: int = MAX_OWNER_REGISTRY_BYTES,
 ) -> OwnerVehicleRegistry:
     registry_path = Path(path)
     try:
-        registry_text = registry_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return OwnerVehicleRegistry.empty()
-    except Exception:
-        if raise_io_errors:
+        return _load_owner_vehicle_registry(registry_path, max_bytes=max_bytes)
+    except OwnerVehicleRegistryError:
+        if strict:
             raise
         return OwnerVehicleRegistry.empty()
+
+
+def _load_owner_vehicle_registry(path: Path, *, max_bytes: int) -> OwnerVehicleRegistry:
+    if max_bytes < 1:
+        raise OwnerVehicleRegistryError("too_large", "owner vehicle registry exceeds the configured byte limit")
     try:
-        payload = json.loads(registry_text)
-        return _registry_from_payload(payload)
-    except Exception:
+        size = path.stat().st_size
+    except FileNotFoundError:
         return OwnerVehicleRegistry.empty()
+    except OSError as exc:
+        raise OwnerVehicleRegistryError("read_failed", "owner vehicle registry metadata could not be read") from exc
+    if size > max_bytes:
+        raise OwnerVehicleRegistryError("too_large", "owner vehicle registry exceeds the configured byte limit")
+    try:
+        with path.open("rb") as registry_file:
+            encoded = registry_file.read(max_bytes + 1)
+    except FileNotFoundError:
+        return OwnerVehicleRegistry.empty()
+    except OSError as exc:
+        raise OwnerVehicleRegistryError("read_failed", "owner vehicle registry could not be read") from exc
+    if len(encoded) > max_bytes:
+        raise OwnerVehicleRegistryError("too_large", "owner vehicle registry exceeds the configured byte limit")
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OwnerVehicleRegistryError("invalid_json", "owner vehicle registry is not valid UTF-8 JSON") from exc
+    try:
+        return _registry_from_payload(payload)
+    except (TypeError, ValueError) as exc:
+        raise OwnerVehicleRegistryError("invalid_schema", "owner vehicle registry does not match schema version 1") from exc
 
 
 def _registry_from_payload(payload: Any) -> OwnerVehicleRegistry:

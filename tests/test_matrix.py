@@ -1905,7 +1905,7 @@ def test_command_service_bootstraps_cursor_without_processing_backlog() -> None:
             raise AssertionError("bootstrap must not reply to backlog")
 
     archive = FakeCommandArchive(cursor=None)
-    service = MatrixCommandService(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@op:example"], bot_user_id="@bot:example")  # type: ignore[arg-type]
+    service = MatrixCommandService(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@op:example"], who_snapshot_provider=lambda base_reply: base_reply, bot_user_id="@bot:example")  # type: ignore[arg-type]
 
     result = service.poll_once()
 
@@ -1942,7 +1942,7 @@ def test_command_service_authorizes_applies_and_replies_safely() -> None:
             return "$reply"
 
     archive = FakeCommandArchive(cursor={"next_batch": "s2"})
-    service = MatrixCommandService(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@op:example"], bot_user_id="@bot:example")  # type: ignore[arg-type]
+    service = MatrixCommandService(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@op:example"], who_snapshot_provider=lambda base_reply: base_reply, bot_user_id="@bot:example")  # type: ignore[arg-type]
 
     result = service.poll_once()
 
@@ -1988,6 +1988,7 @@ def test_command_service_reports_processed_read_only_commands() -> None:
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
     )
 
     result = service.poll_once()
@@ -2017,7 +2018,7 @@ def test_command_service_fails_corrections_when_duplicate_check_is_unavailable()
             raise PermissionError("corrections unreadable")
 
     archive = Archive(cursor={"next_batch": "s2"})
-    service = MatrixCommandService(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@op:example"], bot_user_id="@bot:example")  # type: ignore[arg-type]
+    service = MatrixCommandService(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@op:example"], who_snapshot_provider=lambda base_reply: base_reply, bot_user_id="@bot:example")  # type: ignore[arg-type]
 
     result = service.poll_once()
 
@@ -2056,6 +2057,7 @@ def test_command_service_authorized_correct_records_feedback_label() -> None:
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         feedback_labeler=FeedbackLabeler(),
     )
 
@@ -2106,6 +2108,7 @@ def test_command_service_authorized_learn_routes_to_labeler_with_runtime_context
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         feedback_labeler=FeedbackLabeler(),
         cockpit_context=MatrixOperatorCockpitContext(settings=settings, data_dir=Path("/tmp"), health_path=Path("/tmp/health.json"), state_path=state_path, incident_detector=detector),
     )
@@ -2183,6 +2186,7 @@ def test_command_service_explicit_feedback_aliases_are_authorized_idempotent_and
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         feedback_labeler=FeedbackLabeler(),
         cockpit_context=MatrixOperatorCockpitContext(settings=settings, data_dir=Path("/tmp"), health_path=Path("/tmp/health.json"), state_path=state_path, incident_detector=detector),
     )
@@ -2262,6 +2266,7 @@ def test_command_service_explicit_feedback_aliases_reject_unauthorized_and_malfo
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         feedback_labeler=FeedbackLabeler(),
         unauthorized_reply_cooldown_seconds=0,
     )
@@ -2311,6 +2316,7 @@ def test_command_service_learn_rejects_unauthorized_malformed_and_missing_labele
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         feedback_labeler=FeedbackLabeler(),
     )
 
@@ -2342,6 +2348,7 @@ def test_command_service_learn_rejects_unauthorized_malformed_and_missing_labele
         archive=FakeCommandArchive(cursor={"next_batch": "s3"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
     )
 
     missing_result = missing.poll_once()
@@ -2378,6 +2385,7 @@ def test_command_service_correct_requires_authorization_and_configured_labeler()
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         feedback_labeler=FeedbackLabeler(),
     )
 
@@ -2407,6 +2415,7 @@ def test_command_service_correct_requires_authorization_and_configured_labeler()
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
     )
 
     missing_labeler_result = missing_labeler.poll_once()
@@ -2431,7 +2440,7 @@ def test_command_service_default_empty_allowlist_rejects_mutations() -> None:
             return "$reply"
 
     archive = FakeCommandArchive(cursor={"next_batch": "s2"})
-    service = MatrixCommandService(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=[])  # type: ignore[arg-type]
+    service = MatrixCommandService(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=[], who_snapshot_provider=lambda base_reply: base_reply)  # type: ignore[arg-type]
 
     result = service.poll_once()
 
@@ -2462,7 +2471,7 @@ def test_command_service_rejects_unauthorized_status_before_application() -> Non
             raise AssertionError("unauthorized status must be rejected before application")
 
     archive = FakeCommandArchive(cursor={"next_batch": "s2"})
-    service = Service(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@operator:example"])  # type: ignore[arg-type]
+    service = Service(client=Client(), archive=archive, room_id=ROOM_ID, authorized_senders=["@operator:example"], who_snapshot_provider=lambda base_reply: base_reply)  # type: ignore[arg-type]
 
     result = service.poll_once()
 
@@ -2511,6 +2520,7 @@ def test_command_service_unauthorized_rejection_cooldown_consumes_every_event() 
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@operator:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         unauthorized_reply_cooldown_seconds=300,
         monotonic=lambda: now,
         logger=StructuredLogger(stream=log_stream),
@@ -2565,6 +2575,7 @@ def test_command_service_authorized_status_and_config_reply_via_command_txn_path
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@operator:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
     )
 
@@ -2610,6 +2621,7 @@ def test_command_service_status_and_config_use_cockpit_provider_without_archive_
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
     )
 
@@ -2646,6 +2658,7 @@ def test_command_service_status_provider_failure_replies_safe_failure() -> None:
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=failing_provider,
     )
 
@@ -2678,6 +2691,7 @@ def test_command_service_missing_cockpit_provider_is_deterministic_configuration
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
     )
 
     result = service.poll_once()
@@ -2778,6 +2792,7 @@ def test_command_service_authorized_latest_sends_text_and_one_raw_image_without_
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
     )
 
@@ -2829,6 +2844,7 @@ def test_command_service_resizes_oversized_command_image_before_upload(tmp_path:
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=lambda action: MatrixCommandResponse(
             text="Parking monitor latest",
             image_path=latest_path,
@@ -2862,11 +2878,24 @@ def test_command_service_close_closes_owned_matrix_client() -> None:
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
     )
 
     service.close()
 
     assert client.closed is True
+
+
+def test_matrix_command_service_requires_who_snapshot_provider() -> None:
+    from parking_spot_monitor.matrix import MatrixCommandService
+
+    with pytest.raises(TypeError, match="who_snapshot_provider"):
+        MatrixCommandService(
+            client=object(),  # type: ignore[arg-type]
+            archive=object(),  # type: ignore[arg-type]
+            room_id=ROOM_ID,
+            authorized_senders=["@op:example"],
+        )
 
 
 def test_command_service_who_can_send_active_assignments_with_fresh_snapshot(tmp_path: Path) -> None:
@@ -2913,7 +2942,8 @@ def test_command_service_who_can_send_active_assignments_with_fresh_snapshot(tmp
 
     assert result.processed_count == 1
     assert result.error_count == 0
-    assert provider_inputs and provider_inputs[0].startswith("Active parking sessions:")
+    assert len(provider_inputs) == 1
+    assert provider_inputs[0].startswith("Active parking sessions:")
     assert [call["kind"] for call in calls] == ["text", "upload", "image"]
     assert calls[0]["txn_id"] == "command:$who:text"
     assert "Snapshot: fresh capture" in calls[0]["body"]
@@ -2959,6 +2989,7 @@ def test_command_service_latest_failure_and_unauthorized_latest_are_text_only(tm
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
     )
 
@@ -3049,6 +3080,7 @@ def test_command_service_why_explain_recent_use_provider_text_only_repeatably_wi
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
     )
 
@@ -3110,6 +3142,7 @@ def test_command_service_incident_review_uses_cockpit_context_with_image_respons
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_context=Context(),  # type: ignore[arg-type]
     )
 
@@ -3189,6 +3222,7 @@ def test_command_service_incident_review_real_context_replays_detector_sends_saf
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_context=context,
     )
 
@@ -3247,6 +3281,7 @@ def test_command_service_rejects_unauthorized_why_and_explain_before_memory_or_p
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@operator:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
         unauthorized_reply_cooldown_seconds=0,
     )
@@ -3317,6 +3352,7 @@ def test_command_service_confidence_context_reads_local_artifacts_text_only(tmp_
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_context=context,
     )
 
@@ -3386,6 +3422,7 @@ def test_command_service_analytics_windows_route_to_cockpit_provider_text_only_w
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
     )
 
@@ -3438,6 +3475,7 @@ def test_command_service_rejects_unauthorized_analytics_before_provider_or_artif
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@operator:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
     )
 
@@ -3473,6 +3511,7 @@ def test_command_service_parse_errors_use_configured_command_prefix() -> None:
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         command_prefix=".park",
     )
 
@@ -3543,6 +3582,7 @@ def test_command_service_analytics_context_reads_vehicle_history_text_only_and_d
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_context=context,
     )
 
@@ -3592,6 +3632,7 @@ def test_command_service_rejects_unauthorized_confidence_before_provider_or_arti
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@operator:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
     )
 
@@ -3660,6 +3701,7 @@ def test_command_service_why_explain_recent_context_reads_decision_memory_safely
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_context=context,
     )
 
@@ -3702,6 +3744,7 @@ def test_command_service_recent_missing_context_is_safe_configuration_failure() 
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
     )
 
     result = service.poll_once()
@@ -3785,6 +3828,7 @@ def test_command_service_lab_commands_use_provider_text_only_repeatably_without_
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
     )
 
@@ -3833,6 +3877,7 @@ def test_command_service_rejects_unauthorized_lab_before_provider_or_paths() -> 
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@operator:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
         unauthorized_reply_cooldown_seconds=0,
     )
@@ -3905,6 +3950,7 @@ def test_command_service_lab_context_routes_to_manager_safely_text_only(tmp_path
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_context=context,
     )
 
@@ -3980,6 +4026,7 @@ def test_command_service_malformed_authorized_commands_fail_closed_before_provid
         archive=archive,
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
     )
 
@@ -4032,6 +4079,7 @@ def test_command_service_latest_media_delivery_failure_is_sanitized_text_failure
         archive=FakeCommandArchive(cursor={"next_batch": "s2"}),
         room_id=ROOM_ID,
         authorized_senders=["@op:example"],
+        who_snapshot_provider=lambda base_reply: base_reply,
         cockpit_provider=cockpit_provider,
         logger=StructuredLogger(stream=log_stream),
     )

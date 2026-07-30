@@ -14,9 +14,8 @@ from parking_spot_monitor.matrix_alerts import (
     owner_vehicle_quiet_window_event_id,
 )
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
-from parking_spot_monitor.owner_vehicles import load_owner_vehicle_registry
 from parking_spot_monitor.runtime_health import safe_error_context as _safe_error_context
-from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache
+from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleSnapshotProvider
 from parking_spot_monitor.scheduler import QuietWindowStatus
 from parking_spot_monitor.vehicle_history_alert_payloads import (
     likely_vehicle_payload,
@@ -50,7 +49,7 @@ def _owner_vehicle_quiet_window_alerts(
     emitted_alert_ids: set[str],
     configured_spot_ids: Sequence[str],
     logger: StructuredLogger,
-    owner_vehicle_cache: OwnerVehicleRuntimeCache | None = None,
+    owner_vehicle_snapshot_provider: OwnerVehicleSnapshotProvider,
 ) -> list[dict[str, Any]]:
     if history_archive is None or not quiet_status.active:
         return []
@@ -60,13 +59,9 @@ def _owner_vehicle_quiet_window_alerts(
     configured = set(configured_spot_ids)
     alerts: list[dict[str, Any]] = []
     try:
-        if owner_vehicle_cache is None:
-            registry = load_owner_vehicle_registry(history_archive.root / "owner-vehicles.json")
-            sessions = history_archive.load_active_sessions()
-        else:
-            snapshot = owner_vehicle_cache.snapshot(history_archive)
-            registry = snapshot.registry
-            sessions = snapshot.active_sessions
+        snapshot = owner_vehicle_snapshot_provider.snapshot(history_archive)
+        registry = snapshot.registry
+        sessions = snapshot.active_sessions
     except Exception as exc:
         logger.warning(
             "owner-vehicle-alert-scan-failed",

@@ -10,7 +10,7 @@ from parking_spot_monitor.detection import DetectionFilterResult
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.occupancy import OccupancyUpdate, update_occupancy
 from parking_spot_monitor.runtime_presence import _log_missed_occupied_spot_diagnostics, presence_by_spot
-from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache
+from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleSnapshotProvider
 from parking_spot_monitor.runtime_vehicle_events import _owner_vehicle_quiet_window_alerts
 from parking_spot_monitor.scheduler import QuietWindowStatus, evaluate_quiet_windows, quiet_window_notice_events
 from parking_spot_monitor.state import RuntimeState
@@ -37,7 +37,7 @@ def build_runtime_frame_plan(
     configured_spot_ids: Sequence[str],
     history_archive: VehicleHistoryArchive | None,
     logger: StructuredLogger,
-    owner_vehicle_cache: OwnerVehicleRuntimeCache | None = None,
+    owner_vehicle_snapshot_provider: OwnerVehicleSnapshotProvider,
 ) -> RuntimeFramePlan:
     quiet_status = evaluate_quiet_windows(settings.quiet_windows, observed_at)
     pending_notice_payloads = _pending_quiet_window_notice_payloads(
@@ -81,7 +81,7 @@ def build_runtime_frame_plan(
         emitted_alert_ids=owner_alert_ids,
         configured_spot_ids=configured_spot_ids,
         logger=logger,
-        owner_vehicle_cache=owner_vehicle_cache,
+        owner_vehicle_snapshot_provider=owner_vehicle_snapshot_provider,
     )
     for owner_alert in owner_alerts:
         event_id = owner_alert.get("event_id")

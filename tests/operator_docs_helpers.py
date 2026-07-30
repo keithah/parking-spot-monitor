@@ -61,7 +61,7 @@ def read_matrix_command_contract() -> str:
             return "$image"
 
     client = Client()
-    service = MatrixCommandService(client=client, archive=object(), room_id="!room:example", authorized_senders=["@op:example"])
+    service = MatrixCommandService(client=client, archive=object(), room_id="!room:example", authorized_senders=["@op:example"], who_snapshot_provider=lambda base_reply: base_reply)
     with tempfile.TemporaryDirectory() as tmp:
         image_path = Path(tmp) / "latest.jpg"
         image_path.write_bytes(b"jpeg")

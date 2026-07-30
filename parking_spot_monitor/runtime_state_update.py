@@ -18,7 +18,7 @@ from parking_spot_monitor.operator_decision_memory import DecisionMemoryRecord, 
 from parking_spot_monitor.runtime_decision_memory import build_runtime_state_memory_records
 from parking_spot_monitor.runtime_frame_plan import build_runtime_frame_plan
 from parking_spot_monitor.runtime_health import safe_error_context as _safe_error_context
-from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache
+from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleSnapshotProvider
 from parking_spot_monitor.runtime_vehicle_events import _record_vehicle_history_events
 from parking_spot_monitor.state import RuntimeState, save_runtime_state
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
@@ -44,8 +44,8 @@ def _update_runtime_state_for_frame(
     matrix_delivery: RuntimeMatrixDelivery | None,
     state_path: Path,
     configured_spot_ids: Sequence[str],
+    owner_vehicle_snapshot_provider: OwnerVehicleSnapshotProvider,
     history_archive: VehicleHistoryArchive | None = None,
-    owner_vehicle_cache: OwnerVehicleRuntimeCache | None = None,
     decision_memory_path: Path | None = None,
     pending_decision_records: Sequence[DecisionMemoryRecord] = (),
 ) -> FrameUpdateResult:
@@ -59,7 +59,7 @@ def _update_runtime_state_for_frame(
         configured_spot_ids=configured_spot_ids,
         history_archive=history_archive,
         logger=logger,
-        owner_vehicle_cache=owner_vehicle_cache,
+        owner_vehicle_snapshot_provider=owner_vehicle_snapshot_provider,
     )
     state_save_error: dict[str, Any] | None = None
 

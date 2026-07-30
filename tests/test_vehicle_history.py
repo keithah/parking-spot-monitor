@@ -169,7 +169,7 @@ def test_close_session_revision_invalidates_snapshot_taken_before_active_unlink(
 ) -> None:
     archive = VehicleHistoryArchive(tmp_path)
     active = archive.start_session(occupied_event())
-    cache = OwnerVehicleRuntimeCache(archive.root / "owner-vehicles.json")
+    cache = OwnerVehicleRuntimeCache(archive.root / "owner-vehicles.json", logger=setup_logging())
     active_path = archive.active_dir / f"{active.session_id}.json"
     real_unlink = Path.unlink
     overlap_snapshots = []
