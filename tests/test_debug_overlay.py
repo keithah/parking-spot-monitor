@@ -36,18 +36,73 @@ def records_from(stream: StringIO) -> list[dict[str, object]]:
     return [json.loads(line) for line in stream.getvalue().splitlines()]
 
 
-def test_spot_overlay_does_not_allocate_full_frame_overlay(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_spot_overlay_does_not_allocate_or_convert_full_frame_rgba(monkeypatch: pytest.MonkeyPatch) -> None:
     image = Image.new("RGB", (1458, 806), (20, 30, 40))
     original_new = Image.new
+    original_convert = Image.Image.convert
 
     def guarded_new(mode: str, size: tuple[int, int], *args: object, **kwargs: object) -> Image.Image:
         if mode == "RGBA" and size == image.size:
             raise AssertionError("full-frame overlay allocation")
         return original_new(mode, size, *args, **kwargs)
 
+    def guarded_convert(
+        source: Image.Image, mode: str | None = None, *args: object, **kwargs: object
+    ) -> Image.Image:
+        if source is image and mode == "RGBA":
+            raise AssertionError("full-frame RGBA conversion")
+        return original_convert(source, mode, *args, **kwargs)
+
     monkeypatch.setattr(Image, "new", guarded_new)
+    monkeypatch.setattr(Image.Image, "convert", guarded_convert)
 
     _draw_spot_overlay(image, _configured_spots(load_example_settings()))
+
+
+def test_spot_overlay_does_not_alpha_composite_full_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    image = Image.new("RGB", (1458, 806), (20, 30, 40))
+
+    def reject_alpha_composite(*_args: object, **_kwargs: object) -> Image.Image:
+        raise AssertionError("full-frame alpha composite")
+
+    monkeypatch.setattr(Image, "alpha_composite", reject_alpha_composite)
+
+    _draw_spot_overlay(image, _configured_spots(load_example_settings()))
+
+
+def test_spot_overlay_preserves_representative_pre_jpeg_pixels() -> None:
+    image = Image.new("RGB", (1458, 806), (20, 30, 40))
+
+    _draw_spot_overlay(image, _configured_spots(load_example_settings()))
+
+    assert image.getpixel((350, 200)) == pytest.approx((30, 75, 99), abs=1)
+    assert image.getpixel(LEFT_EDGE_PIXEL) == (14, 165, 233)
+    assert image.getpixel((316, 190)) == pytest.approx((14, 165, 233), abs=3)
+
+
+def test_write_debug_overlay_creates_exactly_one_rgb_working_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = load_example_settings()
+    source_path = tmp_path / "rgba.png"
+    output_path = tmp_path / "debug_latest.jpg"
+    Image.new("RGBA", (settings.stream.frame_width, settings.stream.frame_height), (10, 20, 30, 128)).save(source_path)
+    original_convert = Image.Image.convert
+    rgb_conversions = 0
+
+    def counted_convert(
+        source: Image.Image, mode: str | None = None, *args: object, **kwargs: object
+    ) -> Image.Image:
+        nonlocal rgb_conversions
+        if mode == "RGB":
+            rgb_conversions += 1
+        return original_convert(source, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "convert", counted_convert)
+
+    write_debug_overlay(settings, source_path, output_path)
+
+    assert rgb_conversions == 1
 
 
 def test_write_debug_overlay_renders_configured_spot_polygons_to_jpeg(tmp_path: Path) -> None:
