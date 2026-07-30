@@ -337,7 +337,6 @@ def backup_operation(
         _require_regular_file(path, label)
     if _sha256(model) != approved_model_sha256:
         raise DeploymentError("model does not match the operator-approved SHA-256")
-    runner.run(("docker", "image", "inspect", rollback_tag), check=False)
     existing = runner.run(
         ("docker", "image", "inspect", rollback_tag, "--format", "{{.Id}}"),
         capture=True,
