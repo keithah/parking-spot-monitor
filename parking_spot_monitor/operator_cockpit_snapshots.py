@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 import stat as stat_module
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -394,11 +395,19 @@ def _validate_latest_snapshot(path: Path, *, now: datetime, logger: StructuredLo
         _log_latest_snapshot_problem(logger, reason="too_large", error_type="too large", byte_size=stat.st_size)
         return LatestSnapshotValidation(state="error", error_type="too large")
     try:
-        with Image.open(path) as image:
-            width, height = image.size
-            image_format = image.format
-            image.verify()
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path) as image:
+                width, height = image.size
+                image_format = image.format
+                image.verify()
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ) as exc:
         _log_latest_snapshot_problem(logger, reason="invalid_jpeg", error_type="invalid JPEG", exception_type=exc.__class__.__name__)
         return LatestSnapshotValidation(state="error", error_type="invalid JPEG")
     if image_format != "JPEG" or width <= 0 or height <= 0:

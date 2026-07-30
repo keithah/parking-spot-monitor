@@ -1130,6 +1130,79 @@ def test_latest_snapshot_summary_rejects_invalid_debug_and_oversized_images_safe
     _assert_no_sensitive_text(response.text + log_stream.getvalue())
 
 
+@pytest.mark.parametrize(
+    "bomb",
+    [
+        Image.DecompressionBombError("access_token=latest-bomb-secret"),
+        Image.DecompressionBombWarning("token=latest-warning-secret"),
+    ],
+)
+def test_latest_snapshot_command_redacts_decompression_bombs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bomb: BaseException,
+) -> None:
+    settings = _settings(tmp_path)
+    health_path, state_path = _write_runtime_files(tmp_path)
+    latest_path = tmp_path / "latest.jpg"
+    _write_test_jpeg(latest_path)
+    stream = StringIO()
+    monkeypatch.setattr(operator_cockpit_snapshots.Image, "open", lambda path: (_ for _ in ()).throw(bomb))
+
+    response = operator_cockpit_snapshots.build_latest_snapshot_response(
+        settings=settings,
+        latest_path=latest_path,
+        health_path=health_path,
+        state_path=state_path,
+        logger=StructuredLogger(stream=stream),
+    )
+
+    assert response.image_path is None
+    assert response.image_info is None
+    assert "invalid JPEG" in response.text
+    rendered = response.text + stream.getvalue()
+    assert bomb.__class__.__name__ in rendered
+    assert "bomb-secret" not in rendered
+    assert "warning-secret" not in rendered
+
+
+@pytest.mark.parametrize(
+    "bomb",
+    [
+        Image.DecompressionBombError("access_token=who-bomb-secret"),
+        Image.DecompressionBombWarning("token=who-warning-secret"),
+    ],
+)
+def test_who_snapshot_command_redacts_decompression_bombs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bomb: BaseException,
+) -> None:
+    latest_path = tmp_path / "latest.jpg"
+    _write_test_jpeg(latest_path)
+    stream = StringIO()
+    monkeypatch.setattr(operator_cockpit_snapshots.Image, "open", lambda path: (_ for _ in ()).throw(bomb))
+
+    response = operator_cockpit_snapshots.build_who_snapshot_response(
+        settings=_settings(tmp_path),
+        data_dir=tmp_path,
+        base_text="Parking monitor who",
+        capture_func=lambda *args, **kwargs: SimpleNamespace(
+            latest_path=latest_path,
+            timestamp="2026-05-16T17:42:39Z",
+        ),
+        logger=StructuredLogger(stream=stream),
+    )
+
+    assert response.image_path is None
+    assert response.image_info is None
+    assert "fresh capture unavailable (invalid JPEG)" in response.text
+    rendered = response.text + stream.getvalue()
+    assert bomb.__class__.__name__ in rendered
+    assert "bomb-secret" not in rendered
+    assert "warning-secret" not in rendered
+
+
 def test_latest_snapshot_summary_handles_missing_stale_and_malformed_runtime_files_safely(tmp_path: Path) -> None:
     from parking_spot_monitor.operator_cockpit import build_latest_snapshot_response
 

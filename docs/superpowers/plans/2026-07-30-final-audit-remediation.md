@@ -959,7 +959,7 @@ git commit -m "perf: reuse loaded profile history"
 - Modify: `tests/test_operator_cockpit.py`
 
 **Interfaces:**
-- Produces: `JpegPublication(path: Path, strategy: Literal["hardlink", "reflink", "copy"])` and `publish_canonical_jpeg(source, destination) -> JpegPublication`.
+- Produces: `JpegPublication(path: Path, strategy: Literal["reflink", "copy"])` and `publish_canonical_jpeg(source, destination) -> JpegPublication`.
 - Produces: `JpegDecodeError(code: Literal["unidentified", "decompression_bomb", "invalid_dimensions", "read_failed"])` and `open_decoded_rgb_jpeg(path: Path, *, initial_max_dimension: int) -> ContextManager[DecodedRgbJpeg]`, where `DecodedRgbJpeg(image: Image.Image, source_width: int, source_height: int)` owns bounded draft, decode, RGB conversion, and deterministic closure.
 - Produces: immutable `MatrixUploadDerivative(path: Path, info: Mapping[str, int | str])` and `prepare_upload_derivative(snapshot: MatrixSnapshot, *, destination: Path) -> MatrixUploadDerivative`.
 - Adds outbox intent metadata `upload_derivative_path` and `upload_derivative_info`; both are optional, sanitized schema-v1 metadata.
@@ -968,12 +968,12 @@ git commit -m "perf: reuse loaded profile history"
 - [ ] **Step 1: Add failing link fallback and restart-reuse tests**
 
 ```python
-def test_canonical_jpeg_prefers_hardlink_without_reencoding(tmp_path: Path) -> None:
+def test_canonical_jpeg_prefers_reflink_without_reencoding(tmp_path: Path) -> None:
     source = valid_jpeg(tmp_path / "latest.jpg")
     publication = publish_canonical_jpeg(source, tmp_path / "archive" / "full.jpg")
-    assert publication.strategy == "hardlink"
+    assert publication.strategy == "reflink"
     assert publication.path.read_bytes() == source.read_bytes()
-    assert publication.path.stat().st_ino == source.stat().st_ino
+    assert publication.path.stat().st_ino != source.stat().st_ino
 
 
 def test_upload_retry_reuses_persisted_derivative_after_restart(tmp_path: Path) -> None:
@@ -988,9 +988,9 @@ def test_upload_retry_reuses_persisted_derivative_after_restart(tmp_path: Path) 
     assert derivative.read_bytes() == before
 ```
 
-Add forced `EXDEV`/unsupported-reflink tests proving fallback order hardlink -> reflink -> copy and temp cleanup after failure.
+Add unsupported-reflink tests proving fallback order reflink -> bounded copy and temp cleanup after failure. Prove the returned destination remains unchanged when the writable source is later modified.
 
-Add a source-mode regression: create a source with mode `0o600`, force/observe the hardlink path, and assert both source and publication remain `0o600`; monkeypatch `os.chmod`/`os.fchmod` to fail if called for the hardlinked inode. Add shared-decoder tests proving both `matrix_snapshots.py` and `operator_cockpit_snapshots.py` use `open_decoded_rgb_jpeg`, draft before load, close the opened and converted images on success/failure, and preserve caller-specific mapping: Matrix raises `MatrixError(error_type="snapshot_resize_failed")`, while operator Who returns `LatestSnapshotValidation(state="error", error_type="resize failed")` and its redacted warning.
+Add a source-mode regression: create a source with mode `0o600`, force the independent reflink path, and assert both source and publication remain `0o600`; monkeypatch `os.chmod`/`os.fchmod` to fail if called for the source inode. Add shared-decoder tests proving both `matrix_snapshots.py` and `operator_cockpit_snapshots.py` use `open_decoded_rgb_jpeg`, draft before load, close the opened and converted images on success/failure, and preserve caller-specific mapping: Matrix raises `MatrixError(error_type="snapshot_resize_failed")`, while operator Who returns `LatestSnapshotValidation(state="error", error_type="resize failed")` and its redacted warning.
 
 - [ ] **Step 2: Run focused tests and verify RED**
 
@@ -1000,7 +1000,7 @@ Expected: FAIL because full frames are decoded/re-encoded and upload derivatives
 
 - [ ] **Step 3: Publish the validated source JPEG without re-encoding**
 
-Validate JPEG format/dimensions before publication. Create a temporary destination in the target directory, try `os.link`; on cross-device/unsupported errors try Linux `FICLONE` via `fcntl.ioctl`; otherwise stream `shutil.copyfileobj` in 1 MiB chunks. `fsync` the new file, atomically replace destination, and fsync its directory. Never call `chmod`/`fchmod` on a hardlinked destination because it is the source inode. Preserve the source mode for hardlinks; for independent reflink/copy destinations, preserve that mode as well (or set an independently owned mode only if the existing destination policy explicitly requires it).
+Open the source once, validate JPEG format/dimensions from that descriptor, and bind stable dev/inode/size/mtime/ctime plus SHA-256 evidence to publication. Create a temporary destination in the target directory, try Linux `FICLONE` via `fcntl.ioctl`, and otherwise stream a descriptor-bound copy in 1 MiB chunks. Validate the independent temporary artifact against the digest before and after file `fsync`, atomically replace the destination, and fsync its directory. Preserve source mode on the independently owned reflink/copy destination. Generic mutable sources must never use hardlinks because later source writes would mutate a successfully returned publication.
 
 `capture_occupied_images` publishes the full frame with this helper, then opens the canonical path once to create only the crop.
 
@@ -1185,7 +1185,7 @@ git commit -m "docs: verify final audit remediation"
 - [ ] No archive index or recent-session API is added; the confirmed duplicate profile-summary scan is removed and existing health streaming/revision/TTL caching remains authoritative.
 - [ ] Complete atomic outbox JSON publication remains exactly once per durable network phase, with no journal/database migration and no claim that bounded full-file phase writes were eliminated.
 - [ ] Decision-memory transition, alert, correction, command-outcome, and lifecycle records flush immediately; only routine diagnostics use the documented time/count crash-loss bound.
-- [ ] The canonical JPEG decoder is shared by Matrix and operator Who callers, and hardlink publication never changes the source inode mode.
+- [ ] The canonical JPEG decoder is shared by Matrix and operator Who callers, and canonical publication returns an independently owned reflink/copy whose bytes cannot change through the writable source path.
 - [ ] Matrix command fetching is background-only; cursor writes, archive mutation, detector work, and replies stay on the capture thread.
 - [ ] The detector backend is shared/lazy, and ONNX/TorchScript cannot alter production configuration in this plan.
 - [ ] `pytest-xdist` is explicitly skipped and no verification command uses `-n`.

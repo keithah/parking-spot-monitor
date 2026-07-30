@@ -242,6 +242,13 @@ def test_generic_jpeg_artifacts_do_not_depend_on_matrix_derivative_types() -> No
     assert "_matrix_snapshot_upload" not in derivative_source
 
 
+def test_canonical_jpeg_publication_never_uses_mutable_hardlinks() -> None:
+    source = (ROOT / "parking_spot_monitor/jpeg_artifacts.py").read_text(encoding="utf-8")
+
+    assert '"hardlink"' not in source
+    assert "os.link(" not in source
+
+
 def test_matrix_snapshot_artifact_ownership_is_layered() -> None:
     storage_imports = _imported_module_names("parking_spot_monitor/matrix_snapshot_storage.py")
     derivative_imports = _imported_module_names("parking_spot_monitor/matrix_upload_derivatives.py")

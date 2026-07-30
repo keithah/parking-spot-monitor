@@ -36,7 +36,7 @@ _FALLBACK_ERRNOS = frozenset(
 @dataclass(frozen=True, slots=True)
 class JpegPublication:
     path: Path
-    strategy: Literal["hardlink", "reflink", "copy"]
+    strategy: Literal["reflink", "copy"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +48,7 @@ class DecodedRgbJpeg:
 
 @dataclass(frozen=True, slots=True)
 class _SourceEvidence:
-    signature: tuple[int, int, int, int]
+    signature: tuple[int, int, int, int, int]
     digest: bytes
     mode: int
 
@@ -76,22 +76,16 @@ def publish_canonical_jpeg(source: str | Path, destination: str | Path) -> JpegP
         replaced = False
         try:
             try:
-                _bind_source_path(source_path, source_fd, evidence.signature)
-                os.link(source_path, temporary)
-                strategy: Literal["hardlink", "reflink", "copy"] = "hardlink"
-            except OSError as exc:
-                if exc.errno not in _FALLBACK_ERRNOS:
+                _reflink(source_fd, temporary, evidence.mode)
+                strategy: Literal["reflink", "copy"] = "reflink"
+            except OSError as reflink_exc:
+                if reflink_exc.errno not in _FALLBACK_ERRNOS:
                     raise
-                try:
-                    _reflink(source_fd, temporary, evidence.mode)
-                    strategy = "reflink"
-                except OSError as reflink_exc:
-                    if reflink_exc.errno not in _FALLBACK_ERRNOS:
-                        raise
-                    _copy_file(source_fd, temporary, evidence.mode)
-                    strategy = "copy"
-            _validate_temporary(temporary, source_fd, evidence, strategy=strategy)
+                _copy_file(source_fd, temporary, evidence.mode)
+                strategy = "copy"
+            _validate_temporary(temporary, source_fd, evidence)
             _fsync_file(temporary)
+            _validate_temporary(temporary, source_fd, evidence)
             os.replace(temporary, destination_path)
             replaced = True
             _fsync_directory(destination_path.parent)
@@ -227,21 +221,10 @@ def _validated_source_evidence(source_fd: int) -> _SourceEvidence:
     return _SourceEvidence(before, digest_after, stat.S_IMODE(value.st_mode))
 
 
-def _bind_source_path(path: Path, source_fd: int, expected: tuple[int, int, int, int]) -> None:
-    try:
-        path_value = os.stat(path, follow_symlinks=False)
-    except OSError as exc:
-        raise JpegDecodeError("read_failed", source_error_type=exc.__class__.__name__) from exc
-    if _stat_signature(path_value) != expected or _descriptor_signature(source_fd) != expected:
-        raise JpegDecodeError("read_failed")
-
-
 def _validate_temporary(
     temporary: Path,
     source_fd: int,
     evidence: _SourceEvidence,
-    *,
-    strategy: Literal["hardlink", "reflink", "copy"],
 ) -> None:
     if _descriptor_signature(source_fd) != evidence.signature:
         raise JpegDecodeError("read_failed")
@@ -251,8 +234,6 @@ def _validate_temporary(
         raise JpegDecodeError("read_failed", source_error_type=exc.__class__.__name__) from exc
     try:
         temporary_signature = _descriptor_signature(temporary_fd)
-        if strategy == "hardlink" and temporary_signature[:2] != evidence.signature[:2]:
-            raise JpegDecodeError("read_failed")
         if _digest_descriptor(temporary_fd) != evidence.digest:
             raise JpegDecodeError("read_failed")
         if _descriptor_signature(temporary_fd) != temporary_signature:
@@ -272,12 +253,12 @@ def _digest_descriptor(descriptor: int) -> bytes:
     return digest.digest()
 
 
-def _descriptor_signature(descriptor: int) -> tuple[int, int, int, int]:
+def _descriptor_signature(descriptor: int) -> tuple[int, int, int, int, int]:
     return _stat_signature(os.fstat(descriptor))
 
 
-def _stat_signature(value: os.stat_result) -> tuple[int, int, int, int]:
-    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+def _stat_signature(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:

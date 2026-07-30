@@ -716,7 +716,7 @@ def write_test_jpeg(path: Path, *, size: tuple[int, int] = (8, 6), color: tuple[
     return path
 
 
-def test_canonical_jpeg_prefers_hardlink_without_reencoding_or_mode_change(
+def test_canonical_jpeg_prefers_reflink_without_reencoding_or_source_mode_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = write_test_jpeg(tmp_path / "latest.jpg")
@@ -725,50 +725,135 @@ def test_canonical_jpeg_prefers_hardlink_without_reencoding_or_mode_change(
     original_chmod = os.chmod
     original_fchmod = os.fchmod
 
+    def deterministic_reflink(source_fd: int, temporary: Path, source_mode: int) -> None:
+        temporary.write_bytes(os.pread(source_fd, os.fstat(source_fd).st_size, 0))
+        temporary.chmod(source_mode)
+
     def reject_shared_chmod(path: str | os.PathLike[str], mode: int, *args: object, **kwargs: object) -> None:
         if Path(path).exists() and Path(path).stat().st_ino == source_inode:
-            raise AssertionError("must not chmod a shared hardlink inode")
+            raise AssertionError("must not chmod the source inode")
         original_chmod(path, mode, *args, **kwargs)
 
     def reject_shared_fchmod(fd: int, mode: int) -> None:
         if os.fstat(fd).st_ino == source_inode:
-            raise AssertionError("must not fchmod a shared hardlink inode")
+            raise AssertionError("must not fchmod the source inode")
         original_fchmod(fd, mode)
 
     monkeypatch.setattr(os, "chmod", reject_shared_chmod)
     monkeypatch.setattr(os, "fchmod", reject_shared_fchmod)
+    monkeypatch.setattr(jpeg_artifacts, "_reflink", deterministic_reflink)
 
     publication = publish_canonical_jpeg(source, tmp_path / "archive" / "full.jpg")
 
-    assert publication.strategy == "hardlink"
+    assert publication.strategy == "reflink"
     assert publication.path.read_bytes() == source.read_bytes()
-    assert publication.path.stat().st_ino == source_inode
+    assert publication.path.stat().st_ino != source_inode
     assert stat.S_IMODE(source.stat().st_mode) == 0o600
     assert stat.S_IMODE(publication.path.stat().st_mode) == 0o600
 
 
-def test_canonical_jpeg_falls_back_from_cross_device_link_to_reflink(
+def test_canonical_jpeg_default_publication_is_independent_from_writable_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    validated = source.read_bytes()
+    destination = tmp_path / "archive" / "full.jpg"
+
+    def deterministic_reflink(source_fd: int, temporary: Path, source_mode: int) -> None:
+        temporary.write_bytes(os.pread(source_fd, os.fstat(source_fd).st_size, 0))
+        temporary.chmod(source_mode)
+
+    monkeypatch.setattr(jpeg_artifacts, "_reflink", deterministic_reflink)
+
+    publication = publish_canonical_jpeg(source, destination)
+    source.write_bytes(b"changed after successful publication")
+
+    assert publication.strategy == "reflink"
+    assert destination.read_bytes() == validated
+    assert destination.stat().st_ino != source.stat().st_ino
+
+
+def test_canonical_jpeg_detects_same_length_restore_with_spoofed_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    expected = source.read_bytes()
+    original_mtime = source.stat().st_mtime_ns
+    destination = tmp_path / "archive" / "full.jpg"
+    real_signature = jpeg_artifacts._descriptor_signature
+    source_descriptor: int | None = None
+    mutation_observed = False
+
+    def mutate_restore_and_spoof(source_fd: int, temporary: Path, source_mode: int) -> None:
+        nonlocal mutation_observed, source_descriptor
+        source_descriptor = source_fd
+        temporary.write_bytes(os.pread(source_fd, os.fstat(source_fd).st_size, 0))
+        temporary.chmod(source_mode)
+        source.write_bytes(b"x" * len(expected))
+        source.write_bytes(expected)
+        os.utime(source, ns=(original_mtime, original_mtime))
+        mutation_observed = True
+
+    def signature_with_observed_ctime(descriptor: int) -> tuple[int, int, int, int, int]:
+        signature = real_signature(descriptor)
+        assert len(signature) == 5
+        assert signature[-1] == os.fstat(descriptor).st_ctime_ns
+        if mutation_observed and descriptor == source_descriptor:
+            return (*signature[:-1], signature[-1] + 1)
+        return signature
+
+    monkeypatch.setattr(jpeg_artifacts, "_reflink", mutate_restore_and_spoof)
+    monkeypatch.setattr(jpeg_artifacts, "_descriptor_signature", signature_with_observed_ctime)
+
+    with pytest.raises(JpegDecodeError, match="read_failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert not destination.exists()
+    assert list(destination.parent.glob(".*.tmp")) == []
+
+
+def test_canonical_jpeg_rechecks_integrity_after_temporary_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    expected_size = source.stat().st_size
+    destination = tmp_path / "archive" / "full.jpg"
+    real_fsync = jpeg_artifacts._fsync_file
+
+    def mutate_after_fsync(path: Path) -> None:
+        real_fsync(path)
+        path.write_bytes(b"z" * expected_size)
+
+    monkeypatch.setattr(jpeg_artifacts, "_fsync_file", mutate_after_fsync)
+
+    with pytest.raises(JpegDecodeError, match="read_failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert not destination.exists()
+    assert list(destination.parent.glob(".*.tmp")) == []
+
+
+def test_canonical_jpeg_prefers_reflink_without_attempting_hardlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = write_test_jpeg(tmp_path / "latest.jpg")
     calls: list[str] = []
 
-    def cross_device(*args: object, **kwargs: object) -> None:
-        calls.append("hardlink")
-        raise OSError(errno.EXDEV, "cross-device")
-
     def reflink(source_fd: int, temporary: Path, source_mode: int) -> None:
         calls.append("reflink")
         temporary.write_bytes(os.pread(source_fd, os.fstat(source_fd).st_size, 0))
 
-    monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts.os.link", cross_device)
+    monkeypatch.setattr(
+        "parking_spot_monitor.jpeg_artifacts.os.link",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("hardlink must not be attempted")),
+    )
     monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts._reflink", reflink)
 
     publication = publish_canonical_jpeg(source, tmp_path / "archive" / "full.jpg")
 
     assert publication.strategy == "reflink"
     assert publication.path.read_bytes() == source.read_bytes()
-    assert calls == ["hardlink", "reflink"]
+    assert calls == ["reflink"]
 
 
 def test_canonical_jpeg_falls_back_to_bounded_copy_and_cleans_failed_temp(
@@ -778,22 +863,21 @@ def test_canonical_jpeg_falls_back_to_bounded_copy_and_cleans_failed_temp(
     destination = tmp_path / "archive" / "full.jpg"
     calls: list[str] = []
 
-    def cross_device(*args: object, **kwargs: object) -> None:
-        calls.append("hardlink")
-        raise OSError(errno.EXDEV, "cross-device")
-
     def unsupported(*args: object, **kwargs: object) -> None:
         calls.append("reflink")
         raise OSError(errno.EOPNOTSUPP, "unsupported")
 
-    monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts.os.link", cross_device)
+    monkeypatch.setattr(
+        "parking_spot_monitor.jpeg_artifacts.os.link",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("hardlink must not be attempted")),
+    )
     monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts._reflink", unsupported)
 
     publication = publish_canonical_jpeg(source, destination)
 
     assert publication.strategy == "copy"
     assert publication.path.read_bytes() == source.read_bytes()
-    assert calls == ["hardlink", "reflink"]
+    assert calls == ["reflink"]
     assert list(destination.parent.glob(".*.tmp")) == []
 
 
@@ -814,25 +898,30 @@ def test_canonical_jpeg_post_replace_directory_sync_failure_keeps_committed_file
     assert list(destination.parent.glob(".*.tmp")) == []
 
 
-def test_canonical_jpeg_rejects_source_replaced_after_validation(
+def test_canonical_jpeg_never_publishes_source_path_replacement_after_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = write_test_jpeg(tmp_path / "latest.jpg")
+    expected = source.read_bytes()
     replacement = tmp_path / "replacement.png"
     Image.new("RGB", (8, 6), (200, 20, 20)).save(replacement, "PNG")
     destination = tmp_path / "archive" / "full.jpg"
-    real_link = os.link
+    def swap_then_reflink(source_fd: int, temporary: Path, source_mode: int) -> None:
+        os.replace(replacement, source)
+        temporary.write_bytes(os.pread(source_fd, os.fstat(source_fd).st_size, 0))
+        temporary.chmod(source_mode)
 
-    def swap_then_link(source_path: Path, temporary: Path) -> None:
-        os.replace(replacement, source_path)
-        real_link(source_path, temporary)
+    monkeypatch.setattr(jpeg_artifacts, "_reflink", swap_then_reflink)
 
-    monkeypatch.setattr("parking_spot_monitor.jpeg_artifacts.os.link", swap_then_link)
-
-    with pytest.raises(JpegDecodeError, match="read_failed"):
-        publish_canonical_jpeg(source, destination)
-
-    assert not destination.exists()
+    try:
+        publication = publish_canonical_jpeg(source, destination)
+    except JpegDecodeError as exc:
+        assert str(exc) == "read_failed"
+        assert not destination.exists()
+    else:
+        assert publication.strategy == "reflink"
+        assert destination.read_bytes() == expected
+        assert destination.read_bytes() != source.read_bytes()
     assert list(destination.parent.glob(".*.tmp")) == []
 
 
@@ -859,15 +948,18 @@ def test_canonical_copy_fallback_never_reopens_replaced_source_path(
             os.replace(source, replacement)
             os.replace(original_away, source)
 
-    monkeypatch.setattr(jpeg_artifacts.os, "link", unavailable)
     monkeypatch.setattr(jpeg_artifacts, "_reflink", unavailable)
     monkeypatch.setattr(jpeg_artifacts, "_copy_file", replace_path_during_copy)
 
-    publication = publish_canonical_jpeg(source, destination)
-
-    assert publication.strategy == "copy"
-    assert destination.read_bytes() == expected
-    assert destination.read_bytes() != replacement.read_bytes()
+    try:
+        publication = publish_canonical_jpeg(source, destination)
+    except JpegDecodeError as exc:
+        assert str(exc) == "read_failed"
+        assert not destination.exists()
+    else:
+        assert publication.strategy == "copy"
+        assert destination.read_bytes() == expected
+        assert destination.read_bytes() != replacement.read_bytes()
     assert source.read_bytes() == expected
     assert list(destination.parent.glob(".*.tmp")) == []
 
@@ -914,7 +1006,6 @@ def test_canonical_jpeg_rejects_in_place_mutation_during_fallback_publication(
             real_copy(source_fd, temporary, source_mode)
         source.write_bytes(b"changed during publication")
 
-    monkeypatch.setattr(jpeg_artifacts.os, "link", unavailable)
     monkeypatch.setattr(jpeg_artifacts, "_reflink", publish_then_mutate if strategy == "reflink" else unavailable)
     if strategy == "copy":
         monkeypatch.setattr(jpeg_artifacts, "_copy_file", publish_then_mutate)
@@ -952,7 +1043,7 @@ def test_attach_occupied_images_writes_full_frame_and_clamped_crop_then_close_pr
     assert stat.S_IMODE(full_path.stat().st_mode) == stat.S_IMODE(source.stat().st_mode)
     assert stat.S_IMODE(crop_path.stat().st_mode) == 0o644
     assert full_path.read_bytes() == source_bytes
-    assert full_path.stat().st_ino == source.stat().st_ino
+    assert full_path.stat().st_ino != source.stat().st_ino
     with Image.open(full_path) as full_frame:
         assert full_frame.size == (8, 6)
         assert full_frame.format == "JPEG"
