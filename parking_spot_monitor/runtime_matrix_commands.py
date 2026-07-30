@@ -60,6 +60,25 @@ def command_poll_due(
     )
 
 
+def record_command_poll_requested(
+    state: MatrixCommandPollState,
+    now_monotonic: float,
+) -> MatrixCommandPollState:
+    """Anchor cadence when the worker accepts a request without erasing outage history."""
+    return MatrixCommandPollState(
+        last_attempt_at=now_monotonic,
+        failure_count=state.failure_count,
+        retry_at=None,
+    )
+
+
+def record_async_command_poll_success(
+    state: MatrixCommandPollState,
+) -> MatrixCommandPollState:
+    """Reset failure state while retaining the accepted request's cadence anchor."""
+    return MatrixCommandPollState(last_attempt_at=state.last_attempt_at)
+
+
 def record_command_poll_result(
     settings: MatrixCommandSchedule,
     state: MatrixCommandPollState,

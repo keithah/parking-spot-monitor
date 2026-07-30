@@ -17,7 +17,9 @@ from parking_spot_monitor.runtime_matrix_commands import (
     MatrixCommandPollState,
     MatrixCommandSchedule,
     command_poll_due,
+    record_async_command_poll_success,
     record_command_poll_result,
+    record_command_poll_requested,
 )
 
 
@@ -161,13 +163,18 @@ def advance_matrix_command_poll(
             iteration=iteration,
             decision_memory_path=decision_memory_path,
         )
-        state = record_command_poll_result(
-            settings,
-            state,
-            completed_at(),
-            failed=outcome.transport_failed,
+        state = (
+            record_command_poll_result(
+                settings,
+                state,
+                completed_at(),
+                failed=True,
+            )
+            if outcome.transport_failed
+            else record_async_command_poll_success(state)
         )
         health.record_command_result(outcome.health_error)
     if command_poll_due(settings, state, now_monotonic):
-        worker.request()
+        if worker.request():
+            state = record_command_poll_requested(state, now_monotonic)
     return state

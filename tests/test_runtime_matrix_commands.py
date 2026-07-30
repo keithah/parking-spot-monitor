@@ -11,10 +11,11 @@ from parking_spot_monitor.runtime_matrix_commands import (
     MatrixCommandSchedule,
     command_poll_due,
     record_command_poll_result,
+    record_command_poll_requested,
 )
 from parking_spot_monitor.matrix_commands import MatrixCommandService
 from parking_spot_monitor.matrix_models import MatrixSyncResult
-from parking_spot_monitor.runtime_command_worker import MatrixCommandPollWorker
+from parking_spot_monitor.runtime_command_worker import MatrixCommandPollWorker, advance_matrix_command_poll
 from parking_spot_monitor.runtime_command_results import collect_matrix_commands_once
 from parking_spot_monitor.logging import StructuredLogger
 
@@ -286,4 +287,193 @@ def test_fetch_error_enters_cooldown_only_after_capture_thread_collects_it() -> 
         failure_count=1,
         retry_at=110,
     )
+    worker.close()
+
+
+class _PollResult:
+    processed_count = 0
+    ignored_count = 0
+    error_count = 0
+    bootstrapped = False
+
+
+class _ApplyService:
+    def apply_sync_result(self, _result: MatrixSyncResult) -> _PollResult:
+        return _PollResult()
+
+
+class _Health:
+    def __init__(self) -> None:
+        self.errors: list[dict[str, object] | None] = []
+
+    def record_command_result(self, error: dict[str, object] | None) -> None:
+        self.errors.append(error)
+
+
+class _ScriptedWorker:
+    def __init__(self) -> None:
+        self.completed: MatrixSyncResult | BaseException | None = None
+        self.outstanding = False
+        self.accepted_requests = 0
+
+    def take_completed(self) -> MatrixSyncResult | BaseException | None:
+        completed = self.completed
+        self.completed = None
+        if completed is not None:
+            self.outstanding = False
+        return completed
+
+    def request(self) -> bool:
+        if self.outstanding:
+            return False
+        self.outstanding = True
+        self.accepted_requests += 1
+        return True
+
+
+def _advance(
+    worker: _ScriptedWorker,
+    state: MatrixCommandPollState,
+    now: float,
+    *,
+    interval: float = 60,
+    completed_at: float | None = None,
+) -> MatrixCommandPollState:
+    return advance_matrix_command_poll(
+        _ApplyService(),  # type: ignore[arg-type]
+        worker,  # type: ignore[arg-type]
+        settings=MatrixCommandSchedule(interval, 10, 60),
+        state=state,
+        now_monotonic=now,
+        logger=StructuredLogger(),
+        iteration=1,
+        health=_Health(),
+        decision_memory_path=None,
+        completed_at=lambda: now if completed_at is None else completed_at,
+    )
+
+
+def test_async_success_cadence_is_anchored_to_accepted_request_time() -> None:
+    worker = _ScriptedWorker()
+    state = _advance(worker, MatrixCommandPollState(), 0)
+    assert state == MatrixCommandPollState(last_attempt_at=0)
+    assert worker.accepted_requests == 1
+
+    worker.completed = MatrixSyncResult(next_batch="s1", events=())
+    state = _advance(worker, state, 60, completed_at=60)
+
+    assert worker.accepted_requests == 2
+    assert state == MatrixCommandPollState(last_attempt_at=60)
+
+
+def test_long_running_async_fetch_does_not_move_attempt_time_on_duplicate_request() -> None:
+    worker = _ScriptedWorker()
+    state = _advance(worker, MatrixCommandPollState(), 0)
+
+    state = _advance(worker, state, 60)
+    assert state == MatrixCommandPollState(last_attempt_at=0)
+    assert worker.accepted_requests == 1
+
+    worker.completed = MatrixSyncResult(next_batch="s1", events=())
+    state = _advance(worker, state, 90, completed_at=90)
+    assert state == MatrixCommandPollState(last_attempt_at=90)
+    assert worker.accepted_requests == 2
+
+
+def test_zero_interval_requests_next_fetch_when_success_is_collected() -> None:
+    worker = _ScriptedWorker()
+    state = _advance(worker, MatrixCommandPollState(), 0, interval=0)
+    worker.completed = MatrixSyncResult(next_batch="s1", events=())
+
+    state = _advance(worker, state, 0, interval=0, completed_at=0)
+
+    assert worker.accepted_requests == 2
+    assert state == MatrixCommandPollState(last_attempt_at=0)
+
+
+def test_async_failure_cooldown_remains_anchored_to_collection_time() -> None:
+    worker = _ScriptedWorker()
+    state = _advance(worker, MatrixCommandPollState(), 0)
+    worker.completed = RuntimeError("unavailable")
+
+    state = _advance(worker, state, 60, completed_at=60)
+    assert state == MatrixCommandPollState(last_attempt_at=60, failure_count=1, retry_at=70)
+    assert worker.accepted_requests == 1
+
+    state = _advance(worker, state, 70)
+    assert state == MatrixCommandPollState(last_attempt_at=70, failure_count=1, retry_at=None)
+    assert worker.accepted_requests == 2
+
+
+def test_request_tracking_preserves_failure_history_and_consumes_retry_gate() -> None:
+    state = MatrixCommandPollState(last_attempt_at=60, failure_count=2, retry_at=120)
+
+    assert record_command_poll_requested(state, 120) == MatrixCommandPollState(
+        last_attempt_at=120,
+        failure_count=2,
+        retry_at=None,
+    )
+
+
+def test_real_async_worker_requests_again_at_original_success_cadence() -> None:
+    release_first = Event()
+    release_second = Event()
+    second_started = Event()
+
+    class Service:
+        def __init__(self) -> None:
+            self.fetch_count = 0
+            self.apply_count = 0
+
+        def fetch_once(self) -> MatrixSyncResult:
+            self.fetch_count += 1
+            if self.fetch_count == 1:
+                assert release_first.wait(1)
+            else:
+                second_started.set()
+                release_second.wait(1)
+            return MatrixSyncResult(next_batch=f"s{self.fetch_count}", events=())
+
+        def apply_sync_result(self, _result: MatrixSyncResult) -> _PollResult:
+            self.apply_count += 1
+            return _PollResult()
+
+    service = Service()
+    health = _Health()
+    worker = MatrixCommandPollWorker(service.fetch_once, cancel_pending=release_second.set)
+    state = advance_matrix_command_poll(
+        service,  # type: ignore[arg-type]
+        worker,
+        settings=MatrixCommandSchedule(60, 10, 60),
+        state=MatrixCommandPollState(),
+        now_monotonic=0,
+        logger=StructuredLogger(),
+        iteration=1,
+        health=health,
+        decision_memory_path=None,
+        completed_at=lambda: 60,
+    )
+    assert state == MatrixCommandPollState(last_attempt_at=0)
+    release_first.set()
+
+    deadline = time.monotonic() + 1
+    while service.apply_count == 0 and time.monotonic() < deadline:
+        state = advance_matrix_command_poll(
+            service,  # type: ignore[arg-type]
+            worker,
+            settings=MatrixCommandSchedule(60, 10, 60),
+            state=state,
+            now_monotonic=60,
+            logger=StructuredLogger(),
+            iteration=2,
+            health=health,
+            decision_memory_path=None,
+            completed_at=lambda: 60,
+        )
+        time.sleep(0.001)
+
+    assert service.apply_count == 1
+    assert second_started.wait(1)
+    assert service.fetch_count == 2
+    assert state == MatrixCommandPollState(last_attempt_at=60)
     worker.close()
