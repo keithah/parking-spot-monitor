@@ -59,11 +59,14 @@ def _close_resources(
         try:
             close()
         except Exception as exc:
-            logger.warning(
-                "runtime-resource-close-failed",
-                resource=name,
-                error_type=type(exc).__name__,
-            )
+            try:
+                logger.warning(
+                    "runtime-resource-close-failed",
+                    resource=name,
+                    error_type=type(exc).__name__,
+                )
+            except Exception:
+                pass
 
 
 def install_shutdown_signal_handlers(

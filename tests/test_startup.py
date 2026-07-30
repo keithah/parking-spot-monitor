@@ -4604,9 +4604,46 @@ def test_close_resources_continues_after_first_close_failure(
     assert SECRET_MARKER not in output
 
 
-def test_command_factory_failure_closes_already_created_delivery(tmp_path: Path) -> None:
+def test_close_resources_continues_when_cleanup_logging_fails() -> None:
+    from parking_spot_monitor.__main__ import _close_resources
+
+    closed: list[str] = []
+
+    class FailingClose:
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    class RecordingClose:
+        def close(self) -> None:
+            closed.append("delivery")
+
+    class ClosedLogger:
+        def warning(self, _event: str, **_fields: object) -> None:
+            raise OSError("logging sink closed")
+
+    _close_resources(
+        (("commands", FailingClose()), ("delivery", RecordingClose())),
+        logger=ClosedLogger(),  # type: ignore[arg-type]
+    )
+
+    assert closed == ["delivery"]
+
+
+def test_command_factory_failure_closes_already_created_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from parking_spot_monitor import __main__ as cli
+
     closed: list[str] = []
     original = RuntimeError("command construction failed")
+
+    class CleanupLogger(StructuredLogger):
+        def warning(self, _event: str, **_fields: object) -> None:
+            raise OSError("cleanup logging failed")
+
+    cleanup_logger = CleanupLogger()
+    monkeypatch.setattr(cli, "setup_logging", lambda **_kwargs: cleanup_logger)
 
     class Delivery(FakeMatrixDelivery):
         def close(self) -> None:
