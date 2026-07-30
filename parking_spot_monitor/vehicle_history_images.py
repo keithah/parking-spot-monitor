@@ -11,6 +11,7 @@ from PIL import Image
 
 from parking_spot_monitor.file_descriptor_binding import OwnedFile, RootedDirectoryOwner, descriptor_identity, open_owned_at
 from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, JpegPublication, open_decoded_rgb_jpeg_stream, publish_canonical_jpeg_to_owner
+from parking_spot_monitor.owned_file_recovery import RecoveryResult
 
 BBoxInput = Sequence[float]
 
@@ -64,6 +65,13 @@ def capture_occupied_images(
         with archive_owner.open_child("images", create=True) as images_owner:
             with images_owner.open_child("occupied-full", create=True) as full_owner:
                 with images_owner.open_child("occupied-crops", create=True) as crop_owner:
+                    try:
+                        full_recovery = full_owner.recover_owned()
+                        crop_recovery = crop_owner.recover_owned()
+                    except OSError as exc:
+                        raise VehicleHistoryImageError("vehicle image recovery failed") from exc
+                    if full_recovery.pending or crop_recovery.pending:
+                        raise VehicleHistoryImageError("vehicle image recovery remains pending")
                     _capture_owned_images(
                         source_frame_path=source_frame_path,
                         bbox=bbox,
@@ -73,6 +81,29 @@ def capture_occupied_images(
                     )
 
     return OccupiedImageCaptureResult(full_frame_path=full_frame_path, crop_path=crop_path)
+
+
+def recover_vehicle_image_artifacts(archive_root: str | os.PathLike[str]) -> RecoveryResult:
+    """Recover bounded pending cleanup in both archive-owned image directories."""
+
+    recovered = 0
+    pending = False
+    try:
+        with RootedDirectoryOwner(Path(archive_root), create=False) as archive_owner:
+            with archive_owner.open_child("images", create=False) as images_owner:
+                for child_name in ("occupied-full", "occupied-crops"):
+                    try:
+                        with images_owner.open_child(child_name, create=False) as owner:
+                            result = owner.recover_owned()
+                    except FileNotFoundError:
+                        continue
+                    recovered += result.recovered
+                    pending = pending or result.pending
+    except FileNotFoundError:
+        return RecoveryResult()
+    except OSError:
+        return RecoveryResult(pending=True)
+    return RecoveryResult(recovered, pending)
 
 
 def _capture_owned_images(

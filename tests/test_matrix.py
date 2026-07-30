@@ -16,6 +16,8 @@ import parking_spot_monitor.matrix_snapshot_storage as matrix_snapshot_storage
 import parking_spot_monitor.matrix_retained_publication as matrix_retained_publication
 import parking_spot_monitor.file_descriptor_binding as file_descriptor_binding
 import parking_spot_monitor.jpeg_artifacts as jpeg_artifacts
+import parking_spot_monitor.owned_file_disposal as owned_file_disposal
+import parking_spot_monitor.owned_directory_durability as owned_directory_durability
 from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult
 from parking_spot_monitor.jpeg_artifacts import JpegDecodeError
@@ -1470,6 +1472,147 @@ def test_prune_event_snapshots_logs_safe_failure_without_raising(
     assert '"error_type":"PermissionError"' in output
     assert "secret" not in output
     assert "raw_image_bytes abc" not in output
+
+
+def test_delete_owned_artifact_reports_uncertain_durability_after_successful_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    target = root / "owned.jpg"
+    target.write_bytes(b"owned")
+    real_fsync = matrix_snapshot_storage.os.fsync
+    real_unlink = owned_file_disposal.os.unlink
+    directory_identity = (root.stat().st_dev, root.stat().st_ino)
+    failed = False
+    unlinked = False
+
+    def track_disposal_unlink(name: object, *args: object, **kwargs: object) -> None:
+        nonlocal unlinked
+        real_unlink(name, *args, **kwargs)
+        if str(name).endswith(".dispose"):
+            unlinked = True
+
+    def fail_post_unlink_directory_sync(descriptor: int) -> None:
+        nonlocal failed
+        value = os.fstat(descriptor)
+        if not failed and unlinked and (value.st_dev, value.st_ino) == directory_identity:
+            failed = True
+            raise OSError("directory sync failed")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", track_disposal_unlink)
+    monkeypatch.setattr(matrix_snapshot_storage.os, "fsync", fail_post_unlink_directory_sync)
+    result = matrix_snapshot_storage.delete_owned_artifact(root, None, target.name)
+
+    assert result.status == "deleted"
+    assert result.durable is False
+    assert not target.exists()
+    assert not any(path.name.endswith((".dispose", ".quarantine")) for path in root.iterdir())
+
+
+def test_derivative_directory_sync_failure_is_retried_before_child_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "snapshots"
+    child = root / ".upload-derivatives"
+    child.mkdir(parents=True)
+    with owned_directory_durability.IDENTITY_LOCK:
+        owned_directory_durability.DURABLE_IDENTITIES.clear()
+    root_identity = (root.stat().st_dev, root.stat().st_ino)
+    real_fsync = matrix_snapshot_storage.os.fsync
+    root_syncs = 0
+
+    def fail_first_root_sync(descriptor: int) -> None:
+        nonlocal root_syncs
+        value = os.fstat(descriptor)
+        if (value.st_dev, value.st_ino) == root_identity:
+            root_syncs += 1
+            if root_syncs == 1:
+                raise OSError("root sync failed")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(matrix_snapshot_storage.os, "fsync", fail_first_root_sync)
+    with pytest.raises(OSError):
+        matrix_snapshot_storage.publish_owned_bytes(root, ".upload-derivatives", "first.jpg", b"x", mode=0o600)
+    published = matrix_snapshot_storage.publish_owned_bytes(
+        root, ".upload-derivatives", "second.jpg", b"x", mode=0o600
+    )
+
+    assert root_syncs == 2
+    assert published.read_bytes() == b"x"
+    with owned_directory_durability.IDENTITY_LOCK:
+        owned_directory_durability.DURABLE_IDENTITIES.clear()
+    matrix_snapshot_storage.publish_owned_bytes(
+        root, ".upload-derivatives", "after-restart.jpg", b"x", mode=0o600
+    )
+    assert root_syncs == 3
+
+
+def test_retention_treats_uncertain_durability_as_deleted_and_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    oldest = root / "occupancy-open-event-left-spot-2026-05-18t20-00-00z.jpg"
+    newest = root / "occupancy-open-event-left-spot-2026-05-18t21-00-00z.jpg"
+    oldest.write_bytes(b"old")
+    newest.write_bytes(b"new")
+    real_delete = matrix_snapshots.delete_owned_artifact
+
+    def uncertain_delete(
+        snapshot_root: Path, directory: str | None, filename: str
+    ) -> matrix_snapshot_storage.OwnedArtifactDeleteResult:
+        result = real_delete(snapshot_root, directory, filename)
+        if directory is None and result.status == "deleted":
+            return matrix_snapshot_storage.OwnedArtifactDeleteResult(
+                result.status, result.bytes_deleted, durable=False
+            )
+        return result
+
+    monkeypatch.setattr(matrix_snapshots, "delete_owned_artifact", uncertain_delete)
+    result = prune_event_snapshots(root, retention_count=1, logger=StructuredLogger())
+
+    output = capsys.readouterr().err
+    assert result.pruned_count == 1
+    assert result.failed_count == 0
+    assert result.durability_uncertain_count == 1
+    assert '"event":"snapshot-retention-durability-uncertain"' in output
+
+
+def test_retention_recovers_manifested_raw_and_derivative_work_behind_decoys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "snapshots"
+    derivative_dir = root / ".upload-derivatives"
+    derivative_dir.mkdir(parents=True)
+    oldest_name = "occupancy-open-event-left-spot-2026-05-18t20-00-00z.jpg"
+    newest_name = "occupancy-open-event-left-spot-2026-05-18t21-00-00z.jpg"
+    for directory in (root, derivative_dir):
+        for index in range(300):
+            (directory / f"decoy-{index:03d}").write_bytes(b"x")
+    (root / oldest_name).write_bytes(b"old")
+    (root / newest_name).write_bytes(b"new")
+    (derivative_dir / oldest_name).write_bytes(b"derived")
+    real_unlink = owned_file_disposal.os.unlink
+
+    def interrupt_disposal(name: object, *args: object, **kwargs: object) -> None:
+        if str(name).endswith(".dispose"):
+            raise OSError("simulated crash")
+        real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", interrupt_disposal)
+    first = prune_event_snapshots(root, retention_count=1, logger=StructuredLogger())
+    assert first.failed_count == 1
+    assert not (derivative_dir / oldest_name).exists()
+
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", real_unlink)
+    second = prune_event_snapshots(root, retention_count=1, logger=StructuredLogger())
+
+    assert second.failed_count == 0
+    assert second.pruned_count == 1
+    assert not (root / oldest_name).exists()
+    assert not (derivative_dir / oldest_name).exists()
 
 
 def test_prepare_event_snapshot_prunes_after_copy_without_removing_current_snapshot(tmp_path: Path) -> None:

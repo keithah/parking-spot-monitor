@@ -1453,6 +1453,104 @@ def test_owned_cleanup_persistent_disposal_failure_stays_bounded_then_recovers(
     assert not [path for path in tmp_path.iterdir() if path.name.endswith(".dispose") or ".dispose." in path.name]
 
 
+def test_owned_directory_manifest_recovers_pending_artifact_behind_decoys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    identity = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    for index in range(300):
+        (tmp_path / f"decoy-{index:03d}").write_bytes(b"x")
+    real_unlink = owned_file_disposal.os.unlink
+
+    def interrupt_disposal(name: object, *args: object, **kwargs: object) -> None:
+        if str(name).endswith(".dispose"):
+            raise OSError("simulated crash")
+        real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", interrupt_disposal)
+    assert file_descriptor_binding.unlink_owned_path(target, identity) is False
+    assert not target.exists()
+    assert (tmp_path / ".owned-disposals.json").exists()
+
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", real_unlink)
+    with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as restarted_owner:
+        result = restarted_owner.recover_owned()
+
+    assert result.recovered == 1
+    assert result.pending is False
+    assert target.read_bytes() == b"owned"
+    assert not list(tmp_path.glob("*.dispose"))
+
+
+def test_owned_directory_manifest_rejects_replaced_disposal_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    identity = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    real_unlink = owned_file_disposal.os.unlink
+
+    def interrupt_disposal(name: object, *args: object, **kwargs: object) -> None:
+        if str(name).endswith(".dispose"):
+            raise OSError("simulated crash")
+        real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", interrupt_disposal)
+    assert file_descriptor_binding.unlink_owned_path(target, identity) is False
+    disposal = next(path for path in tmp_path.iterdir() if path.name.endswith(".dispose"))
+    moved_owned = tmp_path / "moved-owned.jpg"
+    disposal.replace(moved_owned)
+    disposal.write_bytes(b"unrelated")
+
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", real_unlink)
+    with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as restarted_owner:
+        result = restarted_owner.recover_owned()
+
+    assert result.pending is True
+    assert not target.exists()
+    assert moved_owned.read_bytes() == b"owned"
+    assert disposal.read_bytes() == b"unrelated"
+
+
+def test_vehicle_capture_recovers_owned_full_and_crop_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "archive"
+    full_dir = archive / "images" / "occupied-full"
+    crop_dir = archive / "images" / "occupied-crops"
+    full_dir.mkdir(parents=True)
+    crop_dir.mkdir(parents=True)
+    pending_paths = [full_dir / "old-full.jpg", crop_dir / "old-crop.jpg"]
+    real_unlink = owned_file_disposal.os.unlink
+
+    def interrupt_disposal(name: object, *args: object, **kwargs: object) -> None:
+        if str(name).endswith(".dispose"):
+            raise OSError("simulated crash")
+        real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", interrupt_disposal)
+    for directory, target in zip((full_dir, crop_dir), pending_paths, strict=True):
+        for index in range(300):
+            (directory / f"decoy-{index:03d}").write_bytes(b"x")
+        target.write_bytes(b"pending")
+        identity = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+        assert file_descriptor_binding.unlink_owned_path(target, identity) is False
+        assert not target.exists()
+
+    source = tmp_path / "source.jpg"
+    Image.new("RGB", (16, 16), "blue").save(source, format="JPEG")
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", real_unlink)
+    capture_occupied_images(
+        archive_root=archive,
+        session_id="new-session",
+        source_frame_path=source,
+        bbox=(0, 0, 8, 8),
+    )
+
+    assert [path.read_bytes() for path in pending_paths] == [b"pending", b"pending"]
+
+
 @pytest.mark.parametrize(
     "token",
     [

@@ -18,11 +18,15 @@ from parking_spot_monitor.file_descriptor_binding import (
     RootedDirectoryOwner,
     descriptor_identity,
     unlink_owned_at,
+    unlink_owned_at_result,
 )
+from parking_spot_monitor.owned_file_recovery import RecoveryResult, recover_owned_directory_at
+from parking_spot_monitor.owned_directory_durability import ensure_child_directory_durable
 from parking_spot_monitor.jpeg_artifacts import jpeg_bytes_dimensions
 from parking_spot_monitor.matrix_retained_publication import MAX_RETAINED_JPEG_BYTES, publish_retained_snapshot
 
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_DEFAULT_UNLINK_OWNED_AT = unlink_owned_at
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +43,7 @@ class RootedJpegEvidence:
 class OwnedArtifactDeleteResult:
     status: Literal["deleted", "missing", "failed"]
     bytes_deleted: int = 0
+    durable: bool = True
 
 
 def absolute_snapshot_root(path: Path) -> Path:
@@ -208,13 +213,32 @@ def delete_owned_artifact(
             if directory is None and not stat.S_ISREG(value.st_mode):
                 return OwnedArtifactDeleteResult("failed")
             intended_identity = expected_identity or FileIdentity.from_stat(value)
-            if unlink_owned_at(directory_fd, safe_name, intended_identity):
-                return OwnedArtifactDeleteResult("deleted", value.st_size)
+            deletion = (
+                unlink_owned_at_result(directory_fd, safe_name, intended_identity)
+                if unlink_owned_at is _DEFAULT_UNLINK_OWNED_AT
+                else None
+            )
+            if deletion is None:
+                if unlink_owned_at(directory_fd, safe_name, intended_identity):
+                    return OwnedArtifactDeleteResult("deleted", value.st_size)
+                return OwnedArtifactDeleteResult("failed")
+            if deletion.deleted:
+                return OwnedArtifactDeleteResult("deleted", value.st_size, deletion.durable)
             return OwnedArtifactDeleteResult("failed")
     except FileNotFoundError:
         return OwnedArtifactDeleteResult("missing")
     except OSError:
         return OwnedArtifactDeleteResult("failed")
+
+
+def recover_owned_artifacts(snapshot_root: Path, directory: str | None) -> RecoveryResult:
+    try:
+        with _artifact_directory(snapshot_root, directory, create=False) as (directory_fd, _parent):
+            return recover_owned_directory_at(directory_fd)
+    except FileNotFoundError:
+        return RecoveryResult()
+    except OSError:
+        return RecoveryResult(pending=True)
 
 
 def secure_snapshot_candidates(snapshot_root: Path) -> list[Path]:
@@ -240,14 +264,11 @@ def _artifact_directory(
             return
         safe_directory = safe_artifact_name(directory)
         if create:
-            created = False
             try:
                 os.mkdir(safe_directory, 0o700, dir_fd=root_fd)
-                created = True
             except FileExistsError:
                 pass
-            if created:
-                os.fsync(root_fd)
+            ensure_child_directory_durable(root_fd, safe_directory)
         child_fd = os.open(safe_directory, _DIRECTORY_FLAGS, dir_fd=root_fd)
         try:
             yield child_fd, root / safe_directory

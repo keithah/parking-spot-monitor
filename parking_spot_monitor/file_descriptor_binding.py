@@ -10,7 +10,14 @@ import os
 from pathlib import Path
 import stat
 
-from parking_spot_monitor.owned_file_cleanup import FileIdentity, recover_quarantined_at, unlink_owned_at
+from parking_spot_monitor.owned_file_cleanup import (
+    FileIdentity,
+    recover_owned_directory_at,
+    recover_quarantined_at,
+    unlink_owned_at,
+    unlink_owned_at_result,
+)
+from parking_spot_monitor.owned_file_recovery import RecoveryResult
 
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
@@ -76,6 +83,9 @@ class RootedDirectoryOwner:
 
     def unlink_if_matches(self, name: str, identity: FileIdentity) -> bool:
         return unlink_owned_at(self.fd, name, identity)
+
+    def recover_owned(self) -> RecoveryResult:
+        return recover_owned_directory_at(self.fd)
 
     def fsync(self) -> None:
         os.fsync(self.fd)

@@ -15,6 +15,8 @@ import pytest
 from PIL import Image
 
 import parking_spot_monitor.matrix_snapshots as matrix_snapshots
+import parking_spot_monitor.file_descriptor_binding as file_descriptor_binding
+import parking_spot_monitor.owned_file_disposal as owned_file_disposal
 from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery
 from parking_monitor.outbox import AlertIntent, LocalOutbox
 from parking_spot_monitor.capture import CaptureError, DecodeMode, FrameCaptureResult, FrameGeometry
@@ -2915,6 +2917,42 @@ def test_runtime_loop_startup_prunes_existing_event_snapshots_without_touching_r
     assert '"event":"snapshot-retention-pruned"' in output
     assert '"trigger":"startup"' in output
     assert_no_secret_leak(output)
+
+
+def test_runtime_startup_recovers_manifested_vehicle_image_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image_dir = tmp_path / "vehicle-history" / "images" / "occupied-full"
+    image_dir.mkdir(parents=True)
+    target = image_dir / "pending.jpg"
+    target.write_bytes(b"pending")
+    identity = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    real_unlink = owned_file_disposal.os.unlink
+
+    def interrupt_disposal(name: object, *args: object, **kwargs: object) -> None:
+        if str(name).endswith(".dispose"):
+            raise OSError("simulated crash")
+        real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", interrupt_disposal)
+    assert file_descriptor_binding.unlink_owned_path(target, identity) is False
+    monkeypatch.setattr(owned_file_disposal.os, "unlink", real_unlink)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(Path("config.yaml.example").read_text(encoding="utf-8"), encoding="utf-8")
+
+    exit_code = _main(
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir)),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: FakeMatrixDelivery(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+    )
+
+    assert exit_code == 0
+    assert target.read_bytes() == b"pending"
 
 
 @pytest.mark.parametrize(

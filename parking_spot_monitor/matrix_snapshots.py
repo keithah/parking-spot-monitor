@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -18,9 +19,12 @@ from parking_spot_monitor.matrix_snapshot_storage import (
     ensure_owned_directory,
     RootedJpegEvidence,
     read_owned_jpeg_evidence,
+    recover_owned_artifacts,
     secure_snapshot_candidates,
 )
+from parking_spot_monitor.matrix_upload_derivatives import DERIVATIVE_DIRECTORY
 from parking_spot_monitor.matrix_retained_publication import publish_retained_snapshot
+from parking_spot_monitor.matrix_retention_logging import log_retention_failure, log_retention_pruned
 from parking_spot_monitor.matrix_snapshot_naming import event_snapshot_path, snapshot_body
 from parking_spot_monitor.matrix_upload_derivatives import delete_upload_derivative
 from parking_spot_monitor.matrix_support import MatrixError, _require_non_empty, _sanitize_diagnostics
@@ -31,6 +35,8 @@ MAX_MATRIX_UPLOAD_IMAGE_BYTES = 300_000
 MATRIX_UPLOAD_INITIAL_MAX_DIMENSION = 960
 MATRIX_UPLOAD_MIN_DIMENSION = 320
 MATRIX_UPLOAD_JPEG_QUALITIES = (85, 75, 65, 55, 45, 35)
+_log_retention_failure = partial(log_retention_failure, event="snapshot-retention-failed")
+_log_retention_pruned = partial(log_retention_pruned, event="snapshot-retention-pruned")
 
 @dataclass(frozen=True)
 class MatrixSnapshot:
@@ -53,6 +59,7 @@ class SnapshotRetentionResult:
     pruned_bytes: int = 0
     retained_count: int = 0
     failed_count: int = 0
+    durability_uncertain_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,16 +297,28 @@ def prune_event_snapshots(
         return SnapshotRetentionResult(failed_count=1)
     if not root.exists():
         return SnapshotRetentionResult()
+    recovery = recover_owned_artifacts(root, None)
+    derivative_recovery = recover_owned_artifacts(root, DERIVATIVE_DIRECTORY)
+    recovery_failed = int(recovery.pending) + int(derivative_recovery.pending)
+    if recovery_failed:
+        _log_retention_failure(
+            logger,
+            root=root,
+            trigger=trigger,
+            error_type="RecoveryPending",
+            message="owned artifact recovery remains pending",
+            failed_count=recovery_failed,
+        )
     try:
         candidates = [path for path in secure_snapshot_candidates(root) if _is_event_snapshot_file(path)]
     except OSError as exc:
         _log_retention_failure(logger, root=root, trigger=trigger, error_type=type(exc).__name__, message=str(exc))
-        return SnapshotRetentionResult(failed_count=1)
+        return SnapshotRetentionResult(failed_count=1 + recovery_failed)
 
     candidates.sort(key=lambda path: (_safe_mtime_ns(path), path.name))
     retained_count = min(len(candidates), retention_count)
     if len(candidates) <= retention_count:
-        return SnapshotRetentionResult(retained_count=len(candidates))
+        return SnapshotRetentionResult(retained_count=len(candidates), failed_count=recovery_failed)
 
     current = Path(current_snapshot).resolve() if current_snapshot is not None else None
     protected = _resolved_paths(protected_snapshots or ())
@@ -308,7 +327,8 @@ def prune_event_snapshots(
     to_delete = candidates[: len(candidates) - retention_count]
     pruned_count = 0
     pruned_bytes = 0
-    failed_count = 0
+    failed_count = recovery_failed
+    durability_uncertain_count = 0
     for path in to_delete:
         if _path_in_resolved_set(path, protected):
             continue
@@ -325,6 +345,16 @@ def prune_event_snapshots(
             continue
         pruned_count += 1
         pruned_bytes += raw_result.bytes_deleted + derivative_result.bytes_deleted
+        uncertain = int(not raw_result.durable) + int(not derivative_result.durable)
+        durability_uncertain_count += uncertain
+        if uncertain and logger is not None:
+            logger.warning(
+                "snapshot-retention-durability-uncertain",
+                root=str(root),
+                trigger=trigger,
+                filename=path.name,
+                uncertain_count=uncertain,
+            )
 
     if pruned_count:
         _log_retention_pruned(
@@ -340,6 +370,7 @@ def prune_event_snapshots(
         pruned_bytes=pruned_bytes,
         retained_count=len(candidates) - pruned_count,
         failed_count=failed_count,
+        durability_uncertain_count=durability_uncertain_count,
     )
 
 
@@ -381,49 +412,3 @@ def _path_in_resolved_set(path: Path, resolved: set[Path]) -> bool:
         return path.resolve() in resolved
     except OSError:
         return False
-
-
-def _log_retention_pruned(
-    logger: StructuredLogger | None,
-    *,
-    root: Path,
-    trigger: str,
-    pruned_count: int,
-    pruned_bytes: int,
-    retained_count: int,
-) -> None:
-    if logger is None:
-        return
-    logger.info(
-        "snapshot-retention-pruned",
-        root=str(root),
-        trigger=trigger,
-        pruned_count=pruned_count,
-        pruned_bytes=pruned_bytes,
-        retained_count=retained_count,
-    )
-
-
-def _log_retention_failure(
-    logger: StructuredLogger | None,
-    *,
-    root: Path,
-    trigger: str,
-    error_type: str,
-    message: str,
-    failed_count: int = 1,
-    pruned_count: int = 0,
-    pruned_bytes: int = 0,
-) -> None:
-    if logger is None:
-        return
-    logger.warning(
-        "snapshot-retention-failed",
-        root=str(root),
-        trigger=trigger,
-        error_type=error_type,
-        message=message,
-        failed_count=failed_count,
-        pruned_count=pruned_count,
-        pruned_bytes=pruned_bytes,
-    )

@@ -36,6 +36,7 @@ from parking_spot_monitor.runtime_detection import _process_detection_for_captur
 from parking_spot_monitor.runtime_overlay import _write_debug_overlay, write_overlay_for_capture
 from parking_spot_monitor.runtime_snapshot_retention import startup_retryable_retained_snapshots
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
+from parking_spot_monitor.vehicle_history_images import recover_vehicle_image_artifacts
 
 if TYPE_CHECKING:
     from parking_spot_monitor.matrix_commands import MatrixCommandService
@@ -147,6 +148,8 @@ def _main(
         logger.info("startup-ready", config_path=config_path, data_dir=str(paths.data_dir), mode="validate-config")
         return 0
 
+    if (vehicle_recovery := recover_vehicle_image_artifacts(paths.vehicle_history_dir)).pending:
+        logger.warning("vehicle-image-recovery-pending", root=str(paths.vehicle_history_dir), recovered_count=vehicle_recovery.recovered)
     protected_snapshots = startup_retryable_retained_snapshots(
         paths.matrix_outbox_file,
         logger=logger,
