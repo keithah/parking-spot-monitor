@@ -818,19 +818,129 @@ def test_canonical_jpeg_rechecks_integrity_after_temporary_fsync(
     source = write_test_jpeg(tmp_path / "latest.jpg")
     expected_size = source.stat().st_size
     destination = tmp_path / "archive" / "full.jpg"
-    real_fsync = jpeg_artifacts._fsync_file
+    real_fsync = os.fsync
 
-    def mutate_after_fsync(path: Path) -> None:
-        real_fsync(path)
-        path.write_bytes(b"z" * expected_size)
+    def mutate_after_fsync(descriptor: int) -> None:
+        real_fsync(descriptor)
+        if stat.S_ISREG(os.fstat(descriptor).st_mode):
+            Path(f"/proc/self/fd/{descriptor}").write_bytes(b"z" * expected_size)
 
-    monkeypatch.setattr(jpeg_artifacts, "_fsync_file", mutate_after_fsync)
+    monkeypatch.setattr(jpeg_artifacts.os, "fsync", mutate_after_fsync)
 
     with pytest.raises(JpegDecodeError, match="read_failed"):
         publish_canonical_jpeg(source, destination)
 
     assert not destination.exists()
     assert list(destination.parent.glob(".*.tmp")) == []
+
+
+def test_canonical_jpeg_rejects_validated_temporary_swap_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    destination = tmp_path / "archive" / "full.jpg"
+    validated_away = tmp_path / "validated-away.jpg"
+    unvalidated = b"arbitrary unvalidated bytes"
+    real_replace = os.replace
+    swapped = False
+
+    def swap_before_replace(
+        source_path: str | bytes | os.PathLike[str],
+        destination_path: str | bytes | os.PathLike[str],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal swapped
+        if Path(destination_path) == destination and not swapped:
+            swapped = True
+            real_replace(source_path, validated_away, *args, **kwargs)
+            Path(source_path).write_bytes(unvalidated)
+        real_replace(source_path, destination_path, *args, **kwargs)
+
+    monkeypatch.setattr(jpeg_artifacts.os, "replace", swap_before_replace)
+
+    with pytest.raises(JpegDecodeError, match="read_failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert swapped is True
+    assert not destination.exists()
+    assert validated_away.read_bytes() == source.read_bytes()
+    assert list(destination.parent.glob(".*.tmp")) == []
+
+
+def test_canonical_jpeg_removes_swapped_temporary_symlink_without_touching_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    destination = tmp_path / "archive" / "full.jpg"
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"unrelated target")
+    real_replace = os.replace
+    swapped = False
+
+    def swap_to_symlink(
+        source_path: str | bytes | os.PathLike[str],
+        destination_path: str | bytes | os.PathLike[str],
+    ) -> None:
+        nonlocal swapped
+        if Path(destination_path) == destination and not swapped:
+            swapped = True
+            real_replace(source_path, tmp_path / "validated-away.jpg")
+            Path(source_path).symlink_to(outside)
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(jpeg_artifacts.os, "replace", swap_to_symlink)
+
+    with pytest.raises(JpegDecodeError, match="read_failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert swapped is True
+    assert not os.path.lexists(destination)
+    assert outside.read_bytes() == b"unrelated target"
+
+
+def test_canonical_jpeg_mismatch_cleanup_preserves_concurrent_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    destination = tmp_path / "archive" / "full.jpg"
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated_bytes = b"concurrent unrelated destination"
+    unrelated.write_bytes(unrelated_bytes)
+    real_validate = jpeg_artifacts._validate_artifact_descriptor
+    validations = 0
+
+    def replace_destination_before_failure(descriptor: int, source_fd: int, evidence: object) -> None:
+        nonlocal validations
+        validations += 1
+        real_validate(descriptor, source_fd, evidence)
+        if validations == 3:
+            os.replace(unrelated, destination)
+            raise JpegDecodeError("read_failed")
+
+    monkeypatch.setattr(jpeg_artifacts, "_validate_artifact_descriptor", replace_destination_before_failure)
+
+    with pytest.raises(JpegDecodeError, match="read_failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert destination.read_bytes() == unrelated_bytes
+    assert list(destination.parent.glob(".*.tmp")) == []
+
+
+def test_canonical_jpeg_rejects_symlinked_destination_parent_before_writing(
+    tmp_path: Path,
+) -> None:
+    source = write_test_jpeg(tmp_path / "latest.jpg")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    archive_link = tmp_path / "archive"
+    archive_link.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        publish_canonical_jpeg(source, archive_link / "full.jpg")
+
+    assert not (outside / "full.jpg").exists()
+    assert list(outside.glob(".*.tmp")) == []
 
 
 def test_canonical_jpeg_prefers_reflink_without_attempting_hardlink(

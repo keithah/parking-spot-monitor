@@ -18,6 +18,13 @@ import warnings
 
 from PIL import Image, UnidentifiedImageError
 
+from parking_spot_monitor.file_descriptor_binding import (
+    descriptor_identity,
+    open_nofollow_regular_descriptors,
+    regular_path_matches_descriptor,
+    unlink_if_descriptor_matches,
+)
+
 _FICLONE = 0x40049409
 _COPY_CHUNK_BYTES = 1024 * 1024
 _FALLBACK_ERRNOS = frozenset(
@@ -73,8 +80,11 @@ def publish_canonical_jpeg(source: str | Path, destination: str | Path) -> JpegP
     try:
         evidence = _validated_source_evidence(source_fd)
         destination_path.parent.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(destination_path.parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)))
         temporary = destination_path.parent / f".{destination_path.name}.{secrets.token_hex(8)}.tmp"
         replaced = False
+        temporary_fd = -1
+        committed_identity_fd = committed_fd = -1
         try:
             try:
                 _reflink(source_fd, temporary, evidence.mode)
@@ -84,14 +94,37 @@ def publish_canonical_jpeg(source: str | Path, destination: str | Path) -> JpegP
                     raise
                 _copy_file(source_fd, temporary, evidence.mode)
                 strategy = "copy"
-            _validate_temporary(temporary, source_fd, evidence)
-            _fsync_file(temporary)
-            _validate_temporary(temporary, source_fd, evidence)
+            temporary_fd = _open_artifact(temporary)
+            _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
+            os.fsync(temporary_fd)
+            _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
             os.replace(temporary, destination_path)
             replaced = True
+            try:
+                committed_identity_fd, committed_fd = open_nofollow_regular_descriptors(destination_path)
+                if committed_fd < 0:
+                    raise JpegDecodeError("read_failed")
+                _validate_artifact_descriptor(committed_fd, source_fd, evidence)
+                if descriptor_identity(committed_fd) != descriptor_identity(temporary_fd):
+                    raise JpegDecodeError("read_failed")
+                if not regular_path_matches_descriptor(destination_path, committed_fd):
+                    raise JpegDecodeError("read_failed")
+            except JpegDecodeError:
+                unlink_if_descriptor_matches(destination_path, committed_identity_fd)
+                raise
             _fsync_directory(destination_path.parent)
+            try:
+                _validate_artifact_descriptor(committed_fd, source_fd, evidence)
+                if not regular_path_matches_descriptor(destination_path, committed_fd):
+                    raise JpegDecodeError("read_failed")
+            except JpegDecodeError:
+                unlink_if_descriptor_matches(destination_path, committed_identity_fd)
+                raise
             return JpegPublication(path=destination_path, strategy=strategy)
         finally:
+            for descriptor in (committed_fd, committed_identity_fd, temporary_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
             if not replaced:
                 _unlink_best_effort(temporary)
     finally:
@@ -229,14 +262,6 @@ def _copy_file(source_fd: int, temporary: Path, source_mode: int) -> None:
         os.close(destination_fd)
 
 
-def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _open_source_descriptor(path: Path) -> int:
     try:
         return os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -257,27 +282,24 @@ def _validated_source_evidence(source_fd: int) -> _SourceEvidence:
     return _SourceEvidence(before, digest_after, stat.S_IMODE(value.st_mode))
 
 
-def _validate_temporary(
-    temporary: Path,
-    source_fd: int,
-    evidence: _SourceEvidence,
-) -> None:
-    if _descriptor_signature(source_fd) != evidence.signature:
-        raise JpegDecodeError("read_failed")
+def _open_artifact(path: Path) -> int:
     try:
-        temporary_fd = os.open(temporary, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        return os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
         raise JpegDecodeError("read_failed", source_error_type=exc.__class__.__name__) from exc
-    try:
-        temporary_signature = _descriptor_signature(temporary_fd)
-        if _digest_descriptor(temporary_fd) != evidence.digest:
-            raise JpegDecodeError("read_failed")
-        if _descriptor_signature(temporary_fd) != temporary_signature:
-            raise JpegDecodeError("read_failed")
-        if _descriptor_signature(source_fd) != evidence.signature:
-            raise JpegDecodeError("read_failed")
-    finally:
-        os.close(temporary_fd)
+
+
+def _validate_artifact_descriptor(descriptor: int, source_fd: int, evidence: _SourceEvidence) -> None:
+    signature = _descriptor_signature(descriptor)
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode) or _digest_descriptor(descriptor) != evidence.digest:
+        raise JpegDecodeError("read_failed")
+    _validate_jpeg_descriptor(descriptor)
+    if (
+        _descriptor_signature(descriptor) != signature
+        or _digest_descriptor(descriptor) != evidence.digest
+        or _descriptor_signature(source_fd) != evidence.signature
+    ):
+        raise JpegDecodeError("read_failed")
 
 
 def _digest_descriptor(descriptor: int) -> bytes:
@@ -320,7 +342,7 @@ def _unlink_best_effort(path: Path) -> None:
 def _fsync_directory(path: Path) -> None:
     if not hasattr(os, "O_DIRECTORY"):
         return
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
     try:
         os.fsync(descriptor)
     finally:

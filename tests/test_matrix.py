@@ -1086,6 +1086,17 @@ def test_rooted_jpeg_evidence_rejects_mutation_during_descriptor_read(
         )
 
 
+def test_rooted_jpeg_evidence_exposes_only_upload_bytes_and_info(tmp_path: Path) -> None:
+    retained = tmp_path / "retained.jpg"
+    payload = write_jpeg(retained, size=(8, 6))
+
+    evidence = matrix_snapshot_storage.read_owned_jpeg_evidence(tmp_path, retained.name)
+
+    assert evidence.data == payload
+    assert dict(evidence.info) == {"mimetype": "image/jpeg", "size": len(payload), "w": 8, "h": 6}
+    assert not hasattr(evidence, "sha256")
+
+
 def test_matrix_snapshot_real_resize_honors_budget_dimensions_and_payload_metadata(tmp_path: Path) -> None:
     source = tmp_path / "large-real.jpg"
     Image.effect_noise((1280, 720), 80).convert("RGB").save(source, "JPEG", quality=95)

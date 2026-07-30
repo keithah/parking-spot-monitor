@@ -23,7 +23,6 @@ MAX_RETAINED_JPEG_BYTES = 32 * 1024 * 1024
 class RootedJpegEvidence:
     data: bytes
     info: Mapping[str, int | str]
-    sha256: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", bytes(self.data))
@@ -140,7 +139,6 @@ def read_owned_jpeg_evidence(
             return RootedJpegEvidence(
                 data=payload,
                 info={"mimetype": "image/jpeg", "size": len(payload), "w": width, "h": height},
-                sha256=payload_digest.hex(),
             )
         finally:
             os.close(file_fd)

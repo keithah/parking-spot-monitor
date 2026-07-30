@@ -5,16 +5,12 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from io import BytesIO
 import hashlib
 from pathlib import Path
 import threading
 from types import MappingProxyType
-import warnings
 
-from PIL import Image, UnidentifiedImageError
-
-from parking_spot_monitor.jpeg_artifacts import JpegDecodeError
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, jpeg_bytes_dimensions
 from parking_spot_monitor.matrix_snapshot_storage import (
     artifact_path,
     delete_owned_artifact,
@@ -79,7 +75,7 @@ def publish_upload_derivative(
     payload = bytes(data)
     if not 0 < len(payload) <= MAX_UPLOAD_DERIVATIVE_BYTES:
         raise JpegDecodeError("read_failed")
-    width, height = _jpeg_bytes_dimensions(payload)
+    width, height = jpeg_bytes_dimensions(payload)
     validated = _validated_info(info, expected_size=len(payload), expected_dimensions=(width, height))
     validated["sha256"] = hashlib.sha256(payload).hexdigest()
     try:
@@ -112,7 +108,7 @@ def read_upload_derivative_bytes(snapshot_root: Path, derivative: MatrixUploadDe
         )
     except OSError as exc:
         raise JpegDecodeError("read_failed", source_error_type=exc.__class__.__name__) from exc
-    width, height = _jpeg_bytes_dimensions(payload)
+    width, height = jpeg_bytes_dimensions(payload)
     expected = _validated_info(
         derivative.info,
         expected_size=len(payload),
@@ -169,23 +165,3 @@ def _validated_info(
     if isinstance(digest, str):
         result["sha256"] = digest
     return result
-
-
-def _jpeg_bytes_dimensions(payload: bytes) -> tuple[int, int]:
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(BytesIO(payload)) as image:
-                if image.format != "JPEG" or image.width <= 0 or image.height <= 0:
-                    raise JpegDecodeError("unidentified")
-                dimensions = image.size
-                image.verify()
-                return dimensions
-    except JpegDecodeError:
-        raise
-    except UnidentifiedImageError as exc:
-        raise JpegDecodeError("unidentified", source_error_type=exc.__class__.__name__) from exc
-    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
-        raise JpegDecodeError("decompression_bomb", source_error_type=exc.__class__.__name__) from exc
-    except (OSError, ValueError) as exc:
-        raise JpegDecodeError("read_failed", source_error_type=exc.__class__.__name__) from exc
