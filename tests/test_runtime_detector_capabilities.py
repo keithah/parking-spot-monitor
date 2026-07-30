@@ -463,5 +463,14 @@ def test_path_capability_cache_uses_identity_not_custom_equality() -> None:
         ) -> list[object]:
             return []
 
-    assert capabilities.detect_accepts_inference_image_size(WithImageSize()) is True
-    assert capabilities.detect_accepts_inference_image_size(WithoutImageSize()) is False
+    with_image_size = WithImageSize()
+    without_image_size = WithoutImageSize()
+    with_reference = weakref.ref(with_image_size)
+    without_reference = weakref.ref(without_image_size)
+
+    assert capabilities.detect_accepts_inference_image_size(with_image_size) is True
+    assert capabilities.detect_accepts_inference_image_size(without_image_size) is False
+    assert with_reference() is with_image_size
+    assert without_reference() is without_image_size
+    assert id(with_image_size) in capabilities._DETECT_CAPABILITY_CACHE
+    assert id(without_image_size) in capabilities._DETECT_CAPABILITY_CACHE
