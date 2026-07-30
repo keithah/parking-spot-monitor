@@ -6,7 +6,7 @@ import math
 import os
 import stat
 import tarfile
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -877,6 +877,32 @@ def test_canonical_jpeg_accepts_exact_32_mib_valid_source(tmp_path: Path) -> Non
     assert publication.path.stat().st_size == 32 * 1024 * 1024
 
 
+def test_canonical_validation_gives_pillow_only_captured_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "source.jpg")
+    preflight_size = source.stat().st_size
+    destination = tmp_path / "archive" / "full.jpg"
+    real_open = jpeg_artifacts.Image.open
+    opened_buffers = 0
+
+    def bounded_open(payload: object, *args: object, **kwargs: object) -> Image.Image:
+        nonlocal opened_buffers
+        assert isinstance(payload, BytesIO)
+        offset = payload.tell()
+        payload.seek(0, os.SEEK_END)
+        assert payload.tell() == preflight_size
+        payload.seek(offset)
+        opened_buffers += 1
+        return real_open(payload, *args, **kwargs)
+
+    monkeypatch.setattr(jpeg_artifacts.Image, "open", bounded_open)
+
+    publish_canonical_jpeg(source, destination)
+
+    assert opened_buffers >= 1
+
+
 def test_canonical_growth_rejection_reads_at_most_preflight_size_plus_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1278,6 +1304,108 @@ def test_owned_cleanup_recovers_quarantined_mismatch_after_name_blocker_removed(
     assert list(tmp_path.glob(".*.quarantine")) == []
 
 
+def test_owned_cleanup_never_unlinks_the_checked_quarantine_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    expected = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_bytes(b"unrelated")
+    owned_away = tmp_path / "owned-away.txt"
+    real_unlink, real_replace = os.unlink, os.replace
+    swapped = False
+
+    def swap_at_old_unlink(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        if str(path).endswith(".quarantine") and kwargs.get("dir_fd") is not None:
+            swapped = True
+            directory_fd = int(kwargs["dir_fd"])
+            quarantine_path = Path(f"/proc/self/fd/{directory_fd}") / str(path)
+            os.replace(quarantine_path, owned_away)
+            real_replace(unrelated, quarantine_path)
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(owned_file_cleanup.os, "unlink", swap_at_old_unlink)
+
+    assert file_descriptor_binding.unlink_owned_path(target, expected) is True
+
+    assert swapped is False
+    assert unrelated.read_bytes() == b"unrelated"
+    assert not target.exists()
+
+
+def test_owned_cleanup_preserves_disposal_transition_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    expected = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_bytes(b"unrelated")
+    owned_away = tmp_path / "owned-away.txt"
+    real_rename, real_replace = os.rename, os.replace
+    transitioned = False
+
+    def swap_disposal(source: object, destination: object, *args: object, **kwargs: object) -> None:
+        nonlocal transitioned
+        real_rename(source, destination, *args, **kwargs)
+        if ".dispose." in str(destination) and not transitioned:
+            transitioned = True
+            directory_fd = int(kwargs["dst_dir_fd"])
+            disposal_path = Path(f"/proc/self/fd/{directory_fd}") / str(destination)
+            os.replace(disposal_path, owned_away)
+            real_replace(unrelated, disposal_path)
+
+    monkeypatch.setattr(owned_file_cleanup.os, "rename", swap_disposal)
+
+    assert file_descriptor_binding.unlink_owned_path(target, expected) is False
+
+    assert transitioned is True
+    assert owned_away.read_bytes() == b"owned"
+    assert target.read_bytes() == b"unrelated"
+    assert not list(tmp_path.glob("*.dispose.*"))
+
+
+@pytest.mark.parametrize("max_entries", [0, 1, 256])
+def test_owned_cleanup_recovery_consumes_at_most_scan_cap_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, max_entries: int
+) -> None:
+    for index in range(300):
+        (tmp_path / f"unrelated-{index:03d}").write_bytes(b"x")
+    directory_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    real_scandir = os.scandir
+    next_calls = 0
+
+    class CountingScandir:
+        def __init__(self, descriptor: int) -> None:
+            self._entries = real_scandir(descriptor)
+
+        def __enter__(self) -> CountingScandir:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self._entries.close()
+
+        def __iter__(self) -> CountingScandir:
+            return self
+
+        def __next__(self) -> os.DirEntry[str]:
+            nonlocal next_calls
+            next_calls += 1
+            return next(self._entries)
+
+    monkeypatch.setattr(owned_file_cleanup.os, "scandir", CountingScandir)
+    try:
+        assert owned_file_cleanup.recover_quarantined_at(
+            directory_fd, "owned.jpg", max_entries=max_entries
+        ) == 0
+    finally:
+        os.close(directory_fd)
+
+    assert next_calls == max_entries
+
+
 @pytest.mark.parametrize(
     "token",
     [
@@ -1325,7 +1453,7 @@ def test_owned_cleanup_recovery_retries_transient_hardlink_unlink(
 
     def fail_once(path: object, *args: object, **kwargs: object) -> None:
         nonlocal failed
-        if path == quarantine.name and kwargs.get("dir_fd") is not None and not failed:
+        if ".dispose." in str(path) and kwargs.get("dir_fd") is not None and not failed:
             failed = True
             raise OSError("transient unlink failure")
         real_unlink(path, *args, **kwargs)
@@ -1601,13 +1729,13 @@ def test_canonical_jpeg_rejects_in_place_mutation_during_descriptor_validation(
     source = write_test_jpeg(tmp_path / "latest.jpg")
     expected = source.read_bytes()
     destination = tmp_path / "archive" / "full.jpg"
-    real_validate = jpeg_artifacts._validate_jpeg_descriptor
+    real_validate = jpeg_artifacts._validate_jpeg_bytes
 
-    def mutate_during_validation(source_fd: int) -> None:
-        real_validate(source_fd)
+    def mutate_during_validation(payload: bytes) -> None:
+        real_validate(payload)
         source.write_bytes(b"not validated")
 
-    monkeypatch.setattr(jpeg_artifacts, "_validate_jpeg_descriptor", mutate_during_validation)
+    monkeypatch.setattr(jpeg_artifacts, "_validate_jpeg_bytes", mutate_during_validation)
 
     with pytest.raises(JpegDecodeError, match="read_failed"):
         publish_canonical_jpeg(source, destination)

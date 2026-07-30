@@ -48,6 +48,7 @@
 | `parking_spot_monitor/jpeg_artifacts.py` | Atomic, identity-bound canonical JPEG publication using reflink or bounded descriptor copy. |
 | `parking_spot_monitor/jpeg_decoding.py` | Shared bounded decode/draft/RGB/close lifecycle for path, byte, stream, and owned-inode inputs. |
 | `parking_spot_monitor/owned_file_cleanup.py` | Exact-name, capped, deterministic quarantine recovery and idempotent identity-bound deletion. |
+| `parking_spot_monitor/owned_file_disposal.py` | Randomized, descriptor-bound disposal plus the cooperative owned-directory threat contract. |
 | `parking_spot_monitor/matrix_retained_publication.py` | Bounded publication and ownership evidence for retained Matrix snapshots. |
 | `parking_spot_monitor/matrix_snapshot_storage.py` | Rooted, no-follow storage and exact-size evidence reads for Matrix snapshot artifacts. |
 | `parking_spot_monitor/matrix_upload_derivatives.py` | Durable upload-derivative publication, validation, reload, read, and deletion. |
@@ -956,6 +957,7 @@ git commit -m "perf: reuse loaded profile history"
 - Create: `parking_spot_monitor/jpeg_decoding.py`
 - Create: `parking_spot_monitor/bounded_descriptor_io.py`
 - Create: `parking_spot_monitor/owned_file_cleanup.py`
+- Create: `parking_spot_monitor/owned_file_disposal.py`
 - Create: `parking_spot_monitor/matrix_retained_publication.py`
 - Create: `parking_spot_monitor/matrix_snapshot_storage.py`
 - Create: `parking_spot_monitor/matrix_upload_derivatives.py`
@@ -980,7 +982,7 @@ git commit -m "perf: reuse loaded profile history"
 - Produces: `read_descriptor_exact(fd, expected_signature, *, capture_bytes=False, destination_fd=None) -> BoundedDescriptorRead`, which consumes exactly the captured size, fails short reads, probes one growth byte, verifies the post-read descriptor signature, and resets the source offset.
 - Produces: `publish_retained_snapshot(source: Path, snapshot_root: Path, filename: str) -> OwnedFile` and rooted `read_owned_jpeg_evidence(snapshot_root, filename, *, max_bytes, expected_identity=None) -> RootedJpegEvidence`.
 - Produces: immutable `MatrixUploadDerivative(path: Path, info: Mapping[str, int | str])`; `publish_upload_derivative(snapshot_root, filename, *, data, info)`, `load_upload_derivative(snapshot_root, filename, *, persisted_path, info)`, and `read_upload_derivative_bytes(snapshot_root, derivative)` are the durable derivative APIs.
-- Produces: `recover_quarantined_path(path: Path) -> int`; recovery accepts only `.<safe_basename>.<16 lowercase hex>.quarantine`, scans at most 256 entries, orders exact candidates deterministically, and completes an interrupted same-inode hardlink restore idempotently.
+- Produces: `recover_quarantined_path(path: Path) -> int`; recovery accepts only `.<safe_basename>.<16 lowercase hex>.quarantine`, consumes at most 256 directory entries, orders exact candidates deterministically, and completes an interrupted same-inode hardlink restore idempotently. Deletion first moves a candidate to a cryptographically random disposal name and binds/rechecks its regular-file identity.
 - Adds outbox intent metadata `upload_derivative_path` and `upload_derivative_info`; both are optional, sanitized schema-v1 metadata.
 - Preserves: `SessionRecord.occupied_snapshot_path` as the canonical archive full JPEG and `occupied_crop_path` as its crop; no session schema change.
 
@@ -1023,7 +1025,7 @@ Open the source once, validate JPEG format/dimensions from that descriptor, and 
 
 `capture_occupied_images` publishes the full frame with this helper, then opens the canonical path once through its returned identity to create only the crop. A pathname or parent-root replacement must fail without decoding or deleting the replacement.
 
-Full-frame publication, identity-bound decode, and crop staging/commit retain archive, images, full-frame, and crop directory descriptors for the whole transaction. Failure cleanup operates only through those held descriptors. Identity cleanup first rejects stable non-regular or mismatched targets, then uses a random same-directory quarantine to close the check/unlink race. A raced mismatch is restored with atomic no-clobber hardlink/unlink semantics; if a new original-name blocker prevents immediate restore, both unrelated files are preserved. The next cleanup attempt performs an exact-name recovery scan capped at 256 directory entries before its ownership check, and `recover_quarantined_path()` exposes the same bounded sweep explicitly.
+Full-frame publication, identity-bound decode, and crop staging/commit retain archive, images, full-frame, and crop directory descriptors for the whole transaction. Failure cleanup operates only through those held descriptors. Identity cleanup first rejects stable non-regular or mismatched targets, then uses a random same-directory quarantine followed by a fresh cryptographically random disposal name. Disposal binds and rechecks the regular-file identity; a raced mismatch is restored with no-clobber hardlink/unlink semantics, and a new original-name blocker preserves both unrelated files. Recovery consumes at most 256 entries before its ownership check, and `recover_quarantined_path()` exposes the same bounded sweep explicitly. Linux has no inode-conditional unlink, so the final randomized-path check/unlink window assumes these application-owned directories exclude noncooperating writers; this mechanism minimizes that window and does not claim safety for hostile shared directories.
 
 - [ ] **Step 4: Share one full JPEG decode lifecycle**
 

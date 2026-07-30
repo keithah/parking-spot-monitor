@@ -39,7 +39,13 @@ def absolute_snapshot_root(path: Path) -> Path:
 
 
 def safe_artifact_name(value: str) -> str:
-    if not isinstance(value, str) or not value or Path(value).name != value or Path(value).is_absolute():
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or Path(value).name != value
+        or Path(value).is_absolute()
+    ):
         raise OSError("artifact filename must be a basename")
     return value
 

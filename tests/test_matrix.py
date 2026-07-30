@@ -1123,6 +1123,34 @@ def test_rooted_jpeg_growth_rejection_reads_at_most_preflight_size_plus_probe(
     assert consumed <= preflight_size + 1
 
 
+@pytest.mark.parametrize("unsafe_name", [".", ".."])
+def test_rooted_storage_rejects_dot_artifact_names(
+    tmp_path: Path, unsafe_name: str
+) -> None:
+    snapshot_root = tmp_path / "snapshots"
+    parent_artifact = tmp_path / "outside.jpg"
+    parent_artifact.write_bytes(b"parent-owned")
+
+    with pytest.raises(OSError, match="basename"):
+        matrix_snapshot_storage.safe_artifact_name(unsafe_name)
+    with pytest.raises(OSError, match="basename"):
+        matrix_snapshot_storage.publish_owned_bytes(
+            snapshot_root,
+            unsafe_name,
+            parent_artifact.name,
+            b"replacement",
+            mode=0o600,
+        )
+    with pytest.raises(OSError, match="basename"):
+        matrix_snapshot_storage.delete_owned_artifact(
+            snapshot_root,
+            unsafe_name,
+            parent_artifact.name,
+        )
+
+    assert parent_artifact.read_bytes() == b"parent-owned"
+
+
 def test_rooted_jpeg_evidence_exposes_only_upload_bytes_and_info(tmp_path: Path) -> None:
     retained = tmp_path / "retained.jpg"
     payload = write_jpeg(retained, size=(8, 6))

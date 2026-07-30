@@ -224,6 +224,7 @@ def test_matrix_module_is_a_small_compatibility_shim() -> None:
         "parking_spot_monitor/jpeg_artifacts.py": 350,
         "parking_spot_monitor/jpeg_decoding.py": 180,
         "parking_spot_monitor/owned_file_cleanup.py": 150,
+        "parking_spot_monitor/owned_file_disposal.py": 120,
         "parking_spot_monitor/matrix_upload_derivatives.py": 400,
         "parking_spot_monitor/matrix_snapshot_storage.py": 320,
         "parking_spot_monitor/matrix_retained_publication.py": 180,

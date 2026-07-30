@@ -2,24 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from itertools import islice
 import os
 from pathlib import Path
 import re
 import secrets
 import stat
 
+from parking_spot_monitor.owned_file_disposal import (
+    FileIdentity,
+    dispose_owned_name_at,
+    same_regular_identity_at,
+)
+
 _MAX_RECOVERY_SCAN_ENTRIES = 256
-
-
-@dataclass(frozen=True, slots=True)
-class FileIdentity:
-    dev: int
-    ino: int
-
-    @classmethod
-    def from_stat(cls, value: os.stat_result) -> FileIdentity:
-        return cls(value.st_dev, value.st_ino)
 
 
 def unlink_owned_at(directory_fd: int, name: str, identity: FileIdentity) -> bool:
@@ -40,13 +36,10 @@ def unlink_owned_at(directory_fd: int, name: str, identity: FileIdentity) -> boo
     except FileNotFoundError:
         return False
     try:
-        quarantined = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
-        if not stat.S_ISREG(quarantined.st_mode) or FileIdentity.from_stat(quarantined) != identity:
-            _restore_quarantined(directory_fd, quarantine, safe_name)
-            return False
-        os.unlink(quarantine, dir_fd=directory_fd)
-        os.fsync(directory_fd)
-        return True
+        if dispose_owned_name_at(directory_fd, quarantine, identity):
+            return True
+        _restore_quarantined(directory_fd, quarantine, safe_name)
+        return False
     except OSError:
         _restore_quarantined(directory_fd, quarantine, safe_name)
         return False
@@ -62,9 +55,7 @@ def recover_quarantined_at(
     recovered = 0
     candidates: list[str] = []
     with os.scandir(directory_fd) as entries:
-        for index, entry in enumerate(entries):
-            if index >= max_entries:
-                break
+        for entry in islice(entries, max(0, max_entries)):
             if quarantine_pattern.fullmatch(entry.name):
                 candidates.append(entry.name)
     for candidate in sorted(candidates):
@@ -83,38 +74,19 @@ def _restore_quarantined(directory_fd: int, quarantine: str, name: str) -> bool:
     if not stat.S_ISREG(quarantined.st_mode):
         return False
     quarantined_identity = FileIdentity.from_stat(quarantined)
-    if _same_regular_identity(directory_fd, name, quarantined_identity):
-        return _unlink_quarantine(directory_fd, quarantine)
+    if same_regular_identity_at(directory_fd, name, quarantined_identity):
+        return dispose_owned_name_at(directory_fd, quarantine, quarantined_identity)
     try:
         os.link(quarantine, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
     except FileExistsError:
-        if _same_regular_identity(directory_fd, name, quarantined_identity):
-            return _unlink_quarantine(directory_fd, quarantine)
+        if same_regular_identity_at(directory_fd, name, quarantined_identity):
+            return dispose_owned_name_at(directory_fd, quarantine, quarantined_identity)
         return False
     except OSError:
         return False
-    return _unlink_quarantine(directory_fd, quarantine)
-
-
-def _same_regular_identity(directory_fd: int, name: str, identity: FileIdentity) -> bool:
-    try:
-        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except OSError:
+    if not same_regular_identity_at(directory_fd, name, quarantined_identity):
         return False
-    return stat.S_ISREG(current.st_mode) and FileIdentity.from_stat(current) == identity
-
-
-def _unlink_quarantine(directory_fd: int, quarantine: str) -> bool:
-    try:
-        os.unlink(quarantine, dir_fd=directory_fd)
-        os.fsync(directory_fd)
-        return True
-    except OSError:
-        try:
-            os.fsync(directory_fd)
-        except OSError:
-            pass
-        return False
+    return dispose_owned_name_at(directory_fd, quarantine, quarantined_identity)
 
 
 def _name_exists(directory_fd: int, name: str) -> bool:

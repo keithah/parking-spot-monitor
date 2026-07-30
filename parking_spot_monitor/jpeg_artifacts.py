@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import errno
 import fcntl
+from io import BytesIO
 import os
 from pathlib import Path
 import secrets
@@ -14,7 +15,11 @@ import warnings
 
 from PIL import Image, UnidentifiedImageError
 
-from parking_spot_monitor.bounded_descriptor_io import descriptor_signature, read_descriptor_exact
+from parking_spot_monitor.bounded_descriptor_io import (
+    BoundedDescriptorRead,
+    descriptor_signature,
+    read_descriptor_exact,
+)
 from parking_spot_monitor.file_descriptor_binding import FileIdentity, RootedDirectoryOwner, descriptor_identity
 from parking_spot_monitor.jpeg_decoding import (
     DecodedRgbJpeg,
@@ -129,19 +134,17 @@ def _publish_validated_to_owner(
                 os.close(descriptor)
 
 
-def _validate_jpeg_descriptor(source_fd: int) -> None:
+def _validate_jpeg_bytes(payload: bytes) -> None:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            os.lseek(source_fd, 0, os.SEEK_SET)
-            with os.fdopen(os.dup(source_fd), "rb") as source_handle:
-                with Image.open(source_handle) as image:
-                    width, height = image.size
-                    if image.format != "JPEG":
-                        raise JpegDecodeError("unidentified")
-                    if width <= 0 or height <= 0:
-                        raise JpegDecodeError("invalid_dimensions")
-                    image.verify()
+            with Image.open(BytesIO(payload)) as image:
+                width, height = image.size
+                if image.format != "JPEG":
+                    raise JpegDecodeError("unidentified")
+                if width <= 0 or height <= 0:
+                    raise JpegDecodeError("invalid_dimensions")
+                image.verify()
     except JpegDecodeError:
         raise
     except UnidentifiedImageError as exc:
@@ -207,12 +210,14 @@ def _validated_source_evidence(source_fd: int) -> _SourceEvidence:
     if not stat.S_ISREG(value.st_mode) or not 0 < value.st_size <= MAX_CANONICAL_JPEG_BYTES:
         raise JpegDecodeError("read_failed")
     before = _stat_signature(value)
-    digest_before = _bounded_digest(source_fd, before)
-    _validate_jpeg_descriptor(source_fd)
-    digest_after = _bounded_digest(source_fd, before)
-    if _descriptor_signature(source_fd) != before or digest_after != digest_before:
+    captured = _bounded_capture(source_fd, before)
+    if captured.data is None:
         raise JpegDecodeError("read_failed")
-    return _SourceEvidence(before, digest_after, stat.S_IMODE(value.st_mode))
+    _validate_jpeg_bytes(captured.data)
+    digest_after = _bounded_digest(source_fd, before)
+    if _descriptor_signature(source_fd) != before or digest_after != captured.digest:
+        raise JpegDecodeError("read_failed")
+    return _SourceEvidence(before, captured.digest, stat.S_IMODE(value.st_mode))
 
 
 def _open_artifact(owner: RootedDirectoryOwner, name: str) -> int:
@@ -224,9 +229,12 @@ def _open_artifact(owner: RootedDirectoryOwner, name: str) -> int:
 
 def _validate_artifact_descriptor(descriptor: int, source_fd: int, evidence: _SourceEvidence) -> None:
     signature = _descriptor_signature(descriptor)
-    if signature[2] != evidence.signature[2] or not stat.S_ISREG(os.fstat(descriptor).st_mode) or _bounded_digest(descriptor, signature) != evidence.digest:
+    if signature[2] != evidence.signature[2] or not stat.S_ISREG(os.fstat(descriptor).st_mode):
         raise JpegDecodeError("read_failed")
-    _validate_jpeg_descriptor(descriptor)
+    captured = _bounded_capture(descriptor, signature)
+    if captured.digest != evidence.digest or captured.data is None:
+        raise JpegDecodeError("read_failed")
+    _validate_jpeg_bytes(captured.data)
     if (
         _descriptor_signature(descriptor) != signature
         or _bounded_digest(descriptor, signature) != evidence.digest
@@ -238,6 +246,15 @@ def _validate_artifact_descriptor(descriptor: int, source_fd: int, evidence: _So
 def _bounded_digest(descriptor: int, signature: tuple[int, int, int, int, int]) -> bytes:
     try:
         return read_descriptor_exact(descriptor, signature).digest
+    except OSError as exc:
+        raise JpegDecodeError("read_failed") from exc
+
+
+def _bounded_capture(
+    descriptor: int, signature: tuple[int, int, int, int, int]
+) -> BoundedDescriptorRead:
+    try:
+        return read_descriptor_exact(descriptor, signature, capture_bytes=True)
     except OSError as exc:
         raise JpegDecodeError("read_failed") from exc
 
