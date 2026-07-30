@@ -526,402 +526,83 @@ Create the output parent directory before starting the benchmark, as shown above
 
 ## Backup and recovery
 
-The canonical recovery bundle is one protected directory containing:
+The deployment helper is written for the operator performing a release or recovery from the repository root. Its four operations preserve the single Compose service and the existing host-owned config, environment, model, and data mounts. The helper fails closed on unmet preconditions and exits `2` on an operational failure.
 
-- `config.yaml`, stored with restricted permissions.
-- The approved detector weight file and its trusted-source checksum record.
-- `.env`, copied only into this restricted recovery bundle or supplied from an associated approved secret backup.
-- `data/state.json` and `data/matrix-outbox.json` for runtime continuity and durable pending delivery.
-- `data/operator-decision-memory.json`, including any uncheckpointed routine tail flushed by a normal stop.
-- `data/vehicle-history/`, snapshots, timeline frames, feedback labels, and decision memory according to retention and recovery needs.
-- Hidden `.owned-disposals.json` manifests and `.upload-derivatives` inside owned data directories; copy the complete `/data` tree rather than selecting around them.
+Before using it:
 
-Set `BACKUP_DIR` to a new, timestamp-qualified destination and `ROLLBACK_TAG` to a new timestamp/revision-qualified local image tag. This block refuses to overwrite either, sets the restart trap before stopping, stages into a unique private partial directory so an interruption does not block a retry, archives the complete stopped `/data` tree as `data.tar`, and restarts on success, failure, or interruption. Run it from the repository root:
+- Configure Compose normally. Standard variables such as `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, and `MODEL_DIR` are honored by the `docker compose` commands.
+- Keep `config.yaml`, `.env`, the approved model, and `data/` on local protected storage. The helper never prints their contents.
+- Obtain the detector SHA-256 from the approved artifact source. The operator-supplied digest establishes provenance; checksums generated inside the bundle establish only later bundle consistency.
+- Run from a clean checkout for upgrade. Verification stays serial to minimize host CPU and RSS.
 
-```sh
-(
-  set -eu
-  umask 077
-  : "${BACKUP_DIR:?set BACKUP_DIR to a new protected backup directory}"
-  : "${ROLLBACK_TAG:?set ROLLBACK_TAG to a new timestamp/revision-qualified image tag}"
-  env_file="${ENV_FILE:-.env}"
-  if [ -z "${MODEL_DIR+x}" ]; then
-    compose_environment="$(docker compose config --environment)"
-    MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
-  fi
-  model_dir="${MODEL_DIR:-./models}"
-  export MODEL_DIR="$model_dir"
-  if [ -e "$BACKUP_DIR" ]; then
-    echo "backup destination already exists" >&2
-    exit 1
-  fi
-  if docker image inspect "$ROLLBACK_TAG" >/dev/null 2>&1; then
-    echo "refusing to overwrite rollback tag" >&2
-    exit 1
-  fi
-  test -f config.yaml
-  test -f "$env_file"
-  test -f "$model_dir/yolov8n.pt"
-  staging_dir="${BACKUP_DIR}.partial.$(date -u +%Y%m%dT%H%M%SZ).$$"
-  mkdir -m 0700 -- "$staging_dir"
-  restart_after_backup() {
-    backup_status="$?"
-    trap - EXIT
-    if ! docker compose start parking-spot-monitor; then
-      echo "backup finished but the service did not restart" >&2
-      exit 1
-    fi
-    exit "$backup_status"
-  }
-  trap restart_after_backup EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-
-  docker image tag parking-spot-monitor:local "$ROLLBACK_TAG"
-  rollback_image_id="$(docker image inspect "$ROLLBACK_TAG" --format '{{.Id}}')"
-  docker compose stop parking-spot-monitor
-
-  install -m 0600 -- config.yaml "$staging_dir/config.yaml"
-  install -m 0600 -- "$env_file" "$staging_dir/.env"
-  install -m 0600 -- "$model_dir/yolov8n.pt" "$staging_dir/yolov8n.pt"
-  tar --format=pax -C data -cpf "$staging_dir/data.tar" .
-  chmod 0600 "$staging_dir/data.tar"
-  (
-    cd "$staging_dir"
-    printf 'source-revision=%s\nrollback-image-tag=%s\nrollback-image-id=%s\nenvironment-copy=.env\n' \
-      "$(git rev-parse HEAD)" "$ROLLBACK_TAG" "$rollback_image_id" > image-id.txt
-    chmod 0600 image-id.txt
-    sha256sum yolov8n.pt > yolov8n.pt.sha256
-    sha256sum data.tar > data.tar.sha256
-    sha256sum config.yaml .env image-id.txt > bundle-files.sha256
-    sha256sum -c yolov8n.pt.sha256
-    sha256sum -c data.tar.sha256
-    sha256sum -c bundle-files.sha256
-    tar -tf data.tar >/dev/null
-  )
-  chmod 0600 "$staging_dir"/* "$staging_dir/.env"
-  mv -- "$staging_dir" "$BACKUP_DIR"
-)
-```
-
-The final directory and every bundled file are mode `0700` and `0600`, respectively. A failed run leaves only a timestamp/PID-qualified `.partial.*` directory for diagnosis; the requested final destination remains available for a clean retry. Store this directory on approved protected media and retain the collision-refusing image tag or an image export. Before relying on the bundle, verify all three manifests with `(cd "$BACKUP_DIR" && sha256sum -c yolov8n.pt.sha256 && sha256sum -c data.tar.sha256 && sha256sum -c bundle-files.sha256 && tar -tf data.tar >/dev/null)` without printing `.env` or artifact contents.
-
-The runtime quarantines several malformed persisted JSON files rather than silently treating corrupt data as valid. Inspect logs and the corresponding `data/` artifacts before deleting any quarantine file.
-
-## Safe upgrade
-
-Review and record the exact commit before publishing a change. Before changing the deployment checkout, complete the backup workflow above with a new protected `BACKUP_DIR` and immutable `ROLLBACK_TAG`; retain both until the upgrade has passed its observation window. Set `REVIEWED_REVISION` to the full reviewed commit SHA. The deployment host must have a completely clean tracked and untracked worktree; ignored operator files remain untouched. Fetch and detach at that exact commit, then run every gate against the code that will be built and deployed:
+Check the command surface without changing deployment state:
 
 ```sh
-(
-set -eu
-: "${REVIEWED_REVISION:?set REVIEWED_REVISION to the full reviewed commit SHA}"
-: "${ROLLBACK_TAG:?set ROLLBACK_TAG to the immutable tag created with the backup}"
-test -z "$(git status --porcelain)" || {
-  echo "refusing upgrade from a dirty worktree" >&2
-  exit 1
-}
-git fetch --prune origin
-git cat-file -e "${REVIEWED_REVISION}^{commit}"
-git checkout --detach "$REVIEWED_REVISION"
-test "$(git rev-parse HEAD)" = "$(git rev-parse "$REVIEWED_REVISION^{commit}")"
-docker image inspect "$ROLLBACK_TAG" >/dev/null
-if [ -z "${MODEL_DIR+x}" ]; then
-  compose_environment="$(docker compose config --environment)"
-  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
-fi
-model_dir="${MODEL_DIR:-./models}"
-export MODEL_DIR="$model_dir"
-python3 -m compileall -q parking_spot_monitor src scripts tests
-python3 -m pytest -q
-python3 -I scripts/lock_dependencies.py --check
-docker compose config --no-interpolate >/tmp/parking-spot-monitor-compose.yaml
-docker compose build parking-spot-monitor
-docker compose run --rm parking-spot-monitor \
-  python -m parking_spot_monitor \
-  --config /config/config.yaml \
-  --data-dir /data \
-  --validate-config
-docker compose up -d --no-build --force-recreate parking-spot-monitor
-docker compose ps
-container_id="$(docker compose ps -q parking-spot-monitor)"
-started_at="$(docker inspect "$container_id" --format '{{.State.StartedAt}}')"
-docker compose exec -T parking-spot-monitor \
-  python -m parking_spot_monitor.healthcheck \
-  --health-file /data/health.json --max-age-seconds 120
-docker compose exec -T parking-spot-monitor python - "$started_at" <<'PY'
-import json
-import sys
-import time
-from datetime import datetime
-from pathlib import Path
-
-started_at = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
-health_path = Path("/data/health.json")
-deadline = time.monotonic() + 180
-while time.monotonic() < deadline:
-    try:
-        payload = json.loads(health_path.read_text(encoding="utf-8"))
-        last_frame = payload.get("last_frame_at")
-        artifact_is_new = (
-            health_path.stat().st_mtime_ns
-            > int(started_at.timestamp() * 1_000_000_000)
-        )
-        frame_is_new = isinstance(last_frame, str) and (
-            datetime.fromisoformat(last_frame.replace("Z", "+00:00")) > started_at
-        )
-        if artifact_is_new and frame_is_new:
-            break
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        pass
-    time.sleep(2)
-else:
-    raise SystemExit("no successful frame newer than this container start")
-PY
-)
+python3 scripts/deployment_operations.py --help
+python3 scripts/deployment_operations.py backup --help
+python3 scripts/deployment_operations.py upgrade --help
+python3 scripts/deployment_operations.py rollback --help
+python3 scripts/deployment_operations.py restore-data --help
 ```
 
-Do not add `-n` or install `pytest-xdist`; the release gate deliberately minimizes peak host CPU and RSS. The commands stay inside the exact-revision upgrade block so the tested checkout and deployed checkout cannot diverge. If you run them earlier for convenience, run them again after checking out `REVIEWED_REVISION`.
+### Create the protected pre-upgrade bundle
+
+Choose a new destination and a collision-resistant rollback tag. Supply the trusted model digest explicitly:
 
 ```sh
-REVIEWED_REVISION="$(git rev-parse HEAD)"
-printf 'review candidate: %s\n' "$REVIEWED_REVISION"
+python3 scripts/deployment_operations.py backup \
+  --backup-dir /protected/parking-backups/2026-07-30T230000Z \
+  --rollback-tag parking-spot-monitor:rollback-20260730T230000Z \
+  --approved-model-sha256 "$APPROVED_MODEL_SHA256"
 ```
 
-Do not upgrade over uncommitted tracked changes. `config.yaml`, `.env`, `models/`, and `data/` are ignored operator files and remain on the host across a normal pull and container recreation. Authenticate replacement weights before recreating the service, and retain the previous approved weight file with the rollback image when an upgrade changes models.
+The helper resolves the running service container and tags its immutable image ID; it never assumes the mutable `parking-spot-monitor:local` tag still names the deployed image. It creates a mode-`0700` private staging directory before copying secrets, installs signal-aware cleanup immediately, stops the service, archives the complete quiesced data tree, writes a UTC recovery timestamp and exact source/image identities, verifies the archive and manifests, publishes the bundle atomically, and restarts the service on both success and failure. Every bundle file is mode `0600`.
 
-After the new service becomes healthy, repeat the health, artifact, cadence, and resource checks above. Keep the rollback tag until the deployment has completed a representative observation window.
+The bundle contains `config.yaml`, `.env`, `yolov8n.pt`, `approved-model.sha256`, the complete `data.tar`, exact image metadata, and separate consistency manifests. Retain the image tag or an exported image on protected media. Do not describe the co-created manifests as signatures or authentication; they detect later corruption only.
 
-Record the immutable rollback tag or digest, protected backup location, new image ID, container creation time, observation start/end, health result, restart count, and aggregate resource results in the remediation report. Never record resolved secrets or artifact payloads.
+### Upgrade the exact reviewed revision
 
-## Rollback
-
-To return to the image, configuration, environment, and model saved immediately before an upgrade, set `ROLLBACK_DIR` to that protected bundle. Verify the bundle and resolve its immutable image reference before stopping the service. Then run this workflow from the repository root:
+Create the bundle first, then deploy the full reviewed SHA:
 
 ```sh
-(
-set -eu
-umask 077
-: "${ROLLBACK_DIR:?set ROLLBACK_DIR to the protected rollback backup}"
-test -f "$ROLLBACK_DIR/.env"
-(cd "$ROLLBACK_DIR" && \
-  sha256sum -c yolov8n.pt.sha256 && \
-  sha256sum -c data.tar.sha256 && \
-  sha256sum -c bundle-files.sha256 && \
-  tar -tf data.tar >/dev/null)
-rollback_tag="$(sed -n 's/^rollback-image-tag=//p' "$ROLLBACK_DIR/image-id.txt")"
-rollback_image_id="$(sed -n 's/^rollback-image-id=//p' "$ROLLBACK_DIR/image-id.txt")"
-test -n "$rollback_tag"
-test -n "$rollback_image_id"
-test "$(docker image inspect "$rollback_tag" --format '{{.Id}}')" = "$rollback_image_id"
-if [ -z "${MODEL_DIR+x}" ]; then
-  compose_environment="$(docker compose config --environment)"
-  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
-fi
-model_dir="${MODEL_DIR:-./models}"
-export MODEL_DIR="$model_dir"
-mkdir -p "$model_dir"
-stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/parking-rollback.XXXXXXXX")"
-mkdir -m 0700 -- "$stage_dir/models"
-install -m 0600 -- "$ROLLBACK_DIR/config.yaml" "$stage_dir/config.yaml"
-install -m 0600 -- "$ROLLBACK_DIR/.env" "$stage_dir/.env"
-install -m 0644 -- "$ROLLBACK_DIR/yolov8n.pt" "$stage_dir/models/yolov8n.pt"
-install -m 0600 -- config.yaml "$stage_dir/active-config.yaml"
-install -m 0600 -- .env "$stage_dir/active.env"
-install -m 0644 -- "$model_dir/yolov8n.pt" "$stage_dir/active-yolov8n.pt"
-container_id="$(docker compose ps -q parking-spot-monitor)"
-active_image_id="$(docker inspect "$container_id" --format '{{.Image}}')"
-data_path="$(realpath data)"
-
-# Validate the staged rollback set before stopping or changing active files.
-docker run --rm --env-file "$stage_dir/.env" \
-  --mount "type=bind,src=$stage_dir/config.yaml,dst=/config/config.yaml,readonly" \
-  --mount "type=bind,src=$stage_dir/models,dst=/models,readonly" \
-  --mount "type=bind,src=$data_path,dst=/data" \
-  "$rollback_image_id" \
-  python -m parking_spot_monitor \
-  --config /config/config.yaml \
-  --data-dir /data \
-  --validate-config
-
-install_atomic() {
-  source_path="$1"
-  target_path="$2"
-  target_mode="$3"
-  temporary_path="${target_path}.rollback-new.$$"
-  install -m "$target_mode" -- "$source_path" "$temporary_path"
-  mv -f -- "$temporary_path" "$target_path"
-}
-require_fresh_frame() {
-  started_at="$1"
-  docker compose exec -T parking-spot-monitor python - "$started_at" <<'PY'
-import json
-import sys
-import time
-from datetime import datetime
-from pathlib import Path
-
-started = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
-path = Path("/data/health.json")
-deadline = time.monotonic() + 180
-while time.monotonic() < deadline:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        frame = payload.get("last_frame_at")
-        if path.stat().st_mtime_ns > int(started.timestamp() * 1_000_000_000) and isinstance(frame, str) and datetime.fromisoformat(frame.replace("Z", "+00:00")) > started:
-            break
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        pass
-    time.sleep(2)
-else:
-    raise SystemExit("no successful frame newer than rollback container start")
-PY
-}
-rollback_finished=0
-service_stopped=0
-recover_failed_rollback() {
-  rollback_status="$?"
-  trap - EXIT
-  if [ "$rollback_finished" -eq 0 ] && [ "$service_stopped" -eq 1 ]; then
-    docker compose stop parking-spot-monitor >/dev/null 2>&1 || true
-    install_atomic "$stage_dir/active-config.yaml" config.yaml 0600
-    install_atomic "$stage_dir/active.env" .env 0600
-    install_atomic "$stage_dir/active-yolov8n.pt" "$model_dir/yolov8n.pt" 0644
-    docker image tag "$active_image_id" parking-spot-monitor:local
-    if ! docker compose up -d --no-build --force-recreate parking-spot-monitor; then
-      echo "rollback failed and the prior deployment could not be recovered" >&2
-      exit 1
-    fi
-  fi
-  rm -rf -- "$stage_dir"
-  exit "$rollback_status"
-}
-trap recover_failed_rollback EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-service_stopped=1
-docker compose stop parking-spot-monitor
-install_atomic "$stage_dir/config.yaml" config.yaml 0600
-install_atomic "$stage_dir/.env" .env 0600
-install_atomic "$stage_dir/models/yolov8n.pt" "$model_dir/yolov8n.pt" 0644
-docker image tag "$rollback_image_id" parking-spot-monitor:local
-docker compose up -d --no-build --force-recreate parking-spot-monitor
-container_id="$(docker compose ps -q parking-spot-monitor)"
-started_at="$(docker inspect "$container_id" --format '{{.State.StartedAt}}')"
-docker compose exec -T parking-spot-monitor \
-  python -m parking_spot_monitor.healthcheck \
-  --health-file /data/health.json --max-age-seconds 120
-require_fresh_frame "$started_at"
-rollback_finished=1
-trap - EXIT HUP INT TERM
-rm -rf -- "$stage_dir"
-docker compose ps
-)
+python3 scripts/deployment_operations.py upgrade \
+  --reviewed-revision "$REVIEWED_REVISION" \
+  --rollback-tag parking-spot-monitor:rollback-20260730T230000Z
 ```
 
-The checksum checks authenticate the model, data archive, configuration/environment metadata, and exact full image ID before the service is stopped. The complete rollback set is staged and validated against the current data directory first. Active bind artifacts are preserved, replacements use same-directory atomic renames, and the EXIT/signal trap restores the prior image/config/environment/model and recreates the prior service on any post-stop failure. Acceptance requires a health artifact and successful frame newer than the rollback container's `StartedAt`; a merely young persistent `health.json` is insufficient. The persistent `data/` bind mount remains in place unless the deliberate recovery procedure below is also required.
+The helper requires a clean worktree before checkout, runs compileall, the complete serial test suite, dependency-lock validation, and Compose validation, and rechecks cleanliness after tests, after the image build, and immediately before recreation. It validates production mounts with the built image, recreates without rebuilding, then waits up to 180 seconds for a valid health status, `updated_at`, health-file mtime, and successful-frame timestamp all newer than the new container `StartedAt`. Only after that freshness gate does it run the one-shot in-container healthcheck.
 
-### Restore the complete data archive
+Do not add `pytest-xdist` or `-n`. Do not edit the checkout while the operation runs. Keep the protected bundle and rollback tag through a representative observation window.
 
-Restore `data.tar` only for deliberate recovery, not for an ordinary image/config rollback. This procedure verifies and extracts into a private sibling directory before downtime, stops the service, preserves the current data directory instead of deleting it, atomically swaps the restored directory into place, and restarts. Set `DATA_DIR` if the Compose bind source is not `./data`:
+### Roll back image, config, environment, and model
+
+Use the bundle created immediately before the failed upgrade:
 
 ```sh
-(
-set -eu
-umask 077
-: "${ROLLBACK_DIR:?set ROLLBACK_DIR to the protected rollback backup}"
-data_dir="${DATA_DIR:-data}"
-test -d "$data_dir"
-test ! -L "$data_dir"
-(cd "$ROLLBACK_DIR" && sha256sum -c data.tar.sha256 && tar -tf data.tar >/dev/null)
-python3 - "$ROLLBACK_DIR/data.tar" <<'PY'
-import sys
-import tarfile
-from pathlib import PurePosixPath
-
-with tarfile.open(sys.argv[1], "r:") as archive:
-    for member in archive:
-        path = PurePosixPath(member.name)
-        if path.is_absolute() or ".." in path.parts:
-            raise SystemExit("data archive contains an unsafe path")
-        if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
-            raise SystemExit("data archive contains a link or special file")
-PY
-stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-restore_dir="${data_dir}.restore.${stamp}.$$"
-preserved_dir="${data_dir}.pre-restore.${stamp}"
-test ! -e "$restore_dir"
-test ! -e "$preserved_dir"
-mkdir -m 0700 -- "$restore_dir"
-tar --no-same-owner -C "$restore_dir" -xpf "$ROLLBACK_DIR/data.tar"
-
-require_fresh_frame() {
-  started_at="$1"
-  docker compose exec -T parking-spot-monitor python - "$started_at" <<'PY'
-import json
-import sys
-import time
-from datetime import datetime
-from pathlib import Path
-
-started = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
-path = Path("/data/health.json")
-deadline = time.monotonic() + 180
-while time.monotonic() < deadline:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        frame = payload.get("last_frame_at")
-        if path.stat().st_mtime_ns > int(started.timestamp() * 1_000_000_000) and isinstance(frame, str) and datetime.fromisoformat(frame.replace("Z", "+00:00")) > started:
-            break
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        pass
-    time.sleep(2)
-else:
-    raise SystemExit("no successful frame newer than restored container start")
-PY
-}
-restore_on_failure() {
-  restore_status="$?"
-  trap - EXIT
-  if [ -d "$preserved_dir" ]; then
-    docker compose stop parking-spot-monitor >/dev/null 2>&1 || true
-    if [ -e "$data_dir" ]; then
-      failed_dir="${data_dir}.failed-restore.${stamp}.$$"
-      mv -- "$data_dir" "$failed_dir"
-    fi
-    mv -- "$preserved_dir" "$data_dir"
-  fi
-  if ! docker compose start parking-spot-monitor; then
-    echo "data restore failed and the preserved service did not restart" >&2
-    exit 1
-  fi
-  exit "$restore_status"
-}
-trap restore_on_failure EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-docker compose stop parking-spot-monitor
-mv -- "$data_dir" "$preserved_dir"
-mv -- "$restore_dir" "$data_dir"
-docker compose start parking-spot-monitor
-container_id="$(docker compose ps -q parking-spot-monitor)"
-started_at="$(docker inspect "$container_id" --format '{{.State.StartedAt}}')"
-docker compose exec -T parking-spot-monitor \
-  python -m parking_spot_monitor.healthcheck \
-  --health-file /data/health.json --max-age-seconds 120
-require_fresh_frame "$started_at"
-trap - EXIT HUP INT TERM
-printf 'preserved pre-restore data at %s\n' "$preserved_dir"
-)
+python3 scripts/deployment_operations.py rollback \
+  --rollback-dir /protected/parking-backups/2026-07-30T230000Z
 ```
 
-Keep the preserved pre-restore directory until health freshness, a successful post-start frame, Matrix outbox continuity, and application-owned recovery metadata have been checked. Never merge two live data trees or extract an archive over an active data directory.
+Rollback verifies every bundle consistency manifest, the operator-approved model record, archive safety, bundle timestamp, and the exact rollback image tag/ID before downtime. Its private temporary directory and cleanup handler exist before `.env` or model bytes are copied. The rollback set is validated against the current data mount before the service stops. Config, environment, and model replacements use same-directory atomic renames. Any failure after stop restores the prior files and image, recreates the prior service, and applies the same post-`StartedAt` freshness gate before returning failure.
 
-For a configuration-only rollback, restore the previous local `config.yaml` and `.env`, validate them with the one-shot Compose command, then restart the service. Never copy secrets into Git history or terminal output captured for tickets.
+An ordinary rollback deliberately keeps the current data tree. This preserves the latest durable Matrix outbox, decision memory, state, and vehicle history.
+
+### Restore the complete data recovery point
+
+Restore `data.tar` only when the current data tree itself is unusable:
+
+```sh
+python3 scripts/deployment_operations.py restore-data \
+  --rollback-dir /protected/parking-backups/2026-07-30T230000Z
+```
+
+The helper validates archive paths and types before extraction, extracts into a private sibling directory, stops the service, preserves the current tree, activates the restored tree by rename, restarts, and applies the shared freshness gate. If restart or freshness fails, it moves the failed restored tree aside, restores the preserved tree, restarts the prior deployment, and verifies fresh health before surfacing the failure. On success it prints only the preserved directory path. Keep that directory until Matrix outbox continuity and application-owned recovery metadata have been checked.
+
+Never merge two live data trees, extract over an active data directory, or delete a preserved tree until recovery acceptance is complete.
+
+### Recorded final recovery point
+
+The final release record names the actual quiesced bundle timestamp, runtime source SHA, immutable predecessor image, archive digest, and potential recovery window. A bundle copied or retagged after creation remains the older recovery point; changing image metadata does not make its data archive current.
 
 ## Troubleshooting deployment failures
 
