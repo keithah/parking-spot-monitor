@@ -92,6 +92,17 @@ def _lock_pin_versions(text: str) -> dict[str, str]:
     }
 
 
+def _remove_lock_requirement(text: str, package: str) -> str:
+    lines = text.splitlines(keepends=True)
+    start = next(
+        index for index, line in enumerate(lines) if line.startswith(f"{package}==")
+    )
+    end = start + 1
+    while end < len(lines) and lines[end].startswith((" ", "\t")):
+        end += 1
+    return "".join(lines[:start] + lines[end:])
+
+
 @pytest.mark.parametrize("path", LOCK_PATHS)
 def test_lock_files_pin_and_hash_every_requirement(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
@@ -516,6 +527,88 @@ def test_build_lock_staging_requires_exact_pip_tools_pin_before_resolution(
     )
 
     with pytest.raises(RuntimeError, match="exact.*pip-tools|pip-tools.*exact"):
+        module.stage_build_lock(root)
+
+
+@pytest.mark.parametrize(
+    "missing_package",
+    ["pip-tools", "click", "packaging", "pyproject-hooks"],
+)
+def test_build_lock_staging_rejects_missing_trusted_closure_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_package: str
+) -> None:
+    root = _copy_lock_inputs(tmp_path)
+    module = _load_lock_module()
+    current_lock = root / "requirements-build.lock"
+    original = current_lock.read_text(encoding="utf-8")
+    versions = _lock_pin_versions(original)
+    current_lock.write_text(
+        _remove_lock_requirement(original, missing_package), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        module.importlib.metadata,
+        "version",
+        lambda name: versions[module._canonical_name(name)],
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("resolver ran with incomplete closure"),
+    )
+
+    with pytest.raises(RuntimeError, match="trusted.*closure|closure.*missing"):
+        module.stage_build_lock(root)
+
+
+def test_build_lock_staging_rejects_untrusted_extra_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _copy_lock_inputs(tmp_path)
+    module = _load_lock_module()
+    current_lock = root / "requirements-build.lock"
+    text = current_lock.read_text(encoding="utf-8") + _compiled_requirement(
+        "unexpected-tool"
+    )
+    current_lock.write_text(text, encoding="utf-8")
+    versions = _lock_pin_versions(text)
+    monkeypatch.setattr(
+        module.importlib.metadata,
+        "version",
+        lambda name: versions[module._canonical_name(name)],
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("resolver ran with untrusted extra"),
+    )
+
+    with pytest.raises(RuntimeError, match="trusted.*closure|unexpected"):
+        module.stage_build_lock(root)
+
+
+def test_build_lock_staging_rejects_renamed_closure_member_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _copy_lock_inputs(tmp_path)
+    module = _load_lock_module()
+    current_lock = root / "requirements-build.lock"
+    text = current_lock.read_text(encoding="utf-8").replace(
+        "click==8.4.2", "cluck==8.4.2"
+    )
+    current_lock.write_text(text, encoding="utf-8")
+    versions = _lock_pin_versions(text)
+    monkeypatch.setattr(
+        module.importlib.metadata,
+        "version",
+        lambda name: versions[module._canonical_name(name)],
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("resolver ran with renamed closure member"),
+    )
+
+    with pytest.raises(RuntimeError, match="trusted.*closure|missing|unexpected"):
         module.stage_build_lock(root)
 
 
