@@ -35,6 +35,51 @@ ls -ld /dev/dri
 
 The tracked service limits the container to 2 CPUs, 4 GiB of memory, and 512 processes. Docker JSON logs rotate at 10 MiB with three retained files.
 
+## Dependency lock maintenance
+
+Container builds install reviewed, exact hashes from two generated manifests. `requirements-runtime.lock` contains the application runtime, while `requirements-detector.lock` contains the detector stack and retains the PyTorch CPU package index. Maintainers continue to edit the broad dependency bounds in `requirements.txt`, `requirements-detector.txt`, and the dependency tables in `pyproject.toml`; do not hand-edit either lock.
+
+### Prerequisites
+
+Create a dedicated build-tool environment from the repository root. The project runtime environment does not need `pip-tools`:
+
+```sh
+python3 -m venv /tmp/parking-lock-tools
+/tmp/parking-lock-tools/bin/python -m pip install -r requirements-build.txt
+```
+
+The generator verifies that the installed `pip-tools` version matches the exact pin in `requirements-build.txt` before resolving anything.
+
+### Regenerate reviewed locks
+
+After changing a dependency input, run:
+
+```sh
+/tmp/parking-lock-tools/bin/python scripts/lock_dependencies.py
+git diff -- requirements-runtime.lock requirements-detector.lock
+python3 scripts/lock_dependencies.py --check
+```
+
+Review unexpected additions, removals, index changes, and version jumps before committing both locks. Generation uses the backtracking resolver, exact versions, and SHA-256 hashes. It writes a shared source digest into both headers so a change to either input manifest or to a `pyproject.toml` dependency table invalidates both locks.
+
+### Check freshness without package-index access
+
+CI and pre-deployment validation only need the standard-library interpreter:
+
+```sh
+PIP_NO_INDEX=1 PYTHONNOUSERSITE=1 \
+  python3 scripts/lock_dependencies.py --check
+```
+
+Check mode reads local inputs and lock headers only. It neither imports `pip-tools`, contacts an index, nor rewrites a missing or stale lock.
+
+### Troubleshoot lock generation
+
+- If generation reports a missing or wrong `pip-tools` version, create a fresh isolated environment and install `requirements-build.txt` in it.
+- If `--check` reports a stale lock, regenerate both locks and review their diff; copying a digest between headers does not update resolved dependencies.
+- If resolution cannot reach PyPI or the PyTorch CPU index, verify outbound HTTPS and proxy or certificate configuration, then rerun generation. Do not remove hashes or replace the CPU index with an unreviewed source.
+- If generation is interrupted, rerun it. Each completed manifest is published from a temporary file, while check mode remains safe to run at any point.
+
 ## First deployment
 
 ### 1. Create local operator files
