@@ -100,9 +100,7 @@ def _configured_spots(settings: RuntimeSettings) -> tuple[tuple[str, SpotConfig]
 
 
 def _draw_spot_overlay(image: Image.Image, spot_items: tuple[tuple[str, SpotConfig], ...]) -> None:
-    canvas = image.convert("RGBA")
-    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    draw = ImageDraw.Draw(image, "RGBA")
 
     styles = {
         "left_spot": {"fill": (56, 189, 248, 72), "outline": (14, 165, 233, 255)},
@@ -117,9 +115,6 @@ def _draw_spot_overlay(image: Image.Image, spot_items: tuple[tuple[str, SpotConf
         draw.line(points + [points[0]], fill=style["outline"], width=5, joint="curve")
         label_x, label_y = points[0]
         draw.text((label_x + 6, label_y + 6), spot_id, fill=style["outline"])
-
-    composed = Image.alpha_composite(canvas, overlay).convert("RGB")
-    image.paste(composed)
 
 
 def _raise_overlay_error(

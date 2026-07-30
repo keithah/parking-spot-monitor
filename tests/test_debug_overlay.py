@@ -8,7 +8,12 @@ import pytest
 from PIL import Image
 
 from parking_spot_monitor.config import load_settings
-from parking_spot_monitor.debug_overlay import DebugOverlayError, write_debug_overlay
+from parking_spot_monitor.debug_overlay import (
+    DebugOverlayError,
+    _configured_spots,
+    _draw_spot_overlay,
+    write_debug_overlay,
+)
 from parking_spot_monitor.logging import StructuredLogger
 from tests.test_config import SECRET_MARKER, fake_environ
 
@@ -29,6 +34,20 @@ def load_example_settings():
 
 def records_from(stream: StringIO) -> list[dict[str, object]]:
     return [json.loads(line) for line in stream.getvalue().splitlines()]
+
+
+def test_spot_overlay_does_not_allocate_full_frame_overlay(monkeypatch: pytest.MonkeyPatch) -> None:
+    image = Image.new("RGB", (1458, 806), (20, 30, 40))
+    original_new = Image.new
+
+    def guarded_new(mode: str, size: tuple[int, int], *args: object, **kwargs: object) -> Image.Image:
+        if mode == "RGBA" and size == image.size:
+            raise AssertionError("full-frame overlay allocation")
+        return original_new(mode, size, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "new", guarded_new)
+
+    _draw_spot_overlay(image, _configured_spots(load_example_settings()))
 
 
 def test_write_debug_overlay_renders_configured_spot_polygons_to_jpeg(tmp_path: Path) -> None:
