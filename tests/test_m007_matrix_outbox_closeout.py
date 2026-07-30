@@ -255,6 +255,24 @@ def test_m007_run_command_binds_canonical_output_policy(monkeypatch, capsys) -> 
 def test_m007_main_binds_canonical_smoke_environment(monkeypatch) -> None:
     module = _load_closeout_script_module()
     calls: list[dict[str, object]] = []
+    expected_passthrough_keys = (
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+        "DOCKER_CONFIG",
+        "XDG_RUNTIME_DIR",
+        "BUILDKIT_HOST",
+        "DOCKER_BUILDKIT",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    )
 
     def fake_smoke_env(**kwargs):
         calls.append(kwargs)
@@ -266,12 +284,14 @@ def test_m007_main_binds_canonical_smoke_environment(monkeypatch) -> None:
     result = module.main([])
 
     assert result == 0
+    assert module.M007_ENV_PASSTHROUGH_KEYS == expected_passthrough_keys
     assert calls == [
         {
             "rtsp_placeholder": module.PLACEHOLDER_RTSP_URL,
             "matrix_token_placeholder": module.PLACEHOLDER_MATRIX_TOKEN,
             "base": None,
             "pythonpath_prefix": str(module.ROOT / "src"),
+            "passthrough_keys": expected_passthrough_keys,
         }
     ]
 

@@ -13,8 +13,10 @@ def smoke_env(
     matrix_token_placeholder: str,
     base: Mapping[str, str] | None = None,
     pythonpath_prefix: str | None = None,
+    passthrough_keys: Sequence[str] = (),
 ) -> dict[str, str]:
-    env = dict(base) if base is not None else {key: os.environ[key] for key in _SAFE_ENV_KEYS if key in os.environ}
+    selected_keys = (*_SAFE_ENV_KEYS, *passthrough_keys)
+    env = dict(base) if base is not None else {key: os.environ[key] for key in selected_keys if key in os.environ}
     env["RTSP_URL"] = rtsp_placeholder
     env["RTSP_URL_4K"] = f"{rtsp_placeholder}-4k"
     env["RTSP_URL_360P"] = f"{rtsp_placeholder}-360p"

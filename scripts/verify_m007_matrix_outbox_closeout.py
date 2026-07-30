@@ -39,6 +39,24 @@ OUTPUT_LIMIT = 4_000
 DOCKER_IMAGE_TAG = "parking-spot-monitor:m007-outbox-smoke"
 PLACEHOLDER_RTSP_URL = "placeholder-rtsp-url-for-m007-closeout"
 PLACEHOLDER_MATRIX_TOKEN = "placeholder-matrix-token-for-m007-closeout"
+M007_ENV_PASSTHROUGH_KEYS = (
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "DOCKER_CONFIG",
+    "XDG_RUNTIME_DIR",
+    "BUILDKIT_HOST",
+    "DOCKER_BUILDKIT",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
 
 M007_CLOSEOUT_START = "M007_CLOSEOUT_START"
 M007_CLOSEOUT_PASS = "M007_CLOSEOUT_PASS"
@@ -705,6 +723,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         matrix_token_placeholder=PLACEHOLDER_MATRIX_TOKEN,
         base=None,
         pythonpath_prefix=str(ROOT / "src"),
+        passthrough_keys=M007_ENV_PASSTHROUGH_KEYS,
     )
     with tempfile.TemporaryDirectory(prefix="m007-outbox-smoke-data-") as temp_dir:
         for command in _build_commands(Path(temp_dir)):

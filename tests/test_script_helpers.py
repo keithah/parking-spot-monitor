@@ -61,6 +61,58 @@ def test_smoke_env_uses_safe_default_environment(monkeypatch: pytest.MonkeyPatch
     assert "PYTHONPATH" not in env
 
 
+def test_smoke_env_keeps_only_explicit_passthrough_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    passthrough_keys = (
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+        "DOCKER_CONFIG",
+        "XDG_RUNTIME_DIR",
+        "BUILDKIT_HOST",
+        "DOCKER_BUILDKIT",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    )
+    monkeypatch.setenv("PATH", "/bin")
+    monkeypatch.setenv("HOME", "/home/operator")
+    for key in passthrough_keys:
+        monkeypatch.setenv(key, f"value-for-{key}")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "should-not-pass")
+    monkeypatch.setenv("MATRIX_SECRET", "should-not-pass")
+    monkeypatch.setenv("RTSP_URL", "rtsp://real-camera")
+    monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "real-matrix-token")
+    monkeypatch.setenv("PYTHONPATH", "/unsafe")
+
+    env = smoke_env(
+        rtsp_placeholder="rtsp://placeholder",
+        matrix_token_placeholder="matrix-placeholder",
+        pythonpath_prefix="/repo",
+        passthrough_keys=passthrough_keys,
+    )
+
+    assert env["PATH"] == "/bin"
+    assert env["HOME"] == "/home/operator"
+    assert {key: env[key] for key in passthrough_keys} == {
+        key: f"value-for-{key}" for key in passthrough_keys
+    }
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "MATRIX_SECRET" not in env
+    assert env["RTSP_URL"] == "rtsp://placeholder"
+    assert env["RTSP_URL_4K"] == "rtsp://placeholder-4k"
+    assert env["RTSP_URL_360P"] == "rtsp://placeholder-360p"
+    assert env["MATRIX_ACCESS_TOKEN"] == "matrix-placeholder"
+    assert env["PYTHONPATH"] == "/repo"
+
+
 def test_smoke_env_keeps_explicit_base_pythonpath() -> None:
     env = smoke_env(
         rtsp_placeholder="rtsp://placeholder",
