@@ -58,7 +58,7 @@ class DecisionMemoryStore:
             )
             after = decision_memory_source_snapshot(self.path)
         load_is_consistent = decision_memory_load_is_consistent(
-            loaded.state, before, after
+            loaded.state, before, after, loaded.source_signature
         )
         self._records: deque[DecisionMemoryRecord] = deque(
             loaded.records if load_is_consistent else (),
@@ -156,7 +156,9 @@ class DecisionMemoryStore:
                     )
                 if not after.available or after.signature != before.signature:
                     return self._defer_reconciliation("source-changed-during-load")
-                if not decision_memory_load_is_consistent(external.state, before, after):
+                if not decision_memory_load_is_consistent(
+                    external.state, before, after, external.source_signature
+                ):
                     return self._defer_reconciliation("source-state-signature-mismatch")
                 if external.state == "available":
                     candidate = deduplicated_decision_memory_tail(

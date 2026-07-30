@@ -56,6 +56,7 @@ from parking_monitor.outbox_storage import (
     persist_records,
 )
 from parking_monitor.outbox_derivatives import OutboxDerivativeMixin
+from parking_monitor.outbox_lookup import OutboxLookupMixin, build_event_index
 
 # Compatibility aliases retained for callers and existing failure-injection tests.
 _SCHEMA_VERSION = SCHEMA_VERSION
@@ -67,7 +68,7 @@ _safe_reason_code = safe_reason_code
 _parse_utc_timestamp = parse_utc_timestamp
 
 
-class LocalOutbox(OutboxDerivativeMixin):
+class LocalOutbox(OutboxDerivativeMixin, OutboxLookupMixin):
     """Thread-safe JSON-file backed Matrix alert outbox."""
 
     def __init__(
@@ -83,6 +84,7 @@ class LocalOutbox(OutboxDerivativeMixin):
         self._lock: threading.RLock = threading.RLock()
         self._records: list[OutboxRecord] = []
         self._index_by_id: dict[str, int] = {}
+        self._indices_by_event_id: dict[str, tuple[int, ...]] = {}
         self._revision = 0
         self._compact_summary_cache: tuple[int, str] | None = None
         with self._lock:
@@ -416,6 +418,7 @@ class LocalOutbox(OutboxDerivativeMixin):
     def _set_records(self, records: list[OutboxRecord], *, mutated: bool = False) -> None:
         self._records = records
         self._index_by_id = {record.id: index for index, record in enumerate(records)}
+        self._indices_by_event_id = build_event_index(records)
         if mutated:
             self._revision += 1
             self._compact_summary_cache = None

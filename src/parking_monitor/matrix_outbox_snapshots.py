@@ -69,13 +69,9 @@ class MatrixOutboxSnapshots:
         event_type: str,
     ) -> OutboxRecord:
         with self._publication_locks.hold(self._publication_key(event_id)):
-            existing = next(
-                (
-                    record
-                    for record in self.outbox.list_records()
-                    if record.intent.event_id == event_id and "upload" in record.phase_states
-                ),
-                None,
+            existing = self.outbox.find_event_record(
+                event_id,
+                required_phase="upload",
             )
             if existing is not None:
                 return existing
@@ -117,7 +113,7 @@ class MatrixOutboxSnapshots:
 
     def prepare_upload(self, record: OutboxRecord) -> PreparedSnapshotUpload:
         with self._publication_locks.hold(self._publication_key(record.intent.event_id)):
-            refreshed = next((item for item in self.outbox.list_records() if item.id == record.id), None)
+            refreshed = self.outbox.get_record(record.id)
             if refreshed is None:
                 raise MatrixError("Matrix outbox record is missing", error_type="snapshot_missing_source")
             return self._prepare_upload_locked(refreshed)

@@ -25,7 +25,7 @@ from parking_spot_monitor.vehicle_history_storage_utils import _session_file_sig
 
 
 class VehicleHistorySessionMixin:
-    def active_session_signature(self) -> tuple[tuple[str, int, int], ...]:
+    def active_session_signature(self) -> tuple[tuple[str, int, int, int, int, int], ...]:
         return _session_file_signature(self.active_dir)
 
     def start_session(self, event: OccupancyEvent) -> SessionRecord:

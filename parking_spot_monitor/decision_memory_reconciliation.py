@@ -7,34 +7,43 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from parking_spot_monitor.operator_decision_memory import DecisionMemoryRecord, LoadState
+from parking_spot_monitor.operator_decision_memory import (
+    MAX_MEMORY_FILE_BYTES,
+    DecisionMemoryRecord,
+    LoadState,
+    SourceSignature,
+    _read_decision_memory_source,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class DecisionMemorySourceSnapshot:
-    signature: tuple[int, int] | None
+    signature: SourceSignature | None
     available: bool
 
 
 def decision_memory_source_snapshot(path: Path) -> DecisionMemorySourceSnapshot:
     try:
-        stat_result = path.stat()
+        _raw, signature = _read_decision_memory_source(path, MAX_MEMORY_FILE_BYTES)
     except FileNotFoundError:
         return DecisionMemorySourceSnapshot(None, True)
-    except OSError:
+    except (OSError, OverflowError):
         return DecisionMemorySourceSnapshot(None, False)
-    return DecisionMemorySourceSnapshot((stat_result.st_mtime_ns, stat_result.st_size), True)
+    return DecisionMemorySourceSnapshot(signature, True)
 
 
 def decision_memory_load_is_consistent(
     state: LoadState,
     before: DecisionMemorySourceSnapshot,
     after: DecisionMemorySourceSnapshot,
+    source_signature: SourceSignature | None = None,
 ) -> bool:
     if not before.available or not after.available or before.signature != after.signature:
         return False
     expected_state = "missing" if before.signature is None else "available"
-    return state == expected_state
+    if state != expected_state:
+        return False
+    return source_signature is None or source_signature == before.signature
 
 
 def deduplicated_decision_memory_tail(

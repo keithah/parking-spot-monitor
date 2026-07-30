@@ -126,16 +126,18 @@ def parity_metrics(
         len(baseline) == len(candidate)
         for baseline, candidate in zip(baseline_frames, candidate_frames, strict=True)
     )
-    confidence_deltas: list[float] = []
-    bbox_ious: list[float] = []
+    maximum_confidence_delta = 0.0
+    minimum_bbox_iou = 1.0
     for baseline, candidate in zip(baseline_frames, candidate_frames):
         for expected, actual in zip(baseline, candidate):
-            confidence_deltas.append(
-                abs(float(expected["confidence"]) - float(actual["confidence"]))
+            maximum_confidence_delta = max(
+                maximum_confidence_delta,
+                abs(float(expected["confidence"]) - float(actual["confidence"])),
             )
-            bbox_ious.append(bbox_iou(expected["bbox"], actual["bbox"]))
-    maximum_confidence_delta = max(confidence_deltas, default=0.0)
-    minimum_bbox_iou = min(bbox_ious, default=1.0)
+            minimum_bbox_iou = min(
+                minimum_bbox_iou,
+                bbox_iou(expected["bbox"], actual["bbox"]),
+            )
     if not no_new_or_omitted:
         minimum_bbox_iou = 0.0
     parity_passed = (

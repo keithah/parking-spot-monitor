@@ -116,8 +116,8 @@ class ProfileCorrectionEvent:
 @dataclass(frozen=True)
 class CorrectionReplaySignature:
     revision: int
-    corrections_stat: tuple[int, int] | None
-    quarantine_stat: tuple[int, int] | None
+    corrections_stat: tuple[int, int, int, int, int] | None
+    quarantine_stat: tuple[int, int, int, int, int] | None
 
 @dataclass(frozen=True)
 class CorrectionReplayState:

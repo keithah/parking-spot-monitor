@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import stat
 import tempfile
 import threading
 from collections.abc import Mapping, Sequence
@@ -10,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from parking_spot_monitor.diagnostic_bounding import _take_bounded
+from parking_spot_monitor.diagnostic_bounding import take_bounded
 from parking_spot_monitor.logging import (
     StructuredLogger,
     is_secret_diagnostic_value,
@@ -40,6 +42,7 @@ RecordKind = Literal[
     "feedback",
 ]
 LoadState = Literal["available", "missing", "unavailable", "partial"]
+SourceSignature = tuple[int, int, int, int, int, str]
 
 _SUPPORTED_KINDS = {
     "accepted_evidence",
@@ -154,6 +157,7 @@ class DecisionMemoryLoad:
     records: tuple[DecisionMemoryRecord, ...] = ()
     error_type: str | None = None
     quarantined_path: Path | None = None
+    source_signature: SourceSignature | None = None
 
 
 def decision_memory_path(data_dir: str | Path) -> Path:
@@ -246,34 +250,60 @@ def load_decision_memory(
 ) -> DecisionMemoryLoad:
     """Load a bounded tail of decision-memory records, quarantining unsafe artifacts."""
 
-    memory_path = Path(path)
-    if not memory_path.exists():
-        _log(logger, "debug", "operator-decision-memory-load-missing", path=memory_path)
-        return DecisionMemoryLoad(state="missing")
-
     try:
-        size = memory_path.stat().st_size
-    except OSError as exc:
-        _log(logger, "warning", "operator-decision-memory-load-failed", path=memory_path, phase="stat", error_type=type(exc).__name__, error=str(exc))
-        return DecisionMemoryLoad(state="unavailable", error_type=type(exc).__name__)
-
-    if size > max_file_bytes:
+        raw, source_signature = _read_decision_memory_source(Path(path), max_file_bytes)
+    except FileNotFoundError:
+        _log(logger, "debug", "operator-decision-memory-load-missing", path=path)
+        return DecisionMemoryLoad(state="missing")
+    except OverflowError:
+        memory_path = Path(path)
         quarantined = _quarantine_file(memory_path)
         _log(logger, "warning", "operator-decision-memory-quarantined", path=memory_path, quarantine_path=quarantined, phase="size", error_type="oversized")
         return DecisionMemoryLoad(state="unavailable", error_type="oversized", quarantined_path=quarantined)
-
+    except OSError as exc:
+        _log(logger, "warning", "operator-decision-memory-load-failed", path=path, phase="read", error_type=type(exc).__name__, error=str(exc))
+        return DecisionMemoryLoad(state="unavailable", error_type=type(exc).__name__)
+    memory_path = Path(path)
     try:
-        with memory_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        payload = json.loads(raw.decode("utf-8"))
         records = _records_from_payload(payload)
-    except (OSError, json.JSONDecodeError, DecisionMemorySchemaError) as exc:
+    except (UnicodeError, json.JSONDecodeError, DecisionMemorySchemaError) as exc:
         quarantined = _quarantine_file(memory_path)
         _log(logger, "warning", "operator-decision-memory-quarantined", path=memory_path, quarantine_path=quarantined, phase="load", error_type=type(exc).__name__, error=str(exc))
         return DecisionMemoryLoad(state="unavailable", error_type=type(exc).__name__, quarantined_path=quarantined)
 
     bounded = tuple(records[-_positive_limit(max_records, MAX_RECORDS) :])
     _log(logger, "debug", "operator-decision-memory-loaded", path=memory_path, record_count=len(bounded), state="available")
-    return DecisionMemoryLoad(state="available", records=bounded)
+    return DecisionMemoryLoad(state="available", records=bounded, source_signature=source_signature)
+
+
+def _read_decision_memory_source(path: Path, max_file_bytes: int) -> tuple[bytes, SourceSignature]:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("decision memory source is not a regular file")
+        if before.st_size > max_file_bytes:
+            raise OverflowError("decision memory source exceeds byte limit")
+        raw = bytearray()
+        while chunk := os.read(descriptor, min(65_536, max_file_bytes + 1 - len(raw))):
+            raw.extend(chunk)
+            if len(raw) > max_file_bytes:
+                raise OverflowError("decision memory source exceeds byte limit")
+        after = os.fstat(descriptor)
+        leaf = os.stat(path, follow_symlinks=False)
+    finally:
+        os.close(descriptor)
+    before_fields = _source_stat_fields(before)
+    after_fields = _source_stat_fields(after)
+    if before_fields != after_fields or after_fields != _source_stat_fields(leaf) or len(raw) != after.st_size:
+        raise OSError("decision memory source changed during read")
+    digest = hashlib.sha256(raw).hexdigest()
+    return bytes(raw), (*after_fields, digest)
+
+
+def _source_stat_fields(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
 
 
 def format_why_reply(
@@ -404,7 +434,7 @@ def _bound_value(value: Any, *, depth: int) -> Any:
         return "<truncated>"
     if isinstance(value, Mapping):
         bounded: dict[str, Any] = {}
-        entries, truncated = _take_bounded(value.items(), MAX_MAPPING_ITEMS)
+        entries, truncated = take_bounded(value.items(), MAX_MAPPING_ITEMS)
         for key, item in entries:
             bounded[_clip_text(key, 80)] = (
                 "<redacted>"
@@ -415,7 +445,7 @@ def _bound_value(value: Any, *, depth: int) -> Any:
             bounded["truncated"] = True
         return bounded
     if (isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray)) or isinstance(value, set | frozenset):
-        items, truncated = _take_bounded(value, MAX_SEQUENCE_ITEMS)
+        items, truncated = take_bounded(value, MAX_SEQUENCE_ITEMS)
         bounded_items = [_bound_value(item, depth=depth + 1) for item in items]
         if truncated:
             bounded_items.append("<truncated>")
@@ -452,7 +482,7 @@ def _format_detail_value(value: Any, *, depth: int = 0) -> str:
         return "<truncated>"
     if isinstance(value, Mapping):
         parts: list[str] = []
-        entries, truncated = _take_bounded(value.items(), _MAX_FORMAT_ITEMS)
+        entries, truncated = take_bounded(value.items(), _MAX_FORMAT_ITEMS)
         for key, item in entries:
             safe_key = _clip_text(key, 48)
             parts.append(f"{safe_key}={_format_detail_value(item, depth=depth + 1)}")
@@ -460,7 +490,7 @@ def _format_detail_value(value: Any, *, depth: int = 0) -> str:
             parts.append("...")
         return _clip_text("; ".join(parts), _MAX_FORMAT_TEXT_CHARS)
     if isinstance(value, list | tuple | set | frozenset):
-        items, truncated = _take_bounded(value, _MAX_FORMAT_ITEMS)
+        items, truncated = take_bounded(value, _MAX_FORMAT_ITEMS)
         rendered = [_format_detail_value(item, depth=depth + 1) for item in items]
         if truncated:
             rendered.append("...")

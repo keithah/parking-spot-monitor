@@ -5,12 +5,21 @@ from pathlib import Path
 from parking_spot_monitor.vehicle_history_models import SessionRecord, _parse_timestamp
 
 
-def _session_file_signature(directory: Path) -> tuple[tuple[str, int, int], ...]:
+def _session_file_signature(directory: Path) -> tuple[tuple[str, int, int, int, int, int], ...]:
     directory.mkdir(parents=True, exist_ok=True)
-    signature: list[tuple[str, int, int]] = []
+    signature: list[tuple[str, int, int, int, int, int]] = []
     for path in sorted(directory.glob("*.json"), key=lambda candidate: candidate.name):
         stat_result = path.stat()
-        signature.append((path.name, stat_result.st_mtime_ns, stat_result.st_size))
+        signature.append(
+            (
+                path.name,
+                stat_result.st_dev,
+                stat_result.st_ino,
+                stat_result.st_size,
+                stat_result.st_mtime_ns,
+                stat_result.st_ctime_ns,
+            )
+        )
     return tuple(signature)
 
 

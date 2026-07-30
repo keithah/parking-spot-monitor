@@ -13,8 +13,8 @@ from parking_spot_monitor.owner_vehicles import (
 from parking_spot_monitor.vehicle_history_models import SessionRecord
 
 MAX_SNAPSHOT_ATTEMPTS = 2
-ActiveSessionSignature = tuple[tuple[str, int, int], ...]
-OwnerVehicleFileSignature = tuple[int, int, int, int]
+ActiveSessionSignature = tuple[tuple[str, int, int, int, int, int], ...]
+OwnerVehicleFileSignature = tuple[int, int, int, int, int]
 OwnerVehicleCacheKey = tuple[OwnerVehicleFileSignature | None, int, ActiveSessionSignature | None]
 
 
@@ -73,6 +73,12 @@ class OwnerVehicleRuntimeCache:
                 and registry_signature == self._last_good_signature
             ):
                 registry = self._last_good_registry
+            elif (
+                self._last_good_registry is not None
+                and registry_signature == self._last_failed_signature
+            ):
+                registry = self._last_good_registry
+                load_failed = True
             else:
                 try:
                     loaded_registry = load_owner_vehicle_registry(self.registry_path, strict=True)
@@ -87,7 +93,8 @@ class OwnerVehicleRuntimeCache:
                             error_code=exc.code,
                             error_message=exc.safe_message,
                         )
-                        self._last_failed_signature = registry_signature
+                        if exc.code != "read_failed":
+                            self._last_failed_signature = registry_signature
                     if self._last_good_registry is None:
                         raise OwnerVehicleSnapshotUnavailableError(
                             "no valid owner vehicle registry snapshot is available"
@@ -114,7 +121,13 @@ def _file_signature(path: Path) -> OwnerVehicleFileSignature | None:
         stat_result = path.stat()
     except FileNotFoundError:
         return None
-    return stat_result.st_mtime_ns, stat_result.st_ctime_ns, stat_result.st_size, stat_result.st_ino
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
 
 
 def _snapshot_key(

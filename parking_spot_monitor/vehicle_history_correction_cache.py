@@ -169,11 +169,17 @@ def _replay_snapshot(
     )
 
 
-def _file_stat_signature(path: Path) -> tuple[tuple[int, int] | None, bool]:
+def _file_stat_signature(path: Path) -> tuple[tuple[int, int, int, int, int] | None, bool]:
     try:
         stat_result = path.stat()
     except FileNotFoundError:
         return None, True
     except OSError:
         return None, False
-    return (stat_result.st_mtime_ns, stat_result.st_size), True
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    ), True

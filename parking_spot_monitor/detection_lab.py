@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from parking_spot_monitor.diagnostic_bounding import _take_bounded
+from parking_spot_monitor.diagnostic_bounding import take_bounded
 from parking_spot_monitor.logging import (
     StructuredLogger,
     is_secret_diagnostic_value,
@@ -380,7 +380,7 @@ def summarize_lab_report(kind: str, report: Mapping[str, Any]) -> dict[str, Any]
             summary["metric_delta_totals"] = _int_mapping(metric_deltas.get("totals", {}))
     redaction = report.get("redaction_scan", {})
     if isinstance(redaction, Mapping):
-        findings, _ = _take_bounded(redaction.get("findings", []), 8)
+        findings, _ = take_bounded(redaction.get("findings", []), 8)
         summary["redaction"] = {
             "passed": bool(redaction.get("passed", False)),
             "findings": [_clip_text(item, 80) for item in findings],
@@ -446,7 +446,7 @@ def _sanitize_status(payload: Mapping[str, Any]) -> dict[str, Any]:
 def _sanitize_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
-        entries, truncated = _take_bounded(value.items(), MAX_DETAIL_ITEMS)
+        entries, truncated = take_bounded(value.items(), MAX_DETAIL_ITEMS)
         for key, item in entries:
             result[_clip_text(key, 80)] = (
                 "<redacted>"
@@ -457,7 +457,7 @@ def _sanitize_value(value: Any) -> Any:
             result["truncated"] = True
         return result
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        items, _ = _take_bounded(value, MAX_DETAIL_ITEMS)
+        items, _ = take_bounded(value, MAX_DETAIL_ITEMS)
         return [_sanitize_value(item) for item in items]
     redacted = redact_diagnostic_value(value)
     if isinstance(redacted, str):
@@ -479,7 +479,7 @@ def _clip_text(value: object, limit: int = MAX_TEXT_CHARS) -> str:
 def _int_mapping(value: Any) -> dict[str, int]:
     if not isinstance(value, Mapping):
         return {}
-    entries, _ = _take_bounded(value.items(), MAX_DETAIL_ITEMS)
+    entries, _ = take_bounded(value.items(), MAX_DETAIL_ITEMS)
     return {_clip_text(key, 80): _safe_int(item) for key, item in entries}
 
 
