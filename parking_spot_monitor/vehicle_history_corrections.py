@@ -51,6 +51,16 @@ class VehicleHistoryCorrectionMixin:
         """Persist a validated correction event without rewriting archive records."""
 
         event = ProfileCorrectionEvent.from_json_dict(event.to_json_dict())
+        complete_state = self._complete_correction_replay_state()
+        if validation_records is None:
+            validation_records = (
+                complete_state,
+                self.load_active_sessions(),
+                self.list_closed_sessions(),
+            )
+        else:
+            _state, active_records, closed_records = validation_records
+            validation_records = (complete_state, active_records, closed_records)
         self._validate_correction_against_archive(event, records=validation_records)
         line = json.dumps(event.to_json_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
         if len(line.encode("utf-8")) > MAX_CORRECTION_LINE_BYTES:
@@ -59,7 +69,7 @@ class VehicleHistoryCorrectionMixin:
             compacted = append_bounded_correction_event(
                 self.corrections_path,
                 line,
-                current_count=self.correction_replay_state().valid_count,
+                current_count=complete_state.valid_count,
                 max_events=MAX_CORRECTION_EVENTS,
                 max_file_bytes=MAX_CORRECTION_FILE_BYTES,
                 compact_at_bytes=MAX_CORRECTION_COMPACT_BYTES,
@@ -204,6 +214,12 @@ class VehicleHistoryCorrectionMixin:
             value=state,
         )
         return state
+
+    def _complete_correction_replay_state(self) -> CorrectionReplayState:
+        loaded = self._load_correction_replay()
+        if not loaded.succeeded:
+            raise ArchiveSchemaError("correction replay unavailable")
+        return build_correction_replay_state(loaded.events, quarantine_count=loaded.quarantine_count)
 
     def resolve_profile_id(self, profile_id: str | None, *, merges: Mapping[str, str] | None = None) -> str | None:
         normalized = _optional_profile_id(profile_id, "profile_id")

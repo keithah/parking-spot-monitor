@@ -8,7 +8,11 @@ import pytest
 
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 from parking_spot_monitor.vehicle_history_correction_io import compact_correction_events, load_correction_events
-from parking_spot_monitor.vehicle_history_models import ProfileCorrectionEvent
+from parking_spot_monitor.vehicle_history_models import (
+    MAX_CORRECTION_INVALID_LINES,
+    ArchiveSchemaError,
+    ProfileCorrectionEvent,
+)
 
 
 def _event_payload(index: int) -> dict[str, Any]:
@@ -116,3 +120,23 @@ def test_compaction_rewrites_only_bounded_valid_events(tmp_path: Path) -> None:
         event.to_json_dict() for event in events
     ]
     assert path.stat().st_size < 2_000
+
+
+def test_replay_limit_failure_blocks_state_and_new_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    archive.corrections_dir.mkdir(parents=True)
+    original = "{invalid\n" * (MAX_CORRECTION_INVALID_LINES + 1)
+    archive.corrections_path.write_text(original, encoding="utf-8")
+    event = ProfileCorrectionEvent.from_json_dict(_event_payload(99_999))
+    monkeypatch.setattr(
+        type(archive),
+        "_validate_correction_against_archive",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(ArchiveSchemaError, match="correction replay unavailable"):
+        archive.append_correction(event)
+
+    assert archive.corrections_path.read_text(encoding="utf-8") == original
