@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -223,6 +224,28 @@ def test_pre_admission_blocked_jobs_apply_bounded_retention(
 
     assert manager.summarize(jobs[-1].job_id)["error"]["code"] == error_code
     assert len(list(manager.jobs_root.glob("lab-*"))) <= 2
+
+
+def test_retention_never_prunes_just_completed_job_when_mtimes_tie(
+    tmp_path: Path,
+) -> None:
+    manager = DetectionLabManager(tmp_path, max_jobs=2)
+    manager.jobs_root.mkdir(parents=True)
+    names = [
+        "lab-20260730T000000Z-00000001",
+        "lab-20260730T000000Z-00000002",
+        "lab-20260730T000000Z-00000003",
+    ]
+    for name in names:
+        path = manager.jobs_root / name
+        path.mkdir()
+        path.touch()
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+
+    manager.retain_recent_jobs(protected_job_id=names[-1])
+
+    assert (manager.jobs_root / names[-1]).is_dir()
+    assert len(list(manager.jobs_root.glob("lab-*"))) == 2
 
 
 def test_malformed_report_is_persisted_as_blocked_status(tmp_path: Path) -> None:

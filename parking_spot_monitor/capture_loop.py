@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import random
 import time
 from collections.abc import Callable
+from contextlib import ExitStack
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -11,20 +14,22 @@ from parking_spot_monitor.capture import CaptureError, StreamProfileCapture
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.detector_adapter import DetectorRunner
 from parking_spot_monitor.logging import StructuredLogger
-from parking_spot_monitor.matrix_alerts import MONITOR_STARTED_EVENT_TYPE, monitor_lifecycle_event
-from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery, dispatch_matrix_event
+from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery
 from parking_spot_monitor.paths import resolve_runtime_paths
 from parking_spot_monitor.runtime_frame import capture_and_detect_runtime_frame
 from parking_spot_monitor.runtime_frame_outcome import prepare_runtime_frame_loop_result
 from parking_spot_monitor.runtime_health import RuntimeLoopHealthState, observed_at
 from parking_spot_monitor.runtime_health_cache import VehicleHistoryHealthSnapshotCache
 from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache
-from parking_spot_monitor.runtime_commands import RuntimeMatrixCommandService, _poll_matrix_commands_once
+from parking_spot_monitor.runtime_command_worker import advance_matrix_command_poll, build_matrix_command_worker
+from parking_spot_monitor.runtime_commands import RuntimeMatrixCommandService
 from parking_spot_monitor.runtime_decision_memory import build_detection_memory_records
 from parking_spot_monitor.runtime_detection import _configured_spot_polygons
 from parking_spot_monitor.runtime_resource_policy import RuntimeResourcePolicyState
 from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
 from parking_spot_monitor.runtime_lifecycle import ShutdownState, monitor_signal_handlers, return_if_shutdown_requested
+from parking_spot_monitor.runtime_log_aggregation import RuntimeLogAggregator, flush_runtime_log_summary
+from parking_spot_monitor.runtime_reconnect import log_capture_reconnect_failure
 from parking_spot_monitor.state import load_runtime_state
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
@@ -46,6 +51,7 @@ def run_capture_loop(
     max_iterations: int | None = None,
     now: Callable[[], datetime] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
+    random_unit: Callable[[], float] = random.random,
     startup_retention_failure_count: int = 0,
 ) -> int:
     iteration = 0
@@ -54,15 +60,13 @@ def run_capture_loop(
     state_path = data_dir / "state.json"
     runtime_paths = resolve_runtime_paths(settings, data_dir)
     runtime_state = load_runtime_state(state_path, spot_ids, logger=logger)
-    effective_history_archive = (
-        history_archive
-        if history_archive is not None
-        else VehicleHistoryArchive(data_dir / "vehicle-history", logger=logger)
-    )
+    effective_history_archive = history_archive if history_archive is not None else VehicleHistoryArchive(data_dir / "vehicle-history", logger=logger)
     now_fn = now if now is not None else lambda: datetime.now(timezone.utc)
     health_state = RuntimeLoopHealthState(retention_failure_count=startup_retention_failure_count)
     resource_policy_state = RuntimeResourcePolicyState()
     matrix_command_poll_state = runtime_matrix_commands.MatrixCommandPollState()
+    capture_failure_count = 0
+    log_aggregator = RuntimeLogAggregator(settings.runtime.log_summary_interval_seconds, 0)
     decision_memory_path = data_dir / "operator-decision-memory.json"
     shutdown_state = shutdown_state if shutdown_state is not None else ShutdownState()
     if wait is not None:
@@ -83,48 +87,50 @@ def run_capture_loop(
     outbox_health_provider = getattr(matrix_delivery, "outbox_health_summary", None)
     if not callable(outbox_health_provider):
         outbox_health_provider = None
+    matrix_command_worker = build_matrix_command_worker(matrix_command_service)
 
-    def write_current_health(*, status: str, iteration: int) -> None:
-        runtime_loop_resources.write_current_loop_health(
-            settings,
+    write_current_health = partial(
+        runtime_loop_resources.write_current_loop_health,
+        settings,
+        logger=logger,
+        health_state=health_state,
+        vehicle_history_health=vehicle_history_health,
+        runtime_paths=runtime_paths,
+        outbox_health_provider=outbox_health_provider,
+    )
+
+    def shutdown_exit(current_iteration: int) -> int | None:
+        return return_if_shutdown_requested(
+            shutdown_state=shutdown_state,
+            matrix_delivery=matrix_delivery,
+            now_fn=now_fn,
             logger=logger,
-            health_state=health_state,
-            status=status,
-            iteration=iteration,
-            vehicle_history_health=vehicle_history_health,
-            runtime_paths=runtime_paths,
-            outbox_health_provider=outbox_health_provider,
+            decision_memory_path=decision_memory_path,
+            iteration=current_iteration,
         )
 
-    with monitor_signal_handlers(shutdown_state, logger=logger):
-        startup_lifecycle_error = dispatch_matrix_event(
+    with ExitStack() as runtime_resources:
+        if matrix_command_worker is not None:
+            runtime_resources.callback(matrix_command_worker.close)
+        runtime_resources.enter_context(monitor_signal_handlers(shutdown_state, logger=logger))
+        runtime_loop_resources.dispatch_startup_lifecycle(
             matrix_delivery,
-            MONITOR_STARTED_EVENT_TYPE,
-            monitor_lifecycle_event(MONITOR_STARTED_EVENT_TYPE, now_fn()),
+            now=now_fn,
             logger=logger,
             decision_memory_path=decision_memory_path,
         )
-        if startup_lifecycle_error is not None:
-            logger.warning(
-                "lifecycle-notice-delivery-degraded",
-                event_type=MONITOR_STARTED_EVENT_TYPE,
-                error_type=startup_lifecycle_error.get("error_type"),
-            )
         startup_status = "degraded" if health_state.retention_failure_count else "starting"
         write_current_health(status=startup_status, iteration=iteration)
         while max_iterations is None or iteration < max_iterations:
-            shutdown_exit = return_if_shutdown_requested(
-                shutdown_state=shutdown_state,
-                matrix_delivery=matrix_delivery,
-                now_fn=now_fn,
-                logger=logger,
-                decision_memory_path=decision_memory_path,
-                iteration=iteration,
-            )
-            if shutdown_exit is not None:
-                return shutdown_exit
+            requested_exit = shutdown_exit(iteration)
+            if requested_exit is not None:
+                return requested_exit
             iteration += 1
             iteration_started_at = monotonic()
+            if log_aggregator.next_summary_at == 0:
+                log_aggregator.next_summary_at = (
+                    iteration_started_at + log_aggregator.interval_seconds
+                )
             logger.debug("capture-loop-iteration", iteration=iteration, data_dir=str(data_dir))
             try:
                 frame_attempt = capture_and_detect_runtime_frame(
@@ -148,14 +154,19 @@ def run_capture_loop(
                     health_state=health_state,
                     logger=logger,
                     iteration=iteration,
+                    log_aggregator=log_aggregator,
                 )
                 detector = frame_result.detector
                 result = frame_result.capture
+                capture_failure_count = 0
+                log_aggregator.record_success("capture")
                 detection_result = frame_result.detection
                 transition_occurred = False
                 frame_has_weak_presence = False
                 overlay_written = False
                 if detection_result is not None:
+                    log_aggregator.record_success("detection")
+                    log_aggregator.record_success("frame")
                     health_state.record_processed_frame(timestamp=result.timestamp, selected_mode=result.selected_mode)
                     pending_decision_records = build_detection_memory_records(
                         detection_result,
@@ -179,6 +190,7 @@ def run_capture_loop(
                         owner_vehicle_snapshot_provider=owner_vehicle_cache,
                         decision_memory_path=decision_memory_path,
                         pending_decision_records=pending_decision_records,
+                        log_aggregator=log_aggregator,
                     )
                     runtime_state = frame_update.runtime_state
                     transition_occurred = frame_update.transition_occurred
@@ -191,26 +203,18 @@ def run_capture_loop(
                         state_save_error=frame_update.state_save_error,
                     )
                     if matrix_command_service is not None:
-                        command_poll_due_at = monotonic()
-                        if runtime_matrix_commands.command_poll_due(
-                            settings.matrix,
-                            matrix_command_poll_state,
-                            command_poll_due_at,
-                        ):
-                            command_outcome = _poll_matrix_commands_once(
-                                matrix_command_service,
-                                logger=logger,
-                                iteration=iteration,
-                                decision_memory_path=decision_memory_path,
-                            )
-                            command_poll_completed_at = monotonic()
-                            matrix_command_poll_state = runtime_matrix_commands.record_command_poll_result(
-                                settings.matrix,
-                                matrix_command_poll_state,
-                                command_poll_completed_at,
-                                failed=command_outcome.transport_failed,
-                            )
-                            health_state.record_command_result(command_outcome.health_error)
+                        matrix_command_poll_state = advance_matrix_command_poll(
+                            matrix_command_service,
+                            matrix_command_worker,
+                            settings=settings.matrix,
+                            state=matrix_command_poll_state,
+                            now_monotonic=monotonic(),
+                            logger=logger,
+                            iteration=iteration,
+                            health=health_state,
+                            decision_memory_path=decision_memory_path,
+                            completed_at=monotonic,
+                        )
                     overlay_written = runtime_loop_resources.record_primary_frame_artifacts(
                         settings,
                         frame_result.primary_capture,
@@ -222,9 +226,10 @@ def run_capture_loop(
                         now_monotonic=iteration_started_at,
                         transition_occurred=transition_occurred,
                     )
-                logger.info("capture-loop-frame-written", iteration=iteration, **result.diagnostics())
+                logger.debug("capture-loop-frame-written", iteration=iteration, **result.diagnostics())
                 write_current_health(status=health_state.status(), iteration=iteration)
                 iteration_finished_at = monotonic()
+                flush_runtime_log_summary(log_aggregator, logger, iteration_finished_at)
                 policy_update = runtime_loop_resources.advance_resource_policy(
                     settings,
                     runtime_state,
@@ -250,31 +255,26 @@ def run_capture_loop(
                     cadence_reason=policy_update.decision.reason,
                 )
                 wait_for_shutdown(sleep_seconds)
-                shutdown_exit = return_if_shutdown_requested(
-                    shutdown_state=shutdown_state,
-                    matrix_delivery=matrix_delivery,
-                    now_fn=now_fn,
-                    logger=logger,
-                    decision_memory_path=decision_memory_path,
-                    iteration=iteration,
-                )
-                if shutdown_exit is not None:
-                    return shutdown_exit
+                requested_exit = shutdown_exit(iteration)
+                if requested_exit is not None:
+                    return requested_exit
             except CaptureError as exc:
                 health_state.record_capture_failure(exc, iteration=iteration)
                 resource_policy_state = runtime_loop_resources.reset_stable_successes(resource_policy_state)
-                backoff_seconds = settings.stream.reconnect_seconds
-                logger.error("capture-loop-failure", iteration=iteration, backoff_seconds=backoff_seconds, **exc.diagnostics())
-                write_current_health(status="down", iteration=iteration)
-                wait_for_shutdown(backoff_seconds)
-                shutdown_exit = return_if_shutdown_requested(
-                    shutdown_state=shutdown_state,
-                    matrix_delivery=matrix_delivery,
-                    now_fn=now_fn,
+                capture_failure_count += 1
+                backoff_seconds = log_capture_reconnect_failure(
+                    exc,
+                    failure_count=capture_failure_count,
+                    stream=settings.stream,
+                    random_unit=random_unit,
+                    log_aggregator=log_aggregator,
                     logger=logger,
-                    decision_memory_path=decision_memory_path,
                     iteration=iteration,
                 )
-                if shutdown_exit is not None:
-                    return shutdown_exit
+                write_current_health(status="down", iteration=iteration)
+                flush_runtime_log_summary(log_aggregator, logger, monotonic())
+                wait_for_shutdown(backoff_seconds)
+                requested_exit = shutdown_exit(iteration)
+                if requested_exit is not None:
+                    return requested_exit
         return 0

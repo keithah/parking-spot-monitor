@@ -360,6 +360,8 @@ def test_runtime_modules_stay_decomposed() -> None:
     module_caps = {
         "parking_spot_monitor/capture_loop.py": 280,
         "parking_spot_monitor/runtime_commands.py": 120,
+        "parking_spot_monitor/runtime_command_worker.py": 190,
+        "parking_spot_monitor/runtime_command_results.py": 150,
         "parking_spot_monitor/runtime_decision_memory.py": 240,
         "parking_spot_monitor/runtime_detection.py": 250,
         # Detector adaptation stays a small construction-time boundary.
@@ -373,6 +375,8 @@ def test_runtime_modules_stay_decomposed() -> None:
         "parking_spot_monitor/runtime_loop_resources.py": 260,
         "parking_spot_monitor/runtime_overlay.py": 90,
         "parking_spot_monitor/runtime_presence.py": 150,
+        "parking_spot_monitor/runtime_reconnect.py": 70,
+        "parking_spot_monitor/runtime_log_aggregation.py": 120,
         "parking_spot_monitor/runtime_state_update.py": 180,
         "parking_spot_monitor/runtime_stream_escalation.py": 170,
         "parking_spot_monitor/runtime_vehicle_events.py": 500,

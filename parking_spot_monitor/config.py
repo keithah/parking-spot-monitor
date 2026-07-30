@@ -109,10 +109,20 @@ class ResolvedStreamProfile:
 class StreamConfig(CaptureGeometryConfig):
     rtsp_url: ResolvedSecret
     reconnect_seconds: int = Field(default=5, gt=0)
+    reconnect_max_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
+    reconnect_jitter_ratio: float = Field(default=0.2, ge=0, le=1, allow_inf_nan=False)
     profiles: dict[str, StreamProfileConfig] = Field(default_factory=dict)
     escalation_profile: str | None = None
     escalation_min_confidence: float = Field(default=0.75, ge=0, le=1)
     escalation_verification_seconds: float = Field(default=600, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def reconnect_maximum_must_cover_initial_delay(self) -> Self:
+        if self.reconnect_max_seconds < self.reconnect_seconds:
+            raise ValueError(
+                "stream.reconnect_max_seconds must be greater than or equal to stream.reconnect_seconds"
+            )
+        return self
 
     @model_validator(mode="after")
     def profile_capture_filenames_must_be_unique(self) -> Self:
@@ -219,6 +229,8 @@ class MatrixConfig(StrictModel):
     command_failure_max_cooldown_seconds: float = Field(
         default=900, gt=0, allow_inf_nan=False
     )
+    command_request_timeout_seconds: float = Field(default=2, gt=0, allow_inf_nan=False)
+    command_retry_attempts: int = Field(default=1, gt=0)
     timeout_seconds: float = Field(default=10, gt=0, allow_inf_nan=False)
     retry_attempts: int = Field(default=3, gt=0)
     retry_backoff_seconds: float = Field(default=1, ge=0, allow_inf_nan=False)
@@ -311,6 +323,7 @@ class RuntimeConfig(StrictModel):
     stable_frame_interval_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
     stable_settle_frames: int = Field(default=3, gt=0)
     debug_overlay_interval_seconds: float = Field(default=60, ge=0, allow_inf_nan=False)
+    log_summary_interval_seconds: float = Field(default=900, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="before")
     @classmethod
@@ -365,6 +378,8 @@ class RuntimeSettings(StrictModel):
                 "frame_width": self.stream.frame_width,
                 "frame_height": self.stream.frame_height,
                 "reconnect_seconds": self.stream.reconnect_seconds,
+                "reconnect_max_seconds": self.stream.reconnect_max_seconds,
+                "reconnect_jitter_ratio": self.stream.reconnect_jitter_ratio,
                 "escalation_profile": self.stream.escalation_profile,
                 "escalation_min_confidence": self.stream.escalation_min_confidence,
                 "escalation_verification_seconds": self.stream.escalation_verification_seconds,
@@ -412,6 +427,8 @@ class RuntimeSettings(StrictModel):
                 "command_poll_interval_seconds": self.matrix.command_poll_interval_seconds,
                 "command_failure_cooldown_seconds": self.matrix.command_failure_cooldown_seconds,
                 "command_failure_max_cooldown_seconds": self.matrix.command_failure_max_cooldown_seconds,
+                "command_request_timeout_seconds": self.matrix.command_request_timeout_seconds,
+                "command_retry_attempts": self.matrix.command_retry_attempts,
                 "timeout_seconds": self.matrix.timeout_seconds,
                 "retry_attempts": self.matrix.retry_attempts,
                 "retry_backoff_seconds": self.matrix.retry_backoff_seconds,
@@ -434,6 +451,7 @@ class RuntimeSettings(StrictModel):
                 "stable_frame_interval_seconds": self.runtime.stable_frame_interval_seconds,
                 "stable_settle_frames": self.runtime.stable_settle_frames,
                 "debug_overlay_interval_seconds": self.runtime.debug_overlay_interval_seconds,
+                "log_summary_interval_seconds": self.runtime.log_summary_interval_seconds,
             },
         }
 

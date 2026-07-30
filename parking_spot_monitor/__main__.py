@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -93,6 +94,7 @@ def _main(
     matrix_delivery_factory: Callable[[RuntimeSettings, Path, StructuredLogger], Any] | None = None,
     matrix_command_service_factory: Callable[[RuntimeSettings, Path, StructuredLogger, VehicleHistoryArchive], Any | None] | None = None,
     now: Callable[[], datetime] | None = None,
+    random_unit: Callable[[], float] = random.random,
 ) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -225,6 +227,7 @@ def _main(
             shutdown_state=shutdown_state,
             max_iterations=max_iterations,
             now=now,
+            random_unit=random_unit,
             startup_retention_failure_count=retention_result.failed_count,
         )
     finally:
@@ -341,8 +344,8 @@ def _default_matrix_command_service_factory(
     client = MatrixClient(
         homeserver=settings.matrix.homeserver,
         access_token=settings.matrix.access_token.value,
-        timeout_seconds=settings.matrix.timeout_seconds,
-        retry_attempts=settings.matrix.retry_attempts,
+        timeout_seconds=settings.matrix.command_request_timeout_seconds,
+        retry_attempts=settings.matrix.command_retry_attempts,
         retry_backoff_seconds=settings.matrix.retry_backoff_seconds,
         retry_jitter_ratio=settings.matrix.retry_jitter_ratio,
         logger=logger,

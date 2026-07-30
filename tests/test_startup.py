@@ -26,6 +26,7 @@ from parking_spot_monitor.operator_decision_memory import (
     load_decision_memory,
 )
 from parking_spot_monitor.matrix import MatrixDelivery, MatrixSnapshot
+from parking_spot_monitor.matrix_models import MatrixSyncResult
 from parking_spot_monitor.__main__ import _default_matrix_command_service_factory, _main, main
 from parking_spot_monitor.runtime_presence import presence_by_spot
 from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as _matrix_outbox_health_payload
@@ -1070,6 +1071,32 @@ def test_process_detection_skips_candidate_summaries_when_info_is_disabled(
     )
 
     assert set(result.by_spot) == {"left_spot", "right_spot"}
+
+
+def test_runtime_detection_does_not_build_candidate_arrays_for_info_logging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    frame = tmp_path / "latest.jpg"
+    Image.new("RGB", (1458, 806), (20, 30, 40)).save(frame, format="JPEG")
+
+    def forbidden_candidate_summaries(_result: DetectionFilterResult) -> list[dict[str, Any]]:
+        pytest.fail("routine runtime INFO must not build candidate arrays")
+
+    monkeypatch.setattr(runtime_detection, "_candidate_summaries", forbidden_candidate_summaries)
+    runtime_detection._process_detection_for_capture(
+        load_settings("config.yaml.example", environ=fake_environ()),
+        adapt_detector(NoopDetector()),
+        frame,
+        logger=StructuredLogger(),
+        mode="runtime-loop",
+        frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
+    )
+
+    assert '"event":"detection-frame-processed"' not in combined_output(capsys)
 
 
 def test_process_detection_keeps_candidate_summary_schema_when_info_is_enabled(
@@ -3040,7 +3067,7 @@ def test_runtime_loop_startup_retention_failure_logs_and_continues(
     assert '"event":"snapshot-retention-failed"' in output
     assert '"trigger":"startup"' in output
     assert '"error_type":"PermissionError"' in output
-    assert '"event":"capture-loop-frame-written"' in output
+    assert '"event":"capture-loop-frame-written"' not in output
     health = health_payload(tmp_path / "health.json")
     assert health["status"] == "degraded"
     assert health["retention_failure_count"] == 1
@@ -3498,7 +3525,7 @@ def test_runtime_loop_overlay_failure_logs_and_continues(
     assert exit_code == 0
     assert overlay_calls == [latest_path]
     assert sleeps == [30]
-    assert '"event":"capture-loop-frame-written"' in output
+    assert '"event":"capture-loop-frame-written"' not in output
     assert '"event":"debug-overlay-failed"' in output
     assert "Traceback" not in output
     assert_no_secret_leak(output)
@@ -3536,12 +3563,13 @@ def test_runtime_loop_success_logs_detection_frame_processed_with_metadata(
             return [VehicleDetection(class_name="truck", confidence=0.88, bbox=(350, 200, 550, 330))]
 
     exit_code = _main(
-        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+        ["--config", str(config_path), "--data-dir", str(tmp_path), "--log-level", "DEBUG"],
         environ=fake_environ(),
         capture=fake_capture,
         detector_factory=lambda _settings: FakeDetector(),
         sleep=sleeps.append,
         max_iterations=1,
+        random_unit=lambda: 0,
     )
 
     output = combined_output(capsys)
@@ -3610,6 +3638,7 @@ def test_default_runtime_loop_logs_failure_and_uses_reconnect_backoff(
         capture=fake_capture,
         sleep=sleeps.append,
         max_iterations=1,
+        random_unit=lambda: 0,
     )
 
     output = combined_output(capsys)
@@ -4768,7 +4797,7 @@ def test_runtime_loop_matrix_failure_updates_health_and_loop_continues(
     assert health["last_matrix_error"]["error_type"] == "RuntimeError"
     assert detections == []
     assert SECRET_MARKER not in json.dumps(health)
-    assert '"event":"capture-loop-frame-written"' in output
+    assert '"event":"capture-loop-frame-written"' not in output
     assert_no_secret_leak(output)
 
 
@@ -4783,7 +4812,7 @@ def test_runtime_loop_state_save_failure_updates_health_and_loop_continues(
     monkeypatch.setattr(runtime_state_update, "save_runtime_state", fail_state_save)
 
     exit_code = _main(
-        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path), "--log-level", "DEBUG"],
         environ=fake_environ(),
         capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir), timestamp="2026-05-18T19:00:00Z"),
         overlay=noop_overlay,
@@ -4949,7 +4978,7 @@ def test_runtime_loop_confirms_occupied_releases_empty_and_logs_open_event(
             return next_detection(detections, allow_exhausted=True)
 
     exit_code = _main(
-        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path), "--log-level", "DEBUG"],
         environ=fake_environ(),
         capture=fake_capture,
         overlay=noop_overlay,
@@ -5328,8 +5357,7 @@ def test_runtime_loop_low_confidence_in_spot_vehicle_suppresses_open_alert(
     assert state["status"] == "occupied"
     assert state["miss_streak"] == 0
     assert '"event":"occupancy-open-event"' not in output
-    assert '"event":"spot-detection-miss-diagnostic"' in output
-    assert '"suppressing_presence":true' in output
+    assert '"event":"spot-detection-miss-diagnostic"' not in output
 
 
 def test_presence_by_spot_treats_small_in_spot_vehicle_as_release_suppression() -> None:
@@ -5667,6 +5695,52 @@ def test_startup_summary_includes_sanitized_detection_lab_dir(capsys: pytest.Cap
     assert_no_secret_leak(output)
 
 
+def test_default_matrix_command_service_uses_short_independent_client_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from parking_spot_monitor import __main__ as cli
+    from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
+
+    captured: list[dict[str, Any]] = []
+
+    class Client:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.append(kwargs)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli, "MatrixClient", Client)
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "matrix": settings.matrix.model_copy(
+                update={"command_authorized_senders": ["@operator:example.org"]}
+            )
+        }
+    )
+
+    delivery = cli._default_matrix_delivery_factory(
+        settings, tmp_path, StructuredLogger()
+    )
+
+    service = _default_matrix_command_service_factory(
+        settings,
+        tmp_path,
+        StructuredLogger(),
+        VehicleHistoryArchive(tmp_path / "vehicle-history"),
+        incident_detector=object(),
+    )
+
+    assert service is not None
+    assert captured[0]["timeout_seconds"] == 10
+    assert captured[0]["retry_attempts"] == 3
+    assert captured[1]["timeout_seconds"] == 2
+    assert captured[1]["retry_attempts"] == 1
+    service.close()
+    delivery.close()
+
+
 
 
 def test_validate_config_does_not_construct_matrix_outbox_or_touch_network(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -5853,6 +5927,78 @@ def test_runtime_loop_closes_matrix_services_on_exit(tmp_path: Path) -> None:
 
     assert exit_code == 0
     assert closed == ["commands", "delivery"]
+
+
+def test_runtime_loop_preserves_injected_falsey_history_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import parking_spot_monitor.capture_loop as capture_loop_module
+    from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
+
+    class FalseyArchive(VehicleHistoryArchive):
+        def __bool__(self) -> bool:
+            return False
+
+    supplied = FalseyArchive(tmp_path / "supplied-history")
+
+    def forbidden_fallback(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("falsey injected archive was replaced")
+
+    monkeypatch.setattr(capture_loop_module, "VehicleHistoryArchive", forbidden_fallback)
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={"runtime": settings.runtime.model_copy(update={"health_file": tmp_path / "health.json"})}
+    )
+
+    assert run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=lambda *_args, **_kwargs: captured_frame(tmp_path),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        history_archive=supplied,
+        sleep=lambda _seconds: None,
+        max_iterations=0,
+    ) == 0
+
+
+def test_runtime_teardown_cancels_command_worker_before_service_close(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    release = threading.Event()
+
+    class Commands:
+        def fetch_once(self) -> MatrixSyncResult:
+            release.wait(1)
+            return MatrixSyncResult(next_batch="s1", events=())
+
+        def apply_sync_result(self, _result: MatrixSyncResult) -> FakeCommandPollResult:
+            return FakeCommandPollResult()
+
+        def cancel_pending(self) -> None:
+            events.append("worker-cancel")
+            release.set()
+
+        def close(self) -> None:
+            events.append("service-close")
+
+    commands = Commands()
+    assert _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery_factory=lambda *_args: FakeMatrixDelivery(),
+        matrix_command_service_factory=lambda *_args: commands,
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+    ) == 0
+
+    assert events == ["worker-cancel", "service-close"]
 
 
 def test_default_matrix_delivery_factory_starts_one_outbox_worker(

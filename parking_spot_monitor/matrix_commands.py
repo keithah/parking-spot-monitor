@@ -118,10 +118,29 @@ class MatrixCommandService:
         if callable(close):
             close()
 
+    def cancel_pending(self) -> None:
+        cancel = getattr(self.client, "cancel_pending", None)
+        if callable(cancel):
+            cancel()
+
     def poll_once(self) -> MatrixCommandPollResult:
+        return self.apply_sync_result(self.fetch_once())
+
+    def fetch_once(self) -> MatrixSyncResult:
+        """Read the cursor and fetch once without applying operator mutations."""
         cursor = self.archive.read_matrix_cursor()
         since = cursor.get("next_batch") if isinstance(cursor, Mapping) else None
-        result = self.client.sync(room_id=self.room_id, since=since, timeout_ms=self.sync_timeout_ms, limit=self.sync_limit)
+        return self.client.sync(
+            room_id=self.room_id,
+            since=since,
+            timeout_ms=self.sync_timeout_ms,
+            limit=self.sync_limit,
+        )
+
+    def apply_sync_result(self, result: MatrixSyncResult) -> MatrixCommandPollResult:
+        """Apply a fetched result on the caller's capture thread."""
+        cursor = self.archive.read_matrix_cursor()
+        since = cursor.get("next_batch") if isinstance(cursor, Mapping) else None
         if not since:
             self.archive.write_matrix_cursor({"next_batch": result.next_batch})
             self._log("info", "matrix-command-sync", phase="bootstrap", next_batch_present=True, processed_count=0, ignored_count=len(result.events))

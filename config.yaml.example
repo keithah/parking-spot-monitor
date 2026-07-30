@@ -3,6 +3,8 @@ stream:
   frame_width: 1458
   frame_height: 806
   reconnect_seconds: 5
+  reconnect_max_seconds: 60
+  reconnect_jitter_ratio: 0.2
   escalation_profile: high_resolution
   escalation_min_confidence: 0.75
   escalation_verification_seconds: 600
@@ -66,6 +68,8 @@ matrix:
   command_poll_interval_seconds: 60
   command_failure_cooldown_seconds: 60
   command_failure_max_cooldown_seconds: 900
+  command_request_timeout_seconds: 2
+  command_retry_attempts: 1
   timeout_seconds: 10
   retry_attempts: 3
   retry_backoff_seconds: 1
@@ -97,3 +101,4 @@ runtime:
   stable_frame_interval_seconds: 60
   stable_settle_frames: 3
   debug_overlay_interval_seconds: 60
+  log_summary_interval_seconds: 900

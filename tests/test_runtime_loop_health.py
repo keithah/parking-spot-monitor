@@ -7,10 +7,14 @@ import pytest
 from PIL import Image
 
 from parking_spot_monitor.__main__ import _main
+from parking_spot_monitor.capture_loop import run_capture_loop
 from parking_spot_monitor.capture import DecodeMode, FrameCaptureResult, FrameGeometry
 from parking_spot_monitor.detection import DetectionError, VehicleDetection
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
 from parking_spot_monitor.state import RuntimeState, save_runtime_state
+from parking_spot_monitor.runtime_reconnect import capture_reconnect_delay
+from parking_spot_monitor.config import load_settings
+from parking_spot_monitor.logging import StructuredLogger
 
 SECRET_MARKER = "startup-secret-should-not-leak"
 FAKE_RTSP_VALUE = f"camera-value-{SECRET_MARKER}"
@@ -71,6 +75,124 @@ def captured_frame(tmp_path: Path, timestamp: str = "2026-05-18T20:30:00Z") -> F
     )
 
 
+def test_capture_reconnect_delay_exponentially_caps_with_injected_jitter() -> None:
+    delays = [
+        capture_reconnect_delay(
+            failure_count,
+            initial_seconds=5,
+            max_seconds=60,
+            jitter_ratio=0.2,
+            random_unit=lambda: 0.5,
+        )
+        for failure_count in range(1, 7)
+    ]
+
+    assert delays == [5.5, 11.0, 22.0, 44.0, 60.0, 60.0]
+
+
+def test_capture_reconnect_delay_saturates_before_large_exponentiation() -> None:
+    assert capture_reconnect_delay(
+        100_000,
+        initial_seconds=5,
+        max_seconds=60,
+        jitter_ratio=0.2,
+        random_unit=lambda: 0.5,
+    ) == 60
+
+
+def test_runtime_loop_emits_bounded_summary_instead_of_per_frame_info(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "adaptive_polling_enabled": False,
+                    "log_summary_interval_seconds": 1,
+                }
+            )
+        }
+    )
+
+    class Detector:
+        def detect(
+            self,
+            _frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    monotonic_values = iter((0.0, 1.0))
+    assert run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=lambda _settings, data_dir, **_kwargs: captured_frame(Path(data_dir)),
+        overlay=lambda *_args, **_kwargs: object(),
+        detector_factory=lambda _settings: Detector(),
+        matrix_delivery=None,
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+        monotonic=lambda: next(monotonic_values),
+    ) == 0
+
+    output = combined_output(capsys)
+    assert '"event":"capture-loop-frame-written"' not in output
+    assert '"event":"detection-frame-processed"' not in output
+    assert '"event":"runtime-loop-summary"' in output
+    assert '"processed_frames":1' in output
+    assert "candidate_summaries" not in output
+
+
+def test_successful_capture_resets_exponential_reconnect_streak(tmp_path: Path) -> None:
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={"health_file": tmp_path / "health.json", "adaptive_polling_enabled": False}
+            )
+        }
+    )
+    outcomes: list[str] = ["fail", "success", "fail"]
+    waits: list[float] = []
+
+    def capture(_settings: object, data_dir: str | Path, **_kwargs: object) -> FrameCaptureResult:
+        outcome = outcomes.pop(0)
+        if outcome == "fail":
+            from parking_spot_monitor.capture import CaptureError
+
+            raise CaptureError(
+                reason="timeout",
+                mode=DecodeMode.SOFTWARE,
+                output_path=Path(data_dir) / "latest.jpg",
+                message="timeout",
+            )
+        return captured_frame(Path(data_dir))
+
+    class Detector:
+        def detect(self, *_args: object, **_kwargs: object) -> list[VehicleDetection]:
+            return []
+
+    assert run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=capture,
+        overlay=lambda *_args, **_kwargs: object(),
+        detector_factory=lambda _settings: Detector(),
+        matrix_delivery=None,
+        sleep=waits.append,
+        max_iterations=3,
+        monotonic=lambda: 0,
+        random_unit=lambda: 0,
+    ) == 0
+
+    assert waits == [5, 30, 5]
+
+
 def test_runtime_loop_detector_failure_logs_and_continues(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -121,7 +243,7 @@ def test_runtime_loop_detector_failure_logs_and_continues(
     assert sleeps == [30]
     assert '"event":"detection-frame-failed"' in output
     assert '"iteration":1' in output
-    assert '"event":"capture-loop-frame-written"' in output
+    assert '"event":"capture-loop-frame-written"' not in output
     assert '"event":"detection-frame-processed"' not in output
     assert health["last_frame_at"] is None
     assert health["selected_decode_mode"] is None

@@ -95,11 +95,14 @@ def _process_detection_for_capture(
         "configured_frame_size": _frame_size_dict(configured_frame_size),
         "frame_size_mismatch": frame_size_mismatch,
     }
-    if logger.is_enabled_for("INFO"):
+    routine_runtime_frame = mode == "runtime-loop"
+    detail_level = "DEBUG" if routine_runtime_frame else "INFO"
+    if logger.is_enabled_for(detail_level):
         fields["candidate_summaries"] = _candidate_summaries(result)
     if iteration is not None:
         fields["iteration"] = iteration
-    logger.info("detection-frame-processed", **fields)
+    log_frame = logger.debug if routine_runtime_frame else logger.info
+    log_frame("detection-frame-processed", **fields)
     return result
 
 

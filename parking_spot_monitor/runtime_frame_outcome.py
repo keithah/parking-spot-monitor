@@ -6,28 +6,23 @@ from parking_spot_monitor.capture import CaptureError, FrameCaptureResult
 from parking_spot_monitor.detection import DetectionError, DetectionFilterResult
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.runtime_health import RuntimeLoopHealthState
+from parking_spot_monitor.runtime_log_aggregation import RuntimeLogAggregator
 
 
 @dataclass(frozen=True)
 class RuntimeFrameCaptureFailed:
     error: CaptureError
-
-
 @dataclass(frozen=True)
 class RuntimeFrameDetectionFailed:
     primary_capture: FrameCaptureResult
     capture: FrameCaptureResult
     detector: object | None
     error: DetectionError
-
-
 @dataclass(frozen=True)
 class RuntimeFrameCaptureEscalationFailed:
     capture: FrameCaptureResult
     detector: object
     error: CaptureError
-
-
 @dataclass(frozen=True)
 class RuntimeFrameDetected:
     primary_capture: FrameCaptureResult
@@ -54,10 +49,9 @@ def prepare_runtime_frame_loop_result(
     health_state: RuntimeLoopHealthState,
     logger: StructuredLogger,
     iteration: int,
+    log_aggregator: RuntimeLogAggregator | None = None,
 ) -> RuntimeFrameLoopResult:
-    # Capture errors are carried back as outcome objects rather than propagating
-    # directly so that health side-effects (recording the last successful capture
-    # on the escalation path) run here before the loop's CaptureError handler sees them.
+    # Preserve capture-success health side effects before escalation errors propagate.
     if isinstance(frame_attempt, RuntimeFrameCaptureFailed):
         raise frame_attempt.error
 
@@ -68,7 +62,10 @@ def prepare_runtime_frame_loop_result(
     if isinstance(frame_attempt, RuntimeFrameDetectionFailed):
         _record_capture_success(health_state, frame_attempt.capture)
         health_state.record_detection_failure(frame_attempt.error, iteration=iteration)
-        logger.error(
+        error_type = frame_attempt.error.diagnostics().get("error_type", "DetectionError")
+        first_or_transition = log_aggregator is None or log_aggregator.record_failure("detection", error_type)
+        log_failure = logger.error if first_or_transition else logger.debug
+        log_failure(
             "detection-frame-failed",
             mode="runtime-loop",
             iteration=iteration,

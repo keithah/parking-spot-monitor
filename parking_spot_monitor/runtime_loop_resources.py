@@ -8,6 +8,8 @@ from parking_spot_monitor.capture import FrameCaptureResult
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.detection import DetectionFilterResult
 from parking_spot_monitor.logging import StructuredLogger
+from parking_spot_monitor.matrix_alerts import MONITOR_STARTED_EVENT_TYPE, monitor_lifecycle_event
+from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery, dispatch_matrix_event
 from parking_spot_monitor.paths import RuntimePaths
 from parking_spot_monitor.runtime_health import (
     RuntimeLoopHealthState,
@@ -26,6 +28,28 @@ from parking_spot_monitor.runtime_resource_policy import (
 )
 from parking_spot_monitor.state import RuntimeState
 from parking_spot_monitor.timeline_buffer import record_timeline_frame
+
+
+def dispatch_startup_lifecycle(
+    delivery: RuntimeMatrixDelivery | None,
+    *,
+    now: Callable[[], Any],
+    logger: StructuredLogger,
+    decision_memory_path: Path,
+) -> None:
+    error = dispatch_matrix_event(
+        delivery,
+        MONITOR_STARTED_EVENT_TYPE,
+        monitor_lifecycle_event(MONITOR_STARTED_EVENT_TYPE, now()),
+        logger=logger,
+        decision_memory_path=decision_memory_path,
+    )
+    if error is not None:
+        logger.warning(
+            "lifecycle-notice-delivery-degraded",
+            event_type=MONITOR_STARTED_EVENT_TYPE,
+            error_type=error.get("error_type"),
+        )
 
 @dataclass(frozen=True)
 class ResourcePolicyUpdate:

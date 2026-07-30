@@ -11,6 +11,7 @@ from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.occupancy import OccupancyUpdate, update_occupancy
 from parking_spot_monitor.runtime_presence import _log_missed_occupied_spot_diagnostics, presence_by_spot
 from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleSnapshotProvider
+from parking_spot_monitor.runtime_log_aggregation import RuntimeLogAggregator
 from parking_spot_monitor.runtime_vehicle_events import _owner_vehicle_quiet_window_alerts
 from parking_spot_monitor.scheduler import QuietWindowStatus, evaluate_quiet_windows, quiet_window_notice_events
 from parking_spot_monitor.state import RuntimeState
@@ -38,6 +39,7 @@ def build_runtime_frame_plan(
     history_archive: VehicleHistoryArchive | None,
     logger: StructuredLogger,
     owner_vehicle_snapshot_provider: OwnerVehicleSnapshotProvider,
+    log_aggregator: RuntimeLogAggregator | None = None,
 ) -> RuntimeFramePlan:
     quiet_status = evaluate_quiet_windows(settings.quiet_windows, observed_at)
     pending_notice_payloads = _pending_quiet_window_notice_payloads(
@@ -57,6 +59,7 @@ def build_runtime_frame_plan(
         detection_result=detection_result,
         open_suppression_classes=settings.detection.open_suppression_classes,
         min_polygon_overlap_ratio=settings.detection.min_polygon_overlap_ratio,
+        log_aggregator=log_aggregator,
     )
     spot_presence = presence_by_spot(
         detection_result,

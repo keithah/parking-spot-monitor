@@ -144,7 +144,7 @@ def test_runtime_loop_escalates_weak_primary_detection_and_uses_primary_artifact
         return object()
 
     exit_code = _main(
-        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+            ["--config", str(config_path), "--data-dir", str(tmp_path), "--log-level", "DEBUG"],
         environ=fake_environ(RTSP_URL_4K=f"high-camera-{SECRET_MARKER}"),
         capture=fake_capture,
         overlay=record_overlay,

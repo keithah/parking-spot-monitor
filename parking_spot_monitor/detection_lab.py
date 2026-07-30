@@ -162,16 +162,31 @@ class DetectionLabManager:
             raise DetectionLabError("status_unreadable", f"Detection lab status is unreadable: {type(exc).__name__}") from exc
         return _sanitize_status(payload)
 
-    def retain_recent_jobs(self) -> list[Path]:
+    def retain_recent_jobs(self, *, protected_job_id: str | None = None) -> list[Path]:
         with self._lock:
             self.jobs_root.mkdir(parents=True, exist_ok=True)
+            protected_ids = {
+                job_id
+                for job_id in (self._active_job_id, protected_job_id)
+                if job_id is not None
+            }
             job_dirs = sorted(
-                (path for path in self.jobs_root.iterdir() if path.is_dir() and path.name != self._active_job_id),
-                key=lambda path: path.stat().st_mtime,
+                (
+                    path
+                    for path in self.jobs_root.iterdir()
+                    if path.is_dir() and path.name not in protected_ids
+                ),
+                key=_job_recency_key,
                 reverse=True,
             )
+            protected_count = int(
+                protected_job_id is not None
+                and protected_job_id != self._active_job_id
+                and (self.jobs_root / protected_job_id).is_dir()
+            )
+            unprotected_budget = max(0, self.max_jobs - protected_count)
             removed: list[Path] = []
-            for job_dir in job_dirs[self.max_jobs :]:
+            for job_dir in job_dirs[unprotected_budget:]:
                 if not _JOB_ID_RE.match(job_dir.name):
                     continue
                 _remove_tree(job_dir)
@@ -202,7 +217,7 @@ class DetectionLabManager:
                 self._log("warning", "detection-lab-job-failed", job_id=job.job_id, kind=job.kind, error_type=type(exc).__name__)
         finally:
             self._release(job)
-            self.retain_recent_jobs()
+            self.retain_recent_jobs(protected_job_id=job.job_id)
 
     def _admit(self, job: DetectionLabJob) -> bool:
         with self._lock:
@@ -251,7 +266,7 @@ class DetectionLabManager:
             candidates = [path for path in self.jobs_root.iterdir() if path.is_dir() and _JOB_ID_RE.match(path.name)]
             if not candidates:
                 raise DetectionLabError("job_not_found", "No detection lab jobs exist")
-            return max(candidates, key=lambda path: path.stat().st_mtime)
+            return max(candidates, key=_job_recency_key)
         if not _JOB_ID_RE.match(job_id):
             raise DetectionLabError("invalid_job_id", "Detection lab job id is invalid")
         return _contained_path(self.jobs_root, job_id)
@@ -318,7 +333,7 @@ class DetectionLabManager:
         if status in {"succeeded", "failed", "blocked"}:
             self._record_outcome(bounded_payload)
         if status == "blocked":
-            self.retain_recent_jobs()
+            self.retain_recent_jobs(protected_job_id=job.job_id)
 
     def _record_outcome(self, status_payload: Mapping[str, Any]) -> None:
         if self.outcome_recorder is None:
@@ -481,6 +496,10 @@ def _utc_now() -> datetime:
 
 def _utc_now_text() -> str:
     return _utc_now().isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _job_recency_key(path: Path) -> tuple[int, str]:
+    return (path.stat().st_mtime_ns, path.name)
 
 
 def _remove_tree(path: Path) -> None:

@@ -7,6 +7,7 @@ from parking_spot_monitor.detection import DetectionFilterResult, RejectionReaso
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.occupancy import OccupancyStatus
 from parking_spot_monitor.state import RuntimeState
+from parking_spot_monitor.runtime_log_aggregation import RuntimeLogAggregator
 
 
 def presence_by_spot(
@@ -66,6 +67,7 @@ def _log_missed_occupied_spot_diagnostics(
     detection_result: DetectionFilterResult,
     open_suppression_classes: Sequence[str],
     min_polygon_overlap_ratio: float,
+    log_aggregator: RuntimeLogAggregator | None = None,
 ) -> None:
     suppression_classes = set(open_suppression_classes)
     for spot_id, spot_result in detection_result.by_spot.items():
@@ -74,9 +76,15 @@ def _log_missed_occupied_spot_diagnostics(
             continue
         best = _best_rejected_detection(spot_result.rejected)
         if best is None:
-            logger.info("spot-detection-miss-diagnostic", spot_id=spot_id, prior_status="occupied", best_rejected=None, suppressing_presence=False)
+            if log_aggregator is not None:
+                log_aggregator.record_diagnostic("no-rejection")
+            log_diagnostic = logger.debug if log_aggregator is not None else logger.info
+            log_diagnostic("spot-detection-miss-diagnostic", spot_id=spot_id, prior_status="occupied", best_rejected=None, suppressing_presence=False)
             continue
-        logger.info(
+        if log_aggregator is not None:
+            log_aggregator.record_diagnostic(f"{best.reason}:{best.detection.class_name}")
+        log_diagnostic = logger.debug if log_aggregator is not None else logger.info
+        log_diagnostic(
             "spot-detection-miss-diagnostic",
             spot_id=spot_id,
             prior_status="occupied",

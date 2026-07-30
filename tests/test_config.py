@@ -101,6 +101,38 @@ def test_example_config_loads_with_fake_env_values() -> None:
     assert settings.runtime.stable_settle_frames == 3
     assert settings.runtime.debug_overlay_interval_seconds == 60
     assert settings.stream.escalation_verification_seconds == 600
+    assert settings.stream.reconnect_max_seconds == 60
+    assert settings.stream.reconnect_jitter_ratio == 0.2
+    assert settings.matrix.command_request_timeout_seconds == 2
+    assert settings.matrix.command_retry_attempts == 1
+    assert settings.runtime.log_summary_interval_seconds == 900
+
+    summary = settings.sanitized_summary()
+    assert summary["stream"]["reconnect_max_seconds"] == 60
+    assert summary["stream"]["reconnect_jitter_ratio"] == 0.2
+    assert summary["matrix"]["command_request_timeout_seconds"] == 2
+    assert summary["matrix"]["command_retry_attempts"] == 1
+    assert summary["runtime"]["log_summary_interval_seconds"] == 900
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "field"),
+    [
+        ("  reconnect_max_seconds: 60", "  reconnect_max_seconds: 4", "reconnect_max_seconds"),
+        ("  reconnect_jitter_ratio: 0.2", "  reconnect_jitter_ratio: 1.1", "reconnect_jitter_ratio"),
+        ("  command_request_timeout_seconds: 2", "  command_request_timeout_seconds: 0", "command_request_timeout_seconds"),
+        ("  command_retry_attempts: 1", "  command_retry_attempts: 0", "command_retry_attempts"),
+        ("  log_summary_interval_seconds: 900", "  log_summary_interval_seconds: 0", "log_summary_interval_seconds"),
+    ],
+)
+def test_bounded_runtime_policy_rejects_invalid_values(
+    tmp_path: Path, old: str, new: str, field: str
+) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(old, new)
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError, match=field):
+        load_settings(path, environ=fake_environ())
 
 
 @pytest.mark.parametrize(
