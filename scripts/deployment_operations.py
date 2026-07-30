@@ -138,6 +138,45 @@ def _checksum_manifest(root: Path, names: Sequence[str]) -> str:
     return "".join(f"{_sha256(root / name)}  {name}\n" for name in names)
 
 
+def _create_data_archive(
+    runner: Runner,
+    data_dir: Path,
+    destination: Path,
+    image_id: str,
+) -> None:
+    if not data_dir.is_dir() or data_dir.is_symlink():
+        raise DeploymentError("data source must be a non-symlink directory")
+    descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    os.close(descriptor)
+    runner.run(
+        (
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--mount",
+            f"type=bind,src={data_dir.resolve()},dst=/source,readonly",
+            "--mount",
+            f"type=bind,src={destination.parent.resolve()},dst=/backup",
+            image_id,
+            "tar",
+            "--format=pax",
+            "-C",
+            "/source",
+            "-cpf",
+            f"/backup/{destination.name}",
+            ".",
+        )
+    )
+    _require_regular_file(destination, "data archive")
+    os.chmod(destination, 0o600)
+
+
 def _verify_manifest(root: Path, manifest_name: str, allowed: set[str]) -> None:
     manifest = root / manifest_name
     _require_regular_file(manifest, manifest_name)
@@ -361,10 +400,9 @@ def backup_operation(
             _copy_private(config_file, stage / "config.yaml")
             _copy_private(env_file, stage / ".env")
             _copy_private(model, stage / "yolov8n.pt")
-            runner.run(
-                ("tar", "--format=pax", "-C", str(data_dir), "-cpf", str(stage / "data.tar"), ".")
+            _create_data_archive(
+                runner, data_dir, stage / "data.tar", running_image_id
             )
-            os.chmod(stage / "data.tar", 0o600)
             created_at = datetime.now(timezone.utc).isoformat()
             source_revision = runner.run(("git", "rev-parse", "HEAD"), capture=True)
             _write_private(

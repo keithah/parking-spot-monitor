@@ -48,9 +48,18 @@ class FakeRunner:
             return "b" * 40
         if call[:2] == ("git", "status"):
             return self.status_values.pop(0) if self.status_values else ""
-        if call and call[0] == "tar":
+        if call[:2] == ("docker", "run") and "tar" in call:
             if self.fail_tar:
                 raise deployment_operations.DeploymentError("injected tar failure")
+            mounts = [call[index + 1] for index, value in enumerate(call) if value == "--mount"]
+            source = Path(mounts[0].split("src=", 1)[1].split(",", 1)[0])
+            output_root = Path(mounts[1].split("src=", 1)[1].split(",", 1)[0])
+            output = output_root / call[call.index("-cpf") + 1].removeprefix("/backup/")
+            with tarfile.open(output, "w") as archive:
+                for path in source.rglob("*"):
+                    archive.add(path, arcname=path.relative_to(source))
+            return ""
+        if call and call[0] == "tar":
             if "-xpf" in call:
                 destination = Path(call[call.index("-C") + 1])
                 archive_path = Path(call[call.index("-xpf") + 1])
