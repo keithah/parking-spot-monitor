@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import time
 from collections import deque
@@ -11,6 +10,10 @@ from pathlib import Path
 from typing import Literal
 
 import parking_spot_monitor.operator_decision_memory as _memory
+from parking_spot_monitor.decision_memory_reconciliation import (
+    decision_memory_source_snapshot,
+    deduplicated_decision_memory_tail,
+)
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import (
     MAX_MEMORY_FILE_BYTES,
@@ -19,26 +22,6 @@ from parking_spot_monitor.operator_decision_memory import (
 )
 
 DecisionMemoryDurability = Literal["routine", "immediate"]
-
-
-def runtime_decision_memory_store(
-    runtime_settings: object,
-    path: str | Path,
-    *,
-    monotonic: Callable[[], float],
-    logger: StructuredLogger | None,
-) -> DecisionMemoryStore:
-    return DecisionMemoryStore(
-        path,
-        checkpoint_interval_seconds=float(
-            getattr(runtime_settings, "decision_memory_checkpoint_interval_seconds")
-        ),
-        checkpoint_max_pending_records=int(
-            getattr(runtime_settings, "decision_memory_checkpoint_max_pending_records")
-        ),
-        monotonic=monotonic,
-        logger=logger,
-    )
 
 
 class DecisionMemoryStore:
@@ -64,12 +47,14 @@ class DecisionMemoryStore:
         self.max_records = _positive_int(max_records, "max_records")
         self._monotonic = monotonic
         self._logger = logger
-        loaded = _memory.load_decision_memory(
-            self.path,
-            max_records=self.max_records,
-            max_file_bytes=MAX_MEMORY_FILE_BYTES,
-            logger=logger,
-        )
+        with _memory._MEMORY_WRITE_LOCK:
+            loaded = _memory.load_decision_memory(
+                self.path,
+                max_records=self.max_records,
+                max_file_bytes=MAX_MEMORY_FILE_BYTES,
+                logger=logger,
+            )
+            source = decision_memory_source_snapshot(self.path)
         self._records: deque[DecisionMemoryRecord] = deque(
             loaded.records,
             maxlen=self.max_records,
@@ -79,7 +64,8 @@ class DecisionMemoryStore:
         self._pending_count = 0
         now = self._monotonic()
         self._next_checkpoint_at = now + self.checkpoint_interval_seconds
-        self._signature = _file_signature(self.path)
+        self._signature = source.signature
+        self._reconcile_required = loaded.state not in {"available", "missing"}
 
     @property
     def records(self) -> tuple[DecisionMemoryRecord, ...]:
@@ -120,6 +106,19 @@ class DecisionMemoryStore:
                 return False
             return self._flush_locked()
 
+    def wait_for_checkpoint(
+        self,
+        wait_seconds: float,
+        *,
+        wait: Callable[[float], bool],
+    ) -> bool:
+        bounded = self._bounded_wait_seconds(wait_seconds)
+        if wait(bounded):
+            return True
+        self.checkpoint_if_due()
+        remaining = max(0.0, wait_seconds - bounded)
+        return wait(remaining) if remaining else False
+
     def flush(self) -> bool:
         with _memory._MEMORY_WRITE_LOCK:
             if not self._dirty:
@@ -130,21 +129,31 @@ class DecisionMemoryStore:
         return self.flush()
 
     def _flush_locked(self) -> bool:
+        candidate = tuple(self._records)
         try:
-            current_signature = _file_signature(self.path)
-            if current_signature != self._signature:
+            before = decision_memory_source_snapshot(self.path)
+            if not before.available:
+                return self._defer_reconciliation("source-stat-unavailable")
+            if self._reconcile_required or before.signature != self._signature:
                 external = _memory.load_decision_memory(
                     self.path,
                     max_records=self.max_records,
                     max_file_bytes=MAX_MEMORY_FILE_BYTES,
                     logger=self._logger,
                 )
-                merged = _deduplicated_tail(
-                    (*external.records, *self._dirty_records),
-                    max_records=self.max_records,
-                )
-                self._records = deque(merged, maxlen=self.max_records)
-            _memory._write_memory(self.path, tuple(self._records))
+                after = decision_memory_source_snapshot(self.path)
+                if external.state not in {"available", "missing"}:
+                    return self._defer_reconciliation(
+                        "source-load-unavailable", source_state=external.state
+                    )
+                if not after.available or after.signature != before.signature:
+                    return self._defer_reconciliation("source-changed-during-load")
+                if external.state == "available":
+                    candidate = deduplicated_decision_memory_tail(
+                        (*external.records, *self._dirty_records),
+                        max_records=self.max_records,
+                    )
+            _memory._write_memory(self.path, candidate)
         except Exception as exc:
             _memory._log(
                 self._logger,
@@ -154,7 +163,12 @@ class DecisionMemoryStore:
                 error_type=type(exc).__name__,
             )
             return False
-        self._signature = _file_signature(self.path)
+        written = decision_memory_source_snapshot(self.path)
+        if not written.available or written.signature is None:
+            return self._defer_reconciliation("written-source-stat-unavailable")
+        self._records = deque(candidate, maxlen=self.max_records)
+        self._signature = written.signature
+        self._reconcile_required = False
         self._dirty_records.clear()
         self._dirty = False
         self._pending_count = 0
@@ -168,30 +182,31 @@ class DecisionMemoryStore:
         )
         return True
 
+    def _bounded_wait_seconds(self, wait_seconds: float) -> float:
+        with _memory._MEMORY_WRITE_LOCK:
+            if not self._dirty:
+                return wait_seconds
+            return min(
+                wait_seconds,
+                max(0.0, self._next_checkpoint_at - self._monotonic()),
+            )
 
-def _deduplicated_tail(
-    records: Sequence[DecisionMemoryRecord],
-    *,
-    max_records: int,
-) -> tuple[DecisionMemoryRecord, ...]:
-    unique: dict[str, DecisionMemoryRecord] = {}
-    for record in records:
-        key = json.dumps(
-            record.to_json_dict(),
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
+    def _defer_reconciliation(
+        self,
+        reason_code: str,
+        *,
+        source_state: str | None = None,
+    ) -> bool:
+        _memory._log(
+            self._logger,
+            "warning",
+            "operator-decision-memory-append-failed",
+            path=self.path,
+            error_type="DecisionMemorySourceUnavailable",
+            reason_code=reason_code,
+            source_state=source_state,
         )
-        unique[key] = record
-    return tuple(unique.values())[-max_records:]
-
-
-def _file_signature(path: Path) -> tuple[int, int] | None:
-    try:
-        stat_result = path.stat()
-    except (FileNotFoundError, OSError):
-        return None
-    return stat_result.st_mtime_ns, stat_result.st_size
+        return False
 
 
 def _positive_finite_float(value: float, field_name: str) -> float:

@@ -19,7 +19,8 @@ from parking_spot_monitor.detection import (
     UltralyticsVehicleDetector,
 )
 from parking_spot_monitor.detector_adapter import SharedLazyDetector, adapt_detector
-from parking_spot_monitor.decision_memory_store import DecisionMemoryStore, runtime_decision_memory_store
+from parking_spot_monitor.decision_memory_runtime import runtime_decision_memory_store
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.live_proof import run_live_proof_once
 from parking_spot_monitor.logging import StructuredLogger, setup_logging

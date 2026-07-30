@@ -117,13 +117,14 @@ def split_runtime_state_memory_records(
         destination.append(record)
     return routine, immediate
 
+
 def _append_lab_outcome_memory(
     target: Path | DecisionMemoryStore,
     status_payload: Mapping[str, Any],
     *,
     data_dir: Path,
     logger: StructuredLogger,
-) -> None:
+) -> bool:
     job_id = status_payload.get("job_id")
     kind = status_payload.get("kind")
     status = status_payload.get("status")
@@ -155,7 +156,7 @@ def _append_lab_outcome_memory(
         details["redaction"] = summary_payload.get("redaction")
     if summary_payload.get("missing_inputs") is not None:
         details["missing_inputs"] = summary_payload.get("missing_inputs")
-    _append_decision_memory(
+    persisted = _append_decision_memory(
         target,
         "lab_outcome",
         spot_id=None,
@@ -164,6 +165,8 @@ def _append_lab_outcome_memory(
         details={key: value for key, value in details.items() if value is not None},
         logger=logger,
     )
+    if not persisted:
+        return False
     logger.info(
         "detection-lab-outcome-recorded",
         phase="detection-lab",
@@ -172,6 +175,8 @@ def _append_lab_outcome_memory(
         status=status,
         lab_dir=str(data_dir / "detection-lab"),
     )
+    return True
+
 
 def _append_decision_memory(
     target: Path | DecisionMemoryStore,
@@ -182,7 +187,7 @@ def _append_decision_memory(
     summary: str,
     details: Mapping[str, Any],
     logger: StructuredLogger,
-) -> None:
+) -> bool:
     record = make_decision_memory_record(
         kind,
         observed_at=observed_at,
@@ -191,9 +196,9 @@ def _append_decision_memory(
         details=details,
     )
     if isinstance(target, DecisionMemoryStore):
-        target.append(record, durability="immediate")
-    else:
-        append_decision_memory_record(target, record, logger=logger)
+        return target.append(record, durability="immediate")
+    return append_decision_memory_record(target, record, logger=logger)
+
 
 def _rejection_reason_counts(rejections: Sequence[Any]) -> dict[str, int]:
     counts: dict[str, int] = {}
@@ -201,6 +206,7 @@ def _rejection_reason_counts(rejections: Sequence[Any]) -> dict[str, int]:
         reason = str(getattr(rejected, "reason", "unknown"))
         counts[reason] = counts.get(reason, 0) + 1
     return counts
+
 
 def _rejected_summary(rejected: Any) -> dict[str, Any]:
     return {

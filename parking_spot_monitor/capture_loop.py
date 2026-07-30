@@ -12,7 +12,8 @@ from parking_spot_monitor import runtime_loop_resources, runtime_matrix_commands
 from parking_spot_monitor.capture import CaptureError, StreamProfileCapture
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.detector_adapter import DetectorRunner
-from parking_spot_monitor.decision_memory_store import DecisionMemoryStore, runtime_decision_memory_store
+from parking_spot_monitor.decision_memory_runtime import runtime_decision_memory_store
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery
 from parking_spot_monitor.paths import resolve_runtime_paths
@@ -224,7 +225,6 @@ def run_capture_loop(
                 write_current_health(status=health_state.status(), iteration=iteration)
                 iteration_finished_at = monotonic()
                 flush_runtime_log_summary(log_aggregator, logger, iteration_finished_at)
-                decision_memory_store.checkpoint_if_due()
                 policy_update = runtime_loop_resources.advance_resource_policy(
                     settings,
                     runtime_state,
@@ -249,7 +249,9 @@ def run_capture_loop(
                     sleep_seconds=sleep_seconds,
                     cadence_reason=policy_update.decision.reason,
                 )
-                wait_for_shutdown(sleep_seconds)
+                decision_memory_store.wait_for_checkpoint(
+                    sleep_seconds, wait=wait_for_shutdown
+                )
                 requested_exit = shutdown_exit(iteration)
                 if requested_exit is not None:
                     return requested_exit
@@ -268,8 +270,9 @@ def run_capture_loop(
                 )
                 write_current_health(status="down", iteration=iteration)
                 flush_runtime_log_summary(log_aggregator, logger, monotonic())
-                decision_memory_store.checkpoint_if_due()
-                wait_for_shutdown(backoff_seconds)
+                decision_memory_store.wait_for_checkpoint(
+                    backoff_seconds, wait=wait_for_shutdown
+                )
                 requested_exit = shutdown_exit(iteration)
                 if requested_exit is not None:
                     return requested_exit

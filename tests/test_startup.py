@@ -5617,6 +5617,84 @@ def test_runtime_checkpoints_decision_memory_once_per_success_and_failed_iterati
     assert checkpoint_calls == 2
 
 
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_runtime_wait_wakes_at_dirty_decision_checkpoint_without_changing_cadence(
+    tmp_path: Path,
+    capture_fails: bool,
+) -> None:
+    from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
+    from parking_spot_monitor.operator_decision_memory import make_decision_memory_record
+
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "frame_interval_seconds": 600,
+                    "stable_frame_interval_seconds": 600,
+                    "adaptive_polling_enabled": False,
+                }
+            ),
+            "stream": settings.stream.model_copy(
+                update={
+                    "reconnect_seconds": 600,
+                    "reconnect_max_seconds": 600,
+                    "reconnect_jitter_ratio": 0,
+                }
+            ),
+        }
+    )
+    clock = [0.0]
+    sleeps: list[float] = []
+    memory_path = tmp_path / "operator-decision-memory.json"
+    store = DecisionMemoryStore(
+        memory_path,
+        checkpoint_interval_seconds=5,
+        checkpoint_max_pending_records=50,
+        monotonic=lambda: clock[0],
+    )
+
+    def capture(_settings: object, data_dir: str | Path, **_kwargs: object) -> FrameCaptureResult:
+        store.append(
+            make_decision_memory_record("miss", summary="deadline probe"),
+            durability="routine",
+        )
+        if capture_fails:
+            raise CaptureError(
+                reason="ffmpeg_error",
+                mode=DecodeMode.SOFTWARE,
+                output_path=Path(data_dir) / "latest.jpg",
+                message="capture unavailable",
+            )
+        return captured_frame(Path(data_dir))
+
+    def sleep(seconds: float) -> None:
+        if sleeps:
+            assert any(
+                record.summary == "deadline probe"
+                for record in load_decision_memory(memory_path).records
+            )
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    assert run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=capture,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        sleep=sleep,
+        max_iterations=1,
+        monotonic=lambda: clock[0],
+        random_unit=lambda: 0.5,
+        decision_memory_store=store,
+    ) == 0
+    assert sleeps == [5, 595]
+
+
 def test_runtime_loop_decision_memory_append_failure_is_non_fatal(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     (tmp_path / "operator-decision-memory.json").mkdir()
     (tmp_path / "operator-decision-memory.json.quarantine").mkdir()
