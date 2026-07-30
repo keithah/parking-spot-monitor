@@ -1608,6 +1608,79 @@ def test_owned_disposal_manifest_transient_stat_error_preserves_pending_entry(
     assert [entry.disposal for entry in entries] == [disposal]
 
 
+def test_owned_disposal_first_bind_eio_retains_manifest_until_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    identity = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    for index in range(300):
+        (tmp_path / f"decoy-{index:03d}").write_bytes(b"x")
+    real_open = owned_file_disposal.os.open
+    fail_bind = True
+
+    def fail_disposal_bind(name: object, *args: object, **kwargs: object) -> int:
+        if fail_bind and str(name).endswith(".dispose"):
+            raise OSError(errno.EIO, "simulated bind error")
+        return real_open(name, *args, **kwargs)
+
+    monkeypatch.setattr(owned_file_disposal.os, "open", fail_disposal_bind)
+    assert file_descriptor_binding.unlink_owned_path(target, identity) is False
+    disposal = next(path for path in tmp_path.iterdir() if path.name.endswith(".dispose"))
+    with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as owner:
+        entries = owned_disposal_manifest.manifest_entries_at(owner.fd)
+    assert not target.exists()
+    assert [entry.disposal for entry in entries] == [disposal.name]
+
+    fail_bind = False
+    with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as restarted_owner:
+        result = restarted_owner.recover_owned()
+        entries = owned_disposal_manifest.manifest_entries_at(restarted_owner.fd)
+
+    assert result.recovered == 1
+    assert result.pending is False
+    assert target.read_bytes() == b"owned"
+    assert not disposal.exists()
+    assert entries == []
+
+
+def test_owned_disposal_same_identity_eio_retains_manifest_until_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    identity = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+    for index in range(300):
+        (tmp_path / f"decoy-{index:03d}").write_bytes(b"x")
+    real_stat = owned_file_disposal.os.stat
+    fail_identity_check = True
+
+    def fail_existing_disposal_stat(name: object, *args: object, **kwargs: object) -> os.stat_result:
+        value = real_stat(name, *args, **kwargs)
+        if fail_identity_check and str(name).endswith(".dispose"):
+            raise OSError(errno.EIO, "simulated identity check error")
+        return value
+
+    monkeypatch.setattr(owned_file_disposal.os, "stat", fail_existing_disposal_stat)
+    assert file_descriptor_binding.unlink_owned_path(target, identity) is False
+    disposal = next(path for path in tmp_path.iterdir() if path.name.endswith(".dispose"))
+    with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as owner:
+        entries = owned_disposal_manifest.manifest_entries_at(owner.fd)
+    assert not target.exists()
+    assert [entry.disposal for entry in entries] == [disposal.name]
+
+    fail_identity_check = False
+    with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as restarted_owner:
+        result = restarted_owner.recover_owned()
+        entries = owned_disposal_manifest.manifest_entries_at(restarted_owner.fd)
+
+    assert result.recovered == 1
+    assert result.pending is False
+    assert target.read_bytes() == b"owned"
+    assert not disposal.exists()
+    assert entries == []
+
+
 def test_owned_disposal_manifest_transaction_is_reentrant(tmp_path: Path) -> None:
     target = tmp_path / "owned.jpg"
     target.write_bytes(b"owned")

@@ -23,6 +23,8 @@ An unlink can remove a filename before the following directory `fsync` reports a
 
 Manifest transition locking is process-local and keyed by the owned directory identity. The supported deployment model has exactly one `parking-spot-monitor` service process owning these artifact directories; do not run a second container, maintenance process, or cleanup command that mutates the same directories concurrently. Recovery and disposal for the same directory serialize across manifest record, rename, classification, and reconciliation, while unrelated owned directories remain concurrent.
 
+After a disposal rename, only a conclusive missing path, nonregular artifact, or inode mismatch can select mismatch handling. Transient `open`, `stat`, or identity-observation failures such as EIO keep the indexed transition pending without restore or manifest deletion. Once the filesystem error clears, startup or the next applicable operation retries the exact manifest entry even when the directory contains more than the legacy scan bound.
+
 ## Host prerequisites
 
 Provide:

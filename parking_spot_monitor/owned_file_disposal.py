@@ -49,14 +49,9 @@ def disposal_pattern(name: str) -> re.Pattern[str]:
 
 @manifest_transaction
 def dispose_owned_name_at(
-    directory_fd: int,
-    name: str,
-    identity: FileIdentity,
-    *,
-    recovery_name: str,
+    directory_fd: int, name: str, identity: FileIdentity, *, recovery_name: str
 ) -> DisposalResult:
     """Move a source to recoverable random disposal before deleting it."""
-
     safe_source = _safe_basename(name)
     safe_recovery = _safe_basename(recovery_name)
     disposal = ""
@@ -72,16 +67,19 @@ def dispose_owned_name_at(
         if disposal:
             forget_disposal_at(directory_fd, disposal)
         return DisposalResult("restored")
-    bound = _bound_regular_identity(directory_fd, disposal)
-    if bound != identity:
-        _restore_disposal(directory_fd, disposal, safe_source, bound)
-        forget_disposal_at(directory_fd, disposal)
-        return DisposalResult("restored")
-    if not _same_regular_identity(directory_fd, disposal, identity):
-        _restore_current_disposal(directory_fd, disposal, safe_source)
-        forget_disposal_at(directory_fd, disposal)
-        return DisposalResult("restored")
-    result = _unlink_disposal(directory_fd, disposal, identity)
+    try:
+        bound = _bound_regular_identity(directory_fd, disposal)
+        if bound != identity:
+            _restore_disposal(directory_fd, disposal, safe_source, bound)
+            forget_disposal_at(directory_fd, disposal)
+            return DisposalResult("restored")
+        if not _same_regular_identity(directory_fd, disposal, identity):
+            _restore_current_disposal(directory_fd, disposal, safe_source)
+            forget_disposal_at(directory_fd, disposal)
+            return DisposalResult("restored")
+        result = _unlink_disposal(directory_fd, disposal, identity)
+    except OSError:
+        return DisposalResult("pending")
     if result.status == "deleted" and result.durable:
         forget_disposal_at(directory_fd, disposal)
     return result
@@ -96,7 +94,10 @@ def recover_disposal_at(
     safe_recovery = _safe_basename(recovery_name)
     if not disposal_pattern(safe_recovery).fullmatch(safe_disposal):
         return DisposalResult("pending")
-    identity = _bound_regular_identity(directory_fd, safe_disposal)
+    try:
+        identity = _bound_regular_identity(directory_fd, safe_disposal)
+    except OSError:
+        return DisposalResult("pending")
     if identity is None or (expected_identity is not None and identity != expected_identity):
         return DisposalResult("pending")
     try:
@@ -114,11 +115,14 @@ def recover_disposal_at(
             return DisposalResult("pending")
     except OSError:
         return DisposalResult("pending")
-    if not _same_regular_identity(directory_fd, safe_recovery, identity):
+    try:
+        if not _same_regular_identity(directory_fd, safe_recovery, identity):
+            return DisposalResult("pending")
+        if not _same_regular_identity(directory_fd, safe_disposal, identity):
+            return DisposalResult("pending")
+        result = _unlink_disposal(directory_fd, safe_disposal, identity)
+    except OSError:
         return DisposalResult("pending")
-    if not _same_regular_identity(directory_fd, safe_disposal, identity):
-        return DisposalResult("pending")
-    result = _unlink_disposal(directory_fd, safe_disposal, identity)
     if result.status == "deleted" and result.durable:
         forget_disposal_at(directory_fd, safe_disposal)
     return result
@@ -144,7 +148,7 @@ def _bound_regular_identity(directory_fd: int, name: str) -> FileIdentity | None
         descriptor = os.open(name, _IDENTITY_OPEN_FLAGS, dir_fd=directory_fd)
         value = os.fstat(descriptor)
         return FileIdentity.from_stat(value) if stat.S_ISREG(value.st_mode) else None
-    except OSError:
+    except FileNotFoundError:
         return None
     finally:
         if descriptor >= 0:
@@ -170,14 +174,12 @@ def _restore_current_disposal(directory_fd: int, disposal: str, name: str) -> bo
     return identity is not None and _restore_disposal(directory_fd, disposal, name, identity)
 
 
-def _restore_disposal(
-    directory_fd: int, disposal: str, name: str, identity: FileIdentity | None
-) -> bool:
+def _restore_disposal(directory_fd: int, disposal: str, name: str, identity: FileIdentity | None) -> bool:
     if identity is None:
         return False
     try:
         os.link(disposal, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-    except OSError:
+    except FileNotFoundError:
         return False
     if not _same_regular_identity(directory_fd, name, identity):
         return False
@@ -187,7 +189,7 @@ def _restore_disposal(
 def _same_regular_identity(directory_fd: int, name: str, identity: FileIdentity) -> bool:
     try:
         current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except OSError:
+    except FileNotFoundError:
         return False
     return stat.S_ISREG(current.st_mode) and FileIdentity.from_stat(current) == identity
 
