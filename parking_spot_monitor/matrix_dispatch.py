@@ -26,6 +26,8 @@ class RuntimeMatrixDelivery(Protocol):
 
     def send_lifecycle_notice(self, event: Mapping[str, Any]) -> object: ...
 
+    def enqueue_lifecycle_notice(self, event: Mapping[str, Any]) -> object: ...
+
     def enqueue_text_notice(self, event_name: str, event: Mapping[str, Any]) -> object: ...
 
     def enqueue_open_spot_alert(self, event: Mapping[str, Any]) -> object: ...
@@ -97,9 +99,13 @@ def dispatch_matrix_event(
             event_name=event_name,
             event=event,
             txn_id=txn_id,
-            send=lambda: matrix_delivery.send_lifecycle_notice(event),
+            send=lambda: matrix_delivery.enqueue_lifecycle_notice(event),
             logger=logger,
             decision_memory_path=decision_memory_path,
+            attempt_log_fields={"delivery_mode": "outbox_enqueue"},
+            success_log_fields={"delivery_mode": "outbox_enqueue"},
+            success_memory_outcome="queued",
+            success_memory_reason="outbox_enqueue",
         )
 
     if event_name == OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE:

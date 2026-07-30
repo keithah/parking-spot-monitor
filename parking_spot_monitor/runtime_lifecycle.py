@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import signal
-from collections.abc import Callable, Iterator, Mapping
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,16 +18,49 @@ from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery, dispatch
 
 @dataclass
 class ShutdownState:
-    """Mutable shutdown flag set from Unix signal handlers (no I/O)."""
+    """Event-backed shutdown state set from Unix signal handlers (no I/O)."""
 
-    requested: bool = False
     signum: int | None = None
+    _event: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    @property
+    def requested(self) -> bool:
+        return self._event.is_set()
+
+    def request(self, signum: int) -> None:
+        if not self._event.is_set():
+            self.signum = signum
+            self._event.set()
+
+    def wait(self, timeout_seconds: float) -> bool:
+        return self._event.wait(max(0.0, timeout_seconds))
 
     @property
     def signal_name(self) -> str | None:
         if self.signum is None:
             return None
         return _signal_name(self.signum)
+
+
+def _close_resources(
+    resources: Sequence[tuple[str, object | None]],
+    *,
+    logger: StructuredLogger,
+) -> None:
+    """Attempt every runtime finalizer and report only safe failure metadata."""
+
+    for name, resource in resources:
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except Exception as exc:
+            logger.warning(
+                "runtime-resource-close-failed",
+                resource=name,
+                error_type=type(exc).__name__,
+            )
 
 
 def install_shutdown_signal_handlers(
@@ -70,9 +104,7 @@ def monitor_signal_handlers(
 
 def _make_shutdown_signal_handler(state: ShutdownState) -> Callable[[int, Any], None]:
     def handle(signum: int, _frame: Any) -> None:
-        if not state.requested:
-            state.requested = True
-            state.signum = signum
+        state.request(signum)
 
     return handle
 

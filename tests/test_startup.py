@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -404,6 +405,12 @@ class FakeMatrixDelivery:
         self.lifecycle_notices.append(dict(event))
         if self.fail:
             raise RuntimeError(f"matrix failure {SECRET_MARKER}")
+
+    def enqueue_lifecycle_notice(self, event: dict[str, Any]) -> object:
+        self.lifecycle_notices.append(dict(event))
+        if self.fail:
+            raise RuntimeError(f"matrix enqueue failure {SECRET_MARKER}")
+        return object()
 
 
 class FakeOutboxDrainResult:
@@ -4416,6 +4423,109 @@ def test_shutdown_signal_handler_records_flag_without_matrix_io(
     assert combined_output(capsys) == ""
 
 
+def test_shutdown_state_wakes_wait_immediately() -> None:
+    from parking_spot_monitor.runtime_lifecycle import ShutdownState
+
+    state = ShutdownState()
+    started = threading.Event()
+    finished = threading.Event()
+
+    def wait_for_shutdown() -> None:
+        started.set()
+        assert state.wait(60) is True
+        finished.set()
+
+    thread = threading.Thread(target=wait_for_shutdown)
+    thread.start()
+    assert started.wait(1)
+    state.request(signal.SIGTERM)
+    assert finished.wait(1)
+    thread.join(1)
+    assert thread.is_alive() is False
+
+
+def test_reconnect_wait_wakes_and_exits_immediately_on_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from parking_spot_monitor.runtime_lifecycle import ShutdownState
+
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={"stream": settings.stream.model_copy(update={"reconnect_seconds": 60})}
+    )
+    monkeypatch.chdir(tmp_path)
+    state = ShutdownState()
+    capture_attempted = threading.Event()
+    exits: list[int] = []
+
+    def fail_capture(
+        _settings: object,
+        data_dir: str | Path,
+        **_kwargs: object,
+    ) -> FrameCaptureResult:
+        capture_attempted.set()
+        raise CaptureError(
+            reason="ffmpeg_error",
+            mode=DecodeMode.SOFTWARE,
+            output_path=Path(data_dir) / "latest.jpg",
+            message="capture unavailable",
+        )
+
+    thread = threading.Thread(
+        target=lambda: exits.append(
+            run_capture_loop(
+                settings,
+                tmp_path,
+                logger=StructuredLogger(),
+                capture=fail_capture,
+                overlay=noop_overlay,
+                detector_factory=noop_detector_factory,
+                matrix_delivery=None,
+                sleep=time.sleep,
+                wait=state.wait,
+                shutdown_state=state,
+            )
+        )
+    )
+    thread.start()
+    assert capture_attempted.wait(1)
+    started = time.monotonic()
+    state.request(signal.SIGTERM)
+    thread.join(1)
+
+    assert time.monotonic() - started < 1
+    assert thread.is_alive() is False
+    assert exits == [0]
+
+
+def test_close_resources_continues_after_first_close_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from parking_spot_monitor.__main__ import _close_resources
+
+    closed: list[str] = []
+
+    class FailingClose:
+        def close(self) -> None:
+            raise RuntimeError(f"close failed {SECRET_MARKER}")
+
+    class RecordingClose:
+        def close(self) -> None:
+            closed.append("delivery")
+
+    _close_resources(
+        (("commands", FailingClose()), ("delivery", RecordingClose())),
+        logger=StructuredLogger(),
+    )
+
+    assert closed == ["delivery"]
+    output = combined_output(capsys)
+    assert '"event":"runtime-resource-close-failed"' in output
+    assert '"resource":"commands"' in output
+    assert SECRET_MARKER not in output
+
+
 def test_dispatch_shutdown_lifecycle_notice_once(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -5686,7 +5796,7 @@ def test_runtime_open_alert_failure_persists_retryable_matrix_outbox(tmp_path: P
     phases = {phase["phase"]: phase for phase in item["phases"]}
 
     assert exit_code == 0
-    assert summary["counts_by_state"] == {"delivered": 2, "retrying": 1}
+    assert summary["counts_by_state"] == {"delivered": 3, "retrying": 1}
     assert phases["upload"]["state"] == "pending"
     assert phases["image"]["state"] == "pending"
     occupancy_text_kinds = [text["txn_id"].split(":", 1)[0] for text in matrix_client.texts if text["txn_id"].startswith("occupancy-")]
@@ -5770,7 +5880,7 @@ def test_runtime_worker_restarts_existing_matrix_outbox_without_new_occupancy_ev
     phases = {phase: {"state": state} for phase, state in record.phase_states.items()}
 
     assert second_exit == 0
-    assert summary["counts_by_state"] == {"delivered": 3}
+    assert summary["counts_by_state"] == {"delivered": 5}
     assert phases["upload"]["state"] == "delivered"
     assert phases["image"]["state"] == "delivered"
     assert [text for text in successful_client.texts if text["txn_id"].startswith("occupancy-open-event:")] == []

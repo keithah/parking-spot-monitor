@@ -14,6 +14,9 @@ services:
       - ./data:/data
       - ${MODEL_DIR:-./models}:/models:ro
     restart: unless-stopped
+    init: true
+    stop_signal: SIGTERM
+    stop_grace_period: 2m
     mem_limit: 4g
     cpus: 2.0
     pids_limit: 512

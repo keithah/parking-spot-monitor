@@ -9,8 +9,10 @@ from urllib.parse import quote
 import httpx
 
 from parking_spot_monitor.logging import StructuredLogger
-from parking_spot_monitor.matrix_models import MatrixSyncResult, MatrixTextEvent
+from parking_spot_monitor.matrix_cancellation import MatrixCancellation
+from parking_spot_monitor.matrix_models import MatrixSyncResult
 from parking_spot_monitor.matrix_support import MatrixError, _http_status_error, _require_non_empty, _require_response_key
+from parking_spot_monitor.matrix_sync import parse_sync_response as _parse_sync_response
 
 CLIENT_API_PREFIX = "/_matrix/client/v3"
 MEDIA_API_PREFIX = "/_matrix/media/v3"
@@ -49,15 +51,19 @@ class MatrixClient:
         self.retry_attempts = max(1, retry_attempts)
         self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
         self.retry_jitter_ratio = max(0.0, retry_jitter_ratio)
-        self._sleep = sleep
         self._random_unit = random_unit
         self._logger = logger
         self._owns_client = http_client is None
         self._client = http_client or httpx.Client(base_url=self.homeserver, timeout=timeout_seconds)
+        self._cancellation = MatrixCancellation(self._client, owns_client=self._owns_client, sleep=sleep)
 
     def close(self) -> None:
-        if self._owns_client:
-            self._client.close()
+        self._cancellation.request(force_close=False)
+
+    def cancel_pending(self) -> None:
+        """Wake retry waits and close the transport to unblock in-flight I/O."""
+
+        self._cancellation.request(force_close=True)
 
     def __enter__(self) -> MatrixClient:
         return self
@@ -152,16 +158,18 @@ class MatrixClient:
     def _retry_request(self, *, operation: str, path: str, request: Callable[[int], _T]) -> _T:
         last_error: MatrixError | None = None
         for attempt in range(1, self.retry_attempts + 1):
+            self._cancellation.raise_if_requested(operation=operation, path=path)
             try:
                 return request(attempt)
             except MatrixError as exc:
                 last_error = exc
+                self._cancellation.raise_if_requested(operation=operation, path=path)
                 if not self._should_retry(exc, attempt):
                     raise
                 delay = self._retry_delay_seconds(exc, attempt=attempt)
                 self._log_retry_decision(error=exc, operation=operation, path=path, attempt=attempt, delay_seconds=delay)
-                if delay > 0:
-                    self._sleep(delay)
+                if delay > 0 and self._cancellation.wait(delay):
+                    self._cancellation.raise_if_requested(operation=operation, path=path)
         if last_error is not None:
             raise last_error
         raise MatrixError("Matrix request failed", error_type="request_error", operation=operation, path=path)
@@ -196,6 +204,10 @@ class MatrixClient:
                 attempt=attempt,
                 exception_type=exc.__class__.__name__,
             ) from exc
+        except Exception as exc:
+            if self._cancellation.requested:
+                raise self._cancellation.error(operation=method, path=path) from exc
+            raise
 
         if response.status_code >= 400:
             raise _http_status_error(response, method=method, path=path, attempt=attempt)
@@ -235,26 +247,3 @@ class MatrixClient:
             backoff_seconds=round(delay_seconds, 6),
             **diagnostics,
         )
-
-def _parse_sync_response(payload: Any, *, room_id: str, operation: str, status_code: int) -> MatrixSyncResult:
-    if not isinstance(payload, dict):
-        raise MatrixError("Matrix sync response was malformed", error_type="malformed_response", operation=operation, status_code=status_code, missing_key="next_batch")
-    next_batch = payload.get("next_batch")
-    if not isinstance(next_batch, str) or not next_batch:
-        raise MatrixError("Matrix sync response was missing a required field", error_type="malformed_response", operation=operation, status_code=status_code, missing_key="next_batch")
-    events_payload = (((payload.get("rooms") or {}).get("join") or {}).get(room_id) or {}).get("timeline", {}).get("events", [])
-    if not isinstance(events_payload, list):
-        raise MatrixError("Matrix sync response room timeline was malformed", error_type="malformed_response", operation=operation, status_code=status_code, missing_key="rooms.join.timeline.events")
-    events: list[MatrixTextEvent] = []
-    for item in events_payload:
-        if not isinstance(item, Mapping) or item.get("type") != "m.room.message":
-            continue
-        content = item.get("content")
-        if not isinstance(content, Mapping) or content.get("msgtype") != "m.text":
-            continue
-        body = content.get("body")
-        event_id = item.get("event_id")
-        sender = item.get("sender")
-        if isinstance(body, str) and isinstance(event_id, str) and isinstance(sender, str):
-            events.append(MatrixTextEvent(event_id=event_id, sender=sender, room_id=room_id, body=body[:512]))
-    return MatrixSyncResult(next_batch=next_batch, events=tuple(events))

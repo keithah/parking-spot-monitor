@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 @dataclass(frozen=True)
 class MatrixTextEvent:
     """Safe inbound Matrix text event projected from /sync."""

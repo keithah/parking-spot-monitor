@@ -200,12 +200,14 @@ def test_matrix_module_is_a_small_compatibility_shim() -> None:
     module_caps = {
         "parking_spot_monitor/matrix_command_catalog.py": 720,
         "parking_spot_monitor/matrix_command_runtime.py": 140,
+        "parking_spot_monitor/matrix_cancellation.py": 100,
         "parking_spot_monitor/matrix_client.py": 260,
         "parking_spot_monitor/matrix_commands.py": 740,
         "parking_spot_monitor/matrix_cockpit.py": 430,
         "parking_spot_monitor/matrix_delivery.py": 280,
         "parking_spot_monitor/matrix_models.py": 100,
         "parking_spot_monitor/matrix_snapshots.py": 430,
+        "parking_spot_monitor/matrix_sync.py": 100,
         "parking_spot_monitor/matrix_dispatch.py": 410,
     }
     for path, max_lines in module_caps.items():
@@ -669,7 +671,7 @@ def test_operator_confidence_groups_memory_records_once() -> None:
 def test_matrix_dispatch_send_paths_do_not_copy_event_mappings() -> None:
     lambda_targets = _lambda_call_targets("parking_spot_monitor/matrix_dispatch.py")
 
-    assert {"send_lifecycle_notice", "enqueue_text_notice"} <= lambda_targets
+    assert {"enqueue_lifecycle_notice", "enqueue_text_notice"} <= lambda_targets
     assert {"enqueue_occupied_spot_alert", "enqueue_open_spot_alert"} <= lambda_targets
     assert not _lambda_calls_function("parking_spot_monitor/matrix_dispatch.py", "dict")
 

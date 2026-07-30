@@ -26,6 +26,7 @@ from parking_spot_monitor.capture_loop import run_capture_loop
 from parking_spot_monitor.config import RuntimeSettings, load_settings, validate_model_path
 from parking_spot_monitor.paths import RuntimePaths, resolve_runtime_paths
 from parking_spot_monitor.runtime_health import matrix_outbox_health_payload as _matrix_outbox_health_payload
+from parking_spot_monitor.runtime_lifecycle import ShutdownState, _close_resources
 from parking_spot_monitor.runtime_decision_memory import _append_lab_outcome_memory
 from parking_spot_monitor.runtime_detection import _process_detection_for_capture
 from parking_spot_monitor.runtime_overlay import _write_debug_overlay, write_overlay_for_capture
@@ -190,7 +191,7 @@ def _main(
                 matrix_delivery=matrix_delivery,
             )
         finally:
-            _close_if_available(matrix_delivery)
+            _close_resources((("matrix_delivery", matrix_delivery),), logger=logger)
 
     history_archive = VehicleHistoryArchive(paths.vehicle_history_dir, logger=logger)
     matrix_delivery = matrix_factory(settings, paths.data_dir, logger)
@@ -206,6 +207,7 @@ def _main(
     else:
         matrix_command_service = matrix_command_service_factory(settings, paths.data_dir, logger, history_archive)
     try:
+        shutdown_state = ShutdownState()
         return run_capture_loop(
             settings,
             paths.data_dir,
@@ -217,13 +219,20 @@ def _main(
             history_archive=history_archive,
             matrix_command_service=matrix_command_service,
             sleep=sleep,
+            wait=shutdown_state.wait if sleep is time.sleep else None,
+            shutdown_state=shutdown_state,
             max_iterations=max_iterations,
             now=now,
             startup_retention_failure_count=retention_result.failed_count,
         )
     finally:
-        _close_if_available(matrix_command_service)
-        _close_if_available(matrix_delivery)
+        _close_resources(
+            (
+                ("matrix_commands", matrix_command_service),
+                ("matrix_delivery", matrix_delivery),
+            ),
+            logger=logger,
+        )
 
 
 def _capture_once(
@@ -258,12 +267,6 @@ def _capture_once(
         return 1
     logger.info("capture-once-complete", **result.diagnostics())
     return 0
-
-
-def _close_if_available(resource: Any | None) -> None:
-    close = getattr(resource, "close", None)
-    if callable(close):
-        close()
 
 
 def _default_detector_factory(settings: RuntimeSettings) -> UltralyticsVehicleDetector:

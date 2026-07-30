@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import httpx
 from PIL import Image
 
 import parking_spot_monitor.matrix_snapshots as matrix_snapshots
@@ -17,6 +18,8 @@ from parking_monitor.outbox import LocalOutbox
 from parking_spot_monitor.image_budget import JpegBudgetResult
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix import MatrixError
+from parking_spot_monitor.matrix_alerts import MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, monitor_lifecycle_event
+from parking_spot_monitor.matrix_client import MatrixClient
 
 ROOM_ID = "!parking-room:example.org"
 EVENT_ID = "occupancy-open-event:left_spot:2026-05-18T20:01:02Z"
@@ -102,6 +105,9 @@ class FakeMatrixClient:
 
     def close(self) -> None:
         self.closed = True
+
+    def cancel_pending(self) -> None:
+        self.close()
 
 
 def make_delivery(
@@ -718,6 +724,123 @@ def test_enqueue_text_notice_is_durable_and_preserves_text_only_transaction_id(t
             "body": "Street sweeping started: street_sweeping:2026-05-18:13:00-15:00",
         }
     ]
+
+
+def test_lifecycle_notice_survives_close_and_restart_exactly_once(tmp_path: Path) -> None:
+    event = monitor_lifecycle_event(
+        MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
+        datetime(2026, 5, 18, 20, 1, 2, tzinfo=timezone.utc),
+        signal="SIGTERM",
+    )
+    first_client = FakeMatrixClient()
+    first = make_delivery(tmp_path, first_client)
+
+    record = first.enqueue_lifecycle_notice(event)
+    first.close()
+
+    assert first_client.calls == []
+    [persisted] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
+    assert persisted.id == record.id
+    assert persisted.state == "pending"
+
+    restarted_client = FakeMatrixClient()
+    restarted = make_delivery(tmp_path, restarted_client)
+    assert restarted.drain_outbox().delivered_count == 1
+    assert restarted.drain_outbox().attempted_count == 0
+    assert [call["txn_id"] for call in restarted_client.calls] == [event["event_id"]]
+
+
+def test_close_cancels_pending_client_once_and_is_idempotent(tmp_path: Path) -> None:
+    class CancelRecordingClient(FakeMatrixClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_calls = 0
+            self.close_calls = 0
+
+        def cancel_pending(self) -> None:
+            self.cancel_calls += 1
+
+        def close(self) -> None:
+            self.close_calls += 1
+            super().close()
+
+    client = CancelRecordingClient()
+    delivery = make_delivery(tmp_path, client)
+
+    delivery.close()
+    delivery.close()
+
+    assert client.cancel_calls == 1
+    assert client.close_calls == 1
+
+
+def test_worker_stop_between_phases_does_not_start_next_phase(tmp_path: Path) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    stopped = threading.Event()
+    delivery: MatrixOutboxDelivery
+
+    def stop_after_text() -> None:
+        delivery.close()
+        stopped.set()
+
+    client = FakeMatrixClient(on_send_text=stop_after_text)
+    delivery = make_delivery(tmp_path, client)
+    delivery.start_worker(retry_interval_seconds=60)
+    delivery.enqueue_open_spot_alert(open_event(source))
+
+    assert stopped.wait(1)
+    worker = delivery.worker_thread
+    assert worker is not None
+    worker.join(1)
+    assert worker.is_alive() is False
+    assert [call["kind"] for call in client.calls] == ["text"]
+    [persisted] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
+    assert persisted.phase_states == {
+        "text": "delivered",
+        "upload": "pending",
+        "image": "pending",
+    }
+
+
+def test_matrix_client_cancel_interrupts_retry_wait_with_safe_error() -> None:
+    attempted = threading.Event()
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        attempted.set()
+        return httpx.Response(503, json={"errcode": "M_UNAVAILABLE"}, request=request)
+
+    client = MatrixClient(
+        homeserver="https://matrix.example.org",
+        access_token="test-token",
+        retry_attempts=3,
+        retry_backoff_seconds=60,
+        retry_jitter_ratio=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    errors: list[MatrixError] = []
+
+    def send() -> None:
+        try:
+            client.send_text(room_id=ROOM_ID, txn_id="cancelled", body="lifecycle")
+        except MatrixError as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=send)
+    thread.start()
+    assert attempted.wait(1)
+    started = time.monotonic()
+    client.cancel_pending()
+    thread.join(1)
+
+    assert time.monotonic() - started < 1
+    assert thread.is_alive() is False
+    assert attempts == 1
+    assert len(errors) == 1
+    assert errors[0].diagnostics["error_type"] == "cancelled"
 
 
 def test_open_alert_queues_image_outbox_record_without_network(tmp_path: Path) -> None:

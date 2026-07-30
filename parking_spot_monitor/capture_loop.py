@@ -41,6 +41,8 @@ def run_capture_loop(
     history_archive: VehicleHistoryArchive | None = None,
     matrix_command_service: RuntimeMatrixCommandService | None = None,
     sleep: Callable[[float], None],
+    wait: Callable[[float], bool] | None = None,
+    shutdown_state: ShutdownState | None = None,
     max_iterations: int | None = None,
     now: Callable[[], datetime] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
@@ -62,7 +64,15 @@ def run_capture_loop(
     resource_policy_state = RuntimeResourcePolicyState()
     matrix_command_poll_state = runtime_matrix_commands.MatrixCommandPollState()
     decision_memory_path = data_dir / "operator-decision-memory.json"
-    shutdown_state = ShutdownState()
+    shutdown_state = shutdown_state if shutdown_state is not None else ShutdownState()
+    if wait is not None:
+        wait_for_shutdown = wait
+    elif sleep is time.sleep:
+        wait_for_shutdown = shutdown_state.wait
+    else:
+        def wait_for_shutdown(timeout_seconds: float) -> bool:
+            sleep(timeout_seconds)
+            return shutdown_state.requested
     vehicle_history_health = VehicleHistoryHealthSnapshotCache(
         effective_history_archive,
         now=now_fn,
@@ -239,7 +249,7 @@ def run_capture_loop(
                     sleep_seconds=sleep_seconds,
                     cadence_reason=policy_update.decision.reason,
                 )
-                sleep(sleep_seconds)
+                wait_for_shutdown(sleep_seconds)
                 shutdown_exit = return_if_shutdown_requested(
                     shutdown_state=shutdown_state,
                     matrix_delivery=matrix_delivery,
@@ -256,7 +266,7 @@ def run_capture_loop(
                 backoff_seconds = settings.stream.reconnect_seconds
                 logger.error("capture-loop-failure", iteration=iteration, backoff_seconds=backoff_seconds, **exc.diagnostics())
                 write_current_health(status="down", iteration=iteration)
-                sleep(backoff_seconds)
+                wait_for_shutdown(backoff_seconds)
                 shutdown_exit = return_if_shutdown_requested(
                     shutdown_state=shutdown_state,
                     matrix_delivery=matrix_delivery,

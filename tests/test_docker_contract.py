@@ -3,8 +3,10 @@ from __future__ import annotations
 import fnmatch
 import importlib.util
 import json
+import os
 import re
 import shlex
+import subprocess
 import sys
 import tomllib
 from pathlib import Path, PurePosixPath
@@ -612,8 +614,40 @@ def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
     assert "--validate-config" not in service["command"]
     assert service["devices"] == ["/dev/dri:/dev/dri"]
     assert service["restart"] == "unless-stopped"
+    assert service["init"] is True
+    assert service["stop_signal"] == "SIGTERM"
+    assert service["stop_grace_period"] in {"2m", "120s"}
     assert "/dev/dri:/dev/dri" in compose_text
     assert "${MODEL_DIR:-./models}:/models:ro" in service["volumes"]
+
+
+def test_rendered_compose_has_bounded_graceful_shutdown_contract() -> None:
+    env = dict(os.environ)
+    env.update(
+        {
+            "RTSP_URL": "rtsp://placeholder.invalid/live",
+            "RTSP_URL_4K": "rtsp://placeholder.invalid/4k",
+            "RTSP_URL_360P": "rtsp://placeholder.invalid/360",
+            "MATRIX_ACCESS_TOKEN": "placeholder-token",
+        }
+    )
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "config", "--format", "json"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+    except FileNotFoundError:
+        pytest.skip("Docker Compose is unavailable")
+    service = json.loads(result.stdout)["services"]["parking-spot-monitor"]
+
+    assert service["init"] is True
+    assert service["stop_signal"] == "SIGTERM"
+    assert service["stop_grace_period"] == "2m0s"
 
 
 def test_readme_documents_final_operator_verification_contract() -> None:

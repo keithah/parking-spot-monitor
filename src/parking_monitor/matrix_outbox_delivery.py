@@ -20,10 +20,12 @@ from typing import Any
 from parking_monitor.outbox import AlertIntent, LocalOutbox, OutboxRecord
 from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_text
 from parking_spot_monitor.matrix_alerts import (
+    LIFECYCLE_EVENT_TYPES,
     OCCUPIED_SPOT_EVENT_TYPE,
     OPEN_SPOT_EVENT_TYPE,
     OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
     format_occupied_spot_alert,
+    format_lifecycle_notice,
     format_open_spot_alert,
     format_owner_vehicle_quiet_window_alert,
     format_quiet_window_notice,
@@ -97,12 +99,26 @@ class MatrixOutboxDelivery:
 
     def close(self) -> None:
         with self._worker_lock:
+            if self._closing:
+                return
             self._closing = True
             self._stop_event.set()
             self._wake_event.set()
             worker = self._worker
+        cancel_pending = getattr(self.client, "cancel_pending", None)
+        if callable(cancel_pending):
+            try:
+                cancel_pending()
+            except Exception as exc:
+                self._log(
+                    "warning",
+                    "matrix-outbox-client-cancel-failed",
+                    error_type=redact_diagnostic_text(exc.__class__.__name__) or "Exception",
+                )
         if worker is not None and worker is not threading.current_thread() and worker.is_alive():
             worker.join(timeout=_WORKER_JOIN_TIMEOUT_SECONDS)
+            if worker.is_alive():
+                self._log("warning", "matrix-outbox-worker-cancel-timeout")
         with self._worker_lock:
             if self._client_closed:
                 return
@@ -273,6 +289,9 @@ class MatrixOutboxDelivery:
         elif event_name in _QUIET_WINDOW_EVENT_TYPES:
             event_id = str(event.get("event_id", ""))
             body = format_quiet_window_notice(event)
+        elif event_name in LIFECYCLE_EVENT_TYPES:
+            event_id = str(event.get("event_id", ""))
+            body = format_lifecycle_notice(event)
         else:
             raise MatrixError(
                 "Matrix text-only outbox event type is unsupported",
@@ -290,6 +309,11 @@ class MatrixOutboxDelivery:
         self._log("info", "matrix-outbox-enqueued", item_id=record.id, event_id=event_id, phase="text")
         self._wake_event.set()
         return record
+
+    def enqueue_lifecycle_notice(self, event: Mapping[str, Any]) -> OutboxRecord:
+        """Persist a monitor lifecycle notice before any Matrix network I/O."""
+
+        return self.enqueue_text_notice(str(event.get("event_type", "")), event)
 
     def _enqueue_snapshot_alert(
         self,
@@ -357,6 +381,8 @@ class MatrixOutboxDelivery:
         delivered = 0
         retrying = 0
         for record in records:
+            if self._worker_stop_requested():
+                break
             attempted += 1
             drained = self._drain_record(record)
             if drained.state == "delivered":
