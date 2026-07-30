@@ -5,7 +5,7 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.debug_overlay import (
@@ -49,7 +49,7 @@ def test_spot_overlay_does_not_allocate_or_convert_full_frame_rgba(monkeypatch: 
     def guarded_convert(
         source: Image.Image, mode: str | None = None, *args: object, **kwargs: object
     ) -> Image.Image:
-        if source is image and mode == "RGBA":
+        if source.size == image.size and mode == "RGBA":
             raise AssertionError("full-frame RGBA conversion")
         return original_convert(source, mode, *args, **kwargs)
 
@@ -70,14 +70,38 @@ def test_spot_overlay_does_not_alpha_composite_full_frames(monkeypatch: pytest.M
     _draw_spot_overlay(image, _configured_spots(load_example_settings()))
 
 
-def test_spot_overlay_preserves_representative_pre_jpeg_pixels() -> None:
+def test_spot_overlay_preserves_representative_pre_jpeg_pixels(monkeypatch: pytest.MonkeyPatch) -> None:
     image = Image.new("RGB", (1458, 806), (20, 30, 40))
+    original_text = ImageDraw.ImageDraw.text
+    text_calls: list[tuple[tuple[int, int], str, tuple[int, int, int, int] | None]] = []
+
+    def recording_text(
+        draw: ImageDraw.ImageDraw,
+        position: tuple[int, int],
+        label: str,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        text_calls.append((position, label, kwargs.get("fill")))
+        original_text(draw, position, label, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", recording_text)
 
     _draw_spot_overlay(image, _configured_spots(load_example_settings()))
 
     assert image.getpixel((350, 200)) == pytest.approx((30, 75, 99), abs=1)
     assert image.getpixel(LEFT_EDGE_PIXEL) == (14, 165, 233)
-    assert image.getpixel((316, 190)) == pytest.approx((14, 165, 233), abs=3)
+    assert text_calls == [
+        ((306, 186), "left_spot", (14, 165, 233, 255)),
+        ((1016, 221), "right_spot", (22, 163, 74, 255)),
+    ]
+    left_label_pixels = list(image.crop((306, 191, 380, 197)).getdata())
+    near_opaque_label = [
+        pixel
+        for pixel in left_label_pixels
+        if all(abs(pixel[channel] - (14, 165, 233)[channel]) <= 12 for channel in range(3))
+    ]
+    assert len(near_opaque_label) >= 8
 
 
 def test_write_debug_overlay_creates_exactly_one_rgb_working_image(
