@@ -176,10 +176,13 @@ def test_dependency_lock_tests_are_split_by_responsibility() -> None:
 
 def test_detector_benchmark_is_decomposed_into_bounded_modules() -> None:
     caps = {
-        "scripts/benchmark_detector_backends.py": 400,
+        "scripts/benchmark_detector_backends.py": 240,
+        "parking_spot_monitor/detector_benchmark_corpus.py": 230,
         "parking_spot_monitor/detector_benchmark_evidence.py": 240,
         "parking_spot_monitor/detector_benchmark_models.py": 120,
         "parking_spot_monitor/detector_benchmark_output.py": 200,
+        "parking_spot_monitor/detector_benchmark_output_paths.py": 90,
+        "parking_spot_monitor/detector_benchmark_worker.py": 300,
     }
     for path, max_lines in caps.items():
         assert (ROOT / path).exists(), path

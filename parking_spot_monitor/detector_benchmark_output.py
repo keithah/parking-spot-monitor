@@ -2,29 +2,34 @@ from __future__ import annotations
 
 import json
 import os
-import stat
-import tempfile
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from parking_spot_monitor.detector_benchmark_output_paths import (
+    ProtectedInput,
+    open_directory_walk,
+    output_identity,
+    protected_input,
+)
 
-@dataclass(frozen=True)
-class _ProtectedInput:
-    resolved_path: Path
-    device: int
-    inode: int
 
-
-@dataclass(frozen=True)
+@dataclass
 class OutputGuard:
     path: Path
     parent: Path
+    parent_descriptor: int
     parent_device: int
     parent_inode: int
     initial_output_identity: tuple[int, int] | None
-    protected_inputs: tuple[_ProtectedInput, ...]
+    protected_inputs: tuple[ProtectedInput, ...]
+
+    def close(self) -> None:
+        if self.parent_descriptor >= 0:
+            os.close(self.parent_descriptor)
+            self.parent_descriptor = -1
 
 
 def validate_benchmark_output(
@@ -32,35 +37,30 @@ def validate_benchmark_output(
     *,
     protected_paths: list[Path],
 ) -> OutputGuard:
-    protected = tuple(_protected_input(path) for path in protected_paths)
+    protected = tuple(protected_input(path) for path in protected_paths)
     path = Path(os.path.abspath(output))
-    try:
-        parent_resolved = path.parent.resolve(strict=True)
-    except OSError as exc:
-        raise ValueError("benchmark output parent must be an existing safe directory") from exc
-    if parent_resolved != path.parent:
-        raise ValueError("benchmark output parent must not use symlinks")
-    parent_descriptor = _open_parent(path.parent)
+    parent_descriptor = open_directory_walk(path.parent)
     try:
         parent_stat = os.fstat(parent_descriptor)
-    finally:
+        if path in {item.resolved_path for item in protected}:
+            raise ValueError("benchmark output must not resolve to an input")
+        identity = output_identity(parent_descriptor, path.name)
+        if identity is not None and any(
+            (item.device, item.inode) == identity for item in protected
+        ):
+            raise ValueError("benchmark output must not hardlink an input")
+        return OutputGuard(
+            path=path,
+            parent=path.parent,
+            parent_descriptor=parent_descriptor,
+            parent_device=parent_stat.st_dev,
+            parent_inode=parent_stat.st_ino,
+            initial_output_identity=identity,
+            protected_inputs=protected,
+        )
+    except BaseException:
         os.close(parent_descriptor)
-    resolved_output = path.resolve(strict=False)
-    if any(item.resolved_path == resolved_output for item in protected):
-        raise ValueError("benchmark output must not resolve to an input")
-    identity = _output_identity(path)
-    if identity is not None and any(
-        (item.device, item.inode) == identity for item in protected
-    ):
-        raise ValueError("benchmark output must not hardlink an input")
-    return OutputGuard(
-        path=path,
-        parent=path.parent,
-        parent_device=parent_stat.st_dev,
-        parent_inode=parent_stat.st_ino,
-        initial_output_identity=identity,
-        protected_inputs=protected,
-    )
+        raise
 
 
 def write_guarded_report(
@@ -72,94 +72,110 @@ def write_guarded_report(
     encoded = (
         json.dumps(report, allow_nan=False, indent=2, sort_keys=True) + "\n"
     ).encode()
-    parent_descriptor = _open_parent(guard.parent)
     temporary_name: str | None = None
+    owned_identity: tuple[int, int] | None = None
+    committed = False
     try:
-        parent_stat = os.fstat(parent_descriptor)
-        if (parent_stat.st_dev, parent_stat.st_ino) != (
+        _verify_requested_parent(guard)
+        _recheck_output(guard)
+        temporary_name, descriptor = _create_temporary(guard)
+        try:
+            _write_all(descriptor, encoded)
+            os.fsync(descriptor)
+            item = os.fstat(descriptor)
+            owned_identity = (item.st_dev, item.st_ino)
+        finally:
+            os.close(descriptor)
+        before_publish()
+        _verify_requested_parent(guard)
+        _recheck_output(guard)
+        os.replace(
+            temporary_name,
+            guard.path.name,
+            src_dir_fd=guard.parent_descriptor,
+            dst_dir_fd=guard.parent_descriptor,
+        )
+        temporary_name = None
+        committed = True
+        os.fsync(guard.parent_descriptor)
+        _verify_requested_parent(guard)
+        _verify_committed_target(guard, owned_identity)
+        _verify_requested_parent(guard)
+    except BaseException:
+        if temporary_name is not None and owned_identity is not None:
+            _unlink_if_owned(guard, temporary_name, owned_identity)
+        if committed and owned_identity is not None:
+            _unlink_if_owned(guard, guard.path.name, owned_identity)
+        raise
+
+
+def _verify_requested_parent(guard: OutputGuard) -> None:
+    descriptor = open_directory_walk(guard.parent)
+    try:
+        item = os.fstat(descriptor)
+        if (item.st_dev, item.st_ino) != (
             guard.parent_device,
             guard.parent_inode,
         ):
             raise ValueError("benchmark output parent changed after preflight")
-        _recheck_output(guard)
-        temporary_descriptor, temporary_path = tempfile.mkstemp(
-            prefix=f".{guard.path.name}.tmp-",
-            dir=guard.parent,
-        )
-        temporary_name = Path(temporary_path).name
-        try:
-            with os.fdopen(temporary_descriptor, "wb", closefd=True) as handle:
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-            before_publish()
-            _recheck_output(guard)
-            os.replace(
-                temporary_name,
-                guard.path.name,
-                src_dir_fd=parent_descriptor,
-                dst_dir_fd=parent_descriptor,
-            )
-            temporary_name = None
-            os.fsync(parent_descriptor)
-        finally:
-            if temporary_name is not None:
-                try:
-                    os.unlink(temporary_name, dir_fd=parent_descriptor)
-                except FileNotFoundError:
-                    pass
     finally:
-        os.close(parent_descriptor)
-
-
-def _protected_input(path: Path) -> _ProtectedInput:
-    try:
-        file_stat = path.stat()
-        resolved = path.resolve(strict=True)
-    except OSError as exc:
-        raise ValueError("benchmark input changed during output preflight") from exc
-    if not stat.S_ISREG(file_stat.st_mode):
-        raise ValueError("benchmark protected input must be a regular file")
-    return _ProtectedInput(
-        resolved_path=resolved,
-        device=file_stat.st_dev,
-        inode=file_stat.st_ino,
-    )
-
-
-def _open_parent(parent: Path) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(parent, flags)
-    except OSError as exc:
-        raise ValueError("benchmark output parent must be an existing safe directory") from exc
-    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
         os.close(descriptor)
-        raise ValueError("benchmark output parent must be a directory")
-    return descriptor
 
 
-def _output_identity(path: Path) -> tuple[int, int] | None:
-    try:
-        file_stat = path.lstat()
-    except FileNotFoundError:
-        return None
-    if stat.S_ISLNK(file_stat.st_mode):
-        raise ValueError("benchmark output must not be a symlink")
-    if not stat.S_ISREG(file_stat.st_mode):
-        raise ValueError("benchmark output must be a regular file when it exists")
-    return (file_stat.st_dev, file_stat.st_ino)
+def _create_temporary(guard: OutputGuard) -> tuple[str, int]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    for _attempt in range(128):
+        name = f".{guard.path.name}.tmp-{secrets.token_hex(16)}"
+        try:
+            return name, os.open(
+                name,
+                flags,
+                0o600,
+                dir_fd=guard.parent_descriptor,
+            )
+        except FileExistsError:
+            continue
+    raise ValueError("unable to reserve a unique benchmark output temporary")
 
 
 def _recheck_output(guard: OutputGuard) -> None:
-    identity = _output_identity(guard.path)
+    identity = output_identity(guard.parent_descriptor, guard.path.name)
     if identity != guard.initial_output_identity:
         raise ValueError("benchmark output changed after preflight")
     if identity is not None and any(
         (item.device, item.inode) == identity for item in guard.protected_inputs
     ):
         raise ValueError("benchmark output became an input alias")
-    if guard.path.resolve(strict=False) in {
-        item.resolved_path for item in guard.protected_inputs
-    }:
-        raise ValueError("benchmark output resolves to an input")
+
+
+def _verify_committed_target(
+    guard: OutputGuard,
+    owned_identity: tuple[int, int] | None,
+) -> None:
+    if owned_identity is None or output_identity(
+        guard.parent_descriptor, guard.path.name
+    ) != owned_identity:
+        raise ValueError("benchmark output changed during atomic publication")
+
+
+def _unlink_if_owned(
+    guard: OutputGuard,
+    name: str,
+    owned_identity: tuple[int, int],
+) -> None:
+    try:
+        current = output_identity(guard.parent_descriptor, name)
+    except ValueError:
+        return
+    if current != owned_identity:
+        return
+    try:
+        os.unlink(name, dir_fd=guard.parent_descriptor)
+    except FileNotFoundError:
+        pass
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        offset += os.write(descriptor, payload[offset:])

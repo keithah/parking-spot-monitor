@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from parking_spot_monitor.detector_benchmark_evidence import validate_worker_evidence
+from parking_spot_monitor.detector_benchmark_output import (
+    validate_benchmark_output,
+    write_guarded_report,
+)
 
 
 def _detection(*, bbox: list[float] | None = None) -> dict[str, Any]:
@@ -40,6 +46,14 @@ def _run_fake_benchmark(
     output_directory: bool = False,
     output_parent_symlink: bool = False,
     output_lexical_alias: str | None = None,
+    mutate_frame_from_backend: str | None = None,
+    restore_frame_bytes: bool = False,
+    mutate_manifest_order_from_backend: str | None = None,
+    second_frame: bool = False,
+    symlink_frame: bool = False,
+    oversize_frame: bool = False,
+    partial_stall_backend: str | None = None,
+    late_backend: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
     fake_modules = tmp_path / "fake-modules"
     fake_modules.mkdir()
@@ -70,15 +84,30 @@ class YOLO:
         self.backend = Path(model_path).suffix.removeprefix(".")
         self.evidence = json.loads(Path(os.environ["FAKE_BACKEND_EVIDENCE"]).read_text())
         self.calls = {}
-        Path(os.environ["FAKE_BACKEND_EVIDENCE"]).with_name(f"started-{self.backend}").touch()
+        Path(os.environ["FAKE_BACKEND_EVIDENCE"]).with_name(f"started-{self.backend}").write_text(str(os.getpid()))
         if self.backend == "torchscript" and self.evidence.get("swap_output_to"):
             output = Path(self.evidence["output_path"])
             output.unlink(missing_ok=True)
             os.link(self.evidence["swap_output_to"], output)
 
     def predict(self, *, source, verbose=False):
+        if self.backend == self.evidence.get("partial_stall_backend"):
+            Path(os.environ["PARKING_BENCHMARK_EVIDENCE_PATH"]).write_text('{"backend":')
+            time.sleep(5)
+        if self.backend == self.evidence.get("late_backend"):
+            time.sleep(0.8)
         if self.backend == self.evidence.get("mutate_from_backend") and self.evidence.get("mutate_model"):
             Path(self.evidence["mutate_model"]).write_bytes(b"mutated-model")
+        if self.backend == self.evidence.get("mutate_frame_from_backend"):
+            target = Path(self.evidence["original_frame"])
+            original = target.read_bytes()
+            target.write_bytes(b"mutated-frame")
+            if self.evidence.get("restore_frame_bytes"):
+                target.write_bytes(original)
+        if self.backend == self.evidence.get("mutate_manifest_order_from_backend"):
+            manifest = Path(self.evidence["manifest_path"])
+            frames = json.loads(manifest.read_text())["frames"]
+            manifest.write_text(json.dumps({"frames": list(reversed(frames))}))
         if self.backend == self.evidence.get("hang_backend"):
             time.sleep(5)
         time.sleep(float(self.evidence["delays"].get(self.backend, 0.0)))
@@ -97,8 +126,24 @@ class YOLO:
     )
     frame = tmp_path / "frame-a.jpg"
     frame.write_bytes(b"fake-frame")
+    if oversize_frame:
+        frame.write_bytes(b"")
+        with frame.open("r+b") as handle:
+            handle.truncate(32 * 1024 * 1024 + 1)
+    if symlink_frame:
+        target = tmp_path / "real-frame-a.jpg"
+        frame.replace(target)
+        frame.symlink_to(target.name)
+    frames = [frame]
+    if second_frame:
+        frame_b = tmp_path / "frame-b.jpg"
+        frame_b.write_bytes(b"fake-frame-b")
+        frames.append(frame_b)
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"frames": [frame.name]}), encoding="utf-8")
+    manifest.write_text(
+        json.dumps({"frames": [item.name for item in frames]}),
+        encoding="utf-8",
+    )
     models = {
         "pt": tmp_path / "model.pt",
         "onnx": tmp_path / "model.onnx",
@@ -119,9 +164,9 @@ class YOLO:
             {
                 "delays": {"pt": 0.002, "onnx": 0.0, "torchscript": 0.0},
                 "detections": {
-                    "pt": {frame.name: [_detection()]},
-                    "onnx": {frame.name: onnx_detections},
-                    "torchscript": {frame.name: [_detection()]},
+                    "pt": {item.name: [_detection()] for item in frames},
+                    "onnx": {item.name: onnx_detections for item in frames},
+                    "torchscript": {item.name: [_detection()] for item in frames},
                 },
                 "sequences": (
                     {"onnx": onnx_sequence} if onnx_sequence is not None else {}
@@ -139,6 +184,15 @@ class YOLO:
                 "swap_output_to": (
                     str(models[swap_output_to]) if swap_output_to else None
                 ),
+                "mutate_frame_from_backend": mutate_frame_from_backend,
+                "restore_frame_bytes": restore_frame_bytes,
+                "original_frame": str(frame),
+                "mutate_manifest_order_from_backend": (
+                    mutate_manifest_order_from_backend
+                ),
+                "manifest_path": str(manifest),
+                "partial_stall_backend": partial_stall_backend,
+                "late_backend": late_backend,
             }
         ),
         encoding="utf-8",
@@ -174,6 +228,9 @@ class YOLO:
         [str(fake_modules), str(Path.cwd()), environment.get("PYTHONPATH", "")]
     )
     environment["FAKE_BACKEND_EVIDENCE"] = str(evidence)
+    benchmark_temp = tmp_path / "benchmark-temp"
+    benchmark_temp.mkdir()
+    environment["TMPDIR"] = str(benchmark_temp)
     command = [
             sys.executable,
             "scripts/benchmark_detector_backends.py",
@@ -374,7 +431,7 @@ def test_backend_benchmark_terminates_a_hanging_worker_before_next_backend(
         tmp_path,
         onnx_detections=[_detection()],
         hang_backend="onnx",
-        worker_timeout_seconds=0.2,
+        worker_timeout_seconds=0.5,
     )
 
     assert result.returncode == 2
@@ -525,3 +582,158 @@ def test_backend_benchmark_rejects_unsafe_output_paths(
     assert "benchmark output" in result.stderr
     assert report == {}
     assert not (tmp_path / "started-pt").exists()
+
+
+def test_backend_benchmark_records_bound_ordered_corpus_provenance(
+    tmp_path: Path,
+) -> None:
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        second_frame=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report["corpus"]["frame_count"] == 2
+    assert len(report["corpus"]["manifest_sha256"]) == 64
+    assert len(report["corpus"]["ordered_frame_sha256"]) == 2
+    assert all(
+        len(digest) == 64
+        for digest in report["corpus"]["ordered_frame_sha256"]
+    )
+    assert len(report["corpus"]["corpus_sha256"]) == 64
+
+
+@pytest.mark.parametrize("restore_frame_bytes", [False, True])
+def test_backend_benchmark_rejects_later_worker_frame_mutation(
+    tmp_path: Path,
+    restore_frame_bytes: bool,
+) -> None:
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        mutate_frame_from_backend="onnx",
+        restore_frame_bytes=restore_frame_bytes,
+    )
+
+    assert result.returncode == 2
+    assert "frame changed after corpus preflight" in result.stderr
+    assert report == {}
+    assert not (tmp_path / "started-torchscript").exists()
+
+
+def test_backend_benchmark_rejects_manifest_order_mutation(
+    tmp_path: Path,
+) -> None:
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        second_frame=True,
+        mutate_manifest_order_from_backend="onnx",
+    )
+
+    assert result.returncode == 2
+    assert "manifest changed after corpus preflight" in result.stderr
+    assert report == {}
+    assert not (tmp_path / "started-torchscript").exists()
+
+
+@pytest.mark.parametrize("unsafe_frame", ["symlink", "oversize"])
+def test_backend_benchmark_rejects_unsafe_corpus_frames_before_workers(
+    tmp_path: Path,
+    unsafe_frame: str,
+) -> None:
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        symlink_frame=unsafe_frame == "symlink",
+        oversize_frame=unsafe_frame == "oversize",
+    )
+
+    assert result.returncode == 2
+    assert "frame" in result.stderr
+    assert report == {}
+    assert not (tmp_path / "started-pt").exists()
+
+
+@pytest.mark.parametrize("worker_case", ["partial-stall", "late-completion"])
+def test_backend_benchmark_enforces_absolute_deadline_and_cleans_worker_state(
+    tmp_path: Path,
+    worker_case: str,
+) -> None:
+    started = time.monotonic()
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        partial_stall_backend="onnx" if worker_case == "partial-stall" else None,
+        late_backend="onnx" if worker_case == "late-completion" else None,
+        worker_timeout_seconds=0.3,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 2
+    assert "onnx worker exceeded timeout" in result.stderr
+    assert elapsed < 2.0
+    assert report == {}
+    worker_pid = int((tmp_path / "started-onnx").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(worker_pid, 0)
+    assert list((tmp_path / "benchmark-temp").iterdir()) == []
+    assert not (tmp_path / "started-torchscript").exists()
+
+
+@pytest.mark.parametrize(
+    "replacement_phase",
+    ["before-temp", "before-replace", "after-replace-fsync"],
+)
+def test_guarded_report_rejects_parent_replacement_at_every_publication_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_phase: str,
+) -> None:
+    from parking_spot_monitor import detector_benchmark_output as output_module
+
+    parent = tmp_path / "evidence"
+    parent.mkdir()
+    protected = tmp_path / "manifest.json"
+    protected.write_text('{"frames":["frame.jpg"]}', encoding="utf-8")
+    output = parent / "report.json"
+    moved_parent = tmp_path / "evidence-moved"
+    guard = validate_benchmark_output(output, protected_paths=[protected])
+    replaced = False
+
+    def replace_parent() -> None:
+        nonlocal replaced
+        if replaced:
+            return
+        parent.rename(moved_parent)
+        parent.mkdir()
+        replaced = True
+
+    if replacement_phase == "before-temp":
+        replace_parent()
+    before_publish = (
+        replace_parent if replacement_phase == "before-replace" else lambda: None
+    )
+    if replacement_phase == "after-replace-fsync":
+        real_fsync = output_module.os.fsync
+
+        def replace_after_directory_fsync(descriptor: int) -> None:
+            real_fsync(descriptor)
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                replace_parent()
+
+        monkeypatch.setattr(output_module.os, "fsync", replace_after_directory_fsync)
+
+    with pytest.raises(ValueError, match="output parent changed"):
+        write_guarded_report(
+            guard,
+            {"schema_version": 1},
+            before_publish=before_publish,
+        )
+
+    assert not output.exists()
+    assert not list(parent.glob(".report.json.tmp-*"))
+    assert not list(moved_parent.glob(".report.json.tmp-*"))
+    assert not (moved_parent / "report.json").exists()
+    guard.close()
