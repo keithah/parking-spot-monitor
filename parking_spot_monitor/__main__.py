@@ -322,7 +322,7 @@ def _default_matrix_command_service_factory(
     paths = resolve_runtime_paths(settings, data_dir)
     feedback_labeler = OperatorFeedbackLabeler(data_dir=paths.data_dir, snapshots_dir=paths.snapshots_dir, logger=logger)
 
-    def record_lab_outcome(status_payload: Mapping[str, Any]) -> None:
+    def record_outcome(status_payload: Mapping[str, Any]) -> None:
         _append_lab_outcome_memory(paths.decision_memory_file, status_payload, data_dir=paths.data_dir, logger=logger)
 
     def who_snapshot_provider(base_text: str) -> Any:
@@ -360,7 +360,7 @@ def _default_matrix_command_service_factory(
             latest_path=paths.latest_frame,
             snapshots_dir=paths.snapshots_dir,
             detection_lab_manager=DetectionLabManager(
-                paths.data_dir, logger=logger, outcome_recorder=record_lab_outcome
+                paths.data_dir, logger=logger, outcome_recorder=record_outcome
             ),
             incident_detector=_LazyIncidentReplayDetector(settings),
         ),
