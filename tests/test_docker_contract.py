@@ -143,6 +143,12 @@ def _compileall_words(arguments: str) -> list[str] | None:
         if words[index : index + 2] == ["-m", "compileall"]
     ]
     if not module_indexes:
+        if (
+            len(words) >= 3
+            and PurePosixPath(words[0]).name == "sh"
+            and words[1] == "-c"
+        ):
+            return _compileall_words(words[2])
         return None
 
     assert len(module_indexes) == 1
@@ -434,6 +440,27 @@ def test_unclassifiable_compileall_module_run_fails_closed() -> None:
         "FROM capture-base AS runtime-app",
         'RUN ["module-runner", "-m", "compileall", "-q", "/app/src"]\n\n'
         "FROM capture-base AS runtime-app",
+        1,
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_exact_final_source_contract(mutated)
+
+
+@pytest.mark.parametrize(
+    "run_instruction",
+    [
+        'RUN sh -c "python -m compileall -q /app/src"',
+        'RUN ["sh", "-c", "python -m compileall -q /app/src"]',
+    ],
+)
+def test_nested_shell_compileall_cannot_hide_in_an_intermediate_stage(
+    run_instruction: str,
+) -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    mutated = dockerfile.replace(
+        "FROM capture-base AS runtime-app",
+        run_instruction + "\n\nFROM capture-base AS runtime-app",
         1,
     )
 
