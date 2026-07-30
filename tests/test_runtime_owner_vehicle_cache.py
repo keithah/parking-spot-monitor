@@ -26,9 +26,6 @@ class FakeArchive:
     def mutation_revision(self) -> int:
         return self.revision
 
-    def active_session_signature(self) -> tuple[tuple[str, int, int], ...]:
-        return ()
-
     def load_active_sessions(self) -> list[object]:
         self.active_loads += 1
         return []
@@ -37,6 +34,17 @@ class FakeArchive:
 def write_registry(path: Path, profile_id: str | None = None) -> None:
     vehicles = [] if profile_id is None else [{"profile_id": profile_id, "label": "Owner car"}]
     path.write_text(json.dumps({"schema_version": 1, "owner_vehicles": vehicles}), encoding="utf-8")
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.current = 0.0
+
+    def __call__(self) -> float:
+        return self.current
+
+    def advance(self, seconds: float) -> None:
+        self.current += seconds
 
 
 def occupied_event(*, spot_id: str = "left", observed_at: str = "2026-05-18T13:00:00Z") -> OccupancyEvent:
@@ -81,6 +89,67 @@ def test_owner_snapshot_reuses_registry_and_active_sessions(tmp_path: Path) -> N
 
     assert second is first
     assert archive.active_loads == 1
+
+
+def test_owner_snapshot_cache_hits_skip_active_file_scans_until_poll_deadline(tmp_path: Path) -> None:
+    registry_path = tmp_path / "owner-vehicles.json"
+    write_registry(registry_path)
+    archive = FakeArchive()
+    clock = FakeClock()
+    cache = OwnerVehicleRuntimeCache(
+        registry_path,
+        logger=StructuredLogger(),
+        now=clock,
+        active_session_poll_seconds=10.0,
+    )
+
+    first = cache.snapshot(archive)
+    for _ in range(100):
+        assert cache.snapshot(archive) is first
+
+    assert archive.active_loads == 1
+
+
+def test_owner_snapshot_revalidates_external_active_files_at_exact_poll_deadline(tmp_path: Path) -> None:
+    registry_path = tmp_path / "owner-vehicles.json"
+    write_registry(registry_path)
+    archive = FakeArchive()
+    clock = FakeClock()
+    cache = OwnerVehicleRuntimeCache(
+        registry_path,
+        logger=StructuredLogger(),
+        now=clock,
+        active_session_poll_seconds=10.0,
+    )
+    first = cache.snapshot(archive)
+
+    clock.advance(9.999)
+    assert cache.snapshot(archive) is first
+    assert archive.active_loads == 1
+
+    clock.advance(0.001)
+    assert cache.snapshot(archive) is first
+    assert archive.active_loads == 2
+
+
+def test_owner_snapshot_archive_revision_invalidates_immediately_within_poll_window(tmp_path: Path) -> None:
+    registry_path = tmp_path / "owner-vehicles.json"
+    write_registry(registry_path)
+    archive = FakeArchive()
+    clock = FakeClock()
+    cache = OwnerVehicleRuntimeCache(
+        registry_path,
+        logger=StructuredLogger(),
+        now=clock,
+        active_session_poll_seconds=10.0,
+    )
+    first = cache.snapshot(archive)
+    archive.revision += 1
+
+    second = cache.snapshot(archive)
+
+    assert second is not first
+    assert archive.active_loads == 2
 
 
 def test_owner_snapshot_copies_active_sessions_into_a_tuple(tmp_path: Path) -> None:
@@ -157,10 +226,16 @@ def test_owner_snapshot_invalidates_on_archive_mutation(tmp_path: Path) -> None:
     assert archive.active_loads == 2
 
 
-def test_owner_snapshot_invalidates_after_external_active_record_replacement(tmp_path: Path) -> None:
+def test_owner_snapshot_invalidates_external_active_record_at_poll_deadline(tmp_path: Path) -> None:
     archive = VehicleHistoryArchive(tmp_path)
     active = archive.start_session(occupied_event())
-    cache = OwnerVehicleRuntimeCache(archive.root / "owner-vehicles.json", logger=StructuredLogger())
+    clock = FakeClock()
+    cache = OwnerVehicleRuntimeCache(
+        archive.root / "owner-vehicles.json",
+        logger=StructuredLogger(),
+        now=clock,
+        active_session_poll_seconds=10.0,
+    )
     first = cache.snapshot(archive)
     revision = archive.mutation_revision()
     old_stat = (archive.active_dir / f"{active.session_id}.json").stat()
@@ -171,21 +246,31 @@ def test_owner_snapshot_invalidates_after_external_active_record_replacement(tmp
         profile_id="profile-external",
         mtime_ns=old_stat.st_mtime_ns + 1_000_000,
     )
+    clock.advance(9.999)
+    still_cached = cache.snapshot(archive)
+    clock.advance(0.001)
     second = cache.snapshot(archive)
 
     assert archive.mutation_revision() == revision
+    assert still_cached is first
     assert second is not first
     assert first.active_sessions[0].profile_id is None
     assert second.active_sessions[0].profile_id == "profile-external"
 
 
-def test_external_active_record_replacement_during_rebuild_retries_to_a_stable_snapshot(
+def test_external_active_record_replacement_after_load_is_visible_at_poll_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     archive = VehicleHistoryArchive(tmp_path)
     active = archive.start_session(occupied_event())
-    cache = OwnerVehicleRuntimeCache(archive.root / "owner-vehicles.json", logger=StructuredLogger())
+    clock = FakeClock()
+    cache = OwnerVehicleRuntimeCache(
+        archive.root / "owner-vehicles.json",
+        logger=StructuredLogger(),
+        now=clock,
+        active_session_poll_seconds=10.0,
+    )
     real_load = archive.load_active_sessions
     active_loads = 0
 
@@ -206,40 +291,33 @@ def test_external_active_record_replacement_during_rebuild_retries_to_a_stable_s
     monkeypatch.setattr(archive, "load_active_sessions", replace_after_first_load)
 
     snapshot = cache.snapshot(archive)
+    clock.advance(10.0)
+    current = cache.snapshot(archive)
 
-    assert snapshot.active_sessions[0].profile_id == "profile-current"
+    assert snapshot.active_sessions[0].profile_id is None
+    assert current.active_sessions[0].profile_id == "profile-current"
     assert active_loads == 2
-    assert cache.snapshot(archive) is snapshot
+    assert cache.snapshot(archive) is current
 
 
-def test_active_session_signature_stat_failure_warns_and_does_not_admit_a_cache_entry(
+def test_active_session_load_failure_warns_and_does_not_admit_a_cache_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     archive = VehicleHistoryArchive(tmp_path)
     active = archive.start_session(occupied_event())
-    active_path = archive.active_dir / f"{active.session_id}.json"
     cache = OwnerVehicleRuntimeCache(archive.root / "owner-vehicles.json", logger=StructuredLogger())
-    real_stat = Path.stat
     real_load = archive.load_active_sessions
-    active_stat_calls = 0
     active_loads = 0
-
-    def fail_active_stat_once(path: Path, *args: object, **kwargs: object) -> os.stat_result:
-        nonlocal active_stat_calls
-        if path == active_path:
-            active_stat_calls += 1
-        if path == active_path and active_stat_calls == 3:
-            raise PermissionError("active session signature denied")
-        return real_stat(path, *args, **kwargs)
 
     def counted_load_active_sessions():
         nonlocal active_loads
         active_loads += 1
+        if active_loads == 1:
+            raise PermissionError("active session load denied")
         return real_load()
 
-    monkeypatch.setattr(Path, "stat", fail_active_stat_once)
     monkeypatch.setattr(archive, "load_active_sessions", counted_load_active_sessions)
 
     alerts = _owner_vehicle_quiet_window_alerts(
@@ -340,7 +418,7 @@ def test_archive_mutation_during_rebuild_is_cached_only_after_a_stable_retry(tmp
     assert snapshot.active_sessions == (current_session,)
     assert cached is snapshot
     assert archive.active_loads == 2
-    assert archive.revision_reads == 5
+    assert archive.revision_reads == 4
 
 
 def test_registry_load_failure_retries_without_claiming_the_new_signature(
@@ -549,7 +627,9 @@ def test_runtime_cache_recovers_after_invalid_registry_is_repaired(tmp_path: Pat
     cache.snapshot(archive)
     registry_path.write_text("{broken", encoding="utf-8")
     stale = cache.snapshot(archive)
-    write_registry(registry_path, "profile-b")
+    repaired_path = registry_path.with_suffix(".repaired.json")
+    write_registry(repaired_path, "profile-b")
+    repaired_path.replace(registry_path)
 
     repaired = cache.snapshot(archive)
 
@@ -558,17 +638,14 @@ def test_runtime_cache_recovers_after_invalid_registry_is_repaired(tmp_path: Pat
     assert repaired.registry.owner_for_profile("profile-b") is not None
 
 
-def test_owner_snapshot_requires_archive_signature_protocol(tmp_path: Path) -> None:
+def test_owner_snapshot_requires_archive_load_protocol(tmp_path: Path) -> None:
     class IncompleteArchive:
         def mutation_revision(self) -> int:
             return 1
 
-        def load_active_sessions(self) -> list[object]:
-            return []
-
     cache = OwnerVehicleRuntimeCache(tmp_path / "missing.json", logger=StructuredLogger())
 
-    with pytest.raises(AttributeError, match="active_session_signature"):
+    with pytest.raises(AttributeError, match="load_active_sessions"):
         cache.snapshot(IncompleteArchive())  # type: ignore[arg-type]
 
 
