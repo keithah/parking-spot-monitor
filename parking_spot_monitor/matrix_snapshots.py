@@ -181,11 +181,12 @@ def prepare_event_snapshot(
             event_id=event_id_text,
             spot_id=spot_id,
         )
-
+    published_identity = None
     try:
         copied_snapshot = not _same_path(source, destination)
         if copied_snapshot:
-            destination = publish_retained_snapshot(source, snapshot_root, filename)
+            publication = publish_retained_snapshot(source, snapshot_root, filename)
+            destination, published_identity = publication.path, publication.identity
     except OSError as exc:
         raise MatrixError(
             "Matrix snapshot copy failed",
@@ -197,7 +198,6 @@ def prepare_event_snapshot(
             spot_id=spot_id,
             exception_type=exc.__class__.__name__,
         ) from exc
-
     byte_size = 0
     try:
         evidence = read_owned_jpeg_evidence(snapshot_root, filename)
@@ -210,9 +210,9 @@ def prepare_event_snapshot(
         Image.DecompressionBombError,
         Image.DecompressionBombWarning,
     ) as exc:
-        if copied_snapshot:
+        if copied_snapshot and published_identity is not None:
             try:
-                delete_owned_artifact(snapshot_root, None, filename)
+                delete_owned_artifact(snapshot_root, None, filename, expected_identity=published_identity)
             except OSError:
                 pass
         raise MatrixError(

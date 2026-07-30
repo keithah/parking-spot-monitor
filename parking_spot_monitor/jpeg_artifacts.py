@@ -19,10 +19,9 @@ import warnings
 from PIL import Image, UnidentifiedImageError
 
 from parking_spot_monitor.file_descriptor_binding import (
+    FileIdentity,
+    RootedDirectoryOwner,
     descriptor_identity,
-    open_nofollow_regular_descriptors,
-    regular_path_matches_descriptor,
-    unlink_if_descriptor_matches,
 )
 
 _FICLONE = 0x40049409
@@ -45,6 +44,7 @@ _FALLBACK_ERRNOS = frozenset(
 class JpegPublication:
     path: Path
     strategy: Literal["reflink", "copy"]
+    identity: FileIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,54 +79,60 @@ def publish_canonical_jpeg(source: str | Path, destination: str | Path) -> JpegP
     source_fd = _open_source_descriptor(source_path)
     try:
         evidence = _validated_source_evidence(source_fd)
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        os.close(os.open(destination_path.parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)))
-        temporary = destination_path.parent / f".{destination_path.name}.{secrets.token_hex(8)}.tmp"
-        replaced = False
-        temporary_fd = -1
-        committed_identity_fd = committed_fd = -1
-        try:
+        with RootedDirectoryOwner(destination_path.parent, create=True) as owner:
+            temporary_name = f".{destination_path.name}.{secrets.token_hex(8)}.tmp"
+            replaced = False
+            temporary_fd = committed_identity_fd = committed_fd = -1
             try:
-                _reflink(source_fd, temporary, evidence.mode)
-                strategy: Literal["reflink", "copy"] = "reflink"
-            except OSError as reflink_exc:
-                if reflink_exc.errno not in _FALLBACK_ERRNOS:
+                try:
+                    _reflink(source_fd, owner, temporary_name, evidence.mode)
+                    strategy: Literal["reflink", "copy"] = "reflink"
+                except OSError as reflink_exc:
+                    if reflink_exc.errno not in _FALLBACK_ERRNOS:
+                        raise
+                    _copy_file(source_fd, owner, temporary_name, evidence.mode)
+                    strategy = "copy"
+                temporary_fd = _open_artifact(owner, temporary_name)
+                temporary_identity = descriptor_identity(temporary_fd)
+                _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
+                os.fsync(temporary_fd)
+                _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
+                owner.replace(temporary_name, destination_path.name)
+                replaced = True
+                try:
+                    committed_identity_fd = owner.open_identity(destination_path.name)
+                    committed_identity = descriptor_identity(committed_identity_fd)
+                    if committed_identity != temporary_identity:
+                        raise JpegDecodeError("read_failed")
+                    committed_fd = _open_artifact(owner, destination_path.name)
+                    _validate_artifact_descriptor(committed_fd, source_fd, evidence)
+                    if descriptor_identity(committed_fd) != temporary_identity:
+                        raise JpegDecodeError("read_failed")
+                    if not owner.matches(destination_path.name, committed_identity):
+                        raise JpegDecodeError("read_failed")
+                except (JpegDecodeError, OSError):
+                    cleanup_identity = (
+                        descriptor_identity(committed_identity_fd)
+                        if committed_identity_fd >= 0
+                        else temporary_identity
+                    )
+                    owner.unlink_if_matches(destination_path.name, cleanup_identity)
+                    raise JpegDecodeError("read_failed") from None
+                owner.fsync()
+                try:
+                    _validate_artifact_descriptor(committed_fd, source_fd, evidence)
+                    if not owner.matches(destination_path.name, committed_identity) or not owner.is_still_bound():
+                        raise JpegDecodeError("read_failed")
+                except JpegDecodeError:
+                    owner.unlink_if_matches(destination_path.name, committed_identity)
                     raise
-                _copy_file(source_fd, temporary, evidence.mode)
-                strategy = "copy"
-            temporary_fd = _open_artifact(temporary)
-            _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
-            os.fsync(temporary_fd)
-            _validate_artifact_descriptor(temporary_fd, source_fd, evidence)
-            os.replace(temporary, destination_path)
-            replaced = True
-            try:
-                committed_identity_fd, committed_fd = open_nofollow_regular_descriptors(destination_path)
-                if committed_fd < 0:
-                    raise JpegDecodeError("read_failed")
-                _validate_artifact_descriptor(committed_fd, source_fd, evidence)
-                if descriptor_identity(committed_fd) != descriptor_identity(temporary_fd):
-                    raise JpegDecodeError("read_failed")
-                if not regular_path_matches_descriptor(destination_path, committed_fd):
-                    raise JpegDecodeError("read_failed")
-            except JpegDecodeError:
-                unlink_if_descriptor_matches(destination_path, committed_identity_fd)
-                raise
-            _fsync_directory(destination_path.parent)
-            try:
-                _validate_artifact_descriptor(committed_fd, source_fd, evidence)
-                if not regular_path_matches_descriptor(destination_path, committed_fd):
-                    raise JpegDecodeError("read_failed")
-            except JpegDecodeError:
-                unlink_if_descriptor_matches(destination_path, committed_identity_fd)
-                raise
-            return JpegPublication(path=destination_path, strategy=strategy)
-        finally:
-            for descriptor in (committed_fd, committed_identity_fd, temporary_fd):
-                if descriptor >= 0:
-                    os.close(descriptor)
-            if not replaced:
-                _unlink_best_effort(temporary)
+                return JpegPublication(path=destination_path, strategy=strategy, identity=committed_identity)
+            finally:
+                if not replaced and temporary_fd >= 0:
+                    owner.unlink_if_matches(temporary_name, descriptor_identity(temporary_fd))
+                for descriptor in (committed_fd, committed_identity_fd, temporary_fd):
+                    if descriptor >= 0:
+                        os.close(descriptor)
     finally:
         os.close(source_fd)
 
@@ -234,32 +240,40 @@ def _validate_jpeg_descriptor(source_fd: int) -> None:
         raise JpegDecodeError("read_failed") from exc
 
 
-def _reflink(source_fd: int, temporary: Path, source_mode: int) -> None:
+def _reflink(source_fd: int, owner: RootedDirectoryOwner, temporary_name: str, source_mode: int) -> None:
     destination_fd = -1
     try:
-        destination_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode)
+        destination_fd = owner.open_file(temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode)
         fcntl.ioctl(destination_fd, _FICLONE, source_fd)
         os.fchmod(destination_fd, source_mode)
     except Exception:
         if destination_fd >= 0:
+            identity = descriptor_identity(destination_fd)
             os.close(destination_fd)
             destination_fd = -1
-        _unlink_best_effort(temporary)
+            owner.unlink_if_matches(temporary_name, identity)
         raise
     finally:
         if destination_fd >= 0:
             os.close(destination_fd)
 
 
-def _copy_file(source_fd: int, temporary: Path, source_mode: int) -> None:
-    destination_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode)
+def _copy_file(source_fd: int, owner: RootedDirectoryOwner, temporary_name: str, source_mode: int) -> None:
+    destination_fd = owner.open_file(temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode)
     try:
         os.lseek(source_fd, 0, os.SEEK_SET)
         while chunk := os.read(source_fd, _COPY_CHUNK_BYTES):
             _write_all(destination_fd, chunk)
         os.fchmod(destination_fd, source_mode)
-    finally:
+    except Exception:
+        identity = descriptor_identity(destination_fd)
         os.close(destination_fd)
+        destination_fd = -1
+        owner.unlink_if_matches(temporary_name, identity)
+        raise
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
 
 
 def _open_source_descriptor(path: Path) -> int:
@@ -282,9 +296,9 @@ def _validated_source_evidence(source_fd: int) -> _SourceEvidence:
     return _SourceEvidence(before, digest_after, stat.S_IMODE(value.st_mode))
 
 
-def _open_artifact(path: Path) -> int:
+def _open_artifact(owner: RootedDirectoryOwner, name: str) -> int:
     try:
-        return os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        return owner.open_file(name, os.O_RDONLY)
     except OSError as exc:
         raise JpegDecodeError("read_failed", source_error_type=exc.__class__.__name__) from exc
 
@@ -330,20 +344,3 @@ def _write_all(descriptor: int, payload: bytes) -> None:
             offset += written
     finally:
         view.release()
-
-
-def _unlink_best_effort(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-def _fsync_directory(path: Path) -> None:
-    if not hasattr(os, "O_DIRECTORY"):
-        return
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)

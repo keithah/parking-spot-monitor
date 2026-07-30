@@ -9,7 +9,8 @@ from typing import Sequence
 
 from PIL import Image
 
-from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, open_decoded_rgb_jpeg, publish_canonical_jpeg
+from parking_spot_monitor.file_descriptor_binding import unlink_owned_path
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError, JpegPublication, open_decoded_rgb_jpeg, publish_canonical_jpeg
 
 BBoxInput = Sequence[float]
 
@@ -59,18 +60,21 @@ def capture_occupied_images(
     full_frame_path = root / "images" / "occupied-full" / f"{session_id}.jpg"
     crop_path = root / "images" / "occupied-crops" / f"{session_id}.jpg"
 
+    publication: JpegPublication | None = None
     try:
-        publish_canonical_jpeg(source_frame_path, full_frame_path)
+        publication = publish_canonical_jpeg(source_frame_path, full_frame_path)
         with open_decoded_rgb_jpeg(full_frame_path, initial_max_dimension=2**31 - 1) as decoded:
             crop_box = clamp_crop_box(bbox, decoded.image.size)
             with decoded.image.crop(crop_box.as_pillow_box) as crop:
                 _write_jpeg_atomic(crop_path, crop)
     except JpegDecodeError as exc:
-        full_frame_path.unlink(missing_ok=True)
+        if publication is not None:
+            unlink_owned_path(full_frame_path, publication.identity)
         message = "source occupied frame must be a JPEG" if exc.code == "unidentified" else "source occupied frame is missing or unreadable"
         raise VehicleHistoryImageError(message) from exc
     except (VehicleHistoryImageError, OSError, ValueError) as exc:
-        full_frame_path.unlink(missing_ok=True)
+        if publication is not None:
+            unlink_owned_path(full_frame_path, publication.identity)
         raise VehicleHistoryImageError(str(exc) or exc.__class__.__name__) from exc
 
     return OccupiedImageCaptureResult(full_frame_path=full_frame_path, crop_path=crop_path)

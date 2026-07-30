@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -15,6 +16,7 @@ import parking_spot_monitor.matrix_snapshot_storage as matrix_snapshot_storage
 import parking_spot_monitor.jpeg_artifacts as jpeg_artifacts
 from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.image_budget import ImageBudgetError, JpegBudgetResult
+from parking_spot_monitor.jpeg_artifacts import JpegDecodeError
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_models import MatrixTextEvent
 from parking_spot_monitor.matrix import (
@@ -1466,6 +1468,37 @@ def test_prepare_event_snapshot_rejects_non_image_bytes_without_claiming_jpeg_me
     assert exc_info.value.diagnostics["source_path"] == str(source)
     assert not (tmp_path / "snapshots" / "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg").exists()
     assert "mimetype" not in exc_info.value.diagnostics
+
+
+def test_prepare_event_snapshot_failure_preserves_replacement_of_published_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    destination = tmp_path / "snapshots" / "occupancy-open-event-left-spot-2026-05-18t20-01-02z.jpg"
+    replacement = tmp_path / "replacement.txt"
+    replacement_bytes = b"unrelated retained replacement"
+    replacement.write_bytes(replacement_bytes)
+
+    def replace_then_fail(*args: object, **kwargs: object) -> object:
+        os.replace(replacement, destination)
+        raise JpegDecodeError("read_failed")
+
+    monkeypatch.setattr(matrix_snapshots, "read_owned_jpeg_evidence", replace_then_fail)
+
+    with pytest.raises(MatrixError) as exc_info:
+        prepare_event_snapshot(
+            source_path=source,
+            data_dir=tmp_path,
+            snapshots_dir=tmp_path / "snapshots",
+            event_type="occupancy-open-event",
+            event_id="event-1",
+            spot_id="left_spot",
+            observed_at="2026-05-18T20:01:02Z",
+        )
+
+    assert exc_info.value.diagnostics["error_type"] == "snapshot_metadata_failed"
+    assert destination.read_bytes() == replacement_bytes
 
 
 @pytest.mark.parametrize(

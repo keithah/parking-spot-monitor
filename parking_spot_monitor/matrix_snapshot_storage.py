@@ -12,6 +12,12 @@ import secrets
 import stat
 from types import MappingProxyType
 
+from parking_spot_monitor.file_descriptor_binding import (
+    FileIdentity,
+    OwnedFile,
+    RootedDirectoryOwner,
+    descriptor_identity,
+)
 from parking_spot_monitor.jpeg_artifacts import jpeg_bytes_dimensions
 
 _COPY_CHUNK_BYTES = 1024 * 1024
@@ -156,7 +162,13 @@ def validate_owned_file(snapshot_root: Path, directory: str | None, filename: st
         return parent / safe_name
 
 
-def delete_owned_artifact(snapshot_root: Path, directory: str | None, filename: str) -> int:
+def delete_owned_artifact(
+    snapshot_root: Path,
+    directory: str | None,
+    filename: str,
+    *,
+    expected_identity: FileIdentity | None = None,
+) -> int:
     try:
         context = _artifact_directory(snapshot_root, directory, create=False)
         with context as (directory_fd, _parent):
@@ -164,6 +176,8 @@ def delete_owned_artifact(snapshot_root: Path, directory: str | None, filename: 
             try:
                 value = os.stat(safe_name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
+                return 0
+            if expected_identity is not None and FileIdentity.from_stat(value) != expected_identity:
                 return 0
             if directory is None and not stat.S_ISREG(value.st_mode):
                 raise OSError("retained snapshot is not a regular file")
@@ -174,7 +188,7 @@ def delete_owned_artifact(snapshot_root: Path, directory: str | None, filename: 
         return 0
 
 
-def publish_retained_snapshot(source: Path, snapshot_root: Path, filename: str) -> Path:
+def publish_retained_snapshot(source: Path, snapshot_root: Path, filename: str) -> OwnedFile:
     source_fd = _open_source_file(source)
     safe_name = safe_artifact_name(filename)
     try:
@@ -198,12 +212,14 @@ def publish_retained_snapshot(source: Path, snapshot_root: Path, filename: str) 
                     raise OSError("snapshot source changed while copying")
                 os.fchmod(temporary_fd, 0o644)
                 os.fsync(temporary_fd)
-                os.close(temporary_fd)
-                temporary_fd = -1
+                published_identity = descriptor_identity(temporary_fd)
                 os.replace(temporary_name, safe_name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
                 replaced = True
+                value = os.stat(safe_name, dir_fd=root_fd, follow_symlinks=False)
+                if not stat.S_ISREG(value.st_mode) or FileIdentity.from_stat(value) != published_identity:
+                    raise OSError("retained snapshot changed during publication")
                 os.fsync(root_fd)
-                return root / safe_name
+                return OwnedFile(root / safe_name, published_identity)
             finally:
                 if temporary_fd >= 0:
                     os.close(temporary_fd)
@@ -250,20 +266,8 @@ def _artifact_directory(
 @contextmanager
 def _directory(path: Path, *, create: bool) -> Iterator[tuple[int, Path]]:
     absolute = absolute_snapshot_root(path)
-    descriptor = os.open(os.sep, _DIRECTORY_FLAGS)
-    try:
-        for part in absolute.parts[1:]:
-            if create:
-                try:
-                    os.mkdir(part, 0o755, dir_fd=descriptor)
-                except FileExistsError:
-                    pass
-            child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = child
-        yield descriptor, absolute
-    finally:
-        os.close(descriptor)
+    with RootedDirectoryOwner(absolute, create=create) as owner:
+        yield owner.fd, absolute
 
 
 def _open_source_file(path: Path) -> int:
