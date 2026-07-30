@@ -13,7 +13,7 @@ from parking_spot_monitor.geometry import (
     point_in_polygon,
     polygon_area,
 )
-from tests.test_config import fake_environ
+from tests.support._config import fake_environ
 
 
 LEFT_SPOT = [(300, 180), (650, 215), (690, 285), (420, 360), (260, 300)]

@@ -15,7 +15,7 @@ from parking_spot_monitor.debug_overlay import (
     write_debug_overlay,
 )
 from parking_spot_monitor.logging import StructuredLogger
-from tests.test_config import SECRET_MARKER, fake_environ
+from tests.support._config import SECRET_MARKER, fake_environ
 
 
 LEFT_EDGE_PIXEL = (300, 180)
