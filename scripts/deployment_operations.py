@@ -327,13 +327,14 @@ def backup_operation(
     *,
     data_dir: Path = Path("data"),
     env_file: Path = Path(".env"),
+    config_file: Path = Path("config.yaml"),
 ) -> None:
     if backup_dir.exists() or backup_dir.is_symlink():
         raise DeploymentError("backup destination already exists")
     if not SHA256_PATTERN.fullmatch(approved_model_sha256):
         raise DeploymentError("approved model SHA-256 must be 64 lowercase hex characters")
     model = _model_dir(runner) / "yolov8n.pt"
-    for path, label in ((Path("config.yaml"), "config"), (env_file, "environment"), (model, "model")):
+    for path, label in ((config_file, "config"), (env_file, "environment"), (model, "model")):
         _require_regular_file(path, label)
     if _sha256(model) != approved_model_sha256:
         raise DeploymentError("model does not match the operator-approved SHA-256")
@@ -357,7 +358,7 @@ def backup_operation(
         try:
             stopped = True
             runner.compose("stop", SERVICE)
-            _copy_private(Path("config.yaml"), stage / "config.yaml")
+            _copy_private(config_file, stage / "config.yaml")
             _copy_private(env_file, stage / ".env")
             _copy_private(model, stage / "yolov8n.pt")
             runner.run(
@@ -433,7 +434,12 @@ def upgrade_operation(runner: Runner, revision: str, rollback_tag: str, data_dir
     wait_for_fresh_health(runner, _started_at(runner), data_dir)
 
 
-def rollback_operation(runner: Runner, rollback_dir: Path, data_dir: Path) -> None:
+def rollback_operation(
+    runner: Runner,
+    rollback_dir: Path,
+    data_dir: Path,
+    config_file: Path = Path("config.yaml"),
+) -> None:
     metadata = verify_bundle(rollback_dir)
     rollback_tag = metadata["rollback-image-tag"]
     rollback_image = metadata["rollback-image-id"]
@@ -455,7 +461,7 @@ def rollback_operation(runner: Runner, rollback_dir: Path, data_dir: Path) -> No
         _copy_private(rollback_dir / "config.yaml", stage / "config.yaml")
         _copy_private(rollback_dir / ".env", stage / ".env")
         _copy_private(rollback_dir / "yolov8n.pt", stage / "models/yolov8n.pt")
-        _copy_private(Path("config.yaml"), stage / "active-config.yaml")
+        _copy_private(config_file, stage / "active-config.yaml")
         _copy_private(Path(".env"), stage / "active.env")
         _copy_private(model_dir / "yolov8n.pt", stage / "active-yolov8n.pt")
         runner.run(
@@ -472,7 +478,7 @@ def rollback_operation(runner: Runner, rollback_dir: Path, data_dir: Path) -> No
             service_stopped = True
             runner.compose("stop", SERVICE)
             switched = True
-            _atomic_install(stage / "config.yaml", Path("config.yaml"), 0o600)
+            _atomic_install(stage / "config.yaml", config_file, 0o600)
             _atomic_install(stage / ".env", Path(".env"), 0o600)
             _atomic_install(stage / "models/yolov8n.pt", model_dir / "yolov8n.pt", 0o644)
             runner.run(("docker", "image", "tag", rollback_image, IMAGE_TAG))
@@ -482,7 +488,7 @@ def rollback_operation(runner: Runner, rollback_dir: Path, data_dir: Path) -> No
             if service_stopped:
                 runner.compose("stop", SERVICE, check=False)
                 if switched:
-                    _atomic_install(stage / "active-config.yaml", Path("config.yaml"), 0o600)
+                    _atomic_install(stage / "active-config.yaml", config_file, 0o600)
                     _atomic_install(stage / "active.env", Path(".env"), 0o600)
                     _atomic_install(stage / "active-yolov8n.pt", model_dir / "yolov8n.pt", 0o644)
                 runner.run(("docker", "image", "tag", active_image, IMAGE_TAG))
@@ -536,6 +542,7 @@ def _parser() -> argparse.ArgumentParser:
     backup.add_argument("--approved-model-sha256", required=True)
     backup.add_argument("--data-dir", default=Path("data"), type=Path)
     backup.add_argument("--env-file", default=Path(".env"), type=Path)
+    backup.add_argument("--config-file", default=Path("config.yaml"), type=Path)
     upgrade = subparsers.add_parser("upgrade")
     upgrade.add_argument("--reviewed-revision", required=True)
     upgrade.add_argument("--rollback-tag", required=True)
@@ -543,6 +550,7 @@ def _parser() -> argparse.ArgumentParser:
     rollback = subparsers.add_parser("rollback")
     rollback.add_argument("--rollback-dir", required=True, type=Path)
     rollback.add_argument("--data-dir", default=Path("data"), type=Path)
+    rollback.add_argument("--config-file", default=Path("config.yaml"), type=Path)
     restore = subparsers.add_parser("restore-data")
     restore.add_argument("--rollback-dir", required=True, type=Path)
     restore.add_argument("--data-dir", default=Path("data"), type=Path)
@@ -561,11 +569,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.approved_model_sha256,
                 data_dir=args.data_dir,
                 env_file=args.env_file,
+                config_file=args.config_file,
             )
         elif args.operation == "upgrade":
             upgrade_operation(runner, args.reviewed_revision, args.rollback_tag, args.data_dir)
         elif args.operation == "rollback":
-            rollback_operation(runner, args.rollback_dir, args.data_dir)
+            rollback_operation(
+                runner, args.rollback_dir, args.data_dir, args.config_file
+            )
         else:
             preserved = restore_data_operation(runner, args.rollback_dir, args.data_dir)
             print(f"preserved pre-restore data at {preserved}")

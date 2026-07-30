@@ -196,7 +196,8 @@ def test_backup_tags_running_image_and_restarts_after_archive_failure(
     (tmp_path / "models").mkdir()
     model = tmp_path / "models/yolov8n.pt"
     model.write_bytes(b"model")
-    (tmp_path / "config.yaml").write_text("config", encoding="utf-8")
+    config_file = tmp_path / "operator-config.yaml"
+    config_file.write_text("config", encoding="utf-8")
     (tmp_path / ".env").write_text("environment", encoding="utf-8")
     (tmp_path / "data").mkdir()
     runner = FakeRunner()
@@ -208,6 +209,7 @@ def test_backup_tags_running_image_and_restarts_after_archive_failure(
             tmp_path / "backup",
             "parking-spot-monitor:rollback-test",
             deployment_operations._sha256(model),
+            config_file=config_file,
         )
 
     assert (

@@ -558,6 +558,8 @@ python3 scripts/deployment_operations.py backup \
 
 The helper resolves the running service container and tags its immutable image ID; it never assumes the mutable `parking-spot-monitor:local` tag still names the deployed image. It creates a mode-`0700` private staging directory before copying secrets, installs signal-aware cleanup immediately, stops the service, archives the complete quiesced data tree, writes a UTC recovery timestamp and exact source/image identities, verifies the archive and manifests, publishes the bundle atomically, and restarts the service on both success and failure. Every bundle file is mode `0600`.
 
+The defaults are `config.yaml`, `.env`, and `data/` in the current checkout. Use `--config-file`, `--env-file`, or `--data-dir` when operator bind sources live elsewhere; rollback accepts the same `--config-file` and `--data-dir` overrides.
+
 The bundle contains `config.yaml`, `.env`, `yolov8n.pt`, `approved-model.sha256`, the complete `data.tar`, exact image metadata, and separate consistency manifests. Retain the image tag or an exported image on protected media. Do not describe the co-created manifests as signatures or authentication; they detect later corruption only.
 
 ### Upgrade the exact reviewed revision
