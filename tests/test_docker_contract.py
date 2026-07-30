@@ -1,11 +1,58 @@
 from __future__ import annotations
 
+import fnmatch
 import importlib.util
+import re
 import sys
 import tomllib
 from pathlib import Path
 
 import yaml
+
+
+PYTHON_BASE_IMAGE = (
+    "python:3.12-slim@sha256:"
+    "090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203"
+)
+
+
+def _docker_stages(dockerfile: str) -> list[tuple[str, str, str]]:
+    matches = list(
+        re.finditer(
+            r"^FROM ([^\s]+) AS ([A-Za-z0-9._-]+)\s*$",
+            dockerfile,
+            flags=re.MULTILINE,
+        )
+    )
+    return [
+        (
+            match.group(1),
+            match.group(2),
+            dockerfile[match.end() : matches[index + 1].start()]
+            if index + 1 < len(matches)
+            else dockerfile[match.end() :],
+        )
+        for index, match in enumerate(matches)
+    ]
+
+
+def _docker_context_path_is_allowed(path: str, patterns: list[str]) -> bool:
+    allowed = True
+    for pattern in patterns:
+        negated = pattern.startswith("!")
+        candidate = pattern[1:] if negated else pattern
+        matches = fnmatch.fnmatchcase(path, candidate)
+        if candidate.endswith("/**"):
+            directory = candidate.removesuffix("/**")
+            if path == directory or path.startswith(directory + "/"):
+                matches = True
+        elif candidate.endswith("/"):
+            directory = candidate.rstrip("/")
+            if path == directory or path.startswith(directory + "/"):
+                matches = True
+        if matches:
+            allowed = negated
+    return allowed
 
 
 SECRET_LIKE_STRINGS = [
@@ -90,6 +137,41 @@ def test_dockerfile_uses_buildkit_cache_hash_locks_and_compileall() -> None:
     assert "python -m compileall -q /app/parking_spot_monitor /app/src" in dockerfile
 
 
+def test_dockerfile_has_exact_ordered_stage_graph_and_pinned_base() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    stages = _docker_stages(dockerfile)
+
+    assert [(base, alias) for base, alias, _body in stages] == [
+        (PYTHON_BASE_IMAGE, "python-base"),
+        ("python-base", "tooling"),
+        ("python-base", "capture-base"),
+        ("capture-base", "runtime-app"),
+        ("capture-base", "runtime-detector"),
+    ]
+
+
+def test_lock_installs_are_exactly_owned_by_their_intended_stages() -> None:
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    stages = {alias: body for _base, alias, body in _docker_stages(dockerfile)}
+    cache_mount = "--mount=type=cache,target=/root/.cache/pip,sharing=locked"
+
+    assert dockerfile.count(cache_mount) == 2
+    assert stages["python-base"].count(cache_mount) == 1
+    assert stages["python-base"].count("COPY requirements-runtime.lock ./") == 1
+    assert stages["python-base"].count(
+        "pip install --require-hashes -r requirements-runtime.lock"
+    ) == 1
+    assert stages["runtime-detector"].count(cache_mount) == 1
+    assert stages["runtime-detector"].count("COPY requirements-detector.lock ./") == 1
+    assert stages["runtime-detector"].count(
+        "pip install --require-hashes -r requirements-detector.lock"
+    ) == 1
+    for alias in ("tooling", "capture-base", "runtime-app"):
+        assert "requirements-runtime.lock" not in stages[alias]
+        assert "requirements-detector.lock" not in stages[alias]
+        assert cache_mount not in stages[alias]
+
+
 def test_dockerfile_has_lightweight_tooling_and_capture_stage_boundary() -> None:
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
 
@@ -107,10 +189,9 @@ def test_dockerfile_has_lightweight_tooling_and_capture_stage_boundary() -> None
 
 def test_each_final_docker_stage_copies_source_once_and_compiles_it() -> None:
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
-    app_stage = dockerfile.split("FROM capture-base AS runtime-app", 1)[1].split(
-        "FROM capture-base AS runtime-detector", 1
-    )[0]
-    detector_stage = dockerfile.split("FROM capture-base AS runtime-detector", 1)[1]
+    stages = {alias: body for _base, alias, body in _docker_stages(dockerfile)}
+    app_stage = stages["runtime-app"]
+    detector_stage = stages["runtime-detector"]
 
     for stage in (app_stage, detector_stage):
         assert stage.count("COPY parking_spot_monitor ./parking_spot_monitor") == 1
@@ -119,50 +200,87 @@ def test_each_final_docker_stage_copies_source_once_and_compiles_it() -> None:
         assert stage.count(
             "python -m compileall -q /app/parking_spot_monitor /app/src"
         ) == 1
+    for alias in ("python-base", "tooling", "capture-base"):
+        assert "COPY parking_spot_monitor" not in stages[alias]
+        assert "COPY src" not in stages[alias]
+        assert "COPY main.py" not in stages[alias]
+        assert "COPY config.yaml.example" not in stages[alias]
 
 
-def test_dockerignore_excludes_runtime_artifacts_and_python_caches() -> None:
-    dockerignore = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
+def test_dockerignore_default_deny_excludes_non_build_context_paths() -> None:
+    patterns = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
 
-    for required in [
-        ".git/",
-        ".gsd/",
-        "data/",
-        "__pycache__/",
-        "*.py[cod]",
-        ".pytest_cache/",
-        "*.log",
-    ]:
-        assert required in dockerignore
-
-
-def test_dockerignore_excludes_review_build_and_local_model_artifacts() -> None:
-    dockerignore = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
-
-    for required in [
-        "tests/",
-        "docs/superpowers/",
-        ".worktrees/",
-        ".superpowers/",
-        "coverage/",
-        ".cache/",
-        "models/",
-        "*.pt",
-        "config.yaml",
+    for excluded in [
+        ".git/config",
+        ".gsd/state.json",
+        ".worktrees/review/file.py",
+        ".superpowers/sdd/report.md",
         ".env",
-        ".env.*",
-        "!.env.example",
+        "config.yaml",
+        "data/latest.jpg",
+        "docs/deployment.md",
+        "models/yolov8n.pt",
+        "README.md",
+        "scripts/lock_dependencies.py",
+        "tests/test_docker_contract.py",
+        "untracked.tmp",
+        "parking_spot_monitor/debug.tmp",
+        "parking_spot_monitor/__pycache__/config.cpython-312.pyc",
+        "src/parking_monitor/__pycache__/outbox.cpython-312.pyc",
     ]:
-        assert required in dockerignore
-    for required_input in [
-        "parking_spot_monitor/",
-        "src/",
+        assert _docker_context_path_is_allowed(excluded, patterns) is False
+
+
+def test_dockerignore_allows_every_consumed_build_input() -> None:
+    patterns = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
+
+    for included in [
+        "Dockerfile",
+        ".dockerignore",
         "requirements-runtime.lock",
         "requirements-detector.lock",
+        "parking_spot_monitor/__main__.py",
+        "src/parking_monitor/__init__.py",
         "main.py",
         "config.yaml.example",
     ]:
-        assert required_input not in dockerignore
+        assert _docker_context_path_is_allowed(included, patterns) is True
+
+
+def test_dockerignore_is_exact_default_deny_build_input_allowlist() -> None:
+    dockerignore = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
+
+    assert dockerignore == [
+        "**",
+        "!Dockerfile",
+        "!.dockerignore",
+        "!requirements-runtime.lock",
+        "!requirements-detector.lock",
+        "!parking_spot_monitor/",
+        "!parking_spot_monitor/**",
+        "!src/",
+        "!src/**",
+        "!main.py",
+        "!config.yaml.example",
+        "**/__pycache__/",
+        "**/*.py[cod]",
+        "**/*.tmp",
+    ]
+    assert not any(
+        forbidden in pattern
+        for pattern in dockerignore[1:]
+        if pattern.startswith("!")
+        for forbidden in (
+            "scripts",
+            "docs",
+            "README",
+            ".env",
+            "models",
+            "data",
+            "tests",
+            "tmp",
+        )
+    )
 
 
 def test_compose_contract_mounts_config_data_and_uses_capture_runtime() -> None:
