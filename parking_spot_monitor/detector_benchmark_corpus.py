@@ -31,6 +31,7 @@ class CorpusSnapshot:
     manifest_snapshot: FileIdentity
     frame_snapshots: tuple[FileIdentity, ...]
     corpus_size_bytes: int
+    per_backend_workload_bytes: int
     workload_bytes: int
     _temporary: tempfile.TemporaryDirectory[str]
 
@@ -61,6 +62,7 @@ class CorpusSnapshot:
             "corpus_sha256": corpus_digest,
             "frame_count": len(self.frames),
             "corpus_size_bytes": self.corpus_size_bytes,
+            "per_backend_workload_bytes": self.per_backend_workload_bytes,
             "workload_bytes": self.workload_bytes,
         }
 
@@ -96,6 +98,7 @@ def prepare_corpus(
     *,
     warmup: int,
     iterations: int,
+    backend_count: int,
 ) -> CorpusSnapshot:
     manifest_path = Path(os.path.abspath(manifest_path))
     manifest_identity, manifest_bytes = read_identity(
@@ -136,9 +139,14 @@ def prepare_corpus(
             os.chmod(frame_dir, 0o500)
             identities.append(identity)
             frame_snapshots.append(snapshot_identity)
-        workload = corpus_size * (warmup + iterations) + identities[0].size_bytes
+        if backend_count < 1:
+            raise ValueError("benchmark backend count must be positive")
+        per_backend_workload = (
+            corpus_size * (warmup + iterations) + identities[0].size_bytes
+        )
+        workload = per_backend_workload * backend_count
         if workload > MAX_WORKLOAD_BYTES:
-            raise ValueError("benchmark corpus workload exceeds the supported bound")
+            raise ValueError("global benchmark corpus workload exceeds the supported bound")
         os.chmod(snapshot_root, 0o500)
         return CorpusSnapshot(
             manifest=manifest_identity,
@@ -146,6 +154,7 @@ def prepare_corpus(
             manifest_snapshot=manifest_snapshot,
             frame_snapshots=tuple(frame_snapshots),
             corpus_size_bytes=corpus_size,
+            per_backend_workload_bytes=per_backend_workload,
             workload_bytes=workload,
             _temporary=temporary,
         )

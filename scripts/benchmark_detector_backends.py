@@ -147,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             args.manifest,
             warmup=args.warmup,
             iterations=args.iterations,
+            backend_count=len(models),
         )
         try:
             model_snapshots = prepare_model_snapshots(models)
