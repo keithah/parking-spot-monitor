@@ -7,12 +7,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from parking_spot_monitor.decision_memory_publication import (
+    SourceSignature,
+    read_decision_memory_source,
+)
 from parking_spot_monitor.operator_decision_memory import (
     MAX_MEMORY_FILE_BYTES,
     DecisionMemoryRecord,
     LoadState,
-    SourceSignature,
-    _read_decision_memory_source,
 )
 
 
@@ -24,7 +26,7 @@ class DecisionMemorySourceSnapshot:
 
 def decision_memory_source_snapshot(path: Path) -> DecisionMemorySourceSnapshot:
     try:
-        _raw, signature = _read_decision_memory_source(path, MAX_MEMORY_FILE_BYTES)
+        _raw, signature = read_decision_memory_source(path, MAX_MEMORY_FILE_BYTES)
     except FileNotFoundError:
         return DecisionMemorySourceSnapshot(None, True)
     except (OSError, OverflowError):

@@ -84,3 +84,103 @@ def test_flush_never_overwrites_same_size_replacement_during_stable_load(
         "outside2",
         "local___",
     ]
+
+
+def test_post_publication_replacement_defers_and_retries_with_local_records(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_write = memory._write_memory
+
+    def replace_after_publish(target, records, *args, **kwargs):
+        result = real_write(target, records, *args, **kwargs)
+        real_write(target, (_record("external"),))
+        return result
+
+    with monkeypatch.context() as context:
+        context.setattr(memory, "_write_memory", replace_after_publish)
+        assert store.flush() is False
+
+    assert [item.summary for item in load_decision_memory(path).records] == ["external"]
+    assert [item.summary for item in store.records] == ["baseline", "local___"]
+    assert store.flush()
+    assert [item.summary for item in load_decision_memory(path).records] == [
+        "external",
+        "local___",
+    ]
+
+
+def test_replacement_immediately_before_exchange_is_restored_and_merged_on_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_exchange = getattr(memory, "_conditional_exchange", None)
+    raced = False
+
+    def replace_before_exchange(source: Path, destination: Path) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            _write_memory(path, (_record("external"),))
+        if real_exchange is not None:
+            real_exchange(source, destination)
+
+    monkeypatch.setattr(
+        memory,
+        "_conditional_exchange",
+        replace_before_exchange,
+        raising=False,
+    )
+
+    assert store.flush() is False
+    assert [item.summary for item in load_decision_memory(path).records] == ["external"]
+    monkeypatch.undo()
+    assert store.flush()
+    assert [item.summary for item in load_decision_memory(path).records] == [
+        "external",
+        "local___",
+    ]
+
+
+def test_missing_source_creation_race_is_never_overwritten(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_link = getattr(memory, "_conditional_link", None)
+    raced = False
+
+    def create_before_link(source: Path, destination: Path) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            _write_memory(path, (_record("external"),))
+        if real_link is not None:
+            real_link(source, destination)
+
+    monkeypatch.setattr(memory, "_conditional_link", create_before_link, raising=False)
+
+    assert store.flush() is False
+    assert [item.summary for item in load_decision_memory(path).records] == ["external"]
+    monkeypatch.undo()
+    assert store.flush()
+    assert [item.summary for item in load_decision_memory(path).records] == [
+        "external",
+        "local___",
+    ]

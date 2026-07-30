@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import stat
 import tempfile
 import threading
 from collections.abc import Mapping, Sequence
@@ -12,6 +10,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from parking_spot_monitor.decision_memory_publication import (
+    ConditionalPublication,
+    SourceSignature,
+    link_exclusive,
+    publish_decision_memory_bytes,
+    read_decision_memory_source,
+    rename_exchange,
+)
 from parking_spot_monitor.diagnostic_bounding import take_bounded
 from parking_spot_monitor.logging import (
     StructuredLogger,
@@ -42,7 +48,6 @@ RecordKind = Literal[
     "feedback",
 ]
 LoadState = Literal["available", "missing", "unavailable", "partial"]
-SourceSignature = tuple[int, int, int, int, int, str]
 
 _SUPPORTED_KINDS = {
     "accepted_evidence",
@@ -120,6 +125,9 @@ _MAX_FORMAT_DEPTH = 3
 _MAX_FORMAT_ITEMS = 6
 _MAX_FORMAT_TEXT_CHARS = 160
 _MEMORY_WRITE_LOCK = threading.RLock()
+_UNCONDITIONAL_WRITE = object()
+_conditional_exchange = rename_exchange
+_conditional_link = link_exclusive
 
 
 class DecisionMemorySchemaError(ValueError):
@@ -251,7 +259,7 @@ def load_decision_memory(
     """Load a bounded tail of decision-memory records, quarantining unsafe artifacts."""
 
     try:
-        raw, source_signature = _read_decision_memory_source(Path(path), max_file_bytes)
+        raw, source_signature = read_decision_memory_source(Path(path), max_file_bytes)
     except FileNotFoundError:
         _log(logger, "debug", "operator-decision-memory-load-missing", path=path)
         return DecisionMemoryLoad(state="missing")
@@ -275,35 +283,6 @@ def load_decision_memory(
     bounded = tuple(records[-_positive_limit(max_records, MAX_RECORDS) :])
     _log(logger, "debug", "operator-decision-memory-loaded", path=memory_path, record_count=len(bounded), state="available")
     return DecisionMemoryLoad(state="available", records=bounded, source_signature=source_signature)
-
-
-def _read_decision_memory_source(path: Path, max_file_bytes: int) -> tuple[bytes, SourceSignature]:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise OSError("decision memory source is not a regular file")
-        if before.st_size > max_file_bytes:
-            raise OverflowError("decision memory source exceeds byte limit")
-        raw = bytearray()
-        while chunk := os.read(descriptor, min(65_536, max_file_bytes + 1 - len(raw))):
-            raw.extend(chunk)
-            if len(raw) > max_file_bytes:
-                raise OverflowError("decision memory source exceeds byte limit")
-        after = os.fstat(descriptor)
-        leaf = os.stat(path, follow_symlinks=False)
-    finally:
-        os.close(descriptor)
-    before_fields = _source_stat_fields(before)
-    after_fields = _source_stat_fields(after)
-    if before_fields != after_fields or after_fields != _source_stat_fields(leaf) or len(raw) != after.st_size:
-        raise OSError("decision memory source changed during read")
-    digest = hashlib.sha256(raw).hexdigest()
-    return bytes(raw), (*after_fields, digest)
-
-
-def _source_stat_fields(value: os.stat_result) -> tuple[int, int, int, int, int]:
-    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
 
 
 def format_why_reply(
@@ -358,9 +337,24 @@ def format_recent_reply(
     return _bounded_reply(lines, max_reply_bytes)
 
 
-def _write_memory(path: Path, records: Sequence[DecisionMemoryRecord]) -> None:
+def _write_memory(
+    path: Path,
+    records: Sequence[DecisionMemoryRecord],
+    *,
+    expected_signature: SourceSignature | None | object = _UNCONDITIONAL_WRITE,
+) -> ConditionalPublication | None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"schema_version": SCHEMA_VERSION, "records": [record.to_json_dict() for record in records]}
+    if expected_signature is not _UNCONDITIONAL_WRITE:
+        encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+        return publish_decision_memory_bytes(
+            path,
+            encoded,
+            expected_signature=expected_signature,  # type: ignore[arg-type]
+            max_file_bytes=MAX_MEMORY_FILE_BYTES,
+            exchange=_conditional_exchange,
+            exclusive_link=_conditional_link,
+        )
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=path.parent, prefix=f".{path.name}.", suffix=".tmp") as handle:
@@ -379,6 +373,7 @@ def _write_memory(path: Path, records: Sequence[DecisionMemoryRecord]) -> None:
             except OSError:
                 pass
         raise
+    return None
 
 
 def _fsync_directory(path: Path) -> None:

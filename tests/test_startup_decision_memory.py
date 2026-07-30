@@ -428,12 +428,12 @@ def test_runtime_wait_wakes_at_dirty_decision_checkpoint_without_changing_cadenc
     real_write = decision_memory._write_memory
     checkpoint_timed = False
 
-    def timed_write(path: Path, records: Sequence[DecisionMemoryRecord]) -> None:
+    def timed_write(path: Path, records: Sequence[DecisionMemoryRecord], **kwargs: object) -> object:
         nonlocal checkpoint_timed
         if sleeps and not checkpoint_timed:
             checkpoint_timed = True
             clock[0] += 10
-        real_write(path, records)
+        return real_write(path, records, **kwargs)
 
     monkeypatch.setattr(decision_memory, "_write_memory", timed_write)
 
