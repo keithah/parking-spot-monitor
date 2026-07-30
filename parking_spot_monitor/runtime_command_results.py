@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_dispatch import append_matrix_event_memory
 from parking_spot_monitor.matrix_models import MatrixSyncResult
@@ -28,7 +29,7 @@ def collect_matrix_commands_once(
     *,
     logger: StructuredLogger,
     iteration: int,
-    decision_memory_path: Path | None = None,
+    decision_memory_path: Path | DecisionMemoryStore | None = None,
 ) -> RuntimeMatrixCommandPollOutcome:
     if isinstance(completed, BaseException):
         return record_matrix_command_failure(
@@ -50,7 +51,7 @@ def record_matrix_command_failure(
     *,
     logger: StructuredLogger,
     iteration: int,
-    decision_memory_path: Path | None,
+    decision_memory_path: Path | DecisionMemoryStore | None,
 ) -> RuntimeMatrixCommandPollOutcome:
     context = safe_error_context(
         "matrix-command", error, extra={"action": "matrix-command", "iteration": iteration}
@@ -72,7 +73,7 @@ def record_matrix_command_result(
     *,
     logger: StructuredLogger,
     iteration: int,
-    decision_memory_path: Path | None,
+    decision_memory_path: Path | DecisionMemoryStore | None,
 ) -> RuntimeMatrixCommandPollOutcome:
     processed = getattr(result, "processed_count", None)
     ignored = getattr(result, "ignored_count", None)

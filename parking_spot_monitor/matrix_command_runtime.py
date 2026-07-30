@@ -11,7 +11,7 @@ from parking_spot_monitor.vehicle_history_models import ProfileAssignment, Profi
 
 
 class MatrixCommandArchive(Protocol):
-    def load_corrections(self) -> Sequence[ProfileCorrectionEvent]: ...
+    def correction_event_seen(self, event_id: str) -> bool: ...
     def load_active_sessions(self) -> Sequence[SessionRecord]: ...
     def list_closed_sessions(self) -> Sequence[SessionRecord]: ...
     def resolve_wrong_match_subject(self, subject_id: str) -> str: ...
@@ -63,7 +63,7 @@ class MatrixCommandRuntime:
         return {"matrix_event_id": event.event_id, "matrix_sender": event.sender, "matrix_room_id": event.room_id}
 
     def correction_already_seen(self, event_id: str) -> bool:
-        return any(correction.matrix_event_id == event_id for correction in self.archive.load_corrections())
+        return self.archive.correction_event_seen(event_id)
 
     def profile_summary(self, profile_id: str, *, event: MatrixTextEvent) -> Mapping[str, Any]:
         return self.archive.profile_summary(profile_id, **self.event_metadata(event))

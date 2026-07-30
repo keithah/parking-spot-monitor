@@ -8,14 +8,15 @@ from typing import Any
 
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.detection import DetectionFilterResult
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_alerts import (
     OCCUPIED_SPOT_EVENT_TYPE,
     OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
 )
 from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery, dispatch_matrix_event
-from parking_spot_monitor.operator_decision_memory import DecisionMemoryRecord, append_decision_memory_records
-from parking_spot_monitor.runtime_decision_memory import build_runtime_state_memory_records
+from parking_spot_monitor.operator_decision_memory import DecisionMemoryRecord
+from parking_spot_monitor.runtime_decision_memory import build_runtime_state_memory_records, split_runtime_state_memory_records
 from parking_spot_monitor.runtime_frame_plan import build_runtime_frame_plan
 from parking_spot_monitor.runtime_health import safe_error_context as _safe_error_context
 from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleSnapshotProvider
@@ -47,7 +48,7 @@ def _update_runtime_state_for_frame(
     configured_spot_ids: Sequence[str],
     owner_vehicle_snapshot_provider: OwnerVehicleSnapshotProvider,
     history_archive: VehicleHistoryArchive | None = None,
-    decision_memory_path: Path | None = None,
+    decision_memory_store: DecisionMemoryStore | None = None,
     pending_decision_records: Sequence[DecisionMemoryRecord] = (),
     log_aggregator: RuntimeLogAggregator | None = None,
 ) -> FrameUpdateResult:
@@ -75,25 +76,26 @@ def _update_runtime_state_for_frame(
             event_name,
             payload | {"event_type": event_name},
             logger=logger,
-            decision_memory_path=decision_memory_path,
+            decision_memory_store=decision_memory_store,
         )
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
 
-    if decision_memory_path is not None:
-        frame_records = [
-            *pending_decision_records,
-            *build_runtime_state_memory_records(
-                previous_state=runtime_state,
-                next_state=frame_plan.occupancy_update.state_by_spot,
-                detection_result=detection_result,
-                quiet_status=frame_plan.quiet_status,
-                observed_at=observed_at,
-                configured_spot_ids=configured_spot_ids,
-                presence_by_spot=frame_plan.presence_by_spot,
-            ),
-        ]
-        append_decision_memory_records(decision_memory_path, frame_records, logger=logger)
+    if decision_memory_store is not None:
+        state_records = build_runtime_state_memory_records(
+            previous_state=runtime_state,
+            next_state=frame_plan.occupancy_update.state_by_spot,
+            detection_result=detection_result,
+            quiet_status=frame_plan.quiet_status,
+            observed_at=observed_at,
+            configured_spot_ids=configured_spot_ids,
+            presence_by_spot=frame_plan.presence_by_spot,
+        )
+        routine_records, transition_records = split_runtime_state_memory_records(state_records)
+        decision_memory_store.extend(
+            (*pending_decision_records, *routine_records), durability="routine"
+        )
+        decision_memory_store.extend(transition_records, durability="immediate")
     history_result = _record_vehicle_history_events(
         history_archive,
         frame_plan.occupancy_update.events,
@@ -111,7 +113,7 @@ def _update_runtime_state_for_frame(
             event_name,
             owner_alert,
             logger=logger,
-            decision_memory_path=decision_memory_path,
+            decision_memory_store=decision_memory_store,
         )
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
@@ -122,7 +124,7 @@ def _update_runtime_state_for_frame(
             str(occupied_alert.get("event_type", OCCUPIED_SPOT_EVENT_TYPE)),
             occupied_alert,
             logger=logger,
-            decision_memory_path=decision_memory_path,
+            decision_memory_store=decision_memory_store,
         )
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
@@ -136,7 +138,7 @@ def _update_runtime_state_for_frame(
             event_name,
             payload | {"event_type": event_name},
             logger=logger,
-            decision_memory_path=decision_memory_path,
+            decision_memory_store=decision_memory_store,
         )
         if matrix_error is not None:
             matrix_errors.append(matrix_error)

@@ -330,6 +330,8 @@ class RuntimeConfig(StrictModel):
     stable_settle_frames: int = Field(default=3, gt=0)
     debug_overlay_interval_seconds: float = Field(default=60, ge=0, allow_inf_nan=False)
     log_summary_interval_seconds: float = Field(default=900, gt=0, allow_inf_nan=False)
+    decision_memory_checkpoint_interval_seconds: float = Field(default=300, gt=0, allow_inf_nan=False)
+    decision_memory_checkpoint_max_pending_records: int = Field(default=50, gt=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -459,6 +461,8 @@ class RuntimeSettings(StrictModel):
                 "stable_settle_frames": self.runtime.stable_settle_frames,
                 "debug_overlay_interval_seconds": self.runtime.debug_overlay_interval_seconds,
                 "log_summary_interval_seconds": self.runtime.log_summary_interval_seconds,
+                "decision_memory_checkpoint_interval_seconds": self.runtime.decision_memory_checkpoint_interval_seconds,
+                "decision_memory_checkpoint_max_pending_records": self.runtime.decision_memory_checkpoint_max_pending_records,
             },
         }
 

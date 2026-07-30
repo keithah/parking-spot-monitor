@@ -1741,8 +1741,8 @@ class FakeCommandArchive:
         self.cursor_writes.append(state)
         self.cursor = state
 
-    def load_corrections(self) -> list[FakeCorrection]:
-        return self.corrections
+    def correction_event_seen(self, event_id: str) -> bool:
+        return any(correction.matrix_event_id == event_id for correction in self.corrections)
 
     def rename_profile(self, *args: Any, **kwargs: Any) -> FakeCorrection:
         self.calls.append(("rename_profile", args, kwargs))
@@ -2108,7 +2108,7 @@ def test_command_service_fails_corrections_when_duplicate_check_is_unavailable()
             return "$reply"
 
     class Archive(FakeCommandArchive):
-        def load_corrections(self) -> list[FakeCorrection]:
+        def correction_event_seen(self, event_id: str) -> bool:
             raise PermissionError("corrections unreadable")
 
     archive = Archive(cursor={"next_batch": "s2"})

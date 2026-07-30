@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_models import MatrixSyncResult
 from parking_spot_monitor.runtime_command_results import (
@@ -31,7 +32,7 @@ def _poll_matrix_commands_once(
     *,
     logger: StructuredLogger,
     iteration: int,
-    decision_memory_path: Path | None = None,
+    decision_memory_path: Path | DecisionMemoryStore | None = None,
 ) -> RuntimeMatrixCommandPollOutcome:
     if matrix_command_service is None:
         return RuntimeMatrixCommandPollOutcome()

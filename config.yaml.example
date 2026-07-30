@@ -103,3 +103,5 @@ runtime:
   stable_settle_frames: 3
   debug_overlay_interval_seconds: 60
   log_summary_interval_seconds: 900
+  decision_memory_checkpoint_interval_seconds: 300
+  decision_memory_checkpoint_max_pending_records: 50

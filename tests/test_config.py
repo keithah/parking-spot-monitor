@@ -107,6 +107,8 @@ def test_example_config_loads_with_fake_env_values() -> None:
     assert settings.matrix.command_request_timeout_seconds == 2
     assert settings.matrix.command_retry_attempts == 1
     assert settings.runtime.log_summary_interval_seconds == 900
+    assert settings.runtime.decision_memory_checkpoint_interval_seconds == 300
+    assert settings.runtime.decision_memory_checkpoint_max_pending_records == 50
 
     summary = settings.sanitized_summary()
     assert summary["stream"]["reconnect_max_seconds"] == 60
@@ -114,6 +116,8 @@ def test_example_config_loads_with_fake_env_values() -> None:
     assert summary["matrix"]["command_request_timeout_seconds"] == 2
     assert summary["matrix"]["command_retry_attempts"] == 1
     assert summary["runtime"]["log_summary_interval_seconds"] == 900
+    assert summary["runtime"]["decision_memory_checkpoint_interval_seconds"] == 300
+    assert summary["runtime"]["decision_memory_checkpoint_max_pending_records"] == 50
 
 
 @pytest.mark.parametrize(
@@ -124,6 +128,8 @@ def test_example_config_loads_with_fake_env_values() -> None:
         ("  command_request_timeout_seconds: 2", "  command_request_timeout_seconds: 0", "command_request_timeout_seconds"),
         ("  command_retry_attempts: 1", "  command_retry_attempts: 0", "command_retry_attempts"),
         ("  log_summary_interval_seconds: 900", "  log_summary_interval_seconds: 0", "log_summary_interval_seconds"),
+        ("  decision_memory_checkpoint_interval_seconds: 300", "  decision_memory_checkpoint_interval_seconds: 0", "decision_memory_checkpoint_interval_seconds"),
+        ("  decision_memory_checkpoint_max_pending_records: 50", "  decision_memory_checkpoint_max_pending_records: 0", "decision_memory_checkpoint_max_pending_records"),
     ],
 )
 def test_bounded_runtime_policy_rejects_invalid_values(

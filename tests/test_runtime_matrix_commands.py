@@ -297,6 +297,32 @@ class _PollResult:
     bootstrapped = False
 
 
+def test_command_outcome_flushes_service_decision_store_immediately(tmp_path) -> None:
+    from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
+    from parking_spot_monitor.operator_decision_memory import load_decision_memory, make_decision_memory_record
+    from parking_spot_monitor.runtime_command_results import record_matrix_command_result
+
+    path = tmp_path / "operator-decision-memory.json"
+    store = DecisionMemoryStore(
+        path,
+        checkpoint_interval_seconds=300,
+        checkpoint_max_pending_records=50,
+    )
+    store.append(make_decision_memory_record("miss", summary="routine"), durability="routine")
+
+    record_matrix_command_result(
+        _PollResult(),
+        logger=StructuredLogger(),
+        iteration=1,
+        decision_memory_path=store,
+    )
+
+    assert [record.kind for record in load_decision_memory(path).records] == [
+        "miss",
+        "command_outcome",
+    ]
+
+
 class _ApplyService:
     def apply_sync_result(self, _result: MatrixSyncResult) -> _PollResult:
         return _PollResult()

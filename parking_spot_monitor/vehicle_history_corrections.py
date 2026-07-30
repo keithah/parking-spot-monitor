@@ -140,6 +140,9 @@ class VehicleHistoryCorrectionMixin:
         self.corrections_dir.mkdir(parents=True, exist_ok=True)
         return list(self._load_correction_replay().events)
 
+    def correction_event_seen(self, event_id: str) -> bool:
+        return event_id in self.correction_replay_state().matrix_event_ids
+
     def _load_correction_replay(self):
         return load_correction_events(
             self.corrections_path,

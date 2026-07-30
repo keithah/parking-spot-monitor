@@ -373,6 +373,7 @@ def test_runtime_modules_stay_decomposed() -> None:
         "parking_spot_monitor/runtime_commands.py": 120,
         "parking_spot_monitor/runtime_command_worker.py": 190,
         "parking_spot_monitor/runtime_command_results.py": 150,
+        "parking_spot_monitor/decision_memory_store.py": 240,
         "parking_spot_monitor/runtime_decision_memory.py": 240,
         "parking_spot_monitor/runtime_detection.py": 250,
         # Detector adaptation stays a small construction-time boundary.

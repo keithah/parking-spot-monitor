@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.capture import FrameCaptureResult
 from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.detection import DetectionFilterResult
@@ -30,19 +32,39 @@ from parking_spot_monitor.state import RuntimeState
 from parking_spot_monitor.timeline_buffer import record_timeline_frame
 
 
+def loop_health_writer(
+    settings: RuntimeSettings,
+    *,
+    logger: StructuredLogger,
+    health_state: RuntimeLoopHealthState,
+    vehicle_history_health: VehicleHistoryHealthSnapshotCache,
+    runtime_paths: RuntimePaths,
+    outbox_health_provider: Callable[[], Any] | None,
+) -> Callable[..., None]:
+    return partial(
+        write_current_loop_health,
+        settings,
+        logger=logger,
+        health_state=health_state,
+        vehicle_history_health=vehicle_history_health,
+        runtime_paths=runtime_paths,
+        outbox_health_provider=outbox_health_provider,
+    )
+
+
 def dispatch_startup_lifecycle(
     delivery: RuntimeMatrixDelivery | None,
     *,
     now: Callable[[], Any],
     logger: StructuredLogger,
-    decision_memory_path: Path,
+    decision_memory_store: DecisionMemoryStore,
 ) -> None:
     error = dispatch_matrix_event(
         delivery,
         MONITOR_STARTED_EVENT_TYPE,
         monitor_lifecycle_event(MONITOR_STARTED_EVENT_TYPE, now()),
         logger=logger,
-        decision_memory_path=decision_memory_path,
+        decision_memory_store=decision_memory_store,
     )
     if error is not None:
         logger.warning(

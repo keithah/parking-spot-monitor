@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from parking_spot_monitor.detection import DetectionFilterResult
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import (
     DecisionMemoryRecord,
@@ -104,8 +105,20 @@ def build_runtime_state_memory_records(
         ))
     return records
 
+
+def split_runtime_state_memory_records(
+    records: Sequence[DecisionMemoryRecord],
+) -> tuple[list[DecisionMemoryRecord], list[DecisionMemoryRecord]]:
+    routine: list[DecisionMemoryRecord] = []
+    immediate: list[DecisionMemoryRecord] = []
+    for record in records:
+        details = record.details or {}
+        destination = immediate if details.get("previous_status") != details.get("new_status") else routine
+        destination.append(record)
+    return routine, immediate
+
 def _append_lab_outcome_memory(
-    path: Path,
+    target: Path | DecisionMemoryStore,
     status_payload: Mapping[str, Any],
     *,
     data_dir: Path,
@@ -143,7 +156,7 @@ def _append_lab_outcome_memory(
     if summary_payload.get("missing_inputs") is not None:
         details["missing_inputs"] = summary_payload.get("missing_inputs")
     _append_decision_memory(
-        path,
+        target,
         "lab_outcome",
         spot_id=None,
         observed_at=status_payload.get("updated_at"),
@@ -161,7 +174,7 @@ def _append_lab_outcome_memory(
     )
 
 def _append_decision_memory(
-    path: Path,
+    target: Path | DecisionMemoryStore,
     kind: str,
     *,
     spot_id: str | None,
@@ -170,11 +183,17 @@ def _append_decision_memory(
     details: Mapping[str, Any],
     logger: StructuredLogger,
 ) -> None:
-    append_decision_memory_record(
-        path,
-        make_decision_memory_record(kind, observed_at=observed_at, spot_id=spot_id, summary=summary, details=details),
-        logger=logger,
+    record = make_decision_memory_record(
+        kind,
+        observed_at=observed_at,
+        spot_id=spot_id,
+        summary=summary,
+        details=details,
     )
+    if isinstance(target, DecisionMemoryStore):
+        target.append(record, durability="immediate")
+    else:
+        append_decision_memory_record(target, record, logger=logger)
 
 def _rejection_reason_counts(rejections: Sequence[Any]) -> dict[str, int]:
     counts: dict[str, int] = {}

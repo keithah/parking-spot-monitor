@@ -8,9 +8,9 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_alerts import MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, monitor_lifecycle_event
 from parking_spot_monitor.matrix_dispatch import RuntimeMatrixDelivery, dispatch_matrix_event
@@ -128,7 +128,7 @@ def return_if_shutdown_requested(
     matrix_delivery: RuntimeMatrixDelivery | None,
     now_fn: Callable[[], datetime],
     logger: StructuredLogger,
-    decision_memory_path: Path,
+    decision_memory_store: DecisionMemoryStore,
     iteration: int,
 ) -> int | None:
     """Exit the capture loop after dispatching a shutdown lifecycle notice."""
@@ -145,6 +145,6 @@ def return_if_shutdown_requested(
             signal=shutdown_state.signal_name,
         ),
         logger=logger,
-        decision_memory_path=decision_memory_path,
+        decision_memory_store=decision_memory_store,
     )
     return 0

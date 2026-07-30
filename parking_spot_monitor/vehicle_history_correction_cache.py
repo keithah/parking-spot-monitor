@@ -93,6 +93,7 @@ def build_correction_replay_state(
     labels: dict[str, str] = {}
     merges: dict[str, str] = {}
     wrong_matches: set[str] = set()
+    matrix_event_ids: set[str] = set()
     valid_count = 0
     last_action: str | None = None
     last_created_at: str | None = None
@@ -100,6 +101,8 @@ def build_correction_replay_state(
         valid_count += 1
         last_action = event.action
         last_created_at = event.created_at
+        if event.matrix_event_id:
+            matrix_event_ids.add(event.matrix_event_id)
         if event.action == CORRECTION_ACTION_RENAME_PROFILE and event.profile_id is not None and event.label is not None:
             labels[_resolve_profile_id(event.profile_id, merges)] = event.label
         elif event.action == CORRECTION_ACTION_MERGE_PROFILES and event.source_profile_id is not None and event.target_profile_id is not None:
@@ -116,6 +119,7 @@ def build_correction_replay_state(
         last_action=last_action,
         last_created_at=last_created_at,
         canonical_profile_ids=MappingProxyType(_canonical_profile_map(merges)),
+        matrix_event_ids=frozenset(matrix_event_ids),
     )
 
 

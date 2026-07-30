@@ -7,17 +7,19 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from parking_monitor.matrix_outbox_delivery import MatrixOutboxDelivery
 from parking_monitor.outbox import LocalOutbox
-from parking_spot_monitor.capture import CaptureError, FrameCaptureResult, StreamProfileCapture, capture_latest
+from parking_spot_monitor.capture import CaptureError, StreamProfileCapture, capture_latest
 from parking_spot_monitor.detection import (
     DetectionError,
     UltralyticsVehicleDetector,
 )
 from parking_spot_monitor.detector_adapter import SharedLazyDetector, adapt_detector
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore, runtime_decision_memory_store
 from parking_spot_monitor.errors import ConfigError
 from parking_spot_monitor.live_proof import run_live_proof_once
 from parking_spot_monitor.logging import StructuredLogger, setup_logging
@@ -161,20 +163,7 @@ def _main(
     )
 
     logger.info("startup-ready", config_path=config_path, data_dir=str(paths.data_dir), mode=mode)
-    def default_capture(
-        loaded_settings: RuntimeSettings,
-        output_dir: str | Path,
-        *,
-        stream_profile: str | None = None,
-    ) -> FrameCaptureResult:
-        return capture_latest(
-            loaded_settings,
-            output_dir,
-            logger=logger,
-            stream_profile=stream_profile,
-        )
-
-    capture_fn = capture if capture is not None else default_capture
+    capture_fn = capture if capture is not None else partial(capture_latest, logger=logger)
     overlay_fn = overlay if overlay is not None else _write_debug_overlay
     detector_fn = detector_factory if detector_factory is not None else _default_detector_factory
     matrix_factory = matrix_delivery_factory if matrix_delivery_factory is not None else _default_matrix_delivery_factory
@@ -196,6 +185,7 @@ def _main(
             _close_resources((("matrix_delivery", matrix_delivery),), logger=logger)
 
     history_archive = VehicleHistoryArchive(paths.vehicle_history_dir, logger=logger)
+    decision_memory_store = runtime_decision_memory_store(settings.runtime, paths.decision_memory_file, monotonic=time.monotonic, logger=logger)
     matrix_delivery: Any | None = None
     matrix_command_service: Any | None = None
     try:
@@ -208,6 +198,7 @@ def _main(
                 logger,
                 history_archive,
                 incident_detector=shared_detector,
+                decision_memory_store=decision_memory_store,
             )
         else:
             matrix_command_service = matrix_command_service_factory(settings, paths.data_dir, logger, history_archive)
@@ -229,12 +220,14 @@ def _main(
             now=now,
             random_unit=random_unit,
             startup_retention_failure_count=retention_result.failed_count,
+            decision_memory_store=decision_memory_store,
         )
     finally:
         _close_resources(
             (
                 ("matrix_commands", matrix_command_service),
                 ("matrix_delivery", matrix_delivery),
+                ("decision_memory", decision_memory_store),
             ),
             logger=logger,
         )
@@ -312,6 +305,7 @@ def _default_matrix_command_service_factory(
     archive: VehicleHistoryArchive,
     *,
     incident_detector: object,
+    decision_memory_store: DecisionMemoryStore | None = None,
 ) -> "MatrixCommandService | None":
     if not settings.matrix.command_authorized_senders:
         logger.info(
@@ -328,10 +322,10 @@ def _default_matrix_command_service_factory(
     from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler
 
     paths = resolve_runtime_paths(settings, data_dir)
-    feedback_labeler = OperatorFeedbackLabeler(data_dir=paths.data_dir, snapshots_dir=paths.snapshots_dir, logger=logger)
+    feedback_labeler = OperatorFeedbackLabeler(data_dir=paths.data_dir, snapshots_dir=paths.snapshots_dir, logger=logger, decision_memory_store=decision_memory_store)
 
     def record_outcome(status_payload: Mapping[str, Any]) -> None:
-        _append_lab_outcome_memory(paths.decision_memory_file, status_payload, data_dir=paths.data_dir, logger=logger)
+        _append_lab_outcome_memory(decision_memory_store or paths.decision_memory_file, status_payload, data_dir=paths.data_dir, logger=logger)
 
     def who_snapshot_provider(base_text: str) -> Any:
         return build_who_snapshot_response(

@@ -1473,6 +1473,35 @@ def test_correction_replay_is_cached_until_revision_changes(tmp_path: Path, monk
     assert archive.correction_revision() == 1
 
 
+def test_correction_event_seen_reuses_replay_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive = VehicleHistoryArchive(tmp_path)
+    closed = archive.start_session(occupied_event(spot_id="cache", observed_at="2026-05-18T08:00:00Z"))
+    archive.close_session(open_event(spot_id="cache", observed_at="2026-05-18T09:00:00Z"))
+    set_session_profile(
+        tmp_path,
+        archive_state="closed",
+        session_id=closed.session_id,
+        profile_id="prof_cache",
+        profile_confidence=0.96,
+    )
+    archive.rename_profile("prof_cache", "Blue car", matrix_event_id="$event")
+    correction_reads = 0
+    original_open = Path.open
+
+    def counted(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal correction_reads
+        if path == archive.corrections_path and args and args[0] == "rb":
+            correction_reads += 1
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted)
+
+    assert archive.correction_event_seen("$event") is True
+    assert archive.correction_event_seen("$event") is True
+    assert archive.correction_event_seen("$missing") is False
+    assert correction_reads == 1
+
+
 def test_successful_correction_append_bumps_explicit_revision(tmp_path: Path) -> None:
     archive = VehicleHistoryArchive(tmp_path)
     closed = archive.start_session(occupied_event(spot_id="revision"))

@@ -130,6 +130,7 @@ class CorrectionReplayState:
     last_action: str | None
     last_created_at: str | None
     canonical_profile_ids: Mapping[str, str] = field(default_factory=dict)
+    matrix_event_ids: frozenset[str] = frozenset()
 
 @dataclass(frozen=True)
 class ProfileAssignment:

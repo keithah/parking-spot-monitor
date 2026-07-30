@@ -4,9 +4,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.incident_review import build_incident_replay
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import (
+    DecisionMemoryRecord,
     append_decision_memory_record,
     decision_memory_path,
     make_decision_memory_record,
@@ -54,12 +56,20 @@ from parking_spot_monitor.operator_timeline import nearest_timeline_frame, parse
 class OperatorFeedbackLabeler:
     """High-level API for Matrix operator spot-state correction labels."""
 
-    def __init__(self, *, data_dir: str | Path, snapshots_dir: str | Path | None = None, logger: StructuredLogger | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        data_dir: str | Path,
+        snapshots_dir: str | Path | None = None,
+        logger: StructuredLogger | None = None,
+        decision_memory_store: DecisionMemoryStore | None = None,
+    ) -> None:
         self.data_dir = Path(data_dir)
         self.snapshots_dir = Path(snapshots_dir) if snapshots_dir is not None else None
         self.logger = logger
         self.labels_path = feedback_labels_path(self.data_dir)
         self.memory_path = decision_memory_path(self.data_dir)
+        self.decision_memory_store = decision_memory_store
 
     def record_correction(
         self,
@@ -157,8 +167,7 @@ class OperatorFeedbackLabeler:
                 label_id=label_id,
             )
 
-        append_decision_memory_record(
-            self.memory_path,
+        self._append_memory(
             make_decision_memory_record(
                 "feedback",
                 observed_at=corrected_text,
@@ -175,8 +184,7 @@ class OperatorFeedbackLabeler:
                     "feedback_category": "false_alert",
                     "feedback_category_details": {"reported_state": candidate.reported_state, "actual_state": state},
                 },
-            ),
-            logger=self.logger,
+            )
         )
         return FeedbackRecordResult(
             recorded=True,
@@ -364,8 +372,7 @@ class OperatorFeedbackLabeler:
                 duplicate=True,
             )
 
-        append_decision_memory_record(
-            self.memory_path,
+        self._append_memory(
             make_decision_memory_record(
                 "feedback",
                 observed_at=learned_text,
@@ -382,8 +389,7 @@ class OperatorFeedbackLabeler:
                     "feedback_category": "missed_alert",
                     "feedback_category_details": {"target_state": state, "requested_at": target_time.isoformat().replace("+00:00", "Z")},
                 },
-            ),
-            logger=self.logger,
+            )
         )
         return LearnLabelRecordResult(
             recorded=True,
@@ -396,6 +402,11 @@ class OperatorFeedbackLabeler:
             degradation_reasons=reasons,
             label_id=label.label_id,
         )
+
+    def _append_memory(self, record: DecisionMemoryRecord) -> bool:
+        if self.decision_memory_store is not None:
+            return self.decision_memory_store.append(record, durability="immediate")
+        return append_decision_memory_record(self.memory_path, record, logger=self.logger)
 
 
 def feedback_labels_path(data_dir: str | Path) -> Path:

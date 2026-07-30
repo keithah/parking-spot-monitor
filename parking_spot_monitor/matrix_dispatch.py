@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_alerts import (
     LIFECYCLE_EVENT_TYPES,
@@ -38,7 +39,7 @@ class RuntimeMatrixDelivery(Protocol):
 
 
 def append_matrix_event_memory(
-    path: Path | None,
+    path: Path | DecisionMemoryStore | None,
     *,
     event_name: str,
     event: Mapping[str, Any],
@@ -50,26 +51,26 @@ def append_matrix_event_memory(
     if path is None:
         return
     spot_id = event.get("spot_id") if isinstance(event.get("spot_id"), str) else None
-    append_decision_memory_record(
-        path,
-        make_decision_memory_record(
-            "alert" if event_name != "matrix-command" else "command_outcome",
-            observed_at=event.get("observed_at") if isinstance(event.get("observed_at"), str) else None,
-            spot_id=spot_id,
-            summary=f"{event_name} {outcome}",
-            details={
-                "event_type": event_name,
-                "event_id": event.get("event_id"),
-                "outcome": outcome,
-                "reason": reason,
-                "error_type": error_type,
-                "suppressed_reason": event.get("suppressed_reason"),
-                "snapshot_path": event.get("retained_snapshot_path") or event.get("snapshot_path") or event.get("occupied_snapshot_path"),
-                "retained_snapshot_path": event.get("retained_snapshot_path"),
-            },
-        ),
-        logger=logger,
+    record = make_decision_memory_record(
+        "alert" if event_name != "matrix-command" else "command_outcome",
+        observed_at=event.get("observed_at") if isinstance(event.get("observed_at"), str) else None,
+        spot_id=spot_id,
+        summary=f"{event_name} {outcome}",
+        details={
+            "event_type": event_name,
+            "event_id": event.get("event_id"),
+            "outcome": outcome,
+            "reason": reason,
+            "error_type": error_type,
+            "suppressed_reason": event.get("suppressed_reason"),
+            "snapshot_path": event.get("retained_snapshot_path") or event.get("snapshot_path") or event.get("occupied_snapshot_path"),
+            "retained_snapshot_path": event.get("retained_snapshot_path"),
+        },
     )
+    if isinstance(path, DecisionMemoryStore):
+        path.append(record, durability="immediate")
+    else:
+        append_decision_memory_record(path, record, logger=logger)
 
 
 def dispatch_matrix_event(
@@ -79,11 +80,13 @@ def dispatch_matrix_event(
     *,
     logger: StructuredLogger,
     decision_memory_path: Path | None = None,
+    decision_memory_store: DecisionMemoryStore | None = None,
 ) -> dict[str, Any] | None:
+    memory_target = decision_memory_store if decision_memory_store is not None else decision_memory_path
     if matrix_delivery is None:
         logger.info("matrix-delivery-skipped", event_type=event_name, reason="not-configured")
         append_matrix_event_memory(
-            decision_memory_path,
+            memory_target,
             event_name=event_name,
             event=event,
             outcome="skipped",
@@ -101,7 +104,7 @@ def dispatch_matrix_event(
             txn_id=txn_id,
             send=lambda: matrix_delivery.enqueue_lifecycle_notice(event),
             logger=logger,
-            decision_memory_path=decision_memory_path,
+            decision_memory_path=memory_target,
             attempt_log_fields={"delivery_mode": "outbox_enqueue"},
             success_log_fields={"delivery_mode": "outbox_enqueue"},
             success_memory_outcome="queued",
@@ -116,7 +119,7 @@ def dispatch_matrix_event(
             txn_id=txn_id,
             send=lambda: matrix_delivery.enqueue_text_notice(event_name, event),
             logger=logger,
-            decision_memory_path=decision_memory_path,
+            decision_memory_path=memory_target,
             attempt_log_fields={"delivery_mode": "outbox_enqueue"},
             success_log_fields={"delivery_mode": "outbox_enqueue"},
             success_memory_outcome="queued",
@@ -131,7 +134,7 @@ def dispatch_matrix_event(
             txn_id=txn_id,
             send=lambda: matrix_delivery.enqueue_text_notice(event_name, event),
             logger=logger,
-            decision_memory_path=decision_memory_path,
+            decision_memory_path=memory_target,
             attempt_log_fields={"delivery_mode": "outbox_enqueue"},
             success_log_fields={"delivery_mode": "outbox_enqueue"},
             success_memory_outcome="queued",
@@ -147,7 +150,7 @@ def dispatch_matrix_event(
             txn_id=txn_id,
             send=lambda: matrix_delivery.enqueue_occupied_spot_alert(event),
             logger=logger,
-            decision_memory_path=decision_memory_path,
+            decision_memory_path=memory_target,
             attempt_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
             success_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
             success_memory_outcome="queued",
@@ -164,7 +167,7 @@ def dispatch_matrix_event(
             txn_id=txn_id,
             send=lambda: matrix_delivery.enqueue_open_spot_alert(event),
             logger=logger,
-            decision_memory_path=decision_memory_path,
+            decision_memory_path=memory_target,
             attempt_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
             success_log_fields=alert_fields | {"delivery_mode": "outbox_enqueue"},
             success_memory_outcome="queued",
@@ -189,7 +192,7 @@ def dispatch_matrix_event(
         **extra_fields,
     )
     append_matrix_event_memory(
-        decision_memory_path,
+        memory_target,
         event_name=event_name,
         event=event,
         outcome="skipped",
@@ -231,7 +234,7 @@ def _attempt_matrix_operation(
     txn_id: str,
     send: Callable[[], Any],
     logger: StructuredLogger,
-    decision_memory_path: Path | None,
+    decision_memory_path: Path | DecisionMemoryStore | None,
     attempt_log_fields: Mapping[str, Any] | None = None,
     success_log_fields: Mapping[str, Any] | None = None,
     sent_event: Mapping[str, Any] | None = None,

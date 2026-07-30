@@ -5,6 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
+from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.matrix_models import MatrixSyncResult
 from parking_spot_monitor.runtime_command_results import (
@@ -127,7 +128,7 @@ def advance_matrix_command_poll(
     logger: StructuredLogger,
     iteration: int,
     health: CommandHealth,
-    decision_memory_path: Path | None,
+    decision_memory_path: Path | DecisionMemoryStore | None,
     completed_at: Callable[[], float],
 ) -> MatrixCommandPollState:
     if worker is None:

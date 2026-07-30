@@ -321,13 +321,19 @@ def _write_jpeg(path: Path, *, size: tuple[int, int] = (11, 7)) -> int:
 
 
 def test_labeler_records_correction_from_latest_alert_with_retained_snapshot(tmp_path: Path) -> None:
-    from parking_spot_monitor.operator_decision_memory import append_decision_memory_record, decision_memory_path, make_decision_memory_record
+    from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
+    from parking_spot_monitor.operator_decision_memory import decision_memory_path, load_decision_memory, make_decision_memory_record
     from parking_spot_monitor.operator_feedback import OperatorFeedbackLabeler, feedback_labels_path, load_feedback_labels
 
     snapshot_path = tmp_path / "snapshots" / "occupancy-occupied-event-left_spot.jpg"
     byte_size = _write_jpeg(snapshot_path, size=(13, 9))
-    assert append_decision_memory_record(
-        decision_memory_path(tmp_path),
+    memory_path = decision_memory_path(tmp_path)
+    store = DecisionMemoryStore(
+        memory_path,
+        checkpoint_interval_seconds=300,
+        checkpoint_max_pending_records=50,
+    )
+    assert store.append(
         make_decision_memory_record(
             "alert",
             observed_at="2026-05-15T21:42:39Z",
@@ -340,9 +346,10 @@ def test_labeler_records_correction_from_latest_alert_with_retained_snapshot(tmp
                 "snapshot_path": "snapshots/occupancy-occupied-event-left_spot.jpg",
             },
         ),
+        durability="immediate",
     )
 
-    result = OperatorFeedbackLabeler(data_dir=tmp_path).record_correction(
+    result = OperatorFeedbackLabeler(data_dir=tmp_path, decision_memory_store=store).record_correction(
         spot_id="left_spot",
         actual_state="open",
         matrix_event_id="$correct",
@@ -370,6 +377,7 @@ def test_labeler_records_correction_from_latest_alert_with_retained_snapshot(tmp
     assert loaded.labels[0].feedback_category_details == {"reported_state": "occupied", "actual_state": "open"}
     assert loaded.labels[0].operator_sender_hash.startswith("sha256:")
     assert "@operator:example" not in (tmp_path / "operator-feedback-labels.json").read_text(encoding="utf-8")
+    assert load_decision_memory(memory_path).records[-1].kind == "feedback"
 
 
 def test_labeler_repeats_duplicate_correction_ack_without_duplicate_label_or_memory(tmp_path: Path) -> None:

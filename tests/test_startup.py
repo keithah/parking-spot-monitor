@@ -6,7 +6,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -555,6 +555,40 @@ def test_dispatch_matrix_open_alert_enqueue_records_queued_memory(tmp_path: Path
     assert records[0]["summary"] == "occupancy-open-event queued"
     assert records[0]["details"]["outcome"] == "queued"
     assert records[0]["details"]["reason"] == "outbox_enqueue"
+
+
+def test_dispatch_matrix_alert_flushes_service_decision_store_immediately(tmp_path: Path) -> None:
+    from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
+    from parking_spot_monitor.operator_decision_memory import make_decision_memory_record
+
+    memory_path = tmp_path / "operator-decision-memory.json"
+    store = DecisionMemoryStore(
+        memory_path,
+        checkpoint_interval_seconds=300,
+        checkpoint_max_pending_records=50,
+    )
+    store.append(
+        make_decision_memory_record("miss", spot_id="left_spot", summary="routine"),
+        durability="routine",
+    )
+    event = {
+        "event_type": "occupancy-state-changed",
+        "event_id": "state:left_spot:1",
+        "spot_id": "left_spot",
+    }
+
+    dispatch_matrix_event(
+        None,
+        event["event_type"],
+        event,
+        logger=StructuredLogger(),
+        decision_memory_store=store,
+    )
+
+    assert [record.summary for record in load_decision_memory(memory_path).records] == [
+        "routine",
+        "occupancy-state-changed skipped",
+    ]
 
 
 def test_dispatch_matrix_occupied_alert_uses_durable_snapshot_enqueue(tmp_path: Path) -> None:
@@ -4710,15 +4744,21 @@ def test_dispatch_shutdown_lifecycle_notice_once(
 ) -> None:
     from parking_spot_monitor.matrix_dispatch import dispatch_matrix_event
     from parking_spot_monitor.matrix import MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, monitor_lifecycle_event
+    from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 
     delivery = FakeMatrixDelivery()
+    store = DecisionMemoryStore(
+        tmp_path / "operator-decision-memory.json",
+        checkpoint_interval_seconds=300,
+        checkpoint_max_pending_records=50,
+    )
     observed_at = datetime(2026, 5, 18, 18, 1, tzinfo=timezone.utc)
     dispatch_matrix_event(
         delivery,
         MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE,
         monitor_lifecycle_event(MONITOR_SHUTDOWN_REQUESTED_EVENT_TYPE, observed_at, signal="SIGTERM"),
         logger=StructuredLogger(),
-        decision_memory_path=tmp_path / "operator-decision-memory.json",
+        decision_memory_store=store,
     )
 
     output = combined_output(capsys)
@@ -4727,6 +4767,7 @@ def test_dispatch_shutdown_lifecycle_notice_once(
     assert notice["event_type"] == "parking-monitor-shutdown-requested"
     assert notice["signal"] == "SIGTERM"
     assert notice["event_id"] == "parking-monitor-shutdown-requested:SIGTERM:2026-05-18T18:01:00Z"
+    assert load_decision_memory(tmp_path / "operator-decision-memory.json").records[-1].kind == "alert"
     assert '"event":"parking-monitor-shutdown-requested"' in output
     assert_no_secret_leak(output)
 
@@ -5412,20 +5453,21 @@ def test_runtime_loop_appends_sanitized_decision_memory_records(
 ) -> None:
     detections = [[left_spot_vehicle()]]
     delivery = FakeMatrixDelivery()
-    batch_calls: list[tuple[DecisionMemoryRecord, ...]] = []
+    from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
+
+    batch_calls: list[tuple[str, tuple[DecisionMemoryRecord, ...]]] = []
+    original_extend = DecisionMemoryStore.extend
 
     def track_batch_append(
-        path: str | Path,
-        records: list[DecisionMemoryRecord],
-        **kwargs: Any,
+        store: DecisionMemoryStore,
+        records: Sequence[DecisionMemoryRecord],
+        *,
+        durability: str,
     ) -> bool:
-        batch_calls.append(tuple(records))
-        return append_decision_memory_records(path, records, **kwargs)
+        batch_calls.append((durability, tuple(records)))
+        return original_extend(store, records, durability=durability)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(
-        "parking_spot_monitor.runtime_state_update.append_decision_memory_records",
-        track_batch_append,
-    )
+    monkeypatch.setattr(DecisionMemoryStore, "extend", track_batch_append)
 
     def fake_capture(_settings: object, _data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         return captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z")
@@ -5456,14 +5498,123 @@ def test_runtime_loop_appends_sanitized_decision_memory_records(
     assert any(record.kind == "accepted_evidence" and record.spot_id == "left_spot" for record in loaded.records)
     assert any(record.kind == "miss" and record.spot_id == "right_spot" for record in loaded.records)
     assert any(record.details and record.details.get("hit_streak") == 1 for record in loaded.records)
-    assert len(batch_calls) == 1
-    frame_records = batch_calls[0]
+    routine_batches = [records for durability, records in batch_calls if durability == "routine" and len(records) == 4]
+    assert len(routine_batches) == 1
+    frame_records = routine_batches[0]
     assert len(frame_records) == 4
     assert [record.spot_id for record in frame_records].count("left_spot") == 2
     assert [record.spot_id for record in frame_records].count("right_spot") == 2
     assert all(len(record.summary.encode("utf-8")) <= MAX_TEXT_FIELD_CHARS for record in frame_records)
     batch_rendered = json.dumps([record.to_json_dict() for record in frame_records])
     assert_no_secret_leak(output + rendered + batch_rendered)
+
+
+def test_runtime_transition_decision_memory_is_immediately_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("confirm_frames: 3", "confirm_frames: 1"),
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, tuple[DecisionMemoryRecord, ...]]] = []
+    original_extend = DecisionMemoryStore.extend
+
+    def tracked(
+        store: DecisionMemoryStore,
+        records: Sequence[DecisionMemoryRecord],
+        *,
+        durability: str,
+    ) -> bool:
+        calls.append((durability, tuple(records)))
+        return original_extend(store, records, durability=durability)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(DecisionMemoryStore, "extend", tracked)
+
+    assert _main(
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path),
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: type(
+            "Detector",
+            (),
+            {"detect": lambda self, _path, **_kwargs: [left_spot_vehicle()]},
+        )(),
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: FakeMatrixDelivery(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+    ) == 0
+
+    transition_batches = [
+        records
+        for durability, records in calls
+        if durability == "immediate"
+        and any(
+            record.details
+            and record.details.get("previous_status") == "unknown"
+            and record.details.get("new_status") == "occupied"
+            for record in records
+        )
+    ]
+    assert len(transition_batches) == 1
+    persisted = load_decision_memory(tmp_path / "operator-decision-memory.json").records
+    assert any(record.details and record.details.get("new_status") == "occupied" for record in persisted)
+
+
+def test_runtime_checkpoints_decision_memory_once_per_success_and_failed_iteration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
+
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    store = DecisionMemoryStore(
+        tmp_path / "operator-decision-memory.json",
+        checkpoint_interval_seconds=300,
+        checkpoint_max_pending_records=50,
+    )
+    checkpoint_calls = 0
+    original_checkpoint = DecisionMemoryStore.checkpoint_if_due
+
+    def tracked_checkpoint(selected: DecisionMemoryStore) -> bool:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        return original_checkpoint(selected)
+
+    monkeypatch.setattr(DecisionMemoryStore, "checkpoint_if_due", tracked_checkpoint)
+    captures = 0
+
+    def capture(_settings: object, data_dir: str | Path, **_kwargs: object) -> FrameCaptureResult:
+        nonlocal captures
+        captures += 1
+        if captures == 1:
+            return captured_frame(Path(data_dir))
+        raise CaptureError(
+            reason="ffmpeg_error",
+            mode=DecodeMode.SOFTWARE,
+            output_path=Path(data_dir) / "latest.jpg",
+            message="capture unavailable",
+        )
+
+    assert run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=capture,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+        matrix_delivery=None,
+        sleep=lambda _seconds: None,
+        max_iterations=2,
+        decision_memory_store=store,
+    ) == 0
+    assert checkpoint_calls == 2
 
 
 def test_runtime_loop_decision_memory_append_failure_is_non_fatal(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -5657,8 +5808,10 @@ def test_runtime_and_default_incident_replay_share_one_lazy_detector_owner(
         _archive: object,
         *,
         incident_detector: SharedLazyDetector,
+        decision_memory_store: object,
     ) -> None:
         incident_owners.append(incident_detector)
+        assert decision_memory_store is not None
         return None
 
     monkeypatch.setattr(cli, "_default_matrix_command_service_factory", command_factory)
