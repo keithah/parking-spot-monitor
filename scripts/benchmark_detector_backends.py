@@ -30,8 +30,12 @@ from parking_spot_monitor.detector_benchmark_evidence import (
     validate_worker_evidence,
 )
 from parking_spot_monitor.detector_benchmark_models import (
-    require_unchanged_model,
+    require_unchanged_models,
     validated_model_identities,
+)
+from parking_spot_monitor.detector_benchmark_output import (
+    validate_benchmark_output,
+    write_guarded_report,
 )
 
 
@@ -302,20 +306,6 @@ def _build_report(
     }
 
 
-def _write_report(path: Path, report: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        temporary.write_text(
-            json.dumps(report, allow_nan=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -336,9 +326,13 @@ def main(argv: list[str] | None = None) -> int:
         }
         frames = _load_manifest(args.manifest)
         identities = validated_model_identities(models)
+        output_guard = validate_benchmark_output(
+            args.output,
+            protected_paths=[*models.values(), args.manifest, *frames],
+        )
         results: dict[str, dict[str, Any]] = {}
         for backend, model in models.items():
-            require_unchanged_model(backend, identities[backend])
+            require_unchanged_models(identities)
             result = _run_isolated_backend(
                 backend,
                 model,
@@ -347,18 +341,19 @@ def main(argv: list[str] | None = None) -> int:
                 iterations=args.iterations,
                 worker_timeout_seconds=args.worker_timeout_seconds,
             )
-            require_unchanged_model(backend, identities[backend])
+            require_unchanged_models(identities)
             result["model_sha256"] = identities[backend].sha256
             result["model_size_bytes"] = identities[backend].size_bytes
             results[backend] = result
-        _write_report(
-            args.output,
+        write_guarded_report(
+            output_guard,
             _build_report(
                 results,
                 warmup=args.warmup,
                 iterations=args.iterations,
                 worker_timeout_seconds=args.worker_timeout_seconds,
             ),
+            before_publish=lambda: require_unchanged_models(identities),
         )
     except ValueError as exc:
         print(f"benchmark input/evidence error: {exc}", file=sys.stderr)

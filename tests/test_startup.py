@@ -73,6 +73,21 @@ def mounted_example_model(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(Path, "is_file", is_file)
 
 
+@pytest.fixture(autouse=True)
+def restore_ultralytics_process_environment() -> Any:
+    from parking_spot_monitor import paths as runtime_paths
+
+    was_present = "YOLO_CONFIG_DIR" in os.environ
+    original = os.environ.get("YOLO_CONFIG_DIR")
+    original_managed = runtime_paths._managed_ultralytics_config_dir
+    yield
+    if was_present and original is not None:
+        os.environ["YOLO_CONFIG_DIR"] = original
+    else:
+        os.environ.pop("YOLO_CONFIG_DIR", None)
+    runtime_paths._managed_ultralytics_config_dir = original_managed
+
+
 def test_explicit_missing_model_path_fails_before_runtime_loop(tmp_path: Path) -> None:
     from parking_spot_monitor import __main__ as cli
 
@@ -2898,6 +2913,7 @@ config_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.syspath_prepend(str(fake_modules))
     monkeypatch.delitem(sys.modules, "ultralytics", raising=False)
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("YOLO_CONFIG_DIR", "test-unset-sentinel")
     monkeypatch.delenv("YOLO_CONFIG_DIR", raising=False)
 
     class ImportingDetector:
@@ -2932,6 +2948,91 @@ config_dir.mkdir(parents=True, exist_ok=True)
     assert (yolo_config_dir / "settings.json").is_file()
     assert not (fake_home / ".config" / "Ultralytics" / "settings.json").exists()
     assert_no_secret_leak(combined_output(capsys))
+
+
+def test_repeated_runtime_main_replaces_its_managed_ultralytics_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_modules = tmp_path / "fake-modules"
+    fake_modules.mkdir()
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_modules / "ultralytics.py").write_text(
+        """\
+import os
+from pathlib import Path
+
+config_dir = Path(os.environ.get("YOLO_CONFIG_DIR", Path.home() / ".config" / "Ultralytics"))
+config_dir.mkdir(parents=True, exist_ok=True)
+(config_dir / "settings.json").write_text("{}", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(fake_modules))
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("YOLO_CONFIG_DIR", "test-unset-sentinel")
+    monkeypatch.delenv("YOLO_CONFIG_DIR")
+    for key, value in fake_environ().items():
+        monkeypatch.setenv(key, value)
+
+    class ImportingDetector:
+        def detect(
+            self,
+            _frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    def detector_factory(_settings: object) -> ImportingDetector:
+        monkeypatch.delitem(sys.modules, "ultralytics", raising=False)
+        __import__("ultralytics")
+        return ImportingDetector()
+
+    data_dirs = [tmp_path / "runtime-a", tmp_path / "runtime-b"]
+    exit_codes = [
+        _main(
+            ["--config", "config.yaml.example", "--data-dir", str(data_dir)],
+            capture=lambda _settings, actual_data_dir, **_kwargs: captured_frame(
+                Path(actual_data_dir)
+            ),
+            overlay=noop_overlay,
+            detector_factory=detector_factory,
+            matrix_delivery_factory=lambda *_args: FakeMatrixDelivery(),
+            sleep=lambda _seconds: None,
+            max_iterations=1,
+        )
+        for data_dir in data_dirs
+    ]
+
+    assert exit_codes == [0, 0]
+    assert os.environ["YOLO_CONFIG_DIR"] == str(data_dirs[1] / "ultralytics")
+    assert all(
+        (data_dir / "ultralytics" / "settings.json").is_file()
+        for data_dir in data_dirs
+    )
+    assert not (fake_home / ".config" / "Ultralytics" / "settings.json").exists()
+    assert_no_secret_leak(combined_output(capsys))
+
+
+def test_explicit_operator_ultralytics_path_must_match_runtime_data_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from parking_spot_monitor.paths import prepare_ultralytics_config_dir
+
+    data_dir = tmp_path / "runtime"
+    operator_path = tmp_path / "operator-selected" / "ultralytics"
+    monkeypatch.setenv("YOLO_CONFIG_DIR", str(operator_path))
+
+    with pytest.raises(ValueError, match="must be the ultralytics directory"):
+        prepare_ultralytics_config_dir(data_dir)
+
+    assert os.environ["YOLO_CONFIG_DIR"] == str(operator_path)
+    assert not (data_dir / "ultralytics").exists()
 
 
 def test_runtime_loop_startup_prunes_existing_event_snapshots_without_touching_runtime_files(

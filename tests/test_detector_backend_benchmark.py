@@ -31,6 +31,15 @@ def _run_fake_benchmark(
     duplicate_model_content: bool = False,
     crosswire_models: bool = False,
     mutate_onnx_from_pt: bool = False,
+    mutate_target: str | None = None,
+    mutate_from_backend: str | None = None,
+    output_alias: str | None = None,
+    output_hardlink: str | None = None,
+    swap_output_to: str | None = None,
+    output_symlink: str | None = None,
+    output_directory: bool = False,
+    output_parent_symlink: bool = False,
+    output_lexical_alias: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
     fake_modules = tmp_path / "fake-modules"
     fake_modules.mkdir()
@@ -62,9 +71,13 @@ class YOLO:
         self.evidence = json.loads(Path(os.environ["FAKE_BACKEND_EVIDENCE"]).read_text())
         self.calls = {}
         Path(os.environ["FAKE_BACKEND_EVIDENCE"]).with_name(f"started-{self.backend}").touch()
+        if self.backend == "torchscript" and self.evidence.get("swap_output_to"):
+            output = Path(self.evidence["output_path"])
+            output.unlink(missing_ok=True)
+            os.link(self.evidence["swap_output_to"], output)
 
     def predict(self, *, source, verbose=False):
-        if self.backend == "pt" and self.evidence.get("mutate_model"):
+        if self.backend == self.evidence.get("mutate_from_backend") and self.evidence.get("mutate_model"):
             Path(self.evidence["mutate_model"]).write_bytes(b"mutated-model")
         if self.backend == self.evidence.get("hang_backend"):
             time.sleep(5)
@@ -115,13 +128,44 @@ class YOLO:
                 ),
                 "hang_backend": hang_backend,
                 "mutate_model": (
-                    str(models["onnx"]) if mutate_onnx_from_pt else None
+                    str(models[mutate_target or "onnx"])
+                    if mutate_onnx_from_pt or mutate_target
+                    else None
+                ),
+                "mutate_from_backend": (
+                    mutate_from_backend or ("pt" if mutate_onnx_from_pt else None)
+                ),
+                "output_path": str(tmp_path / "report.json"),
+                "swap_output_to": (
+                    str(models[swap_output_to]) if swap_output_to else None
                 ),
             }
         ),
         encoding="utf-8",
     )
-    output = tmp_path / "report.json"
+    aliases = {
+        "pt": models["pt"],
+        "onnx": models["onnx"],
+        "torchscript": models["torchscript"],
+        "manifest": manifest,
+        "frame": frame,
+    }
+    if output_parent_symlink:
+        real_parent = tmp_path / "real-output-parent"
+        real_parent.mkdir()
+        linked_parent = tmp_path / "linked-output-parent"
+        linked_parent.symlink_to(real_parent.name, target_is_directory=True)
+        output = linked_parent / "report.json"
+    elif output_lexical_alias:
+        output = tmp_path / "missing-parent" / ".." / aliases[output_lexical_alias].name
+    else:
+        output = aliases[output_alias] if output_alias else tmp_path / "report.json"
+    if output_hardlink is not None:
+        os.link(aliases[output_hardlink], output)
+    if output_symlink is not None:
+        output.symlink_to(aliases[output_symlink])
+    if output_directory:
+        output.mkdir()
     cli_models = dict(models)
     if crosswire_models:
         cli_models["pt"], cli_models["onnx"] = cli_models["onnx"], cli_models["pt"]
@@ -160,7 +204,11 @@ class YOLO:
         text=True,
         timeout=30,
     )
-    report = json.loads(output.read_text(encoding="utf-8")) if output.exists() else {}
+    report = (
+        json.loads(output.read_text(encoding="utf-8"))
+        if result.returncode == 0 and output.exists()
+        else {}
+    )
     return result, report
 
 
@@ -379,3 +427,101 @@ def test_backend_benchmark_rejects_model_mutation_before_its_worker(
     assert report == {}
     assert (tmp_path / "started-pt").is_file()
     assert not (tmp_path / "started-onnx").exists()
+
+
+def test_backend_benchmark_never_uses_a_model_as_its_output(tmp_path: Path) -> None:
+    original = b"fake-pt-model"
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        output_alias="pt",
+    )
+
+    assert result.returncode == 2
+    assert "benchmark output" in result.stderr
+    assert report == {}
+    assert (tmp_path / "model.pt").read_bytes() == original
+    assert not (tmp_path / "started-pt").exists()
+
+
+@pytest.mark.parametrize(
+    ("output_alias", "output_hardlink"),
+    [
+        ("manifest", None),
+        ("frame", None),
+        (None, "manifest"),
+        (None, "frame"),
+        (None, "pt"),
+    ],
+)
+def test_backend_benchmark_rejects_output_aliases_to_nonmodel_inputs(
+    tmp_path: Path,
+    output_alias: str | None,
+    output_hardlink: str | None,
+) -> None:
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        output_alias=output_alias,
+        output_hardlink=output_hardlink,
+    )
+
+    assert result.returncode == 2
+    assert "benchmark output" in result.stderr
+    assert report == {}
+    assert not (tmp_path / "started-pt").exists()
+
+
+def test_backend_benchmark_rechecks_output_alias_before_atomic_publication(
+    tmp_path: Path,
+) -> None:
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        swap_output_to="pt",
+    )
+
+    assert result.returncode == 2
+    assert "benchmark output changed after preflight" in result.stderr
+    assert report == {}
+    assert (tmp_path / "model.pt").read_bytes() == b"fake-pt-model"
+
+
+def test_backend_benchmark_revalidates_earlier_models_after_later_workers(
+    tmp_path: Path,
+) -> None:
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        mutate_target="pt",
+        mutate_from_backend="onnx",
+    )
+
+    assert result.returncode == 2
+    assert "pt model changed after preflight validation" in result.stderr
+    assert report == {}
+    assert not (tmp_path / "report.json").exists()
+    assert not (tmp_path / "started-torchscript").exists()
+
+
+@pytest.mark.parametrize(
+    "unsafe_output",
+    ["symlink", "directory", "parent-symlink", "lexical-alias"],
+)
+def test_backend_benchmark_rejects_unsafe_output_paths(
+    tmp_path: Path,
+    unsafe_output: str,
+) -> None:
+    result, report = _run_fake_benchmark(
+        tmp_path,
+        onnx_detections=[_detection()],
+        output_symlink="manifest" if unsafe_output == "symlink" else None,
+        output_directory=unsafe_output == "directory",
+        output_parent_symlink=unsafe_output == "parent-symlink",
+        output_lexical_alias="pt" if unsafe_output == "lexical-alias" else None,
+    )
+
+    assert result.returncode == 2
+    assert "benchmark output" in result.stderr
+    assert report == {}
+    assert not (tmp_path / "started-pt").exists()

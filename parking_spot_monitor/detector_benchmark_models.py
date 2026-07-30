@@ -40,6 +40,11 @@ def require_unchanged_model(backend: str, expected: ModelIdentity) -> None:
         raise ValueError(f"{backend} model changed after preflight validation")
 
 
+def require_unchanged_models(identities: dict[str, ModelIdentity]) -> None:
+    for backend, identity in identities.items():
+        require_unchanged_model(backend, identity)
+
+
 def _model_identity(backend: str, path: Path) -> ModelIdentity:
     if path.suffix != MODEL_SUFFIXES[backend]:
         raise ValueError(

@@ -205,6 +205,8 @@ docker compose run --rm parking-spot-monitor \
 
 Validation should name missing environment variables or invalid fields without printing resolved secrets. It also verifies that the explicit `/models/yolov8n.pt` path is a file inside the container. A missing or misnamed weight file fails here, before detector construction or the capture loop.
 
+The tracked Compose service pins `YOLO_CONFIG_DIR=/data/ultralytics`; when launching the package directly, it can be left unset. Before importing Ultralytics, the runtime creates `<data-dir>/ultralytics` with mode `0750` and exports that exact path for the process, so Ultralytics does not write under the container user's home directory. A repeated in-process startup replaces only a fallback value that the runtime previously managed. Any explicitly configured `YOLO_CONFIG_DIR` must name the `ultralytics` directory directly under the selected `--data-dir`; a mismatch fails startup instead of silently redirecting writes.
+
 ### 5. Start and verify the service
 
 ```sh
@@ -406,7 +408,9 @@ python -m json.tool data/detector-benchmark/evidence/backends.json
 python -m pytest tests/test_detector_backend_benchmark.py -q
 ```
 
-A completed benchmark exits zero even when no alternative is eligible. Missing models or frames, a malformed manifest, a failed backend worker, a worker timeout, or malformed/non-finite evidence exits two. Preflight accepts only non-symlink regular files with the documented `.pt`, `.onnx`, and `.torchscript` suffixes; all three must have distinct resolved paths, inodes, and content. It rechecks each model around its worker and records the bounded file size and SHA-256 digest in evidence.
+A completed benchmark exits zero even when no alternative is eligible. Missing models or frames, a malformed manifest, a failed backend worker, a worker timeout, or malformed/non-finite evidence exits two. Preflight accepts only non-symlink regular files with the documented `.pt`, `.onnx`, and `.torchscript` suffixes; all three must have distinct resolved paths, inodes, and content. The harness rechecks every model's stable identity, size, and SHA-256 digest after every worker and immediately before report publication, then records the bounded size and digest in evidence. If any backend changes any model, the run exits two and publishes no report.
+
+Create the output parent directory before starting the benchmark, as shown above. The output must not be a model, manifest, frame, hardlink to any input, symlink, directory, or path through a symlinked parent. The harness validates those constraints before spawning a worker, pins the parent directory identity, and repeats its output and model checks immediately before an atomic report replacement. An output path that changes after preflight is rejected; the harness never intentionally overwrites benchmark inputs.
 
 `load_seconds` consistently means time from constructor start through the first completed, normalized prediction. That readiness prediction is excluded from warmup and measured inference timings. The harness compares normalized results from every measured iteration within each backend and records a bounded reference digest plus mismatch count/first mismatch; any intra-backend change makes the run ineligible even if the final iteration matches `.pt`. Eligibility also requires exact frame and ordered class/count parity with no added or omitted detections, minimum bbox IoU `0.99` using the runtime's canonical geometry function, maximum confidence delta `0.02`, and at least a 15% improvement in p95 inference time or isolated-process peak RSS. All alternatives must pass parity before the report can set `production_switch_eligible` to true. Treat that flag as permission to begin a separately approved production-switch review, never as authorization to edit the live backend automatically.
 

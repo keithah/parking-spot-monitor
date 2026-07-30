@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from parking_spot_monitor.config import RuntimeSettings
+
+
+_ULTRALYTICS_ENV_LOCK = threading.Lock()
+_managed_ultralytics_config_dir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,27 +59,37 @@ def prepare_ultralytics_config_dir(
 ) -> Path:
     """Create the writable Ultralytics state directory without following a leaf symlink."""
 
-    effective_data_dir = Path(data_dir)
-    selected_environ = os.environ if environ is None else environ
-    config_dir = Path(
-        selected_environ.get("YOLO_CONFIG_DIR", str(effective_data_dir / "ultralytics"))
-    )
-    if config_dir.parent != effective_data_dir or config_dir.name != "ultralytics":
-        raise ValueError("YOLO_CONFIG_DIR must be the ultralytics directory under --data-dir")
+    global _managed_ultralytics_config_dir
 
-    effective_data_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        config_dir.mkdir(mode=0o750)
-    except FileExistsError:
-        pass
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(config_dir, flags)
-    try:
-        os.fchmod(descriptor, 0o750)
-    finally:
-        os.close(descriptor)
-    os.environ["YOLO_CONFIG_DIR"] = str(config_dir)
-    return config_dir
+    with _ULTRALYTICS_ENV_LOCK:
+        effective_data_dir = Path(data_dir)
+        selected_environ = os.environ if environ is None else environ
+        configured = selected_environ.get("YOLO_CONFIG_DIR")
+        managed_default = configured is None or (
+            environ is None and configured == _managed_ultralytics_config_dir
+        )
+        config_dir = (
+            effective_data_dir / "ultralytics"
+            if managed_default
+            else Path(configured)
+        )
+        if config_dir.parent != effective_data_dir or config_dir.name != "ultralytics":
+            raise ValueError("YOLO_CONFIG_DIR must be the ultralytics directory under --data-dir")
+
+        effective_data_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            config_dir.mkdir(mode=0o750)
+        except FileExistsError:
+            pass
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(config_dir, flags)
+        try:
+            os.fchmod(descriptor, 0o750)
+        finally:
+            os.close(descriptor)
+        os.environ["YOLO_CONFIG_DIR"] = str(config_dir)
+        _managed_ultralytics_config_dir = str(config_dir) if managed_default else None
+        return config_dir
 
 
 def _resolve_under_data_dir(value: Path | None, data_dir: Path, *, default: str | None = None) -> Path:
