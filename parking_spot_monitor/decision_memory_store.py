@@ -112,11 +112,14 @@ class DecisionMemoryStore:
         *,
         wait: Callable[[float], bool],
     ) -> bool:
+        wait_deadline = self._monotonic() + wait_seconds
         bounded = self._bounded_wait_seconds(wait_seconds)
         if wait(bounded):
             return True
         self.checkpoint_if_due()
-        remaining = max(0.0, wait_seconds - bounded)
+        if bounded >= wait_seconds:
+            return False
+        remaining = max(0.0, wait_deadline - self._monotonic())
         return wait(remaining) if remaining else False
 
     def flush(self) -> bool:
@@ -148,6 +151,9 @@ class DecisionMemoryStore:
                     )
                 if not after.available or after.signature != before.signature:
                     return self._defer_reconciliation("source-changed-during-load")
+                expected_state = "missing" if before.signature is None else "available"
+                if external.state != expected_state:
+                    return self._defer_reconciliation("source-state-signature-mismatch")
                 if external.state == "available":
                     candidate = deduplicated_decision_memory_tail(
                         (*external.records, *self._dirty_records),

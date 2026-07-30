@@ -135,6 +135,45 @@ def test_failed_deadline_checkpoint_retries_at_next_iteration_boundary(
     ]
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_seconds", "expected_sleeps", "expected_elapsed"),
+    ((10, [5, 585], 600), (700, [5], 705)),
+)
+def test_checkpoint_duration_counts_toward_requested_wait_cadence(
+    tmp_path: Path,
+    checkpoint_seconds: float,
+    expected_sleeps: list[float],
+    expected_elapsed: float,
+) -> None:
+    path = decision_memory_path(tmp_path)
+    clock = [0.0]
+    sleeps: list[float] = []
+    store = _store(path, interval=5, monotonic=lambda: clock[0])
+    assert store.append(_record("miss", "left_spot", "timed checkpoint"), durability="routine")
+    real_write = decision_memory._write_memory
+
+    def timed_write(*args, **kwargs):
+        clock[0] += checkpoint_seconds
+        return real_write(*args, **kwargs)
+
+    def wait(seconds: float) -> bool:
+        sleeps.append(seconds)
+        clock[0] += seconds
+        return False
+
+    with patch(
+        "parking_spot_monitor.operator_decision_memory._write_memory",
+        side_effect=timed_write,
+    ):
+        assert store.wait_for_checkpoint(600, wait=wait) is False
+
+    assert sleeps == expected_sleeps
+    assert clock[0] == expected_elapsed
+    assert [record.summary for record in load_decision_memory(path).records] == [
+        "timed checkpoint"
+    ]
+
+
 def test_decision_store_merges_external_replacement_before_flush(tmp_path: Path) -> None:
     path = decision_memory_path(tmp_path)
     assert append_decision_memory_record(path, _record("miss", "left_spot", "baseline"))
@@ -204,6 +243,67 @@ def test_external_unavailable_load_defers_without_overwriting_or_losing_dirty_re
         "external",
         "local",
     ]
+
+
+def test_false_missing_load_for_extant_source_defers_without_overwriting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = decision_memory_path(tmp_path)
+    assert append_decision_memory_record(path, _record("alert", None, "baseline"))
+    store = _store(path, monotonic=lambda: 0)
+    assert store.append(_record("miss", "left_spot", "local"), durability="routine")
+    assert append_decision_memory_record(path, _record("alert", None, "external"))
+    before = path.read_bytes()
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            decision_memory,
+            "load_decision_memory",
+            lambda *_args, **_kwargs: DecisionMemoryLoad(state="missing"),
+        )
+        assert store.flush() is False
+
+    assert path.read_bytes() == before
+    assert [record.summary for record in store.records] == ["baseline", "local"]
+    assert store.flush() is True
+    assert [record.summary for record in load_decision_memory(path).records] == [
+        "baseline",
+        "external",
+        "local",
+    ]
+
+
+def test_available_load_for_missing_source_defers_without_creating_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = decision_memory_path(tmp_path)
+    with monkeypatch.context() as context:
+        context.setattr(
+            decision_memory,
+            "load_decision_memory",
+            lambda *_args, **_kwargs: DecisionMemoryLoad(
+                state="unavailable", error_type="PermissionError"
+            ),
+        )
+        store = _store(path, monotonic=lambda: 0)
+    assert store.append(_record("miss", "left_spot", "local"), durability="routine")
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            decision_memory,
+            "load_decision_memory",
+            lambda *_args, **_kwargs: DecisionMemoryLoad(
+                state="available", records=(_record("alert", None, "phantom"),)
+            ),
+        )
+        assert store.flush() is False
+
+    assert not path.exists()
+    assert [record.summary for record in store.records] == ["local"]
+    assert store.flush() is True
+    assert [record.summary for record in load_decision_memory(path).records] == ["local"]
 
 
 def test_quarantined_external_source_requires_a_missing_source_retry(tmp_path: Path) -> None:

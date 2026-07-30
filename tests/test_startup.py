@@ -5621,7 +5621,9 @@ def test_runtime_checkpoints_decision_memory_once_per_success_and_failed_iterati
 def test_runtime_wait_wakes_at_dirty_decision_checkpoint_without_changing_cadence(
     tmp_path: Path,
     capture_fails: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import parking_spot_monitor.operator_decision_memory as decision_memory
     from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
     from parking_spot_monitor.operator_decision_memory import make_decision_memory_record
 
@@ -5654,6 +5656,17 @@ def test_runtime_wait_wakes_at_dirty_decision_checkpoint_without_changing_cadenc
         checkpoint_max_pending_records=50,
         monotonic=lambda: clock[0],
     )
+    real_write = decision_memory._write_memory
+    checkpoint_timed = False
+
+    def timed_write(path: Path, records: Sequence[DecisionMemoryRecord]) -> None:
+        nonlocal checkpoint_timed
+        if sleeps and not checkpoint_timed:
+            checkpoint_timed = True
+            clock[0] += 10
+        real_write(path, records)
+
+    monkeypatch.setattr(decision_memory, "_write_memory", timed_write)
 
     def capture(_settings: object, data_dir: str | Path, **_kwargs: object) -> FrameCaptureResult:
         store.append(
@@ -5692,7 +5705,8 @@ def test_runtime_wait_wakes_at_dirty_decision_checkpoint_without_changing_cadenc
         random_unit=lambda: 0.5,
         decision_memory_store=store,
     ) == 0
-    assert sleeps == [5, 595]
+    assert sleeps == [5, 585]
+    assert clock[0] == 600
 
 
 def test_runtime_loop_decision_memory_append_failure_is_non_fatal(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
