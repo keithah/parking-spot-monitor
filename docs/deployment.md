@@ -284,7 +284,46 @@ The resource controls are:
 - `runtime.debug_overlay_interval_seconds`: periodic overlay interval; transitions still force an overlay.
 - `stream.escalation_verification_seconds`: periodic high-resolution verification interval; transitions can still escalate sooner.
 
+Capture validation rejects any primary or named profile above 7,680 pixels in either dimension or 33,177,600 pixels in total. A captured JPEG must be no larger than 32 MiB, decode as JPEG, and match its configured profile dimensions before publication. A rejected capture does not replace the previous known-good frame.
+
+Detection-lab execution admits at most one active replay or tuning job. A concurrent request is persisted as blocked with `lab_busy`; retention does not remove the active job directory. The Matrix outbox similarly owns at most one delivery worker, and that worker drains no more than one durable record per pass.
+
+Matrix timing and outage controls use these production defaults:
+
+| Key | Default | Rollback or compatibility setting |
+| --- | ---: | --- |
+| `matrix.command_poll_interval_seconds` | `60` | `0` restores polling on every capture-loop iteration. |
+| `matrix.command_failure_cooldown_seconds` | `60` | Must remain positive. Keep `60` for the documented compatibility baseline. |
+| `matrix.command_failure_max_cooldown_seconds` | `900` | Set equal to the initial cooldown (`60`) to disable exponential cooldown growth while retaining failure pacing. |
+| `matrix.unauthorized_reply_cooldown_seconds` | `300` | `0` restores a rejection reply for every unauthorized command. |
+| `matrix.retry_jitter_ratio` | `0.2` | `0` disables locally calculated retry jitter; server `Retry-After` remains authoritative. |
+| `matrix.outbox_retry_interval_seconds` | `60` | Must remain positive. Use explicit drain tooling for immediate troubleshooting, or restore the rollback image for the prior delivery implementation. |
+
+Successful command polls wait for the poll interval. Failed half-open probes double the cooldown up to the maximum, and a successful probe resets it. Capture continues while command polling is in cooldown; the loop does not sleep for the Matrix failure interval.
+
 To restore the former faster active polling, set `frame_interval_seconds` to 15 and restart. To disable adaptive cadence entirely, set `adaptive_polling_enabled: false`. Keep the stable interval greater than or equal to the active interval.
+
+### 2026-07-29 production rollout evidence
+
+The resource-hardening image was built with `--pull`, validated against the production bind mounts, and recreated with the existing operator configuration, data, and authenticated model. Docker reported the service healthy, the explicit in-container healthcheck passed, and the restart count remained zero through the bounded observation. The previous immutable image remained tagged for rollback, and the pre-deployment configuration and model remained in a protected host backup.
+
+The following evidence compares the redaction-safe baseline in `data/resource-hardening-prechange-baseline.md` with the first production observation. Neither side is a controlled benchmark: Docker statistics, thread count, outbox size, and health-snapshot duration are point samples under different live workloads.
+
+| Measurement | Pre-change baseline | Post-deployment evidence |
+| --- | ---: | ---: |
+| Docker CPU | `63.07%` | `0.00%` in each of two instantaneous samples |
+| Docker memory | `362.2 MiB` | `577.5 MiB`, then `624.4 MiB`, of a `4 GiB` limit |
+| Docker PIDs / process threads | `13` / `13` | `14` / `14` |
+| Matrix outbox file size | `1,565,331 bytes` | `1,614,450 bytes` |
+| Vehicle-history health snapshot | `59.083 ms` | `63.968 ms` |
+| Docker network I/O | `307 MB / 11.8 MB` after about 11 hours | `3.57 MB / 119 kB` after about 7 minutes |
+| Docker block I/O | `14.2 GB / 5.7 GB` after about 11 hours | `319 MB / 5.68 MB` after about 7 minutes |
+
+The bounded steady log window ran from `2026-07-30T06:11:40Z` through `2026-07-30T06:14:52Z` (`192` seconds). It contained `33` structured `INFO` records, no `WARNING` or `ERROR` records, and no unparsed records. Scaling that short count gives an explicit projection of `14,850 INFO records/day`. The baseline is an observed 24-hour count of `13,117 INFO`, `31 WARNING`, and `0 ERROR` records, not a projection. Startup was excluded because its `194.469`-second window projected `21,770 INFO records/day`; the 192-second result is still too short and workload-dependent to claim a log-volume reduction. Repeat the same aggregate-only measurement over a representative 24-hour period before drawing a trend conclusion.
+
+A synthetic scheduler trace, without a Matrix network request, confirmed the documented failure pacing: a first failed poll retried after `60` seconds, a second consecutive failure doubled the wait to `120` seconds, and a success cleared the failure count and resumed the normal `60`-second interval. This demonstrates scheduler behavior only; it is not evidence of homeserver availability or end-to-end delivery.
+
+These measurements establish a healthy, rollback-ready deployment, not a performance win. Network and block I/O are cumulative from container creation and reset on recreation, while memory and CPU can vary substantially with capture and inference timing. Keep the rollback image and backup until a representative observation period confirms acceptable behavior and resource use.
 
 ## Backup and recovery
 
