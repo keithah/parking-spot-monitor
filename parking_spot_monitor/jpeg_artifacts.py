@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import errno
 import fcntl
-import hashlib
 import os
 from pathlib import Path
 import secrets
@@ -15,6 +14,7 @@ import warnings
 
 from PIL import Image, UnidentifiedImageError
 
+from parking_spot_monitor.bounded_descriptor_io import descriptor_signature, read_descriptor_exact
 from parking_spot_monitor.file_descriptor_binding import FileIdentity, RootedDirectoryOwner, descriptor_identity
 from parking_spot_monitor.jpeg_decoding import (
     DecodedRgbJpeg,
@@ -26,7 +26,6 @@ from parking_spot_monitor.jpeg_decoding import (
 )
 
 _FICLONE = 0x40049409
-_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_CANONICAL_JPEG_BYTES = 32 * 1024 * 1024
 _FALLBACK_ERRNOS = frozenset(
     error
@@ -91,7 +90,7 @@ def _publish_validated_to_owner(
         except OSError as reflink_exc:
             if reflink_exc.errno not in _FALLBACK_ERRNOS:
                 raise
-            _copy_file(source_fd, owner, temporary_name, evidence.mode, evidence.signature[2])
+            _copy_file(source_fd, owner, temporary_name, evidence.mode, evidence.signature)
             strategy = "copy"
         temporary_fd = _open_artifact(owner, temporary_name)
         temporary_identity = descriptor_identity(temporary_fd)
@@ -176,20 +175,14 @@ def _copy_file(
     owner: RootedDirectoryOwner,
     temporary_name: str,
     source_mode: int,
-    source_size: int,
+    source_signature: tuple[int, int, int, int, int],
 ) -> None:
     destination_fd = owner.open_file(temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode)
     try:
-        os.lseek(source_fd, 0, os.SEEK_SET)
-        remaining = source_size
-        while remaining:
-            chunk = os.read(source_fd, min(_COPY_CHUNK_BYTES, remaining))
-            if not chunk:
-                raise JpegDecodeError("read_failed")
-            _write_all(destination_fd, chunk)
-            remaining -= len(chunk)
-        if os.read(source_fd, 1):
-            raise JpegDecodeError("read_failed")
+        try:
+            read_descriptor_exact(source_fd, source_signature, destination_fd=destination_fd)
+        except OSError as exc:
+            raise JpegDecodeError("read_failed") from exc
         os.fchmod(destination_fd, source_mode)
     except Exception:
         identity = descriptor_identity(destination_fd)
@@ -214,9 +207,9 @@ def _validated_source_evidence(source_fd: int) -> _SourceEvidence:
     if not stat.S_ISREG(value.st_mode) or not 0 < value.st_size <= MAX_CANONICAL_JPEG_BYTES:
         raise JpegDecodeError("read_failed")
     before = _stat_signature(value)
-    digest_before = _digest_descriptor(source_fd)
+    digest_before = _bounded_digest(source_fd, before)
     _validate_jpeg_descriptor(source_fd)
-    digest_after = _digest_descriptor(source_fd)
+    digest_after = _bounded_digest(source_fd, before)
     if _descriptor_signature(source_fd) != before or digest_after != digest_before:
         raise JpegDecodeError("read_failed")
     return _SourceEvidence(before, digest_after, stat.S_IMODE(value.st_mode))
@@ -231,42 +224,27 @@ def _open_artifact(owner: RootedDirectoryOwner, name: str) -> int:
 
 def _validate_artifact_descriptor(descriptor: int, source_fd: int, evidence: _SourceEvidence) -> None:
     signature = _descriptor_signature(descriptor)
-    if signature[2] != evidence.signature[2] or not stat.S_ISREG(os.fstat(descriptor).st_mode) or _digest_descriptor(descriptor) != evidence.digest:
+    if signature[2] != evidence.signature[2] or not stat.S_ISREG(os.fstat(descriptor).st_mode) or _bounded_digest(descriptor, signature) != evidence.digest:
         raise JpegDecodeError("read_failed")
     _validate_jpeg_descriptor(descriptor)
     if (
         _descriptor_signature(descriptor) != signature
-        or _digest_descriptor(descriptor) != evidence.digest
+        or _bounded_digest(descriptor, signature) != evidence.digest
         or _descriptor_signature(source_fd) != evidence.signature
     ):
         raise JpegDecodeError("read_failed")
 
 
-def _digest_descriptor(descriptor: int) -> bytes:
-    digest = hashlib.sha256()
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    while chunk := os.read(descriptor, _COPY_CHUNK_BYTES):
-        digest.update(chunk)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    return digest.digest()
+def _bounded_digest(descriptor: int, signature: tuple[int, int, int, int, int]) -> bytes:
+    try:
+        return read_descriptor_exact(descriptor, signature).digest
+    except OSError as exc:
+        raise JpegDecodeError("read_failed") from exc
 
 
 def _descriptor_signature(descriptor: int) -> tuple[int, int, int, int, int]:
-    return _stat_signature(os.fstat(descriptor))
+    return descriptor_signature(descriptor)
 
 
 def _stat_signature(value: os.stat_result) -> tuple[int, int, int, int, int]:
     return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
-
-
-def _write_all(descriptor: int, payload: bytes) -> None:
-    view = memoryview(payload)
-    try:
-        offset = 0
-        while offset < len(view):
-            written = os.write(descriptor, view[offset:])
-            if written <= 0:
-                raise OSError("JPEG publication write made no progress")
-            offset += written
-    finally:
-        view.release()

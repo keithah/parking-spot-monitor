@@ -17,6 +17,7 @@ from PIL import Image
 from parking_spot_monitor import (
     file_descriptor_binding,
     jpeg_artifacts,
+    owned_file_cleanup,
     vehicle_history_corrections,
     vehicle_history_images,
     vehicle_history_storage,
@@ -865,6 +866,49 @@ def test_canonical_jpeg_rejects_oversized_source_before_creating_destination(tmp
     assert not destination.parent.exists()
 
 
+def test_canonical_jpeg_accepts_exact_32_mib_valid_source(tmp_path: Path) -> None:
+    source = write_test_jpeg(tmp_path / "exact-limit.jpg")
+    with source.open("ab") as handle:
+        handle.truncate(32 * 1024 * 1024)
+    destination = tmp_path / "archive" / "full.jpg"
+
+    publication = publish_canonical_jpeg(source, destination)
+
+    assert publication.path.stat().st_size == 32 * 1024 * 1024
+
+
+def test_canonical_growth_rejection_reads_at_most_preflight_size_plus_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_test_jpeg(tmp_path / "growing.jpg")
+    preflight_size = source.stat().st_size
+    source_identity = (source.stat().st_dev, source.stat().st_ino)
+    destination = tmp_path / "archive" / "full.jpg"
+    growth_limit = 40 * 1024 * 1024
+    real_read = os.read
+    consumed = 0
+
+    def inject_40_mib_growth(descriptor: int, size: int) -> bytes:
+        nonlocal consumed
+        chunk = real_read(descriptor, size)
+        value = os.fstat(descriptor)
+        if (value.st_dev, value.st_ino) == source_identity:
+            consumed += len(chunk)
+            if chunk and source.stat().st_size < growth_limit:
+                with source.open("r+b") as handle:
+                    handle.truncate(growth_limit)
+        return chunk
+
+    monkeypatch.setattr(jpeg_artifacts.os, "read", inject_40_mib_growth)
+
+    with pytest.raises(JpegDecodeError, match="read_failed"):
+        publish_canonical_jpeg(source, destination)
+
+    assert consumed <= preflight_size + 1
+    assert source.stat().st_size == growth_limit
+    assert not destination.exists()
+
+
 def test_canonical_copy_growth_never_writes_beyond_preflight_size(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1234,6 +1278,82 @@ def test_owned_cleanup_recovers_quarantined_mismatch_after_name_blocker_removed(
     assert list(tmp_path.glob(".*.quarantine")) == []
 
 
+@pytest.mark.parametrize(
+    "token",
+    [
+        "0123456789abcde",
+        "0123456789abcdef0",
+        "0123456789abcdeF",
+        "0123456789abcdeg",
+        "0123456789abcdef.manual",
+    ],
+)
+def test_owned_cleanup_recovery_ignores_noncanonical_quarantine_names(
+    tmp_path: Path, token: str
+) -> None:
+    target = tmp_path / "owned[1].jpg"
+    candidate = tmp_path / f".{target.name}.{token}.quarantine"
+    candidate.write_bytes(b"unrelated")
+
+    assert file_descriptor_binding.recover_quarantined_path(target) == 0
+
+    assert not target.exists()
+    assert candidate.read_bytes() == b"unrelated"
+
+
+def test_owned_cleanup_recovery_unlinks_prior_hardlink_idempotently(tmp_path: Path) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    quarantine = tmp_path / ".owned.jpg.0123456789abcdef.quarantine"
+    os.link(target, quarantine)
+
+    assert file_descriptor_binding.recover_quarantined_path(target) == 1
+
+    assert target.read_bytes() == b"owned"
+    assert not quarantine.exists()
+
+
+def test_owned_cleanup_recovery_retries_transient_hardlink_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"owned")
+    quarantine = tmp_path / ".owned.jpg.0123456789abcdef.quarantine"
+    os.link(target, quarantine)
+    real_unlink = os.unlink
+    failed = False
+
+    def fail_once(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal failed
+        if path == quarantine.name and kwargs.get("dir_fd") is not None and not failed:
+            failed = True
+            raise OSError("transient unlink failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(owned_file_cleanup.os, "unlink", fail_once)
+
+    assert file_descriptor_binding.recover_quarantined_path(target) == 0
+    assert quarantine.exists()
+    assert file_descriptor_binding.recover_quarantined_path(target) == 1
+    assert not quarantine.exists()
+
+
+def test_owned_cleanup_recovery_selects_exact_candidates_deterministically(tmp_path: Path) -> None:
+    target = tmp_path / "owned[1].jpg"
+    later = tmp_path / f".{target.name}.ffffffffffffffff.quarantine"
+    first = tmp_path / f".{target.name}.0000000000000000.quarantine"
+    unrelated = tmp_path / f".{target.name}.AAAAAAAAAAAAAAAA.quarantine"
+    later.write_bytes(b"later")
+    first.write_bytes(b"first")
+    unrelated.write_bytes(b"unrelated")
+
+    assert file_descriptor_binding.recover_quarantined_path(target) == 1
+
+    assert target.read_bytes() == b"first"
+    assert later.read_bytes() == b"later"
+    assert unrelated.read_bytes() == b"unrelated"
+
+
 def test_vehicle_failure_cleanup_preserves_swap_at_delete_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1511,12 +1631,17 @@ def test_canonical_jpeg_rejects_in_place_mutation_during_fallback_publication(
         raise OSError(errno.EXDEV, "fallback required")
 
     def publish_then_mutate(
-        source_fd: int, owner: Any, temporary_name: str, source_mode: int, source_size: int | None = None
+        source_fd: int,
+        owner: Any,
+        temporary_name: str,
+        source_mode: int,
+        source_signature: tuple[int, int, int, int, int] | None = None,
     ) -> None:
         if strategy == "reflink":
             write_owned_temporary(owner, temporary_name, source_fd, source_mode)
         else:
-            real_copy(source_fd, owner, temporary_name, source_mode, int(source_size))
+            assert source_signature is not None
+            real_copy(source_fd, owner, temporary_name, source_mode, source_signature)
         source.write_bytes(b"changed during publication")
 
     monkeypatch.setattr(jpeg_artifacts, "_reflink", publish_then_mutate if strategy == "reflink" else unavailable)

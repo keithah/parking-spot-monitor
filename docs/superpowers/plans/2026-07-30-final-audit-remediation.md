@@ -44,7 +44,13 @@
 | `parking_spot_monitor/decision_memory_store.py` | Service-scoped bounded records, dirty tracking, timed checkpoints, and close flush. |
 | `parking_spot_monitor/vehicle_history_profiles.py` | Profile estimates, including reuse of already-loaded effective records in profile summaries. |
 | `parking_spot_monitor/runtime_health_cache.py` | Existing revision/TTL cache over streamed archive-health snapshots. |
-| `parking_spot_monitor/jpeg_artifacts.py` | Atomic canonical JPEG publication plus one bounded decode/draft/RGB/close helper shared by snapshot callers. |
+| `parking_spot_monitor/bounded_descriptor_io.py` | Exact captured-size descriptor hashing/capture/copy, one-byte growth probing, signature verification, and offset reset. |
+| `parking_spot_monitor/jpeg_artifacts.py` | Atomic, identity-bound canonical JPEG publication using reflink or bounded descriptor copy. |
+| `parking_spot_monitor/jpeg_decoding.py` | Shared bounded decode/draft/RGB/close lifecycle for path, byte, stream, and owned-inode inputs. |
+| `parking_spot_monitor/owned_file_cleanup.py` | Exact-name, capped, deterministic quarantine recovery and idempotent identity-bound deletion. |
+| `parking_spot_monitor/matrix_retained_publication.py` | Bounded publication and ownership evidence for retained Matrix snapshots. |
+| `parking_spot_monitor/matrix_snapshot_storage.py` | Rooted, no-follow storage and exact-size evidence reads for Matrix snapshot artifacts. |
+| `parking_spot_monitor/matrix_upload_derivatives.py` | Durable upload-derivative publication, validation, reload, read, and deletion. |
 | `scripts/benchmark_detector_backends.py` | Offline `.pt`/ONNX/TorchScript timing, memory, and parity evidence only. |
 | `docs/deployment.md` | New timing controls, graceful stop, Ultralytics state, benchmark gate, rollout, measurement, and rollback. |
 
@@ -947,6 +953,13 @@ git commit -m "perf: reuse loaded profile history"
 
 **Files:**
 - Create: `parking_spot_monitor/jpeg_artifacts.py`
+- Create: `parking_spot_monitor/jpeg_decoding.py`
+- Create: `parking_spot_monitor/bounded_descriptor_io.py`
+- Create: `parking_spot_monitor/owned_file_cleanup.py`
+- Create: `parking_spot_monitor/matrix_retained_publication.py`
+- Create: `parking_spot_monitor/matrix_snapshot_storage.py`
+- Create: `parking_spot_monitor/matrix_upload_derivatives.py`
+- Modify: `parking_spot_monitor/file_descriptor_binding.py`
 - Modify: `parking_spot_monitor/vehicle_history_images.py`
 - Modify: `parking_spot_monitor/vehicle_history_sessions.py`
 - Modify: `parking_spot_monitor/matrix_snapshots.py`
@@ -957,12 +970,17 @@ git commit -m "perf: reuse loaded profile history"
 - Modify: `tests/test_matrix_outbox_delivery.py`
 - Modify: `tests/test_image_budget.py`
 - Modify: `tests/test_operator_cockpit.py`
+- Modify: `tests/test_matrix.py`
+- Modify: `tests/test_module_decomposition.py`
 
 **Interfaces:**
 - Produces: `JpegPublication(path: Path, strategy: Literal["reflink", "copy"], identity: FileIdentity)` and `publish_canonical_jpeg(source, destination) -> JpegPublication`. The `(dev, ino)` identity is an ownership token: immediate consumers must bind an `O_NOFOLLOW` descriptor to it, and failure cleanup may remove only that exact published inode.
 - Preserves a 32 MiB `MAX_CANONICAL_JPEG_BYTES` ceiling: source size is checked before hashing or destination creation, bounded copy writes exactly the preflight size and probes once for growth, and reflink/copy temporaries must retain that size and validated source evidence.
-- Produces: `JpegDecodeError(code: Literal["unidentified", "decompression_bomb", "invalid_dimensions", "read_failed"])` and `open_decoded_rgb_jpeg(path: Path, *, initial_max_dimension: int) -> ContextManager[DecodedRgbJpeg]`, where `DecodedRgbJpeg(image: Image.Image, source_width: int, source_height: int)` owns bounded draft, decode, RGB conversion, and deterministic closure.
-- Produces: immutable `MatrixUploadDerivative(path: Path, info: Mapping[str, int | str])` and `prepare_upload_derivative(snapshot: MatrixSnapshot, *, destination: Path) -> MatrixUploadDerivative`.
+- Produces: `JpegDecodeError(code: Literal["unidentified", "decompression_bomb", "invalid_dimensions", "read_failed"])` and `open_decoded_rgb_jpeg(path: Path, *, initial_max_dimension: int, expected_identity: FileIdentity | None = None) -> ContextManager[DecodedRgbJpeg]`, plus byte and stream variants. `DecodedRgbJpeg(image: Image.Image, source_width: int, source_height: int)` owns bounded draft, decode, RGB conversion, and deterministic closure.
+- Produces: `read_descriptor_exact(fd, expected_signature, *, capture_bytes=False, destination_fd=None) -> BoundedDescriptorRead`, which consumes exactly the captured size, fails short reads, probes one growth byte, verifies the post-read descriptor signature, and resets the source offset.
+- Produces: `publish_retained_snapshot(source: Path, snapshot_root: Path, filename: str) -> OwnedFile` and rooted `read_owned_jpeg_evidence(snapshot_root, filename, *, max_bytes, expected_identity=None) -> RootedJpegEvidence`.
+- Produces: immutable `MatrixUploadDerivative(path: Path, info: Mapping[str, int | str])`; `publish_upload_derivative(snapshot_root, filename, *, data, info)`, `load_upload_derivative(snapshot_root, filename, *, persisted_path, info)`, and `read_upload_derivative_bytes(snapshot_root, derivative)` are the durable derivative APIs.
+- Produces: `recover_quarantined_path(path: Path) -> int`; recovery accepts only `.<safe_basename>.<16 lowercase hex>.quarantine`, scans at most 256 entries, orders exact candidates deterministically, and completes an interrupted same-inode hardlink restore idempotently.
 - Adds outbox intent metadata `upload_derivative_path` and `upload_derivative_info`; both are optional, sanitized schema-v1 metadata.
 - Preserves: `SessionRecord.occupied_snapshot_path` as the canonical archive full JPEG and `occupied_crop_path` as its crop; no session schema change.
 

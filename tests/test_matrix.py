@@ -1090,6 +1090,39 @@ def test_rooted_jpeg_evidence_rejects_mutation_during_descriptor_read(
         )
 
 
+def test_rooted_jpeg_growth_rejection_reads_at_most_preflight_size_plus_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    retained = tmp_path / "growing.jpg"
+    write_jpeg(retained)
+    preflight_size = retained.stat().st_size
+    retained_identity = (retained.stat().st_dev, retained.stat().st_ino)
+    growth_limit = 40 * 1024 * 1024
+    real_read = os.read
+    consumed = 0
+    read_calls = 0
+
+    def continuously_growing_read(descriptor: int, size: int) -> bytes:
+        nonlocal consumed, read_calls
+        value = os.fstat(descriptor)
+        if (value.st_dev, value.st_ino) == retained_identity:
+            read_calls += 1
+            if read_calls >= 2 and retained.stat().st_size < growth_limit:
+                with retained.open("ab") as handle:
+                    handle.write(b"x" * min(1024 * 1024, growth_limit - retained.stat().st_size))
+        chunk = real_read(descriptor, size)
+        if (value.st_dev, value.st_ino) == retained_identity:
+            consumed += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(matrix_snapshot_storage.os, "read", continuously_growing_read)
+
+    with pytest.raises(OSError, match="changed while reading"):
+        matrix_snapshot_storage.read_owned_jpeg_evidence(tmp_path, retained.name)
+
+    assert consumed <= preflight_size + 1
+
+
 def test_rooted_jpeg_evidence_exposes_only_upload_bytes_and_info(tmp_path: Path) -> None:
     retained = tmp_path / "retained.jpg"
     payload = write_jpeg(retained, size=(8, 6))
@@ -1543,14 +1576,14 @@ def test_read_owned_jpeg_evidence_rejects_snapshot_root_swap_during_read(
     snapshot_root = tmp_path / "snapshots"
     publication = matrix_retained_publication.publish_retained_snapshot(source, snapshot_root, "event.jpg")
     moved_root = tmp_path / "snapshots-held"
-    real_read_exact = matrix_snapshot_storage._read_exact
+    real_read_exact = matrix_snapshot_storage.read_descriptor_exact
 
-    def swap_root(descriptor: int, size: int) -> bytes:
+    def swap_root(descriptor: int, signature: object, **kwargs: object) -> object:
         os.replace(snapshot_root, moved_root)
         snapshot_root.mkdir()
-        return real_read_exact(descriptor, size)
+        return real_read_exact(descriptor, signature, **kwargs)
 
-    monkeypatch.setattr(matrix_snapshot_storage, "_read_exact", swap_root)
+    monkeypatch.setattr(matrix_snapshot_storage, "read_descriptor_exact", swap_root)
 
     with pytest.raises(OSError):
         matrix_snapshot_storage.read_owned_jpeg_evidence(snapshot_root, "event.jpg")

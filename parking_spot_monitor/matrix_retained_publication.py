@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 import secrets
 import stat
 
+from parking_spot_monitor.bounded_descriptor_io import descriptor_signature, read_descriptor_exact
 from parking_spot_monitor.file_descriptor_binding import (
     OwnedFile,
     RootedDirectoryOwner,
@@ -16,7 +16,6 @@ from parking_spot_monitor.file_descriptor_binding import (
 )
 from parking_spot_monitor.jpeg_artifacts import MAX_CANONICAL_JPEG_BYTES
 
-_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_RETAINED_JPEG_BYTES = MAX_CANONICAL_JPEG_BYTES
 
 
@@ -58,11 +57,12 @@ def _publish_into_owner(
         digest = _copy_bounded(source_fd, temporary_fd, source_before)
         os.fchmod(temporary_fd, 0o644)
         os.fsync(temporary_fd)
-        if (
-            _descriptor_signature(source_fd) != source_before
-            or _digest_descriptor(source_fd) != digest
-            or _digest_descriptor(temporary_fd) != digest
-        ):
+        temporary_signature = _descriptor_signature(temporary_fd)
+        if temporary_signature[2] != source_before[2]:
+            raise OSError("snapshot source changed while copying")
+        if read_descriptor_exact(source_fd, source_before).digest != digest:
+            raise OSError("snapshot source changed while copying")
+        if read_descriptor_exact(temporary_fd, temporary_signature).digest != digest:
             raise OSError("snapshot source changed while copying")
         published_identity = descriptor_identity(temporary_fd)
         owner.replace(temporary_name, safe_name)
@@ -87,42 +87,11 @@ def _publish_into_owner(
 def _copy_bounded(
     source_fd: int, temporary_fd: int, source_before: tuple[int, int, int, int, int]
 ) -> bytes:
-    remaining = source_before[2]
-    digest = hashlib.sha256()
-    while remaining:
-        chunk = os.read(source_fd, min(_COPY_CHUNK_BYTES, remaining))
-        if not chunk:
-            raise OSError("snapshot source ended while copying")
-        _write_all(temporary_fd, chunk)
-        digest.update(chunk)
-        remaining -= len(chunk)
-    if os.read(source_fd, 1) or _descriptor_signature(source_fd) != source_before:
-        raise OSError("snapshot source changed while copying")
-    return digest.digest()
-
-
-def _write_all(descriptor: int, payload: bytes) -> None:
-    view = memoryview(payload)
     try:
-        offset = 0
-        while offset < len(view):
-            written = os.write(descriptor, view[offset:])
-            if written <= 0:
-                raise OSError("snapshot publication write made no progress")
-            offset += written
-    finally:
-        view.release()
-
-
-def _digest_descriptor(descriptor: int) -> bytes:
-    digest = hashlib.sha256()
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    while chunk := os.read(descriptor, _COPY_CHUNK_BYTES):
-        digest.update(chunk)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    return digest.digest()
+        return read_descriptor_exact(source_fd, source_before, destination_fd=temporary_fd).digest
+    except OSError as exc:
+        raise OSError("snapshot source changed while copying") from exc
 
 
 def _descriptor_signature(descriptor: int) -> tuple[int, int, int, int, int]:
-    value = os.fstat(descriptor)
-    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+    return descriptor_signature(descriptor)

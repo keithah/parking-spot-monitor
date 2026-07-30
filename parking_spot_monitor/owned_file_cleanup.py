@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 
@@ -55,24 +56,56 @@ def recover_quarantined_at(
     directory_fd: int, name: str, *, max_entries: int = _MAX_RECOVERY_SCAN_ENTRIES
 ) -> int:
     safe_name = _safe_basename(name)
-    prefix, suffix = f".{safe_name}.", ".quarantine"
+    quarantine_pattern = re.compile(
+        rf"^\.{re.escape(safe_name)}\.[0-9a-f]{{16}}\.quarantine$"
+    )
     recovered = 0
+    candidates: list[str] = []
     with os.scandir(directory_fd) as entries:
         for index, entry in enumerate(entries):
             if index >= max_entries:
                 break
-            candidate = entry.name
-            if candidate.startswith(prefix) and candidate.endswith(suffix):
-                if _restore_quarantined(directory_fd, candidate, safe_name):
-                    recovered += 1
-                if _name_exists(directory_fd, safe_name):
-                    break
+            if quarantine_pattern.fullmatch(entry.name):
+                candidates.append(entry.name)
+    for candidate in sorted(candidates):
+        if _restore_quarantined(directory_fd, candidate, safe_name):
+            recovered += 1
+        if _name_exists(directory_fd, safe_name):
+            break
     return recovered
 
 
 def _restore_quarantined(directory_fd: int, quarantine: str, name: str) -> bool:
     try:
+        quarantined = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if not stat.S_ISREG(quarantined.st_mode):
+        return False
+    quarantined_identity = FileIdentity.from_stat(quarantined)
+    if _same_regular_identity(directory_fd, name, quarantined_identity):
+        return _unlink_quarantine(directory_fd, quarantine)
+    try:
         os.link(quarantine, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+    except FileExistsError:
+        if _same_regular_identity(directory_fd, name, quarantined_identity):
+            return _unlink_quarantine(directory_fd, quarantine)
+        return False
+    except OSError:
+        return False
+    return _unlink_quarantine(directory_fd, quarantine)
+
+
+def _same_regular_identity(directory_fd: int, name: str, identity: FileIdentity) -> bool:
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(current.st_mode) and FileIdentity.from_stat(current) == identity
+
+
+def _unlink_quarantine(directory_fd: int, quarantine: str) -> bool:
+    try:
         os.unlink(quarantine, dir_fd=directory_fd)
         os.fsync(directory_fd)
         return True

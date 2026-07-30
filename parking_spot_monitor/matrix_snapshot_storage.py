@@ -5,13 +5,13 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-import hashlib
 import os
 from pathlib import Path
 import secrets
 import stat
 from types import MappingProxyType
 
+from parking_spot_monitor.bounded_descriptor_io import descriptor_signature, read_descriptor_exact
 from parking_spot_monitor.file_descriptor_binding import (
     FileIdentity,
     RootedDirectoryOwner,
@@ -21,7 +21,6 @@ from parking_spot_monitor.file_descriptor_binding import (
 from parking_spot_monitor.jpeg_artifacts import jpeg_bytes_dimensions
 from parking_spot_monitor.matrix_retained_publication import MAX_RETAINED_JPEG_BYTES, publish_retained_snapshot
 
-_COPY_CHUNK_BYTES = 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
@@ -109,7 +108,12 @@ def read_owned_bytes(
             before = _descriptor_signature(file_fd)
             if not stat.S_ISREG(os.fstat(file_fd).st_mode) or not 0 < before[2] <= max_bytes:
                 raise OSError("artifact is not a bounded regular file")
-            payload = _read_exact(file_fd, before[2])
+            try:
+                payload = read_descriptor_exact(file_fd, before, capture_bytes=True).data
+            except OSError as exc:
+                raise OSError("artifact changed while reading") from exc
+            if payload is None:
+                raise OSError("artifact bytes were not captured")
             if _descriptor_signature(file_fd) != before:
                 raise OSError("artifact changed while reading")
             return payload
@@ -138,12 +142,19 @@ def read_owned_jpeg_evidence(
                 raise OSError("snapshot identity changed")
             if not stat.S_ISREG(os.fstat(file_fd).st_mode) or not 0 < before[2] <= max_bytes:
                 raise OSError("snapshot is not a bounded regular file")
-            payload = _read_exact(file_fd, before[2])
-            payload_digest = hashlib.sha256(payload).digest()
+            try:
+                captured = read_descriptor_exact(file_fd, before, capture_bytes=True)
+                payload = captured.data
+            except OSError as exc:
+                raise OSError("snapshot changed while reading") from exc
+            if payload is None:
+                raise OSError("snapshot bytes were not captured")
             width, height = jpeg_bytes_dimensions(payload)
-            if _descriptor_signature(file_fd) != before:
-                raise OSError("snapshot changed while reading")
-            if _digest_descriptor(file_fd) != payload_digest or _descriptor_signature(file_fd) != before:
+            try:
+                stable_digest = read_descriptor_exact(file_fd, before).digest
+            except OSError as exc:
+                raise OSError("snapshot changed while reading") from exc
+            if stable_digest != captured.digest or _descriptor_signature(file_fd) != before:
                 raise OSError("snapshot changed while reading")
             return RootedJpegEvidence(
                 data=payload,
@@ -246,28 +257,8 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         view.release()
 
 
-def _read_exact(descriptor: int, size: int) -> bytes:
-    payload = bytearray()
-    while len(payload) < size:
-        chunk = os.read(descriptor, size - len(payload))
-        if not chunk:
-            raise OSError("artifact read was incomplete")
-        payload.extend(chunk)
-    return bytes(payload)
-
-
-def _digest_descriptor(descriptor: int) -> bytes:
-    digest = hashlib.sha256()
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    while chunk := os.read(descriptor, _COPY_CHUNK_BYTES):
-        digest.update(chunk)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    return digest.digest()
-
-
 def _descriptor_signature(descriptor: int) -> tuple[int, int, int, int, int]:
-    value = os.fstat(descriptor)
-    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+    return descriptor_signature(descriptor)
 
 
 def _unlink_best_effort(directory_fd: int, name: str) -> None:
