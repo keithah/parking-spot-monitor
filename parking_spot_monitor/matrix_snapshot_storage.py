@@ -238,7 +238,7 @@ def recover_owned_artifacts(snapshot_root: Path, directory: str | None) -> Recov
     except FileNotFoundError:
         return RecoveryResult()
     except OSError:
-        return RecoveryResult(pending=True)
+        return RecoveryResult(pending=True, blocking=True)
 
 
 def secure_snapshot_candidates(snapshot_root: Path) -> list[Path]:

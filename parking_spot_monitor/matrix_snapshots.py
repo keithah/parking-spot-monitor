@@ -299,7 +299,7 @@ def prune_event_snapshots(
         return SnapshotRetentionResult()
     recovery = recover_owned_artifacts(root, None)
     derivative_recovery = recover_owned_artifacts(root, DERIVATIVE_DIRECTORY)
-    recovery_failed = int(recovery.pending) + int(derivative_recovery.pending)
+    recovery_failed = int(recovery.blocking) + int(derivative_recovery.blocking)
     if recovery_failed:
         _log_retention_failure(
             logger,
