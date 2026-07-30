@@ -114,24 +114,44 @@ Check mode reads local inputs and lock files only. It verifies declaration synch
 From the repository root:
 
 ```sh
+(
+set -eu
+if [ -z "${MODEL_DIR+x}" ]; then
+  compose_environment="$(docker compose config --environment)"
+  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
+fi
+model_dir="${MODEL_DIR:-./models}"
+export MODEL_DIR="$model_dir"
 cp config.yaml.example config.yaml
 cp .env.example .env
-mkdir -p data models
+mkdir -p data "$model_dir"
 chmod 700 data
 chmod 600 config.yaml .env
+)
 ```
 
 Edit `config.yaml` for the real Matrix endpoint, room, authorized senders, spot polygons, and supported thresholds. Edit `.env` with the real camera streams and Matrix access token. Do not put resolved credentials in `config.yaml`.
 
-Compose reads `.env` automatically for variable interpolation even though the service has no `env_file` entry. Values already exported in the invoking shell take precedence according to normal Compose rules.
+Compose reads `.env` automatically for variable interpolation even though the service has no `env_file` entry. Values already exported in the invoking shell take precedence according to normal Compose rules. Each workflow below runs in a subshell, independently resolves the same value from the invoking environment or Compose's `.env` environment, defaults it to `./models`, and exports it back to Compose. This keeps host file operations and the `/models` bind mount aligned without leaking the resolved value into the next block. For a custom location such as `/srv/models`, set `MODEL_DIR=/srv/models` in `.env` before running the next block.
 
 ### 2. Stage and authenticate the detector weights
 
 Obtain `yolov8n.pt` through the operator-approved artifact channel and place it in the host model directory. Do not rely on an unreviewed first-run download for production. Check the local digest:
 
 ```sh
-mkdir -p models
-sha256sum models/yolov8n.pt
+(
+set -eu
+if [ -z "${MODEL_DIR+x}" ]; then
+  compose_environment="$(docker compose config --environment)"
+  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
+fi
+model_dir="${MODEL_DIR:-./models}"
+export MODEL_DIR="$model_dir"
+mkdir -p "$model_dir"
+test -f "$model_dir/yolov8n.pt"
+chmod 0644 "$model_dir/yolov8n.pt"
+sha256sum "$model_dir/yolov8n.pt"
+)
 ```
 
 Compare the printed checksum with the SHA-256 checksum published by the trusted artifact source before continuing. This runbook intentionally does not embed a checksum because the artifact owner is the authority for the exact approved file. Keep `detection.model: /models/yolov8n.pt` in `config.yaml`. If the trusted directory is elsewhere, set `MODEL_DIR` in `.env`; Compose mounts that directory read-only at `/models`.
@@ -139,8 +159,17 @@ Compare the printed checksum with the SHA-256 checksum published by the trusted 
 ### 3. Build the complete detector image
 
 ```sh
+(
+set -eu
+if [ -z "${MODEL_DIR+x}" ]; then
+  compose_environment="$(docker compose config --environment)"
+  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
+fi
+model_dir="${MODEL_DIR:-./models}"
+export MODEL_DIR="$model_dir"
 docker compose config --quiet
 docker compose build parking-spot-monitor
+)
 ```
 
 The resulting local image is `parking-spot-monitor:local`. The Dockerfile also has a smaller `runtime-app` target with the application and capture stack but without the YOLO detector packages; it is not the complete live camera-monitor image. The dependency-only `tooling` target omits both application source and capture packages and is intended for build-layer validation.
@@ -150,11 +179,20 @@ The model is not copied into the image. Container recreation reuses the authenti
 ### 4. Validate configuration and the mounted model
 
 ```sh
+(
+set -eu
+if [ -z "${MODEL_DIR+x}" ]; then
+  compose_environment="$(docker compose config --environment)"
+  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
+fi
+model_dir="${MODEL_DIR:-./models}"
+export MODEL_DIR="$model_dir"
 docker compose run --rm parking-spot-monitor \
   python -m parking_spot_monitor \
   --config /config/config.yaml \
   --data-dir /data \
   --validate-config
+)
 ```
 
 Validation should name missing environment variables or invalid fields without printing resolved secrets. It also verifies that the explicit `/models/yolov8n.pt` path is a file inside the container. A missing or misnamed weight file fails here, before detector construction or the capture loop.
@@ -162,9 +200,18 @@ Validation should name missing environment variables or invalid fields without p
 ### 5. Start and verify the service
 
 ```sh
+(
+set -eu
+if [ -z "${MODEL_DIR+x}" ]; then
+  compose_environment="$(docker compose config --environment)"
+  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
+fi
+model_dir="${MODEL_DIR:-./models}"
+export MODEL_DIR="$model_dir"
 docker compose up -d --build parking-spot-monitor
 docker compose ps
 docker compose logs --tail 100 parking-spot-monitor
+)
 ```
 
 The Compose status should become `healthy`. The startup log should include `startup-config-loaded`, `startup-ready`, and successful primary capture events. Confirm the container health command directly when needed:
@@ -255,6 +302,12 @@ Set `BACKUP_DIR` to a new protected destination, then run this block from the re
 (
   set -eu
   : "${BACKUP_DIR:?set BACKUP_DIR to a new protected backup directory}"
+  if [ -z "${MODEL_DIR+x}" ]; then
+    compose_environment="$(docker compose config --environment)"
+    MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
+  fi
+  model_dir="${MODEL_DIR:-./models}"
+  export MODEL_DIR="$model_dir"
   if [ -e "$BACKUP_DIR" ]; then
     echo "backup destination already exists" >&2
     exit 1
@@ -267,10 +320,13 @@ Set `BACKUP_DIR` to a new protected destination, then run this block from the re
   trap 'exit 143' TERM
 
   cp -- config.yaml "$BACKUP_DIR/config.yaml"
-  cp -- models/yolov8n.pt "$BACKUP_DIR/yolov8n.pt"
+  test -f "$model_dir/yolov8n.pt"
+  model_checksum="$(sha256sum "$model_dir/yolov8n.pt" | awk '{print $1}')"
+  cp -- "$model_dir/yolov8n.pt" "$BACKUP_DIR/yolov8n.pt"
   (
     cd "$BACKUP_DIR"
-    sha256sum yolov8n.pt > yolov8n.pt.sha256
+    printf '%s  %s\n' "$model_checksum" yolov8n.pt > yolov8n.pt.sha256
+    sha256sum -c yolov8n.pt.sha256
   )
   docker image inspect parking-spot-monitor:local \
     --format '{{.Id}}' > "$BACKUP_DIR/image-id.txt"
@@ -287,6 +343,14 @@ The runtime quarantines several malformed persisted JSON files rather than silen
 Run repository tests before publishing a change. Before changing the deployment checkout, complete the backup workflow above with a new protected `BACKUP_DIR`; retain that directory as `ROLLBACK_DIR` until the upgrade has passed its observation window. On the deployment host, tag the rollback image and then fast-forward the checkout:
 
 ```sh
+(
+set -eu
+if [ -z "${MODEL_DIR+x}" ]; then
+  compose_environment="$(docker compose config --environment)"
+  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
+fi
+model_dir="${MODEL_DIR:-./models}"
+export MODEL_DIR="$model_dir"
 docker image tag parking-spot-monitor:local parking-spot-monitor:rollback
 git status --short
 git pull --ff-only
@@ -295,6 +359,7 @@ docker compose build parking-spot-monitor
 docker compose up -d --no-build --force-recreate parking-spot-monitor
 docker compose ps
 docker compose logs --tail 100 parking-spot-monitor
+)
 ```
 
 Do not upgrade over uncommitted tracked changes. `config.yaml`, `.env`, `models/`, and `data/` are ignored operator files and remain on the host across a normal pull and container recreation. Authenticate replacement weights before recreating the service, and retain the previous approved weight file with the rollback image when an upgrade changes models.
@@ -306,14 +371,22 @@ After the new service becomes healthy, repeat the health, artifact, cadence, and
 To return to the image, configuration, and model saved immediately before an upgrade, set `ROLLBACK_DIR` to that protected backup. Restore the matching `.env` through the approved secret-backup process before validation. Then run this complete workflow from the repository root:
 
 ```sh
+(
 set -eu
 : "${ROLLBACK_DIR:?set ROLLBACK_DIR to the protected rollback backup}"
+if [ -z "${MODEL_DIR+x}" ]; then
+  compose_environment="$(docker compose config --environment)"
+  MODEL_DIR="$(printf '%s\n' "$compose_environment" | sed -n 's/^MODEL_DIR=//p')"
+fi
+model_dir="${MODEL_DIR:-./models}"
+export MODEL_DIR="$model_dir"
 docker compose stop parking-spot-monitor
 docker image tag parking-spot-monitor:rollback parking-spot-monitor:local
 cp -- "$ROLLBACK_DIR/config.yaml" config.yaml
-mkdir -p models
+mkdir -p "$model_dir"
 (cd "$ROLLBACK_DIR" && sha256sum -c yolov8n.pt.sha256)
-cp -- "$ROLLBACK_DIR/yolov8n.pt" models/yolov8n.pt
+cp -f -- "$ROLLBACK_DIR/yolov8n.pt" "$model_dir/yolov8n.pt"
+chmod 0644 "$model_dir/yolov8n.pt"
 docker compose run --rm parking-spot-monitor \
   python -m parking_spot_monitor \
   --config /config/config.yaml \
@@ -322,9 +395,10 @@ docker compose run --rm parking-spot-monitor \
 docker compose up -d --no-build --force-recreate parking-spot-monitor
 docker compose ps
 docker compose logs --tail 100 parking-spot-monitor
+)
 ```
 
-The checksum check authenticates the backed-up model before it is restored. The one-shot command then validates that the rollback image can read the restored configuration and model through their container mounts before Compose recreates the service. The persistent `data/` bind mount remains in place.
+The checksum check authenticates the backed-up model before it is restored. Within this explicit rollback workflow, `cp -f` intentionally replaces the active weight with the compatible backed-up file; it never copies the model directory itself. The one-shot command then validates that the rollback image can read the restored configuration and model through the same exported bind mount before Compose recreates the service. The persistent `data/` bind mount remains in place.
 
 For a configuration-only rollback, restore the previous local `config.yaml` and `.env`, validate them with the one-shot Compose command, then restart the service. Never copy secrets into Git history or terminal output captured for tickets.
 

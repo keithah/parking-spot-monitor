@@ -32,8 +32,8 @@ def test_deployment_runbook_is_discoverable_and_actionable() -> None:
         "/dev/dri",
         "frame_interval_seconds",
         "stable_frame_interval_seconds",
-        "mkdir -p models",
-        "sha256sum models/yolov8n.pt",
+        'mkdir -p "$model_dir"',
+        'sha256sum "$model_dir/yolov8n.pt"',
         "trusted artifact source",
     ]:
         assert required in runbook
@@ -86,12 +86,93 @@ def test_compose_mounts_read_only_model_directory() -> None:
 def test_deployment_documents_model_preflight_before_start() -> None:
     runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
 
-    checksum = runbook.index("sha256sum models/yolov8n.pt")
+    checksum = runbook.index('sha256sum "$model_dir/yolov8n.pt"')
     validation = runbook.index("--validate-config", checksum)
     deployment = runbook.index("docker compose up -d", validation)
 
     assert checksum < validation < deployment
     assert "compare" in runbook[checksum:validation].lower()
+
+
+def test_model_directory_resolution_supports_default_and_custom_environment() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+    resolution = 'model_dir="${MODEL_DIR:-./models}"'
+
+    assert resolution in runbook
+    for environ, expected in [({}, "./models"), ({"MODEL_DIR": "/srv/models"}, "/srv/models")]:
+        resolved = subprocess.run(
+            ["bash", "-c", f'{resolution}\nprintf "%s" "$model_dir"'],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=environ,
+        )
+        assert resolved.returncode == 0, resolved.stderr
+        assert resolved.stdout == expected
+
+
+def test_custom_model_directory_flows_through_stage_backup_and_rollback() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+    deployment = runbook.split("## First deployment", 1)[1].split("## Routine operations", 1)[0]
+    deployment_workflows = re.findall(r"```sh\n(.*?)```", deployment, flags=re.DOTALL)
+    staging = deployment_workflows[1]
+    backup = re.findall(
+        r"```sh\n(.*?)```",
+        runbook.split("## Backup and recovery", 1)[1].split("## Safe upgrade", 1)[0],
+        flags=re.DOTALL,
+    )[0]
+    rollback = re.findall(
+        r"```sh\n(.*?)```",
+        runbook.split("## Rollback", 1)[1].split(
+            "## Troubleshooting deployment failures", 1
+        )[0],
+        flags=re.DOTALL,
+    )[0]
+    upgrade = re.findall(
+        r"```sh\n(.*?)```",
+        runbook.split("## Safe upgrade", 1)[1].split("## Rollback", 1)[0],
+        flags=re.DOTALL,
+    )[0]
+
+    for workflow in (*deployment_workflows[:5], backup, upgrade, rollback):
+        assert workflow.startswith("(\n")
+        assert workflow.rstrip().endswith(")")
+        assert 'model_dir="${MODEL_DIR:-./models}"' in workflow
+        assert 'export MODEL_DIR="$model_dir"' in workflow
+        assert "source .env" not in workflow
+        assert "eval " not in workflow
+        syntax = subprocess.run(
+            ["bash", "-n"], input=workflow, text=True, capture_output=True, check=False
+        )
+        assert syntax.returncode == 0, syntax.stderr
+
+    assert 'test -f "$model_dir/yolov8n.pt"' in staging
+    assert 'sha256sum "$model_dir/yolov8n.pt"' in staging
+    assert 'test -f "$model_dir/yolov8n.pt"' in backup
+    assert 'cp -- "$model_dir/yolov8n.pt" "$BACKUP_DIR/yolov8n.pt"' in backup
+    assert 'sha256sum "$model_dir/yolov8n.pt"' in backup
+    assert 'mkdir -p "$model_dir"' in rollback
+    assert 'cp -f -- "$ROLLBACK_DIR/yolov8n.pt" "$model_dir/yolov8n.pt"' in rollback
+    assert "models/yolov8n.pt" not in staging
+    assert "models/yolov8n.pt" not in backup
+    assert "models/yolov8n.pt" not in rollback
+
+
+def test_custom_model_restore_precedes_container_validation_and_recreation() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+    section = runbook.split("## Rollback", 1)[1].split(
+        "## Troubleshooting deployment failures", 1
+    )[0]
+    workflow = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)[0]
+
+    resolve = workflow.index('model_dir="${MODEL_DIR:-./models}"')
+    restore = workflow.index(
+        'cp -f -- "$ROLLBACK_DIR/yolov8n.pt" "$model_dir/yolov8n.pt"'
+    )
+    validate = workflow.index("--validate-config")
+    recreate = workflow.index("docker compose up -d --no-build --force-recreate")
+
+    assert resolve < restore < validate < recreate
 
 
 @pytest.mark.parametrize(
@@ -124,7 +205,9 @@ def test_rollback_restores_and_validates_model_pair_before_recreate() -> None:
     workflow = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)[0]
 
     restore_config = workflow.index('cp -- "$ROLLBACK_DIR/config.yaml" config.yaml')
-    restore_model = workflow.index('cp -- "$ROLLBACK_DIR/yolov8n.pt" models/yolov8n.pt')
+    restore_model = workflow.index(
+        'cp -f -- "$ROLLBACK_DIR/yolov8n.pt" "$model_dir/yolov8n.pt"'
+    )
     validate = workflow.index("--validate-config")
     recreate = workflow.index("docker compose up -d --no-build --force-recreate")
 
@@ -155,8 +238,8 @@ def test_backup_workflow_captures_model_checksum_config_data_and_image_identity(
 
     for required in [
         "cp -- config.yaml",
-        "cp -- models/yolov8n.pt",
-        "sha256sum yolov8n.pt",
+        'cp -- "$model_dir/yolov8n.pt"',
+        'sha256sum "$model_dir/yolov8n.pt"',
         "docker image inspect parking-spot-monitor:local",
         "cp -a -- data",
     ]:
