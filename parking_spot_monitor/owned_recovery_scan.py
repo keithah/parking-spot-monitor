@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
 import os
 import re
 import threading
@@ -12,6 +13,12 @@ _SCAN_LOCK = threading.Lock()
 _ACTIVE_SCANS: OrderedDict[tuple[int, int, str | None], object] = OrderedDict()
 
 
+@dataclass(frozen=True, slots=True)
+class TransitionScanBatch:
+    candidates: tuple[tuple[str, str, str], ...]
+    exhausted: bool
+
+
 def scan_transition_batch(
     directory_fd: int,
     *,
@@ -19,12 +26,13 @@ def scan_transition_batch(
     indexed: set[str],
     max_entries: int,
     transition_pattern: re.Pattern[str],
-) -> list[tuple[str, str, str]]:
+) -> TransitionScanBatch:
     if max_entries <= 0:
-        return []
+        return TransitionScanBatch((), False)
     value = os.fstat(directory_fd)
     key = (value.st_dev, value.st_ino, selected)
     candidates: list[tuple[str, str, str]] = []
+    exhausted = False
     with _SCAN_LOCK:
         iterator = _ACTIVE_SCANS.get(key)
         if iterator is None:
@@ -41,6 +49,7 @@ def scan_transition_batch(
             except StopIteration:
                 iterator.close()
                 _ACTIVE_SCANS.pop(key, None)
+                exhausted = True
                 break
             if item.name in indexed:
                 continue
@@ -48,4 +57,4 @@ def scan_transition_batch(
             if match is None or (selected is not None and match["recovery"] != selected):
                 continue
             candidates.append((item.name, match["recovery"], match["kind"]))
-    return candidates
+    return TransitionScanBatch(tuple(candidates), exhausted)

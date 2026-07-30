@@ -15,19 +15,24 @@ from parking_spot_monitor.owned_file_recovery import recover_owned_directory_at
 def test_recovery_finds_legacy_quarantine_after_many_ordinary_entries(tmp_path: Path) -> None:
     target = tmp_path / "owned.jpg"
     target.write_bytes(b"owned")
-    quarantine = tmp_path / ".owned.jpg.0123456789abcdef.quarantine"
-    os.link(target, quarantine)
     for index in range(300):
         (tmp_path / f"ordinary-{index:04d}").write_bytes(b"ordinary")
+    quarantine = tmp_path / ".owned.jpg.0123456789abcdef.quarantine"
+    os.link(target, quarantine)
 
     with RootedDirectoryOwner(tmp_path, create=False) as owner:
         result = recover_owned_directory_at(owner.fd, max_entries=1)
-        for _ in range(302):
-            if result.recovered:
+        assert result.recovered == 0
+        assert result.pending is True
+        assert result.blocking is False
+        recovered = result.recovered
+        for _ in range(303):
+            if not result.pending:
                 break
             result = recover_owned_directory_at(owner.fd, max_entries=1)
+            recovered += result.recovered
 
-    assert result.recovered == 1
+    assert recovered == 1
     assert result.pending is False
     assert target.read_bytes() == b"owned"
     assert not quarantine.exists()

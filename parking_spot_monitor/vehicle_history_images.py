@@ -70,7 +70,7 @@ def capture_occupied_images(
                         crop_recovery = crop_owner.recover_owned()
                     except OSError as exc:
                         raise VehicleHistoryImageError("vehicle image recovery failed") from exc
-                    if full_recovery.pending or crop_recovery.pending:
+                    if full_recovery.blocking or crop_recovery.blocking:
                         raise VehicleHistoryImageError("vehicle image recovery remains pending")
                     _capture_owned_images(
                         source_frame_path=source_frame_path,

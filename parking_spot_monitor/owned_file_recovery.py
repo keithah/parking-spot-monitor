@@ -33,6 +33,7 @@ _TRANSITION_PATTERN = re.compile(
 class RecoveryResult:
     recovered: int = 0
     pending: bool = False
+    blocking: bool = False
 
 
 def recover_owned_at(
@@ -57,6 +58,7 @@ def _recover_locked(directory_fd: int, selected: str | None, *, max_entries: int
     budget = max(0, min(max_entries, MAX_RECOVERY_SCAN_ENTRIES))
     recovered = 0
     pending = False
+    blocking = False
     all_entries = manifest_entries_at(directory_fd)
     matching_entries = [
         entry
@@ -66,31 +68,36 @@ def _recover_locked(directory_fd: int, selected: str | None, *, max_entries: int
     entries = matching_entries[:budget]
     indexed_disposals = {entry.disposal for entry in all_entries}
     pending = len(matching_entries) > len(entries)
+    blocking = pending
     for entry in entries:
         result = _recover_manifest_entry(directory_fd, entry)
         recovered += result.recovered
         pending = pending or result.pending
+        blocking = blocking or result.blocking or result.pending
     remaining = budget - len(entries)
     if remaining <= 0:
-        return RecoveryResult(recovered, pending)
+        return RecoveryResult(recovered, pending, blocking)
 
-    candidates = scan_transition_batch(
+    scan = scan_transition_batch(
         directory_fd,
         selected=selected,
         indexed=indexed_disposals,
         max_entries=remaining,
         transition_pattern=_TRANSITION_PATTERN,
     )
-    for candidate, recovery, kind in sorted(candidates):
+    pending = pending or not scan.exhausted
+    for candidate, recovery, kind in sorted(scan.candidates):
         if kind == "dispose":
             result = recover_disposal_at(directory_fd, candidate, recovery)
             recovered += result.status == "deleted"
             pending = pending or result.status != "deleted" or not result.durable
+            blocking = blocking or result.status != "deleted" or not result.durable
         elif _restore_quarantined(directory_fd, candidate, recovery):
             recovered += 1
         else:
             pending = True
-    return RecoveryResult(recovered, pending)
+            blocking = True
+    return RecoveryResult(recovered, pending, blocking)
 
 
 def restore_quarantined_at(directory_fd: int, quarantine: str, name: str) -> bool:

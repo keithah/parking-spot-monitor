@@ -43,7 +43,7 @@ def unlink_owned_at_result(directory_fd: int, name: str, identity: FileIdentity)
         recovery = recover_owned_at(directory_fd, safe_name)
     except OSError:
         return OwnedUnlinkResult(False)
-    if recovery.pending:
+    if recovery.blocking:
         return OwnedUnlinkResult(False)
     try:
         current = os.stat(safe_name, dir_fd=directory_fd, follow_symlinks=False)

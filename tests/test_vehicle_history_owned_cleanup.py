@@ -262,7 +262,8 @@ def test_owned_directory_manifest_recovers_pending_artifact_behind_decoys(
         result = restarted_owner.recover_owned()
 
     assert result.recovered == 1
-    assert result.pending is False
+    assert result.pending is True
+    assert result.blocking is False
     assert target.read_bytes() == b"owned"
     assert not list(tmp_path.glob("*.dispose"))
 
@@ -419,7 +420,8 @@ def test_owned_disposal_first_bind_eio_retains_manifest_until_recovery(
         entries = owned_disposal_manifest.manifest_entries_at(restarted_owner.fd)
 
     assert result.recovered == 1
-    assert result.pending is False
+    assert result.pending is True
+    assert result.blocking is False
     assert target.read_bytes() == b"owned"
     assert not disposal.exists()
     assert entries == []
@@ -456,7 +458,8 @@ def test_owned_disposal_same_identity_eio_retains_manifest_until_recovery(
         entries = owned_disposal_manifest.manifest_entries_at(restarted_owner.fd)
 
     assert result.recovered == 1
-    assert result.pending is False
+    assert result.pending is True
+    assert result.blocking is False
     assert target.read_bytes() == b"owned"
     assert not disposal.exists()
     assert entries == []
