@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 import math
 from os import PathLike
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
 from parking_spot_monitor.geometry import (
     PolygonInput,
@@ -152,6 +152,19 @@ class _EvaluatedCandidate:
     detection: VehicleDetection
 
 
+@runtime_checkable
+class InMemoryDetector(Protocol):
+    """Detector that can consume an already-decoded image without filesystem I/O."""
+
+    def detect_image(
+        self,
+        image: object,
+        *,
+        confidence_threshold: float | None = None,
+        inference_image_size: int | None = None,
+    ) -> list[VehicleDetection]: ...
+
+
 class UltralyticsVehicleDetector:
     """Lazy Ultralytics YOLO adapter that emits detector-neutral vehicles."""
 
@@ -179,7 +192,38 @@ class UltralyticsVehicleDetector:
         """Run one model prediction and normalize all result batches."""
 
         safe_frame_path = str(frame_path)
-        predict_kwargs: dict[str, Any] = {"source": safe_frame_path, "verbose": False}
+        return self._predict(
+            safe_frame_path,
+            confidence_threshold=confidence_threshold,
+            inference_image_size=inference_image_size,
+            frame_label=safe_frame_path,
+        )
+
+    def detect_image(
+        self,
+        image: object,
+        *,
+        confidence_threshold: float | None = None,
+        inference_image_size: int | None = None,
+    ) -> list[VehicleDetection]:
+        """Run one model prediction directly against an in-memory image."""
+
+        return self._predict(
+            image,
+            confidence_threshold=confidence_threshold,
+            inference_image_size=inference_image_size,
+            frame_label="<in-memory-image>",
+        )
+
+    def _predict(
+        self,
+        source: object,
+        *,
+        confidence_threshold: float | None,
+        inference_image_size: int | None,
+        frame_label: str,
+    ) -> list[VehicleDetection]:
+        predict_kwargs: dict[str, Any] = {"source": source, "verbose": False}
         if confidence_threshold is not None:
             predict_kwargs["conf"] = confidence_threshold
         if inference_image_size is not None:
@@ -195,7 +239,7 @@ class UltralyticsVehicleDetector:
                 exc,
                 model_path=self.model_path,
                 phase="predict",
-                frame_path=safe_frame_path,
+                frame_path=frame_label,
             ) from exc
 
 

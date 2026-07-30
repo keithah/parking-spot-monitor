@@ -5,6 +5,7 @@ import math
 from unittest.mock import patch
 
 import pytest
+from PIL import Image
 from pydantic import ValidationError
 
 from parking_spot_monitor.config import DetectionConfig
@@ -335,6 +336,24 @@ def test_ultralytics_detector_forwards_configured_inference_image_size(tmp_path)
     ]
 
 
+def test_ultralytics_detector_accepts_in_memory_image() -> None:
+    detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
+    detector._model.results = [  # type: ignore[attr-defined]
+        FakeResult(
+            boxes=FakeBoxes(xyxy=[[1, 2, 11, 22]], conf=[0.91], cls=[2]),
+            names={2: "car"},
+        )
+    ]
+    image = Image.new("RGB", (32, 24))
+
+    detections = detector.detect_image(image, confidence_threshold=0.2, inference_image_size=320)
+
+    assert detections == [VehicleDetection(class_name="car", confidence=0.91, bbox=(1, 2, 11, 22))]
+    assert detector._model.predict_calls == [  # type: ignore[attr-defined]
+        {"source": image, "verbose": False, "conf": 0.2, "imgsz": 320}
+    ]
+
+
 def test_ultralytics_detector_normalizes_fake_results_and_forwards_confidence(tmp_path) -> None:
     FakeYOLO.constructed_with = []
     detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=FakeYOLO)
@@ -472,6 +491,30 @@ def test_ultralytics_detector_raises_safe_error_for_prediction_failure(tmp_path)
         "error_type": "RuntimeError",
         "message": "predict failed access_token=<redacted>",
     }
+
+
+def test_ultralytics_in_memory_prediction_failure_uses_stable_safe_frame_label() -> None:
+    class PredictFailYOLO:
+        def __init__(self, model_path: str) -> None:
+            self.model_path = model_path
+
+        def predict(self, **kwargs: object) -> list[FakeResult]:
+            raise RuntimeError("in-memory predict failed token=secret")
+
+    detector = UltralyticsVehicleDetector("yolov8n.pt", yolo_class=PredictFailYOLO)
+    image = Image.new("RGB", (2, 2), (17, 23, 31))
+
+    with pytest.raises(DetectionError) as exc_info:
+        detector.detect_image(image)
+
+    assert exc_info.value.diagnostics() == {
+        "phase": "predict",
+        "model_path": "yolov8n.pt",
+        "frame_path": "<in-memory-image>",
+        "error_type": "RuntimeError",
+        "message": "in-memory predict failed token=<redacted>",
+    }
+    assert repr(image) not in str(exc_info.value)
 
 
 def test_detection_error_redacts_secret_bearing_model_and_frame_paths() -> None:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gc
 import json
 import signal
 import threading
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -598,9 +600,232 @@ def test_process_detection_uses_spot_crop_inference_to_recover_full_frame_miss(
     assert right is not None
     assert right.bbox == pytest.approx((1010, 215, 1395, 355))
     assert [size for _path, size in detector.calls] == [(1458, 806), (526, 276), (531, 296)]
+    assert all(not path.exists() for path, _size in detector.calls[1:])
     output = combined_output(capsys)
     assert '"spot_crop_inference_enabled":true' in output
     assert '"spot_crop_detection_count":1' in output
+
+
+def test_process_detection_uses_no_temporary_files_for_in_memory_crop_detector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("spot_crop_inference: false", "spot_crop_inference: true"),
+        encoding="utf-8",
+    )
+    frame = tmp_path / "latest.jpg"
+    Image.new("RGB", (1458, 806), (20, 30, 40)).save(frame, format="JPEG")
+    real_image_open = Image.open
+    image_open_calls = 0
+
+    def counting_image_open(*args: object, **kwargs: object) -> Image.Image:
+        nonlocal image_open_calls
+        image_open_calls += 1
+        return real_image_open(*args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", counting_image_open)
+
+    class RecordingInMemoryDetector:
+        def __init__(self) -> None:
+            self.crop_images: list[Image.Image] = []
+            self.crop_calls: list[dict[str, object]] = []
+
+        def detect(self, frame_path: str | Path, **kwargs: object) -> list[VehicleDetection]:
+            return []
+
+        def detect_image(self, image: Image.Image, **kwargs: object) -> list[VehicleDetection]:
+            self.crop_images.append(image)
+            self.crop_calls.append({"size": image.size, **kwargs})
+            if image.size == (531, 296):
+                return [VehicleDetection(class_name="car", confidence=0.88, bbox=(98, 93, 483, 233))]
+            return []
+
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    def fail_temporary_directory(*args: object, **kwargs: object) -> object:
+        pytest.fail("in-memory crop inference allocated a temporary directory")
+
+    monkeypatch.setattr(runtime_detection.tempfile, "TemporaryDirectory", fail_temporary_directory)
+    detector = RecordingInMemoryDetector()
+    settings = load_settings(config_path, environ=fake_environ())
+
+    result = runtime_detection._process_detection_for_capture(
+        settings,
+        detector,
+        frame,
+        logger=StructuredLogger(),
+        mode="test",
+        frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
+    )
+
+    assert detector.crop_calls == [
+        {"size": (526, 276), "confidence_threshold": 0.1, "inference_image_size": 1280},
+        {"size": (531, 296), "confidence_threshold": 0.1, "inference_image_size": 1280},
+    ]
+    assert result.by_spot["right_spot"].accepted is not None
+    assert result.by_spot["right_spot"].accepted.bbox == pytest.approx((1010, 215, 1395, 355))
+    assert image_open_calls == 1
+    for crop in detector.crop_images:
+        with pytest.raises(ValueError, match="closed"):
+            crop.getpixel((0, 0))
+
+
+def test_detector_signature_capability_is_cached_without_retaining_detector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    class Detector:
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    real_signature = runtime_detection.inspect.signature
+    signature_calls = 0
+
+    def counting_signature(callable_object: object) -> object:
+        nonlocal signature_calls
+        signature_calls += 1
+        return real_signature(callable_object)
+
+    monkeypatch.setattr(runtime_detection.inspect, "signature", counting_signature)
+    detector = Detector()
+    detector_reference = weakref.ref(detector)
+
+    assert runtime_detection._detect_accepts_inference_image_size(detector) is True
+    assert runtime_detection._detect_accepts_inference_image_size(detector) is True
+    assert signature_calls == 1
+
+    del detector
+    gc.collect()
+    assert detector_reference() is None
+
+
+def test_spot_crop_image_size_failure_closes_open_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("spot_crop_inference: false", "spot_crop_inference: true"),
+        encoding="utf-8",
+    )
+
+    class FailingSizeImage:
+        def __init__(self) -> None:
+            self.closed = False
+
+        @property
+        def size(self) -> tuple[int, int]:
+            raise OSError("unreadable dimensions")
+
+        def close(self) -> None:
+            self.closed = True
+
+    class EmptyDetector:
+        def detect(self, frame_path: str | Path, **kwargs: object) -> list[VehicleDetection]:
+            return []
+
+    source = FailingSizeImage()
+    monkeypatch.setattr(Image, "open", lambda *args, **kwargs: source)
+
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    runtime_detection._process_detection_for_capture(
+        load_settings(config_path, environ=fake_environ()),
+        EmptyDetector(),
+        tmp_path / "latest.jpg",
+        logger=StructuredLogger(),
+        mode="test",
+        frame_geometry=FrameGeometry(stream_profile="primary", expected_size=(1458, 806)),
+    )
+
+    assert source.closed is True
+
+
+def test_non_weakrefable_detector_recomputes_signature_without_being_retained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    class NonWeakrefableDetector:
+        __slots__ = ()
+
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    real_signature = runtime_detection.inspect.signature
+    signature_calls = 0
+
+    def counting_signature(callable_object: object) -> object:
+        nonlocal signature_calls
+        signature_calls += 1
+        return real_signature(callable_object)
+
+    monkeypatch.setattr(runtime_detection.inspect, "signature", counting_signature)
+    detector = NonWeakrefableDetector()
+
+    assert runtime_detection._detect_accepts_inference_image_size(detector) is True
+    assert runtime_detection._detect_accepts_inference_image_size(detector) is True
+    assert signature_calls == 2
+
+
+def test_detector_signature_cache_uses_identity_not_custom_equality() -> None:
+    import parking_spot_monitor.runtime_detection as runtime_detection
+
+    class EqualDetector:
+        def __init__(self, accepts_image_size: bool) -> None:
+            self.accepts_image_size = accepts_image_size
+
+        @property
+        def detect(self) -> object:
+            if self.accepts_image_size:
+                return self._detect_with_image_size
+            return self._detect_without_image_size
+
+        def _detect_with_image_size(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+            inference_image_size: int | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+        def _detect_without_image_size(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, EqualDetector)
+
+        def __hash__(self) -> int:
+            return 1
+
+    with_image_size = EqualDetector(True)
+    without_image_size = EqualDetector(False)
+
+    assert runtime_detection._detect_accepts_inference_image_size(with_image_size) is True
+    assert runtime_detection._detect_accepts_inference_image_size(without_image_size) is False
 
 
 def test_process_detection_scales_configured_polygons_to_actual_frame_size(
