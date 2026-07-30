@@ -6,10 +6,11 @@ from pathlib import Path
 import pytest
 
 from parking_spot_monitor.file_descriptor_binding import RootedDirectoryOwner
-from parking_spot_monitor import owned_file_cleanup
+from parking_spot_monitor import owned_file_cleanup, owned_file_recovery
 from parking_spot_monitor.owned_disposal_manifest import DisposalManifestEntry, manifest_entries_at
 from parking_spot_monitor.owned_file_disposal import DisposalResult, FileIdentity
 from parking_spot_monitor.owned_file_recovery import recover_owned_directory_at
+from parking_spot_monitor.owned_recovery_scan import TransitionScanBatch
 
 
 def test_recovery_finds_legacy_quarantine_after_many_ordinary_entries(tmp_path: Path) -> None:
@@ -24,7 +25,7 @@ def test_recovery_finds_legacy_quarantine_after_many_ordinary_entries(tmp_path: 
         result = recover_owned_directory_at(owner.fd, max_entries=1)
         assert result.recovered == 0
         assert result.pending is True
-        assert result.blocking is False
+        assert result.blocking is True
         recovered = result.recovered
         for _ in range(303):
             if not result.pending:
@@ -65,3 +66,22 @@ def test_interrupted_quarantine_is_indexed_before_followup_disposal(
             identity.ino,
         )
     ]
+
+
+def test_unfinished_legacy_directory_scan_blocks_conflicting_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"current publication")
+    monkeypatch.setattr(
+        owned_file_recovery,
+        "scan_transition_batch",
+        lambda *_args, **_kwargs: TransitionScanBatch((), exhausted=False),
+    )
+
+    with RootedDirectoryOwner(tmp_path, create=False) as owner:
+        result = recover_owned_directory_at(owner.fd)
+
+    assert result.blocking is True
+    assert target.read_bytes() == b"current publication"
+    assert list(tmp_path.glob(".*.quarantine")) == []

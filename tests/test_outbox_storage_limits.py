@@ -153,3 +153,17 @@ def test_loader_quarantines_legacy_record_over_record_limit(
 
     assert reloaded.list_records() == []
     assert reloaded.status_summary()["recovery"]["reason_counts"] == {"oversized_record": 1}
+
+
+def test_loader_quarantines_non_finite_legacy_record(tmp_path: Path) -> None:
+    path = tmp_path / "matrix-outbox.json"
+    seeded = LocalOutbox(path)
+    seeded.enqueue(AlertIntent(event_id="legacy-nan", phase="text", body="ok"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["items"][0]["retry_attempt_count"] = float("nan")
+    path.write_text(json.dumps(payload, allow_nan=True), encoding="utf-8")
+
+    reloaded = LocalOutbox(path)
+
+    assert reloaded.list_records() == []
+    assert reloaded.status_summary()["recovery"]["reason_counts"] == {"malformed_record": 1}

@@ -263,7 +263,7 @@ def test_owned_directory_manifest_recovers_pending_artifact_behind_decoys(
 
     assert result.recovered == 1
     assert result.pending is True
-    assert result.blocking is False
+    assert result.blocking is True
     assert target.read_bytes() == b"owned"
     assert not list(tmp_path.glob("*.dispose"))
 
@@ -421,7 +421,7 @@ def test_owned_disposal_first_bind_eio_retains_manifest_until_recovery(
 
     assert result.recovered == 1
     assert result.pending is True
-    assert result.blocking is False
+    assert result.blocking is True
     assert target.read_bytes() == b"owned"
     assert not disposal.exists()
     assert entries == []
@@ -459,7 +459,7 @@ def test_owned_disposal_same_identity_eio_retains_manifest_until_recovery(
 
     assert result.recovered == 1
     assert result.pending is True
-    assert result.blocking is False
+    assert result.blocking is True
     assert target.read_bytes() == b"owned"
     assert not disposal.exists()
     assert entries == []
@@ -574,6 +574,13 @@ def test_vehicle_capture_recovers_owned_full_and_crop_directories(
     source = tmp_path / "source.jpg"
     Image.new("RGB", (16, 16), "blue").save(source, format="JPEG")
     monkeypatch.setattr(owned_file_disposal.os, "unlink", real_unlink)
+    with pytest.raises(VehicleHistoryImageError, match="recovery remains pending"):
+        capture_occupied_images(
+            archive_root=archive,
+            session_id="new-session",
+            source_frame_path=source,
+            bbox=(0, 0, 8, 8),
+        )
     capture_occupied_images(
         archive_root=archive,
         session_id="new-session",

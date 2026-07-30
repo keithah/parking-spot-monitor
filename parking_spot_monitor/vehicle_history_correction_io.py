@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 from pathlib import Path
+import stat
 from typing import Any
 
 from parking_spot_monitor.vehicle_history_models import ArchiveSchemaError, ArchiveWriteError, ProfileCorrectionEvent
@@ -29,6 +32,30 @@ class CorrectionReplayLoadResult:
 class CorrectionQuarantineCountResult:
     count: int
     succeeded: bool
+
+
+@contextmanager
+def correction_ledger_transaction(path: Path) -> Iterator[None]:
+    """Serialize every replay/replace/append sequence on a stable sidecar inode."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    descriptor = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    locked = False
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("correction ledger lock must be a regular file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def load_correction_events(

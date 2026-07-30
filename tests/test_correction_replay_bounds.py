@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 from typing import Any
 
 import pytest
 
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
+from parking_spot_monitor import vehicle_history_correction_compaction, vehicle_history_correction_io
 from parking_spot_monitor.vehicle_history_correction_io import compact_correction_events, load_correction_events
 from parking_spot_monitor.vehicle_history_models import (
     MAX_CORRECTION_INVALID_LINES,
@@ -170,3 +172,59 @@ def test_legacy_summary_audit_at_event_cap_is_compacted_before_real_correction(
     assert len(lines) == 1
     assert json.loads(lines[0])["action"] == "rename_profile"
     assert archive.correction_replay_state().labels["prof_a"] == "Blue hatchback"
+
+
+def test_legacy_compaction_serializes_concurrent_append_without_record_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_archive = VehicleHistoryArchive(tmp_path)
+    second_archive = VehicleHistoryArchive(tmp_path)
+    first_archive.corrections_dir.mkdir(parents=True)
+    first_archive.corrections_path.write_text(json.dumps(_event_payload(1)) + "\n", encoding="utf-8")
+    first_payload = _event_payload(2)
+    first_payload.update(action="rename_profile", label="First", matrix_event_id="$first")
+    second_payload = _event_payload(3)
+    second_payload.update(action="rename_profile", label="Second", matrix_event_id="$second")
+    first_event = ProfileCorrectionEvent.from_json_dict(first_payload)
+    second_event = ProfileCorrectionEvent.from_json_dict(second_payload)
+    monkeypatch.setattr(type(first_archive), "_validate_correction_against_archive", lambda *_args, **_kwargs: None)
+    real_compact = vehicle_history_correction_compaction.compact_correction_events
+    real_flock = vehicle_history_correction_io.fcntl.flock
+    compaction_entered = threading.Event()
+    release_compaction = threading.Event()
+    concurrent_lock_attempted = threading.Event()
+    failures: list[BaseException] = []
+
+    def paused_compaction(*args: Any, **kwargs: Any) -> bool:
+        compaction_entered.set()
+        if not release_compaction.wait(2):
+            raise AssertionError("test did not release legacy compaction")
+        return real_compact(*args, **kwargs)
+
+    def observed_flock(descriptor: int, operation: int) -> None:
+        if threading.current_thread().name == "concurrent-correction" and operation & vehicle_history_correction_io.fcntl.LOCK_EX:
+            concurrent_lock_attempted.set()
+        real_flock(descriptor, operation)
+
+    def append(archive: VehicleHistoryArchive, event: ProfileCorrectionEvent) -> None:
+        try:
+            archive.append_correction(event)
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(vehicle_history_correction_compaction, "compact_correction_events", paused_compaction)
+    monkeypatch.setattr(vehicle_history_correction_io.fcntl, "flock", observed_flock)
+    first = threading.Thread(target=append, args=(first_archive, first_event), name="legacy-compaction")
+    second = threading.Thread(target=append, args=(second_archive, second_event), name="concurrent-correction")
+    first.start()
+    assert compaction_entered.wait(2)
+    second.start()
+    assert concurrent_lock_attempted.wait(2)
+    release_compaction.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert failures == []
+    payloads = [json.loads(line) for line in first_archive.corrections_path.read_text(encoding="utf-8").splitlines()]
+    assert {item["matrix_event_id"] for item in payloads} == {"$first", "$second"}

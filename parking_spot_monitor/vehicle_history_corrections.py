@@ -12,6 +12,7 @@ from parking_spot_monitor.logging import redact_diagnostic_text
 from parking_spot_monitor.vehicle_history_correction_cache import _canonical_profile_map, build_correction_replay_state
 from parking_spot_monitor.vehicle_history_correction_compaction import load_complete_correction_state
 from parking_spot_monitor.vehicle_history_correction_io import append_bounded_correction_event, load_correction_events, quarantine_correction_line
+from parking_spot_monitor.vehicle_history_correction_io import correction_ledger_transaction
 from parking_spot_monitor.vehicle_history_models import (
     CORRECTION_ACTION_MERGE_PROFILES,
     CORRECTION_ACTION_RENAME_PROFILE,
@@ -51,33 +52,34 @@ class VehicleHistoryCorrectionMixin:
         """Persist a validated correction event without rewriting archive records."""
 
         event = ProfileCorrectionEvent.from_json_dict(event.to_json_dict())
-        complete_state = load_complete_correction_state(self)
-        if validation_records is None:
-            validation_records = (
-                complete_state,
-                self.load_active_sessions(),
-                self.list_closed_sessions(),
-            )
-        else:
-            _state, active_records, closed_records = validation_records
-            validation_records = (complete_state, active_records, closed_records)
-        self._validate_correction_against_archive(event, records=validation_records)
-        line = json.dumps(event.to_json_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
-        if len(line.encode("utf-8")) > MAX_CORRECTION_LINE_BYTES:
-            raise ArchiveSchemaError("correction event exceeds maximum size")
         try:
-            compacted = append_bounded_correction_event(
-                self.corrections_path,
-                line,
-                current_count=complete_state.valid_count,
-                max_events=MAX_CORRECTION_EVENTS,
-                max_file_bytes=MAX_CORRECTION_FILE_BYTES,
-                compact_at_bytes=MAX_CORRECTION_COMPACT_BYTES,
-                load_events=self._load_correction_replay,
-                record_failure=self._record_failure,
-            )
-            if compacted:
-                self._bump_correction_revision()
+            with correction_ledger_transaction(self.corrections_path):
+                complete_state = load_complete_correction_state(self)
+                if validation_records is None:
+                    validation_records = (
+                        complete_state,
+                        self.load_active_sessions(),
+                        self.list_closed_sessions(),
+                    )
+                else:
+                    _state, active_records, closed_records = validation_records
+                    validation_records = (complete_state, active_records, closed_records)
+                self._validate_correction_against_archive(event, records=validation_records)
+                line = json.dumps(event.to_json_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
+                if len(line.encode("utf-8")) > MAX_CORRECTION_LINE_BYTES:
+                    raise ArchiveSchemaError("correction event exceeds maximum size")
+                compacted = append_bounded_correction_event(
+                    self.corrections_path,
+                    line,
+                    current_count=complete_state.valid_count,
+                    max_events=MAX_CORRECTION_EVENTS,
+                    max_file_bytes=MAX_CORRECTION_FILE_BYTES,
+                    compact_at_bytes=MAX_CORRECTION_COMPACT_BYTES,
+                    load_events=self._load_correction_replay,
+                    record_failure=self._record_failure,
+                )
+                if compacted:
+                    self._bump_correction_revision()
         except ArchiveWriteError:
             raise
         except OSError as exc:

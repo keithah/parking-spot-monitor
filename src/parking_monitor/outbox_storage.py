@@ -127,7 +127,13 @@ def load_records(
     records: list[OutboxRecord] = []
     recovery = RecoveryResult()
     for item in payload["items"]:
-        if len(_json_bytes(item)) > max_record_bytes:
+        try:
+            item_size = len(_json_bytes(item))
+        except (TypeError, ValueError):
+            event = _quarantine_json(path, item, reason="malformed_record", fsync_directory=fsync_directory)
+            recovery = recovery.with_event(event)
+            continue
+        if item_size > max_record_bytes:
             event = _quarantine_json(path, item, reason="oversized_record", fsync_directory=fsync_directory)
             recovery = recovery.with_event(event)
             continue
