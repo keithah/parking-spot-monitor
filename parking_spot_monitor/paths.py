@@ -73,6 +73,7 @@ def prepare_ultralytics_config_dir(
         os.fchmod(descriptor, 0o750)
     finally:
         os.close(descriptor)
+    os.environ["YOLO_CONFIG_DIR"] = str(config_dir)
     return config_dir
 
 

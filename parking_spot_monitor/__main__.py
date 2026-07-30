@@ -130,7 +130,7 @@ def _main(
         settings = _with_effective_runtime_paths(settings, paths)
         validate_model_path(settings.detection.model)
         if not args.validate_config:
-            prepare_ultralytics_config_dir(paths.data_dir)
+            prepare_ultralytics_config_dir(paths.data_dir, environ=environ)
     except ConfigError as exc:
         _log_config_error(logger, exc, config_path=config_path)
         return 2

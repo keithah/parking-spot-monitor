@@ -174,6 +174,17 @@ def test_dependency_lock_tests_are_split_by_responsibility() -> None:
         assert len(path.read_text(encoding="utf-8").splitlines()) <= 500, name
 
 
+def test_detector_benchmark_is_decomposed_into_bounded_modules() -> None:
+    caps = {
+        "scripts/benchmark_detector_backends.py": 400,
+        "parking_spot_monitor/detector_benchmark_evidence.py": 240,
+        "parking_spot_monitor/detector_benchmark_models.py": 120,
+    }
+    for path, max_lines in caps.items():
+        assert (ROOT / path).exists(), path
+        assert _line_count(path) <= max_lines, path
+
+
 def test_runtime_decision_memory_does_not_import_runtime_detection() -> None:
     imports = _imported_module_names(
         "parking_spot_monitor/runtime_decision_memory.py"

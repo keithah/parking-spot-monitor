@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -2897,7 +2898,7 @@ config_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.syspath_prepend(str(fake_modules))
     monkeypatch.delitem(sys.modules, "ultralytics", raising=False)
     monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.setenv("YOLO_CONFIG_DIR", str(yolo_config_dir))
+    monkeypatch.delenv("YOLO_CONFIG_DIR", raising=False)
 
     class ImportingDetector:
         def detect(
@@ -2927,6 +2928,7 @@ config_dir.mkdir(parents=True, exist_ok=True)
     )
 
     assert exit_code == 0
+    assert os.environ["YOLO_CONFIG_DIR"] == str(yolo_config_dir)
     assert (yolo_config_dir / "settings.json").is_file()
     assert not (fake_home / ".config" / "Ultralytics" / "settings.json").exists()
     assert_no_secret_leak(combined_output(capsys))

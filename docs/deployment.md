@@ -388,7 +388,7 @@ root.joinpath("manifest.json").write_text(
 PY
 ```
 
-Run the three heavy backends serially. The harness gives `.pt`, ONNX, and TorchScript separate spawned processes, performs three warmup passes and twenty measured passes by default, and writes aggregate evidence to the requested output. Do not run multiple copies concurrently, do not add `pytest-xdist`, and run the related tests without `-n`; minimizing peak host CPU and memory is more important than test throughput.
+Run the three heavy backends serially. The harness gives `.pt`, ONNX, and TorchScript separate spawned processes, performs three warmup passes and twenty measured passes by default, and writes aggregate evidence to the requested output. It caps a manifest at 256 frames, warmup at 20 passes, measured iterations at 100, and each model at 2 GiB. The per-worker deadline defaults to 1,800 seconds and is capped at 3,600 seconds. A timed-out worker is terminated, killed if necessary, and reaped before the command stops; the next backend is not started. Do not run multiple copies concurrently, do not add `pytest-xdist`, and run the related tests without `-n`; minimizing peak host CPU and memory is more important than test throughput.
 
 ```sh
 YOLO_CONFIG_DIR=data/detector-benchmark/ultralytics \
@@ -399,13 +399,16 @@ YOLO_CONFIG_DIR=data/detector-benchmark/ultralytics \
   --torchscript-model data/detector-benchmark/models/baseline.torchscript \
   --output data/detector-benchmark/evidence/backends.json \
   --warmup 3 \
-  --iterations 20
+  --iterations 20 \
+  --worker-timeout-seconds 1800
 
 python -m json.tool data/detector-benchmark/evidence/backends.json
 python -m pytest tests/test_detector_backend_benchmark.py -q
 ```
 
-A completed benchmark exits zero even when no alternative is eligible. Missing models or frames, a malformed manifest, a failed backend worker, or malformed evidence exits two. Eligibility requires exact frame and ordered class/count parity with no added or omitted detections, minimum bbox IoU `0.99`, maximum confidence delta `0.02`, and at least a 15% improvement in p95 inference time or isolated-process peak RSS. All alternatives must pass parity before the report can set `production_switch_eligible` to true. Treat that flag as permission to begin a separately approved production-switch review, never as authorization to edit the live backend automatically.
+A completed benchmark exits zero even when no alternative is eligible. Missing models or frames, a malformed manifest, a failed backend worker, a worker timeout, or malformed/non-finite evidence exits two. Preflight accepts only non-symlink regular files with the documented `.pt`, `.onnx`, and `.torchscript` suffixes; all three must have distinct resolved paths, inodes, and content. It rechecks each model around its worker and records the bounded file size and SHA-256 digest in evidence.
+
+`load_seconds` consistently means time from constructor start through the first completed, normalized prediction. That readiness prediction is excluded from warmup and measured inference timings. The harness compares normalized results from every measured iteration within each backend and records a bounded reference digest plus mismatch count/first mismatch; any intra-backend change makes the run ineligible even if the final iteration matches `.pt`. Eligibility also requires exact frame and ordered class/count parity with no added or omitted detections, minimum bbox IoU `0.99` using the runtime's canonical geometry function, maximum confidence delta `0.02`, and at least a 15% improvement in p95 inference time or isolated-process peak RSS. All alternatives must pass parity before the report can set `production_switch_eligible` to true. Treat that flag as permission to begin a separately approved production-switch review, never as authorization to edit the live backend automatically.
 
 ## Backup and recovery
 
