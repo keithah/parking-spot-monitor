@@ -884,7 +884,7 @@ def test_who_resize_logs_temp_cleanup_failure_without_masking_primary_publish_er
     real_unlink(temporary_files[0])
 
 
-def test_who_resize_preserves_existing_destination_mode_and_uses_compatible_default_for_new_file(
+def test_who_resize_preserves_existing_destination_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -907,14 +907,34 @@ def test_who_resize_preserves_existing_destination_mode_and_uses_compatible_defa
     )
     assert existing.stat().st_mode & 0o777 == 0o640
 
-    new_destination = tmp_path / "new" / "who_latest.jpg"
-    operator_cockpit_snapshots._resize_who_snapshot_for_matrix(
-        source,
-        destination=new_destination,
-        now=datetime.now(timezone.utc),
-        logger=None,
+
+@pytest.mark.parametrize(("process_umask", "expected_mode"), [(0o077, 0o600), (0o022, 0o644)])
+def test_who_resize_new_destination_mode_matches_path_write_bytes_umask_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    process_umask: int,
+    expected_mode: int,
+) -> None:
+    source = tmp_path / "latest.jpg"
+    _write_test_jpeg(source, size=(1280, 720))
+    monkeypatch.setattr(
+        operator_cockpit_snapshots,
+        "encode_jpeg_under_budget",
+        lambda image, **kwargs: JpegBudgetResult(b"jpeg", 640, 360, 65, 2),
     )
-    assert new_destination.stat().st_mode & 0o777 == 0o644
+    new_destination = tmp_path / "new" / "who_latest.jpg"
+    previous_umask = os.umask(process_umask)
+    try:
+        operator_cockpit_snapshots._resize_who_snapshot_for_matrix(
+            source,
+            destination=new_destination,
+            now=datetime.now(timezone.utc),
+            logger=None,
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert new_destination.stat().st_mode & 0o777 == expected_mode
 
 
 @pytest.mark.parametrize("failure", ["destination-stat", "fchmod"])

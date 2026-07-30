@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import os
+import secrets
 import stat as stat_module
-import tempfile
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,7 +46,6 @@ _WHO_SNAPSHOT_OPERATIONAL_ERRORS = (
     Image.DecompressionBombError,
     Image.DecompressionBombWarning,
 )
-_WHO_SNAPSHOT_DEFAULT_MODE = 0o644
 
 
 def build_latest_snapshot_response(
@@ -325,28 +324,25 @@ def _resize_who_snapshot_for_matrix(path: Path, *, destination: Path, now: datet
     )
 
 
-def _who_snapshot_destination_mode(destination: Path) -> int:
+def _who_snapshot_destination_mode(destination: Path) -> int | None:
     try:
         return stat_module.S_IMODE(destination.stat().st_mode)
     except FileNotFoundError:
-        return _WHO_SNAPSHOT_DEFAULT_MODE
+        return None
 
 
 def _publish_who_snapshot(
     destination: Path,
     data: bytes,
     *,
-    mode: int,
+    mode: int | None,
     logger: StructuredLogger | None,
 ) -> os.stat_result:
-    file_descriptor, temporary_name = tempfile.mkstemp(
-        dir=destination.parent,
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-    )
-    temporary = Path(temporary_name)
+    temporary = destination.with_name(f".{destination.name}.{secrets.token_hex(8)}.tmp")
+    file_descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     try:
-        os.fchmod(file_descriptor, mode)
+        if mode is not None:
+            os.fchmod(file_descriptor, mode)
         view = memoryview(data)
         try:
             offset = 0
