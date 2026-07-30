@@ -15,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_SCRIPT = ROOT / "scripts" / "lock_dependencies.py"
 LOCK_PATHS = (
+    ROOT / "requirements-build.lock",
     ROOT / "requirements-runtime.lock",
     ROOT / "requirements-detector.lock",
 )
@@ -28,7 +29,12 @@ def _run_check(root: Path) -> subprocess.CompletedProcess[str]:
         "PYTHONNOUSERSITE": "1",
     }
     return subprocess.run(
-        [sys.executable, str(root / "scripts" / "lock_dependencies.py"), "--check"],
+        [
+            sys.executable,
+            "-I",
+            str(root / "scripts" / "lock_dependencies.py"),
+            "--check",
+        ],
         cwd=root,
         env=environment,
         text=True,
@@ -44,10 +50,12 @@ def _copy_lock_inputs(tmp_path: Path) -> Path:
         "requirements.txt",
         "requirements-detector.txt",
         "requirements-build.txt",
+        "requirements-build.lock",
         "pyproject.toml",
         "requirements-runtime.lock",
         "requirements-detector.lock",
         "scripts/lock_dependencies.py",
+        "scripts/dependency_lock_validation.py",
     ):
         source = ROOT / relative
         destination = root / relative
@@ -102,15 +110,41 @@ def test_build_toolchain_is_fully_exact_pinned() -> None:
     assert all("==" in line and not line.startswith((" ", "#", "--")) for line in lines)
 
 
+def test_build_tool_lock_is_hash_pinned_to_explicit_pypi() -> None:
+    path = ROOT / "requirements-build.lock"
+    text = path.read_text(encoding="utf-8")
+    assert text.splitlines()[3] == "--index-url https://pypi.org/simple"
+    blocks = _requirement_blocks(text)
+    assert blocks
+    assert all("==" in block for block in blocks)
+    assert all("--hash=sha256:" in block for block in blocks)
+
+
+def test_lock_generator_modules_stay_below_decomposition_caps() -> None:
+    assert len(LOCK_SCRIPT.read_text(encoding="utf-8").splitlines()) <= 400
+    support = ROOT / "scripts" / "dependency_lock_validation.py"
+    assert len(support.read_text(encoding="utf-8").splitlines()) <= 350
+
+
 def test_lock_check_reports_current_manifests_without_installed_pip_tools() -> None:
     completed = _run_check(ROOT)
     assert completed.returncode == 0, completed.stderr
     assert "dependency locks are current" in completed.stdout.lower()
 
 
+def test_lock_check_does_not_create_validation_bytecode(tmp_path: Path) -> None:
+    root = _copy_lock_inputs(tmp_path)
+
+    completed = _run_check(root)
+
+    assert completed.returncode == 0, completed.stderr
+    assert not (root / "scripts" / "__pycache__").exists()
+
+
 @pytest.mark.parametrize(
     ("relative_path", "expected_message"),
     [
+        ("requirements-build.lock", "missing"),
         ("requirements-runtime.lock", "missing"),
         ("requirements-detector.lock", "missing"),
     ],
@@ -296,18 +330,42 @@ def _compiled_requirement(name: str, version: str = "1.0") -> str:
 
 
 def _valid_compiled(source: str) -> str:
-    if source == "requirements.txt":
+    if source in {"requirements.txt", "requirements-build.txt"}:
         # pip-tools suppresses its default PyPI directive even when supplied
         # explicitly; the generator must make the reviewed install source explicit.
         directives = ""
-        requirements = ("httpx", "pillow", "pydantic", "pyyaml")
+        requirements = (
+            (
+                ("httpx", "0.28.1"),
+                ("pillow", "12.3.0"),
+                ("pydantic", "2.13.4"),
+                ("pyyaml", "6.0.3"),
+            )
+            if source == "requirements.txt"
+            else (
+                ("build", "1.5.0"),
+                ("click", "8.4.2"),
+                ("packaging", "26.2"),
+                ("pip", "24.0"),
+                ("pip-tools", "7.5.0"),
+                ("pyproject-hooks", "1.2.0"),
+                ("setuptools", "83.0.0"),
+                ("wheel", "0.47.0"),
+            )
+        )
     else:
         directives = (
             "--index-url https://download.pytorch.org/whl/cpu\n"
             "--extra-index-url https://pypi.org/simple\n\n"
         )
-        requirements = ("torch", "torchvision", "ultralytics")
-    return directives + "".join(_compiled_requirement(name) for name in requirements)
+        requirements = (
+            ("torch", "2.7.1+cpu"),
+            ("torchvision", "0.22.1+cpu"),
+            ("ultralytics", "8.4.60"),
+        )
+    return directives + "".join(
+        _compiled_requirement(name, version) for name, version in requirements
+    )
 
 
 def test_generation_sanitizes_indexes_and_publishes_explicit_sources(
@@ -338,9 +396,9 @@ def test_generation_sanitizes_indexes_and_publishes_explicit_sources(
 
     module.generate_locks(root)
 
-    assert len(calls) == 2
+    assert len(calls) == len(module.COMMANDS)
     for command, environment in calls:
-        assert command[:4] == [sys.executable, "-P", "-m", "piptools"]
+        assert command[:4] == [sys.executable, "-I", "-m", "piptools"]
         assert any(
             argument
             in (
@@ -543,3 +601,242 @@ def test_lock_validation_rejects_broken_continuation_syntax(
             text,
             digest,
         )
+
+
+@pytest.mark.parametrize(
+    "broken_block",
+    [
+        "httpx==1.0 \\  \n" + f"    --hash=sha256:{'a' * 64}\n",
+        "httpx==1.0\\\n" + f"    --hash=sha256:{'a' * 64}\n",
+        (
+            "httpx==1.0 \\\n"
+            f"    --hash=sha256:{'a' * 64}  \\\n"
+            f"    --hash=sha256:{'b' * 64}\n"
+        ),
+        (
+            "httpx==1.0 \\\n"
+            f"    --hash=sha256:{'a' * 64}\n"
+            f"    --hash=sha256:{'b' * 64}\n"
+        ),
+        "httpx==1.0 \\\n" + f"    --hash=sha256:{'a' * 64}  \n",
+    ],
+)
+def test_lock_validation_rejects_raw_whitespace_and_backslash_corruption(
+    tmp_path: Path, broken_block: str
+) -> None:
+    root = _copy_lock_inputs(tmp_path)
+    module = _load_lock_module()
+    digest = module.compute_source_digest(root)
+    text = (
+        "# This file is autogenerated by scripts/lock_dependencies.py.\n"
+        f"# source-sha256: {digest}\n\n"
+        "--index-url https://pypi.org/simple\n\n"
+        + broken_block
+        + _compiled_requirement("pillow", "12.3.0")
+        + _compiled_requirement("pydantic", "2.13.4")
+        + _compiled_requirement("pyyaml", "6.0.3")
+    )
+
+    with pytest.raises(RuntimeError, match="whitespace|continuation"):
+        module._validate_lock_text(
+            root,
+            "requirements.txt",
+            "requirements-runtime.lock",
+            text,
+            digest,
+        )
+
+
+def test_lock_validation_rejects_direct_pin_outside_input_constraint(
+    tmp_path: Path,
+) -> None:
+    root = _copy_lock_inputs(tmp_path)
+    module = _load_lock_module()
+    digest = module.compute_source_digest(root)
+    text = (
+        "# This file is autogenerated by scripts/lock_dependencies.py.\n"
+        f"# source-sha256: {digest}\n\n"
+        "--index-url https://pypi.org/simple\n\n"
+        + _compiled_requirement("httpx", "0.28.1")
+        + _compiled_requirement("pillow", "1.0")
+        + _compiled_requirement("pydantic", "2.13.4")
+        + _compiled_requirement("pyyaml", "6.0.3")
+    )
+
+    with pytest.raises(RuntimeError, match="does not satisfy"):
+        module._validate_lock_text(
+            root,
+            "requirements.txt",
+            "requirements-runtime.lock",
+            text,
+            digest,
+        )
+
+
+def test_compatible_release_constraint_semantics() -> None:
+    module = _load_lock_module()
+
+    assert module._version_satisfies("1.4.9", "~=1.4.5") is True
+    assert module._version_satisfies("1.5.0", "~=1.4.5") is False
+    assert module._version_satisfies("1.9.0", "~=1.4") is True
+    assert module._version_satisfies("2.0.0", "~=1.4") is False
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        'example>=1; python_version >= "3.12"',
+        "example @ https://example.invalid/package.whl",
+        "example^=1.2",
+        "example==1.*",
+    ],
+)
+def test_input_requirement_rejects_unsupported_constraint_forms(
+    requirement: str,
+) -> None:
+    module = _load_lock_module()
+
+    with pytest.raises(RuntimeError, match="unsupported dependency requirement"):
+        module._canonical_input_requirement(requirement)
+
+
+def test_cli_requires_python_312_isolated_mode() -> None:
+    completed = subprocess.run(
+        [sys.executable, str(LOCK_SCRIPT), "--check"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "Python 3.12" in completed.stderr
+    assert "-I" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("version_info", "isolated"),
+    [((3, 11, 9), 1), ((3, 13, 0), 1), ((3, 12, 0), 0)],
+)
+def test_interpreter_validation_rejects_wrong_version_or_nonisolated_mode(
+    version_info: tuple[int, int, int], isolated: int
+) -> None:
+    module = _load_lock_module()
+
+    with pytest.raises(RuntimeError, match="Python 3.12.*-I"):
+        module._validate_interpreter(version_info=version_info, isolated=isolated)
+
+
+@pytest.mark.parametrize("first_destination_exists", [True, False])
+def test_second_publish_failure_restores_prior_pair_and_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_destination_exists: bool,
+) -> None:
+    root = _copy_lock_inputs(tmp_path)
+    module = _load_lock_module()
+    monkeypatch.setattr(module, "_validate_build_tool", lambda _root: None)
+    destinations = [root / destination for _, destination in module.COMMANDS]
+    if not first_destination_exists:
+        destinations[0].unlink(missing_ok=True)
+    before = {
+        path.name: path.read_bytes() if path.exists() else None for path in destinations
+    }
+
+    def fake_run(command, *, cwd, check, env):
+        output = next(
+            arg.split("=", 1)[1]
+            for arg in command
+            if arg.startswith("--output-file=")
+        )
+        (root / output).write_text(_valid_compiled(command[-1]), encoding="utf-8")
+        return SimpleNamespace(returncode=0)
+
+    real_replace = module.os.replace
+    replace_count = 0
+
+    def fail_second_replace(source, destination):
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count == 2:
+            raise OSError("injected second publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module.os, "replace", fail_second_replace)
+
+    with pytest.raises(OSError, match="second publish"):
+        module.generate_locks(root)
+
+    after = {
+        path.name: path.read_bytes() if path.exists() else None for path in destinations
+    }
+    assert after == before
+
+
+def test_cleanup_failure_reports_without_masking_primary_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = _copy_lock_inputs(tmp_path)
+    module = _load_lock_module()
+    digest = module.compute_source_digest(root)
+
+    def fake_run(command, *, cwd, check, env):
+        output = next(
+            arg.split("=", 1)[1]
+            for arg in command
+            if arg.startswith("--output-file=")
+        )
+        (root / output).write_text("malformed compiler output\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0)
+
+    real_unlink = module.Path.unlink
+
+    def fail_temp_unlink(path, *args, **kwargs):
+        if path.name.startswith(".requirements-runtime.lock."):
+            raise OSError("injected cleanup failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module.Path, "unlink", fail_temp_unlink)
+
+    with pytest.raises(RuntimeError, match="invalid generated dependency lock") as caught:
+        module._compile_lock(
+            root,
+            "requirements.txt",
+            "requirements-runtime.lock",
+            digest,
+        )
+
+    assert any("cleanup failure" in note for note in getattr(caught.value, "__notes__", ()))
+    assert "cleanup warning" in capsys.readouterr().err
+
+
+def test_rollback_temp_cleanup_failure_does_not_mask_replace_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_lock_module()
+    destination = tmp_path / "requirements-runtime.lock"
+    destination.write_bytes(b"new")
+    real_unlink = module.Path.unlink
+
+    def fail_replace(source, target):
+        raise OSError("injected rollback replace failure")
+
+    def fail_rollback_unlink(path, *args, **kwargs):
+        if ".rollback." in path.name:
+            raise OSError("injected rollback cleanup failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "replace", fail_replace)
+    monkeypatch.setattr(module.Path, "unlink", fail_rollback_unlink)
+
+    with pytest.raises(OSError, match="rollback replace") as caught:
+        module._restore_destination(destination, ("file", b"old", 0o644))
+
+    assert any("cleanup failure" in note for note in getattr(caught.value, "__notes__", ()))
+    assert "cleanup warning" in capsys.readouterr().err
