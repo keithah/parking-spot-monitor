@@ -108,6 +108,7 @@ class ResolvedStreamProfile:
 
 class StreamConfig(CaptureGeometryConfig):
     rtsp_url: ResolvedSecret
+    capture_timeout_seconds: float = Field(default=15, gt=0, allow_inf_nan=False)
     reconnect_seconds: int = Field(default=5, gt=0)
     reconnect_max_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
     reconnect_jitter_ratio: float = Field(default=0.2, ge=0, le=1, allow_inf_nan=False)
@@ -325,6 +326,7 @@ class RuntimeConfig(StrictModel):
     log_level: str = "INFO"
     startup_timeout_seconds: int = Field(default=30, gt=0)
     frame_interval_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
+    occupied_frame_interval_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
     adaptive_polling_enabled: bool = True
     stable_frame_interval_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
     stable_settle_frames: int = Field(default=3, gt=0)
@@ -335,15 +337,16 @@ class RuntimeConfig(StrictModel):
 
     @model_validator(mode="before")
     @classmethod
-    def resolve_omitted_stable_interval(cls, value: Any) -> Any:
-        if not isinstance(value, Mapping) or "stable_frame_interval_seconds" in value:
+    def resolve_omitted_runtime_intervals(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
             return value
         resolved = dict(value)
         try:
             active_interval = float(resolved.get("frame_interval_seconds", 30))
         except (TypeError, ValueError):
             return value
-        resolved["stable_frame_interval_seconds"] = max(60.0, active_interval)
+        resolved.setdefault("occupied_frame_interval_seconds", active_interval)
+        resolved.setdefault("stable_frame_interval_seconds", max(60.0, active_interval))
         return resolved
 
     @model_validator(mode="after")
@@ -385,6 +388,7 @@ class RuntimeSettings(StrictModel):
                 "rtsp_url": self.stream.rtsp_url.sanitized_summary(),
                 "frame_width": self.stream.frame_width,
                 "frame_height": self.stream.frame_height,
+                "capture_timeout_seconds": self.stream.capture_timeout_seconds,
                 "reconnect_seconds": self.stream.reconnect_seconds,
                 "reconnect_max_seconds": self.stream.reconnect_max_seconds,
                 "reconnect_jitter_ratio": self.stream.reconnect_jitter_ratio,
@@ -456,6 +460,7 @@ class RuntimeSettings(StrictModel):
                 "log_level": self.runtime.log_level,
                 "startup_timeout_seconds": self.runtime.startup_timeout_seconds,
                 "frame_interval_seconds": self.runtime.frame_interval_seconds,
+                "occupied_frame_interval_seconds": self.runtime.occupied_frame_interval_seconds,
                 "adaptive_polling_enabled": self.runtime.adaptive_polling_enabled,
                 "stable_frame_interval_seconds": self.runtime.stable_frame_interval_seconds,
                 "stable_settle_frames": self.runtime.stable_settle_frames,

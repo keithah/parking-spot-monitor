@@ -13,6 +13,47 @@ def test_runtime_frame_interval_seconds_is_configurable_and_summarized(tmp_path:
     assert settings.sanitized_summary()["runtime"]["frame_interval_seconds"] == 7
 
 
+def test_omitted_occupied_cadence_follows_custom_active_cadence(tmp_path: Path) -> None:
+    config = (
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("  frame_interval_seconds: 30", "  frame_interval_seconds: 17")
+        .replace("  occupied_frame_interval_seconds: 30\n", "")
+    )
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(path, environ=fake_environ())
+
+    assert settings.runtime.occupied_frame_interval_seconds == 17
+
+
+@pytest.mark.parametrize("bad_value", ["0", "-1", ".nan", ".inf"])
+@pytest.mark.parametrize(
+    ("original", "field"),
+    [
+        ("  capture_timeout_seconds: 15", "capture_timeout_seconds"),
+        ("  occupied_frame_interval_seconds: 30", "occupied_frame_interval_seconds"),
+    ],
+)
+def test_low_latency_timing_controls_must_be_positive_and_finite(
+    tmp_path: Path,
+    original: str,
+    field: str,
+    bad_value: str,
+) -> None:
+    indentation = original[: len(original) - len(original.lstrip())]
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        original,
+        f"{indentation}{field}: {bad_value}",
+    )
+    path = write_config(tmp_path, config)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(path, environ=fake_environ())
+
+    assert field in str(exc_info.value)
+
+
 def test_adaptive_runtime_settings_are_configurable_and_summarized(tmp_path: Path) -> None:
     config = (
         Path("config.yaml.example")

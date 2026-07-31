@@ -66,6 +66,7 @@ def test_example_config_exposes_operator_calibration_and_runtime_fields() -> Non
         ("stream", "rtsp_url_env"),
         ("stream", "frame_width"),
         ("stream", "frame_height"),
+        ("stream", "capture_timeout_seconds"),
         ("stream", "reconnect_seconds"),
         ("stream", "escalation_profile"),
         ("stream", "escalation_min_confidence"),
@@ -93,6 +94,7 @@ def test_example_config_exposes_operator_calibration_and_runtime_fields() -> Non
         ("storage", "snapshot_retention_count"),
         ("runtime", "health_file"),
         ("runtime", "frame_interval_seconds"),
+        ("runtime", "occupied_frame_interval_seconds"),
         ("runtime", "adaptive_polling_enabled"),
         ("runtime", "stable_frame_interval_seconds"),
         ("runtime", "stable_settle_frames"),
@@ -107,9 +109,11 @@ def test_example_config_exposes_operator_calibration_and_runtime_fields() -> Non
 
     assert config["stream"]["rtsp_url_env"] == "RTSP_URL"
     assert config["stream"]["profiles"]["high_resolution"]["rtsp_url_env"] == "RTSP_URL_4K"
+    assert config["stream"]["capture_timeout_seconds"] == 15
     assert config["stream"]["escalation_verification_seconds"] == 600
     assert config["matrix"]["access_token_env"] == "MATRIX_ACCESS_TOKEN"
     assert config["runtime"]["frame_interval_seconds"] == 30
+    assert config["runtime"]["occupied_frame_interval_seconds"] == 30
     assert config["runtime"]["adaptive_polling_enabled"] is True
     assert config["runtime"]["stable_frame_interval_seconds"] == 60
     assert config["runtime"]["stable_settle_frames"] == 3

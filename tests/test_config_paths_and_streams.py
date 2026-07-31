@@ -92,6 +92,31 @@ def test_example_config_loads_with_fake_env_values() -> None:
     assert summary["runtime"]["decision_memory_checkpoint_max_pending_records"] == 50
 
 
+def test_low_latency_capture_and_occupied_cadence_are_configurable(tmp_path: Path) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8")
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(path, environ=fake_environ())
+
+    assert settings.stream.capture_timeout_seconds == 15
+    assert settings.runtime.occupied_frame_interval_seconds == 30
+    summary = settings.sanitized_summary()
+    assert summary["stream"]["capture_timeout_seconds"] == 15
+    assert summary["runtime"]["occupied_frame_interval_seconds"] == 30
+
+
+def test_omitted_capture_timeout_uses_compatible_default(tmp_path: Path) -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8").replace(
+        "  capture_timeout_seconds: 15\n",
+        "",
+    )
+    path = write_config(tmp_path, config)
+
+    settings = load_settings(path, environ=fake_environ())
+
+    assert settings.stream.capture_timeout_seconds == 15
+
+
 @pytest.mark.parametrize(
     ("old", "new", "field"),
     [

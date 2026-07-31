@@ -2,6 +2,7 @@ stream:
   rtsp_url_env: RTSP_URL
   frame_width: 1458
   frame_height: 806
+  capture_timeout_seconds: 15
   reconnect_seconds: 5
   reconnect_max_seconds: 60
   reconnect_jitter_ratio: 0.2
@@ -98,6 +99,7 @@ runtime:
   log_level: INFO
   startup_timeout_seconds: 30
   frame_interval_seconds: 30
+  occupied_frame_interval_seconds: 30
   adaptive_polling_enabled: true
   stable_frame_interval_seconds: 60
   stable_settle_frames: 3
