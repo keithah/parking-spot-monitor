@@ -415,6 +415,14 @@ Immediately before recreation, the hardened helper durably published `/home/keit
 
 Five 10-second-spaced samples reported CPU `0.00%`, `0.01%`, `0.00%`, `0.00%`, and `4.24%`; RSS was `354.7`, `377.0`, `377.0`, `377.0`, and `391.4 MiB`. Docker reported 16 PIDs: a 15-thread Python process plus `docker-init`. Block I/O moved from `7.10 MB / 2.65 MB` to `7.24 MB / 3.67 MB`. A graceful stop took `1.45s`, exited zero without OOM or runtime error, and restarted in `0.19s`. The same container returned healthy with zero restarts and fresh post-start health/frame evidence; the post-restart point was `0.00%` CPU and `350.5 MiB` RSS. Final artifact sizes were outbox `1,195,128 B`, decision memory `94,925 B`, and health `1,869 B`. These remain short health observations, not peak or workload-matched resource acceptance.
 
+### 2026-07-31 failure-window and cooperative-writer closure deployment evidence
+
+Source boundary `b8959617ebe2f28dff62adfa977151a8fc16d126` passed `1,719` serial tests in `46.49s` (`47.13s` timed process elapsed, `206,252 KiB` peak RSS), compileall, dependency locks, Compose rendering, production-mount validation, and the final decision-publication, conflict-compaction, temporal-retention, backup-parent, secondary-recovery-note, and cooperative-outbox-writer regressions. The image rebuilt as `sha256:2f380efcdd1bce53d98a5b3f7f2f20f14806ca5f3e140c9026dc7142662471a5`, retained as `parking-spot-monitor:release-final-b895961-20260731`, and recreated in `1.25s`.
+
+Immediately before recreation, the helper durably published `/home/keith/backups/parking-spot-monitor/final-b895961-20260731T011200Z` at `2026-07-31T01:12:20.337655+00:00`, then waited for a healthy frame after restarting the predecessor. The mode-`0700` bundle contains only mode-`0600` files and records exact predecessor `sha256:b941c94a7a45e237bc02b21482b6068d3e1169d824467347bd748152ec24430c` under `parking-spot-monitor:rollback-pre-b895961-20260731T011200Z`. Its complete `1,195,509,760`-byte archive has SHA-256 `70fb94951e2aee94e42b1c1b8afbbcfe2d17128df1f51103b1a5c9b8017a29a4`; bundle manifests, archive safety, approved model, exact image identity, and durable publication ordering passed.
+
+Five 10-second-spaced samples reported CPU `0.00%`, `79.89%`, `0.01%`, `0.00%`, and `0.00%`; RSS was `350.5`, `350.5`, `350.5`, `350.5`, and `372.0 MiB`. Docker reported 16 PIDs: a 15-thread Python process plus `docker-init`. Block I/O moved from `6.83 MB / 3.93 MB` to `7.10 MB / 5.44 MB`. A graceful stop took `1.51s`, exited zero without OOM, and restarted in `0.20s`. The same container returned healthy with zero restarts and fresh post-start health/frame evidence; the post-restart point was `0.00%` CPU and `350.3 MiB` RSS. Post-restart artifact sizes were outbox `1,199,142 B`, decision memory `96,438 B`, and health `1,869 B`. These remain short health observations, not peak or workload-matched resource acceptance.
+
 ### Comparable post-upgrade observation
 
 Use equal healthy and Matrix-outage windows and record only aggregate, redaction-safe evidence. Do not print environment values, config bodies, health/outbox/decision payloads, raw log lines, camera images, or Matrix responses.
@@ -572,7 +580,13 @@ python3 scripts/deployment_operations.py restore-data --help
 
 ### Create the protected pre-upgrade bundle
 
-Choose a new destination and a collision-resistant rollback tag. Supply the trusted model digest explicitly:
+The backup parent must already exist, resolve without any symlink component, be a directory, and have no group or other write bits. Create or harden it before invoking the helper; the helper validates it before stopping the service or creating staging data and fails closed rather than changing its permissions:
+
+```sh
+install -d -m 0700 /protected/parking-backups
+```
+
+Choose a new child destination and a collision-resistant rollback tag. Supply the trusted model digest explicitly:
 
 ```sh
 python3 scripts/deployment_operations.py backup \
