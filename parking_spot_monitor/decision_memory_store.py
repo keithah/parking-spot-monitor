@@ -14,8 +14,11 @@ from parking_spot_monitor.decision_memory_reconciliation import (
     decision_memory_source_snapshot,
     deduplicated_decision_memory_tail,
 )
-from parking_spot_monitor.decision_memory_store_validation import (
-    positive_finite_float, positive_int,
+from parking_spot_monitor.decision_memory_store_validation import positive_finite_float, positive_int
+from parking_spot_monitor.decision_memory_store_publication import (
+    load_initial_state,
+    publish_bounded_candidate,
+    verified_publication_signature,
 )
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import (
@@ -55,33 +58,20 @@ class DecisionMemoryStore:
         )
         self._monotonic = monotonic
         self._logger = logger
-        with _memory._MEMORY_WRITE_LOCK:
-            before = decision_memory_source_snapshot(self.path, self.max_file_bytes)
-            loaded = _memory.load_decision_memory(
-                self.path,
-                max_records=self.max_records,
-                max_file_bytes=self.max_file_bytes,
-                logger=logger,
-            )
-            after = decision_memory_source_snapshot(self.path, self.max_file_bytes)
-        load_is_consistent = decision_memory_load_is_consistent(
-            loaded.state,
-            before,
-            after,
-            loaded.source_signature,
-            has_conflicts=bool(loaded.conflict_signatures),
+        initial = load_initial_state(
+            self.path,
+            max_records=self.max_records,
+            max_file_bytes=self.max_file_bytes,
+            logger=logger,
         )
-        self._records: deque[DecisionMemoryRecord] = deque(
-            loaded.records if load_is_consistent else (),
-            maxlen=self.max_records,
-        )
+        self._records: deque[DecisionMemoryRecord] = deque(initial.records, maxlen=self.max_records)
         self._dirty_records: deque[DecisionMemoryRecord] = deque(maxlen=self.max_records)
         self._dirty = False
         self._pending_count = 0
         now = self._monotonic()
         self._next_checkpoint_at = now + self.checkpoint_interval_seconds
-        self._signature = after.signature
-        self._reconcile_required = not load_is_consistent or bool(loaded.conflict_signatures)
+        self._signature = initial.signature
+        self._reconcile_required = initial.reconcile_required
 
     @property
     def records(self) -> tuple[DecisionMemoryRecord, ...]:
@@ -182,23 +172,12 @@ class DecisionMemoryStore:
                         max_records=self.max_records,
                     )
                     conflicts_to_clear = external.conflict_signatures
-            candidate, _encoded = _memory._bounded_memory_payload(
-                candidate,
-                max_records=self.max_records,
-                max_file_bytes=self.max_file_bytes,
-            )
-            if conflicts_to_clear:
-                conflicts_to_clear = _memory.compact_decision_memory_conflicts(
-                    self.path,
-                    candidate,
-                    conflicts_to_clear,
-                    max_records=self.max_records,
-                    max_file_bytes=self.max_file_bytes,
-                )
-            publication = _memory._write_memory(
+            candidate, conflicts_to_clear, publication = publish_bounded_candidate(
                 self.path,
                 candidate,
+                conflicts_to_clear,
                 expected_signature=before.signature,
+                max_records=self.max_records,
                 max_file_bytes=self.max_file_bytes,
             )
         except Exception as exc:
@@ -210,16 +189,13 @@ class DecisionMemoryStore:
                 error_type=type(exc).__name__,
             )
             return False
-        written = decision_memory_source_snapshot(self.path, self.max_file_bytes)
-        if (
-            publication is None
-            or not publication.published
-            or publication.signature is None
-            or written.signature != publication.signature
-        ):
+        signature = verified_publication_signature(
+            self.path, publication, max_file_bytes=self.max_file_bytes
+        )
+        if signature is None:
             return self._defer_reconciliation("written-source-stat-unavailable")
         self._records = deque(candidate, maxlen=self.max_records)
-        self._signature = publication.signature
+        self._signature = signature
         self._dirty_records.clear()
         self._reconcile_required = not _memory.clear_decision_memory_conflicts(
             conflicts_to_clear,
