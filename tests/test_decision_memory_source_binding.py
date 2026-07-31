@@ -262,20 +262,75 @@ def test_rollback_exhaustion_restores_latest_external_writer_to_canonical(
     def replace_before_every_exchange(source: Path, destination: Path) -> None:
         nonlocal exchange_count
         exchange_count += 1
-        _write_memory(path, (_record(f"external-{exchange_count}"),))
+        if exchange_count <= 12:
+            _write_memory(path, (_record(f"external-{exchange_count}"),))
         real_exchange(source, destination)
 
     monkeypatch.setattr(memory, "_conditional_exchange", replace_before_every_exchange)
 
     assert store.flush() is False
-    assert exchange_count == 9
+    assert exchange_count == 13
     assert [item.summary for item in load_decision_memory(path).records] == [
-        "external-9"
+        "external-12"
     ]
     assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
     monkeypatch.undo()
     assert store.flush()
     assert [item.summary for item in load_decision_memory(path).records] == [
-        "external-9",
+        "external-12",
         "local___",
     ]
+
+
+def test_rollback_churn_never_falls_back_to_nonconditional_replace(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.decision_memory_publication as publication
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    exchange_writers = []
+    for index in range(1, 10):
+        writer = tmp_path / f"external-{index}.json"
+        _write_memory(writer, (_record(f"external-{index}"),))
+        exchange_writers.append(writer)
+    exchange_final = tmp_path / "external-final-exchange.json"
+    fallback_final = tmp_path / "external-final-fallback.json"
+    _write_memory(exchange_final, (_record("external-final"),))
+    _write_memory(fallback_final, (_record("external-final"),))
+
+    real_exchange = memory._conditional_exchange
+    real_replace = publication.os.replace
+    exchange_count = 0
+    fallback_attempts = 0
+
+    def replace_before_exchange(source: Path, destination: Path) -> None:
+        nonlocal exchange_count
+        exchange_count += 1
+        if exchange_count <= len(exchange_writers):
+            real_replace(exchange_writers[exchange_count - 1], path)
+        elif exchange_count == len(exchange_writers) + 1:
+            real_replace(exchange_final, path)
+        real_exchange(source, destination)
+
+    def replace_during_fallback(source: Path, destination: Path) -> None:
+        nonlocal fallback_attempts
+        if destination == path and source.name.startswith(f".{path.name}."):
+            fallback_attempts += 1
+            real_replace(fallback_final, path)
+        real_replace(source, destination)
+
+    monkeypatch.setattr(memory, "_conditional_exchange", replace_before_exchange)
+    monkeypatch.setattr(publication.os, "replace", replace_during_fallback)
+
+    assert store.flush() is False
+    assert exchange_count == 11
+    assert fallback_attempts == 0
+    assert [item.summary for item in load_decision_memory(path).records] == [
+        "external-final"
+    ]
+    assert not list(tmp_path.glob(f".{path.name}.*.tmp"))

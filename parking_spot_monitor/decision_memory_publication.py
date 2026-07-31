@@ -18,7 +18,6 @@ ExclusiveLink = Callable[[Path, Path], None]
 
 _AT_FDCWD = -100
 _RENAME_EXCHANGE = 2
-_MAX_ROLLBACK_EXCHANGES = 8
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _LIBC.renameat2.argtypes = [
     ctypes.c_int,
@@ -176,19 +175,13 @@ def _restore_latest_canonical(
     canonical = read_source_signature(path, max_file_bytes)
     if not _same_content_identity(canonical, current):
         return True
-    for _attempt in range(_MAX_ROLLBACK_EXCHANGES):
+    while True:
         exchange(temporary, path)
         _fsync_directory(path.parent)
         swapped_out = read_source_signature(temporary, max_file_bytes)
         if _same_content_identity(swapped_out, current):
             return True
         current, desired = desired, swapped_out
-    canonical = read_source_signature(path, max_file_bytes)
-    if not _same_content_identity(canonical, current):
-        return True
-    os.replace(temporary, path)
-    _fsync_directory(path.parent)
-    return True
 
 
 def _source_stat_fields(value: os.stat_result) -> tuple[int, int, int, int, int]:
