@@ -399,6 +399,14 @@ Immediately before recreation, the transactional helper created the quiesced bun
 
 Five 10-second-spaced final samples reported CPU `0.00%`, `9.31%`, `0.00%`, `0.00%`, and `0.00%`; RSS was `350.1`, `372.1`, `343.2`, `343.2`, and `343.4 MiB`. A point five seconds after restart was `0.00%` CPU and `355.4 MiB` RSS. Docker reported 16–17 PIDs during the samples; steady state has one 15-thread Python process plus `docker-init`. Final artifact sizes were outbox `1,187,100 B`, decision memory `94,721 B`, and health `1,869 B`. These remain short, workload-dependent health observations rather than peak or controlled performance evidence.
 
+### 2026-07-31 final review-closure deployment evidence
+
+Source boundary `503e2f53c0dd6386f61938405403f48e26efb2f6` passed `1,697` serial tests in `51.49s` with test-process peak RSS `205,704 KiB`, compileall, dependency-lock validation, Compose rendering, production-mount validation, and the final recovery/publication/cache/rollback regressions. The detector image rebuilt as `sha256:97b05f5fd098f7d3dd2d5cb9ace459e0b82a776f4cb798ad058605f2bc0613a5` and is retained as `parking-spot-monitor:release-final-503e2f5-20260731`. Recreation took `1.79s`.
+
+Immediately before recreation, the transactional helper created `/home/keith/backups/parking-spot-monitor/final-503e2f5-20260731T002235Z` at `2026-07-31T00:23:03.669634+00:00`. The bundle records the exact predecessor `sha256:780eb5e056276c53bda2004a89a8810a92cedfee4b1ce5822f12376bb78762a8` under `parking-spot-monitor:rollback-pre-503e2f5-20260731T002235Z`. The directory is mode `0700`; every file is mode `0600`. Its complete `1,191,096,320`-byte data archive has SHA-256 `1d4456afee248bc6404e4868c771b2fd8db020d0244d5364b188346fad913251`; bundle manifests, archive safety, approved-model identity, and rollback image identity all passed.
+
+Five 10-second-spaced samples reported CPU `194.57%`, `0.00%`, `0.00%`, `200.62%`, and `0.00%`; RSS was `387.8`, `356.1`, `356.1`, `388.4`, and `388.4 MiB`. The two high CPU points overlapped detector work on the configured two-CPU limit. Docker reported 16 PIDs: a 15-thread Python process plus `docker-init`. Block I/O moved from `7.23 MB / 3.07 MB` to `7.23 MB / 3.69 MB` over the short window. A graceful stop took `4.25s`, exited zero without OOM or runtime error, and restarted in `0.32s`. The same container returned healthy with zero restarts and post-start health/frame evidence; the post-restart point was `0.00%` CPU and `356.3 MiB` RSS. Final artifact sizes were outbox `1,191,114 B`, decision memory `93,980 B`, and health `1,869 B`. These are bounded health observations, not peak or workload-matched performance acceptance.
+
 ### Comparable post-upgrade observation
 
 Use equal healthy and Matrix-outage windows and record only aggregate, redaction-safe evidence. Do not print environment values, config bodies, health/outbox/decision payloads, raw log lines, camera images, or Matrix responses.
