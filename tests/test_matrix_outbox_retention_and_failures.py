@@ -53,6 +53,30 @@ def test_occupied_snapshot_preparation_failure_persists_and_drains_text_fallback
     assert persisted.phase_states == {"text": "delivered"}
 
 
+def test_occupied_fallback_record_wins_when_snapshot_source_becomes_valid(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "occupied.jpg"
+    client = FakeMatrixClient()
+    delivery = make_delivery(tmp_path, client)
+    event = occupied_event(source)
+
+    fallback = delivery.enqueue_occupied_spot_alert(event)
+    first_drain = delivery.drain_outbox(record_id=fallback.id)
+    write_jpeg(source)
+
+    repeated = delivery.enqueue_occupied_spot_alert(event)
+    second_drain = delivery.drain_outbox(record_id=repeated.id)
+
+    assert first_drain.delivered_count == 1
+    assert repeated.id == fallback.id
+    assert repeated.phase_states == {"text": "delivered"}
+    assert second_drain.attempted_count == 0
+    assert len(delivery.outbox.list_records()) == 1
+    assert [call["kind"] for call in client.calls] == ["text"]
+    assert client.calls[0]["txn_id"] == fallback.intent.event_id
+
+
 def test_occupied_snapshot_fallback_does_not_replace_existing_durable_snapshot_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

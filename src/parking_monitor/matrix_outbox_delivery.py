@@ -284,6 +284,10 @@ class MatrixOutboxDelivery:
         """Persist a text-plus-image occupied-alert record without performing network I/O."""
 
         event_id = occupied_spot_event_id(event)
+        existing = self.outbox.find_event_record(event_id)
+        if existing is not None:
+            self._wake_event.set()
+            return existing
         metadata = _occupied_alert_metadata(event)
         body = format_occupied_spot_alert(event)
         try:
