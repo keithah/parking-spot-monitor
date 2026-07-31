@@ -1,22 +1,27 @@
-# Low-Latency Departure Detection Implementation Plan
+# Low-Latency Occupancy Transition Detection Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Deliver a high-resolution-verified Matrix open-spot alert within 30 seconds of a real departure when the host, camera, inference, and Matrix service are healthy.
+**Goal:** Deliver the corresponding Matrix alert within 30 seconds of a real arrival or departure when the host, camera, inference, and Matrix service are healthy.
 
-**Architecture:** Extend the pure runtime resource policy with an occupied-state cadence that uses the existing low-resolution primary stream every eight seconds while a car is present. Preserve the existing release-candidate escalation so the second primary-stream miss is immediately verified with the 4K profile, and wire a configurable per-decoder capture timeout through the single runtime capture callable. Add bounded latency fields at the transition and outbox-delivery boundaries so future delays can be assigned to observation, capture, confirmation, enqueue, or Matrix delivery.
+**Architecture:** Use the existing low-resolution primary stream every eight seconds during confirmation, occupancy, and transitions, and every 12 seconds when every spot is stably empty. Preserve conditional 4K entry verification and threshold-reaching 4K release verification, and wire a configurable per-decoder timeout through the single runtime capture callable. Build occupied alerts from confirmed state transitions before optional vehicle-history enrichment, with durable text fallback when occupied snapshot preparation fails, then expose bounded latency fields at transition and outbox-delivery boundaries.
 
 **Tech Stack:** Python 3.11+, Pydantic v2 configuration, pytest, existing FFmpeg capture modes, existing primary/4K stream escalation, structured JSON logging, durable Matrix outbox, Docker Compose.
 
 ## Global Constraints
 
-- The healthy-path target is at most 30 seconds from physical departure to Matrix alert.
+- The healthy-path target is at most 30 seconds from physical arrival or departure to its Matrix alert.
+- Production unknown, confirmation, and transition polling is 8 seconds.
 - Production primary polling while a spot is occupied is 8 seconds.
+- Production stable all-empty polling is 12 seconds.
+- Production entry confirmation is 2 frames.
 - Production release confirmation is 2 frames.
 - Production per-decoder capture timeout is 4 seconds; omission remains backward-compatible at 15 seconds.
 - Omitted `runtime.occupied_frame_interval_seconds` resolves to `runtime.frame_interval_seconds`.
 - Routine polling stays on the 1458×806 primary stream; only transition verification uses 3840×2160.
-- Capture or verification failures never count as empty evidence.
+- Capture or verification failures never count as occupancy evidence in either direction.
+- Confirmed occupied transitions queue exactly one base alert independently of vehicle-history enrichment.
+- Occupied snapshot-preparation failure durably falls back to text with the same event ID.
 - The service does not modify or restart unrelated containers.
 - Every production-code change begins with a failing test and preserves secret-redacted diagnostics.
 - All latency values are finite, non-negative seconds rounded to six decimal places.
@@ -29,10 +34,13 @@
 - `parking_spot_monitor/runtime_resource_policy.py`: choose the occupied cadence with a stable reason code.
 - `parking_spot_monitor/runtime_loop_resources.py`: subtract iteration work from every adaptive cadence.
 - `parking_spot_monitor/__main__.py`: bind the configured timeout once into the runtime capture callable.
+- `parking_spot_monitor/runtime_vehicle_events.py`: merge optional vehicle-history enrichment onto a mandatory base occupied alert.
+- `parking_spot_monitor/runtime_state_update.py`: dispatch exactly one occupied alert per confirmed transition.
+- `src/parking_monitor/matrix_outbox_delivery.py`: persist a text-only occupied fallback when snapshot preparation fails before durable enqueue.
 - `parking_spot_monitor/runtime_transition_latency.py`: pure, bounded transition-observation timing helpers.
 - `parking_spot_monitor/capture_loop.py`: maintain in-memory last occupied evidence and log confirmed release latency.
-- `src/parking_monitor/matrix_outbox_delivery.py`: log observation-to-enqueue and enqueue-to-delivery timing when an outbox record reaches `delivered`.
-- `config.yaml.example`, `README.md`, `docs/deployment.md`: document defaults, production values, healthy-host assumptions, rollback, and resource preflight.
+- `src/parking_monitor/matrix_outbox_delivery.py`: also log observation-to-enqueue and enqueue-to-delivery timing when an outbox record reaches `delivered`.
+- `config.yaml.example`, `README.md`, `docs/deployment.md`: document defaults, the 8/8/12 production cadence, two-frame thresholds, healthy-host assumptions, rollback, and resource preflight.
 - Focused tests live beside the existing configuration, policy, startup, escalation, outbox, and documentation suites.
 
 ---
@@ -382,19 +390,34 @@ git commit -m "fix: bound runtime decoder attempts"
 
 ---
 
-### Task 4: Two-Frame Release with Immediate 4K Verification
+### Task 4: Two-Frame Transition Confirmation and 4K Verification
 
 **Files:**
 - Test: `tests/test_runtime_stream_escalation.py`
 - Test: `tests/test_runtime_loop_stream_escalation.py`
 - Test: `tests/test_calibration_replay.py`
+- Test: `tests/test_startup_cadence_and_shutdown.py`
 
 **Interfaces:**
 - Consumes: existing `_stream_escalation_reason(...)` and `detect_with_stream_escalation(...)` behavior.
-- Verifies: a primary miss that would reach `release_frames` captures `stream.escalation_profile` before occupancy state advances.
+- Verifies: two accepted frames confirm entry with `confirm_frames=2`.
+- Verifies: low-confidence entry evidence captures `stream.escalation_profile` immediately.
+- Verifies: a primary miss that would reach `release_frames=2` captures `stream.escalation_profile` before occupancy state advances.
 - Verifies: high-resolution vehicle evidence cancels the release; high-resolution absence produces one open event.
 
-- [ ] **Step 1: Write an integration test for the production threshold**
+- [ ] **Step 1: Write failing production-cadence transition tests**
+
+Build settings with active, occupied, and stable intervals of 8, 8, and 12 seconds and both confirmation thresholds set to two. Seed stable empty state, provide two accepted entry frames, and assert the first hit returns to the eight-second active cadence and the second hit confirms occupancy:
+
+```python
+assert sleeps[:2] == [pytest.approx(12.0), pytest.approx(8.0)]
+assert final_state.state_by_spot["right_spot"].status is OccupancyStatus.OCCUPIED
+assert len(occupied_transitions) == 1
+```
+
+Add a low-confidence first entry candidate and assert the capture profile sequence includes one immediate `high_resolution` verification. Add a failed high-resolution capture case and assert hit streak and status do not advance from incomplete evidence.
+
+- [ ] **Step 2: Write the two-frame release integration tests**
 
 Build settings with `release_frames=2`, seed an occupied spot with `miss_streak=1`, and provide a capture/detector sequence in which primary and high-resolution frames both contain no accepted vehicle:
 
@@ -406,7 +429,7 @@ assert result.detection.by_spot["right_spot"].accepted is None
 
 Pass the result through the existing frame-plan/state-update path and assert exactly one `occupancy-open-event`. Add the inverse case where the 4K frame contains an accepted vehicle and assert no open event and occupied state is retained.
 
-- [ ] **Step 2: Run escalation tests and establish the baseline**
+- [ ] **Step 3: Run cadence and escalation tests and establish the baseline**
 
 Run:
 
@@ -414,12 +437,13 @@ Run:
 pytest -q \
   tests/test_runtime_stream_escalation.py \
   tests/test_runtime_loop_stream_escalation.py \
-  tests/test_calibration_replay.py
+  tests/test_calibration_replay.py \
+  tests/test_startup_cadence_and_shutdown.py
 ```
 
-Expected: the new tests should pass if the existing escalation contract fully covers a two-frame threshold. If either fails, the failure must identify a real missing boundary before production code is changed.
+Expected: the production-cadence tests pass using the interfaces completed in Tasks 1–2, and verification tests pass if the existing escalation boundary already covers both two-frame thresholds. Any failure identifies the smallest correction allowed in Step 4.
 
-- [ ] **Step 3: Make the smallest correction only if RED identifies one**
+- [ ] **Step 4: Make the smallest escalation correction only if a verification test remains RED**
 
 The intended condition remains:
 
@@ -430,24 +454,188 @@ if spot_state.miss_streak + 1 >= settings.occupancy.release_frames:
 
 Do not introduce routine 4K polling. If the baseline already passes, retain production code and commit the regression tests alone.
 
-- [ ] **Step 4: Re-run escalation tests and verify GREEN**
+- [ ] **Step 5: Re-run cadence and escalation tests and verify GREEN**
 
-Run the Step 2 command. Expected: all selected tests pass and no duplicate event is emitted.
+Run the Step 3 command. Expected: all selected tests pass, failures never advance evidence, and no duplicate event is emitted.
 
-- [ ] **Step 5: Commit the verified escalation contract**
+- [ ] **Step 6: Commit the verified transition contract**
 
 ```bash
 git add tests/test_runtime_stream_escalation.py \
   tests/test_runtime_loop_stream_escalation.py \
-  tests/test_calibration_replay.py parking_spot_monitor/runtime_stream_escalation.py
-git commit -m "test: lock two-frame release verification"
+  tests/test_calibration_replay.py tests/test_startup_cadence_and_shutdown.py \
+  parking_spot_monitor/runtime_stream_escalation.py
+git commit -m "test: lock low-latency transition verification"
 ```
 
 If `runtime_stream_escalation.py` is unchanged, omit it from `git add`.
 
 ---
 
-### Task 5: Transition and Matrix Latency Telemetry
+### Task 5: Occupied Alert Independence and Text Fallback
+
+**Files:**
+- Modify: `parking_spot_monitor/runtime_vehicle_events.py`
+- Modify: `parking_spot_monitor/runtime_state_update.py`
+- Modify: `src/parking_monitor/matrix_outbox_delivery.py`
+- Test: `tests/test_startup_runtime_alerts.py`
+- Test: `tests/test_startup_runtime_commands_and_health.py`
+- Test: `tests/test_matrix_outbox_retention_and_failures.py`
+- Test: `tests/test_matrix_outbox_retry_and_derivatives.py`
+
+**Interfaces:**
+- Produces: `build_occupied_transition_alerts(events, enriched_alerts) -> list[dict[str, Any]]`.
+- Produces: one base `occupancy-occupied-event` for every confirmed non-occupied-to-occupied transition, even when history is unavailable or broken.
+- Produces: optional history/profile fields merged into the base alert without replacing its event identity, spot, observation time, or authoritative snapshot path.
+- Produces: text-only durable occupied fallback for recognized snapshot-preparation failures.
+- Preserves: outbox persistence failures remain failures; retries and event-ID idempotency remain intact.
+
+- [ ] **Step 1: Write failing history-independence tests**
+
+Add runtime-loop tests for three failure boundaries: `start_session` raises, `attach_occupied_images` raises the live `VehicleHistoryImageError("vehicle image recovery remains pending")`, and no history archive is supplied. Each test confirms occupancy and asserts:
+
+```python
+assert len(delivery.occupied_alerts) == 1
+alert = delivery.occupied_alerts[0]
+assert alert["event_type"] == "occupancy-occupied-event"
+assert alert["spot_id"] == "right_spot"
+assert alert["occupied_snapshot_path"] == str(tmp_path / "latest.jpg")
+assert alert["event_id"].startswith("occupancy-occupied-event:right_spot:")
+```
+
+Retain assertions that the history failure appears in health and redacted logs. Add a success case asserting there is still exactly one alert and useful profile/estimate enrichment remains present.
+
+- [ ] **Step 2: Run runtime alert tests and verify RED**
+
+Run:
+
+```bash
+pytest -q \
+  tests/test_startup_runtime_alerts.py \
+  tests/test_startup_runtime_commands_and_health.py
+```
+
+Expected: the live image-recovery and archive-start failure cases produce zero occupied alerts.
+
+- [ ] **Step 3: Build mandatory base alerts and merge optional enrichment**
+
+Add a pure helper in `runtime_vehicle_events.py`:
+
+```python
+def build_occupied_transition_alerts(
+    events: Sequence[OccupancyEvent],
+    enriched_alerts: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    enriched_by_transition = {
+        (str(alert.get("spot_id", "")), str(alert.get("observed_at", ""))): alert
+        for alert in enriched_alerts
+    }
+    alerts: list[dict[str, Any]] = []
+    for event in events:
+        if (
+            event.event_type is not OccupancyEventType.STATE_CHANGED
+            or event.previous_status is OccupancyStatus.OCCUPIED
+            or event.new_status is not OccupancyStatus.OCCUPIED
+        ):
+            continue
+        key = (event.spot_id, str(event.observed_at))
+        enrichment = dict(enriched_by_transition.get(key, {}))
+        base: dict[str, Any] = {
+            "event_type": OCCUPIED_SPOT_EVENT_TYPE,
+            "spot_id": event.spot_id,
+            "observed_at": event.observed_at,
+            "source_timestamp": event.source_timestamp,
+            "occupied_snapshot_path": event.snapshot_path,
+        }
+        payload = base | enrichment | base
+        payload["event_id"] = occupied_spot_event_id(payload)
+        alerts.append(payload)
+    return alerts
+```
+
+Import `Mapping` and `occupied_spot_event_id`. The final `| base` deliberately protects transition identity and the authoritative frame from optional enrichment.
+
+In `runtime_state_update.py`, replace direct iteration over `history_result.occupied_alerts` with `build_occupied_transition_alerts(frame_plan.occupancy_update.events, history_result.occupied_alerts)`. Dispatch that single merged list through the existing occupied-event branch.
+
+- [ ] **Step 4: Run runtime alert tests and verify GREEN**
+
+Run the Step 2 command. Expected: every confirmed occupied transition queues exactly one alert; success cases retain enrichments.
+
+- [ ] **Step 5: Write failing occupied snapshot-fallback tests**
+
+Patch `MatrixOutboxSnapshots.enqueue` to raise a `MatrixError` with `error_type="snapshot_copy_failed"` before durable enqueue. Call `enqueue_occupied_spot_alert` and assert:
+
+```python
+assert record.state == "pending"
+assert record.intent.event_id == occupied_spot_event_id(event)
+assert record.phase_states == {"text": "pending"}
+assert record.intent.metadata["event_type"] == "occupancy-occupied-event"
+assert record.intent.metadata["snapshot_degraded_reason"] == "snapshot_copy_failed"
+```
+
+Drain the record and assert one text send and no upload/image send. Add cases for `snapshot_invalid_source`, `snapshot_metadata_failed`, and `snapshot_resize_failed`. Add an outbox persistence failure case proving it propagates instead of falling back to an in-memory send.
+
+- [ ] **Step 6: Run outbox tests and verify RED**
+
+Run:
+
+```bash
+pytest -q \
+  tests/test_matrix_outbox_retention_and_failures.py \
+  tests/test_matrix_outbox_retry_and_derivatives.py
+```
+
+Expected: recognized snapshot errors currently escape and no text-only record exists.
+
+- [ ] **Step 7: Implement durable text fallback at the outbox boundary**
+
+Catch only `MatrixError` from `_enqueue_snapshot_alert`. Extract its bounded `error_type`; re-raise unless it belongs to:
+
+```python
+_OCCUPIED_SNAPSHOT_FALLBACK_REASONS = frozenset(
+    {
+        "snapshot_invalid_source",
+        "snapshot_missing_source",
+        "snapshot_copy_failed",
+        "snapshot_metadata_failed",
+        "snapshot_resize_failed",
+    }
+)
+```
+
+Before creating a fallback, call `self.outbox.find_event_record(event_id)`. If a prior snapshot-path attempt already durably created the event, wake the worker and return that record so the pending text phase delivers. Otherwise persist one `AlertIntent` with phases `("text",)`, the formatted occupied body, and metadata containing only `event_type`, `spot_id`, `observed_at`, and `snapshot_degraded_reason`. Log `matrix-outbox-occupied-snapshot-degraded`, log the normal enqueue event with `phase="text"`, wake the worker, and return the record.
+
+- [ ] **Step 8: Run runtime and outbox tests and verify GREEN**
+
+Run:
+
+```bash
+pytest -q \
+  tests/test_startup_runtime_alerts.py \
+  tests/test_startup_runtime_commands_and_health.py \
+  tests/test_matrix_outbox_retention_and_failures.py \
+  tests/test_matrix_outbox_retry_and_derivatives.py \
+  tests/test_startup_matrix_dispatch.py
+```
+
+Expected: all selected tests pass with exactly-once event identity and no secret-bearing error text in metadata or logs.
+
+- [ ] **Step 9: Commit the occupied-alert reliability slice**
+
+```bash
+git add parking_spot_monitor/runtime_vehicle_events.py \
+  parking_spot_monitor/runtime_state_update.py \
+  src/parking_monitor/matrix_outbox_delivery.py \
+  tests/test_startup_runtime_alerts.py \
+  tests/test_startup_runtime_commands_and_health.py \
+  tests/test_matrix_outbox_retention_and_failures.py \
+  tests/test_matrix_outbox_retry_and_derivatives.py
+git commit -m "fix: deliver occupied alerts independently"
+```
+
+---
+
+### Task 6: Transition and Matrix Latency Telemetry
 
 **Files:**
 - Create: `parking_spot_monitor/runtime_transition_latency.py`
@@ -458,8 +646,8 @@ If `runtime_stream_escalation.py` is unchanged, omit it from `git add`.
 - Test: `tests/test_matrix_outbox_worker_lifecycle.py`
 
 **Interfaces:**
-- Produces: `OccupiedEvidenceTracker` with `observe(...)` and `confirmed_release_fields(...)` pure timestamp calculations.
-- Produces: `departure-detection-latency` structured event.
+- Produces: `TransitionEvidenceTracker` with `observe(...)` and `confirmed_transition_fields(...)` pure timestamp calculations.
+- Produces: `occupancy-transition-latency` structured events for arrival and departure.
 - Produces: bounded `capture-loop-cadence-changed` records only when cadence interval or reason changes.
 - Produces: `matrix-outbox-record-delivered` fields `observation_to_enqueue_seconds` and `enqueue_to_delivery_seconds` when timestamps are valid.
 - Preserves: invalid, absent, backward, or non-finite timestamps omit latency fields instead of failing delivery.
@@ -469,16 +657,18 @@ If `runtime_stream_escalation.py` is unchanged, omit it from `git add`.
 Define the expected tracker API through tests:
 
 ```python
-def test_confirmed_release_partitions_observation_and_capture_latency() -> None:
-    tracker = OccupiedEvidenceTracker()
+def test_confirmed_departure_partitions_observation_and_capture_latency() -> None:
+    tracker = TransitionEvidenceTracker()
     tracker.observe(
         spot_id="right_spot",
         observed_at=datetime(2026, 7, 31, 5, 0, 0, tzinfo=UTC),
-        occupied_evidence=True,
+        evidence_status=OccupancyStatus.OCCUPIED,
     )
 
-    fields = tracker.confirmed_release_fields(
+    fields = tracker.confirmed_transition_fields(
         spot_id="right_spot",
+        previous_status=OccupancyStatus.OCCUPIED,
+        new_status=OccupancyStatus.EMPTY,
         confirmed_at=datetime(2026, 7, 31, 5, 0, 16, tzinfo=UTC),
         primary_capture_seconds=0.4,
         verification_capture_seconds=1.2,
@@ -488,7 +678,8 @@ def test_confirmed_release_partitions_observation_and_capture_latency() -> None:
 
     assert fields == {
         "spot_id": "right_spot",
-        "occupied_evidence_to_confirmation_seconds": 16.0,
+        "transition_direction": "occupied-to-empty",
+        "opposite_evidence_to_confirmation_seconds": 16.0,
         "primary_capture_seconds": 0.4,
         "verification_capture_seconds": 1.2,
         "cadence_seconds": 8.0,
@@ -496,7 +687,7 @@ def test_confirmed_release_partitions_observation_and_capture_latency() -> None:
     }
 ```
 
-Add cases for absent prior evidence, backward datetimes, and non-finite durations. Those cases must return only safe fields or `None`, never throw from the capture loop.
+Add the symmetric empty-to-occupied case, plus absent prior evidence, backward datetimes, same-state calls, and non-finite durations. Those cases must return only safe fields or `None`, never throw from the capture loop.
 
 - [ ] **Step 2: Run the new telemetry module and verify RED**
 
@@ -508,24 +699,39 @@ Use a small in-memory mapping and one shared numeric sanitizer:
 
 ```python
 @dataclass
-class OccupiedEvidenceTracker:
-    _last_by_spot: dict[str, datetime] = field(default_factory=dict)
+class TransitionEvidenceTracker:
+    _last_by_spot_status: dict[tuple[str, OccupancyStatus], datetime] = field(
+        default_factory=dict
+    )
 
-    def observe(self, *, spot_id: str, observed_at: datetime, occupied_evidence: bool) -> None:
-        if occupied_evidence and observed_at.tzinfo is not None:
-            self._last_by_spot[spot_id] = observed_at
-
-    def confirmed_release_fields(
+    def observe(
         self,
         *,
         spot_id: str,
+        observed_at: datetime,
+        evidence_status: OccupancyStatus,
+    ) -> None:
+        if observed_at.tzinfo is not None:
+            self._last_by_spot_status[(spot_id, evidence_status)] = observed_at
+
+    def confirmed_transition_fields(
+        self,
+        *,
+        spot_id: str,
+        previous_status: OccupancyStatus,
+        new_status: OccupancyStatus,
         confirmed_at: datetime,
         primary_capture_seconds: float,
         verification_capture_seconds: float | None,
         cadence_seconds: float,
         cadence_reason: str,
     ) -> dict[str, str | float] | None:
-        previous = self._last_by_spot.pop(spot_id, None)
+        if previous_status is new_status:
+            return None
+        previous = self._last_by_spot_status.pop(
+            (spot_id, previous_status),
+            None,
+        )
         if previous is None or confirmed_at.tzinfo is None:
             return None
         elapsed = (confirmed_at - previous).total_seconds()
@@ -533,7 +739,8 @@ class OccupiedEvidenceTracker:
             return None
         fields: dict[str, str | float] = {
             "spot_id": spot_id,
-            "occupied_evidence_to_confirmation_seconds": round(elapsed, 6),
+            "transition_direction": f"{previous_status.value}-to-{new_status.value}",
+            "opposite_evidence_to_confirmation_seconds": round(elapsed, 6),
             "primary_capture_seconds": bounded_seconds(primary_capture_seconds),
             "cadence_seconds": bounded_seconds(cadence_seconds),
             "cadence_reason": cadence_reason,
@@ -549,14 +756,17 @@ class OccupiedEvidenceTracker:
 
 - [ ] **Step 4: Integrate transition telemetry with a failing loop test**
 
-In a runtime-loop test, run an occupied evidence frame followed by the two misses that produce a high-resolution-confirmed open event. Assert one JSON log record:
+In runtime-loop tests, run an occupied evidence frame followed by two misses, and an empty evidence frame followed by two accepted detections. Assert one JSON log record for each direction:
 
 ```python
 latency = next(
-    record for record in records if record["event"] == "departure-detection-latency"
+    record
+    for record in records
+    if record["event"] == "occupancy-transition-latency"
+    and record["transition_direction"] == "occupied-to-empty"
 )
 assert latency["spot_id"] == "right_spot"
-assert latency["occupied_evidence_to_confirmation_seconds"] == 16.0
+assert latency["opposite_evidence_to_confirmation_seconds"] == 16.0
 assert latency["verification_capture_seconds"] >= 0
 assert latency["cadence_reason"] == "occupied"
 ```
@@ -565,7 +775,7 @@ Expected before integration: no matching record.
 
 - [ ] **Step 5: Integrate the tracker in `capture_loop.py`**
 
-Instantiate one tracker before entering the loop. After detection and before state replacement, record accepted vehicle evidence for spots that were confirmed occupied. Preserve `previous_runtime_state`, then compare it with `frame_update.runtime_state`; for each `OCCUPIED -> EMPTY` transition, log `departure-detection-latency` using the primary capture duration, the final capture duration only when `frame_result.escalated`, and the policy decision that scheduled the current iteration.
+Instantiate one tracker before entering the loop. After detection and before state replacement, record `OCCUPIED` evidence for an accepted candidate and `EMPTY` evidence only when a spot has neither an accepted candidate nor weak presence. Preserve `previous_runtime_state`, then compare it with `frame_update.runtime_state`; for each changed confirmed status, log `occupancy-transition-latency` using the primary capture duration, the final capture duration only when `frame_result.escalated`, and the policy decision that scheduled the current iteration.
 
 Store the prior `RuntimeResourceDecision` beside `resource_policy_state`, initializing it with `frame_interval_seconds` and reason `"unknown"`, then replace it after every successful policy advance. This keeps telemetry descriptive and does not affect cadence decisions.
 
@@ -634,12 +844,12 @@ git add parking_spot_monitor/runtime_transition_latency.py \
   tests/test_runtime_transition_latency.py \
   tests/test_runtime_loop_stream_escalation.py \
   tests/test_matrix_outbox_worker_lifecycle.py
-git commit -m "feat: expose departure alert latency"
+git commit -m "feat: expose occupancy transition latency"
 ```
 
 ---
 
-### Task 6: Operator Documentation and Production Profile
+### Task 7: Operator Documentation and Production Profile
 
 **Files:**
 - Modify: `README.md`
@@ -650,8 +860,9 @@ git commit -m "feat: expose departure alert latency"
 
 **Interfaces:**
 - Documents: compatible defaults of 15-second timeout and active-matching occupied cadence.
-- Documents: production values `capture_timeout_seconds: 4`, `occupied_frame_interval_seconds: 8`, and `release_frames: 2`.
-- Documents: fixed-cadence and conservative release rollback.
+- Documents: production values `capture_timeout_seconds: 4`, active/occupied/stable cadence `8/8/12`, and confirmation/release thresholds `2/2`.
+- Documents: fixed-cadence and conservative transition rollback.
+- Documents: confirmed occupied alerts are independent of history enrichment and have durable text fallback.
 - Documents: host resource preflight and the healthy-host scope of the 30-second target.
 
 - [ ] **Step 1: Write failing documentation contract tests**
@@ -661,7 +872,10 @@ Extend documentation tests to require these exact concepts and keys:
 ```python
 required_fragments = (
     "capture_timeout_seconds: 4",
+    "frame_interval_seconds: 8",
     "occupied_frame_interval_seconds: 8",
+    "stable_frame_interval_seconds: 12",
+    "confirm_frames: 2",
     "release_frames: 2",
     "healthy host",
     "low-resolution",
@@ -674,7 +888,7 @@ for fragment in required_fragments:
     assert fragment in deployment_text
 ```
 
-Also assert rollback text restores timeout 15, omits or raises occupied cadence, and restores release frames 3.
+Also assert rollback text restores timeout 15, restores the prior cadence, omits or raises occupied cadence, and restores confirmation and release frames to 3.
 
 - [ ] **Step 2: Run documentation tests and verify RED**
 
@@ -695,16 +909,17 @@ stream:
   capture_timeout_seconds: 4
 
 occupancy:
+  confirm_frames: 2
   release_frames: 2
 
 runtime:
-  frame_interval_seconds: 30
+  frame_interval_seconds: 8
   occupied_frame_interval_seconds: 8
   adaptive_polling_enabled: true
-  stable_frame_interval_seconds: 60
+  stable_frame_interval_seconds: 12
 ```
 
-Explain that primary low-resolution captures run at the occupied cadence, the threshold-reaching miss immediately invokes one high-resolution verification, and the high-resolution result is authoritative for that iteration. Include `free -h` and bounded `docker stats --no-stream` commands, state that external host starvation invalidates the latency target, and state that unrelated containers require separate operator authorization.
+Explain that primary low-resolution captures use 12 seconds only when every spot is stably empty and eight seconds otherwise. Document conditional high-resolution entry verification, threshold-reaching high-resolution release verification, and the authoritative final result for an escalated iteration. Document that confirmed occupied transitions create the base alert independently of history/profile work and that occupied snapshot preparation degrades to durable text. Include `free -h` and bounded `docker stats --no-stream` commands, state that external host starvation invalidates the latency target, and state that unrelated containers require separate operator authorization.
 
 - [ ] **Step 4: Run documentation tests and verify GREEN**
 
@@ -720,7 +935,7 @@ git commit -m "docs: add low-latency deployment profile"
 
 ---
 
-### Task 7: Verification, Deployment, and Measurement
+### Task 8: Verification, Deployment, and Measurement
 
 **Files:**
 - Modify outside Git: `/home/keith/src/parking-spot-monitor/config.yaml` after creating a protected backup.
@@ -728,7 +943,7 @@ git commit -m "docs: add low-latency deployment profile"
 - Verify: existing deployment override `/tmp/parking-spot-monitor-task6-compose.yml`.
 
 **Interfaces:**
-- Consumes: the tested code and production profile from Tasks 1–6.
+- Consumes: the tested code and production profile from Tasks 1–7.
 - Produces: protected rollback bundle, new immutable image ID, healthy recreated parking-monitor service, and before/after resource and latency evidence.
 
 - [ ] **Step 1: Run bytecode compilation and focused suites**
@@ -745,8 +960,12 @@ pytest -q \
   tests/test_startup_capture_and_pacing.py \
   tests/test_runtime_stream_escalation.py \
   tests/test_runtime_loop_stream_escalation.py \
+  tests/test_startup_runtime_alerts.py \
+  tests/test_startup_runtime_commands_and_health.py \
   tests/test_runtime_transition_latency.py \
   tests/test_matrix_outbox_worker_lifecycle.py \
+  tests/test_matrix_outbox_retention_and_failures.py \
+  tests/test_matrix_outbox_retry_and_derivatives.py \
   tests/test_operator_runtime_docs.py \
   tests/test_deployment_docs.py
 ```
@@ -784,9 +1003,12 @@ Use `apply_patch` to change only these operator-owned values in `/home/keith/src
 stream:
   capture_timeout_seconds: 4
 occupancy:
+  confirm_frames: 2
   release_frames: 2
 runtime:
+  frame_interval_seconds: 8
   occupied_frame_interval_seconds: 8
+  stable_frame_interval_seconds: 12
 ```
 
 Run the containerized `--validate-config` command with the same env file, Compose files, mounts, and image that production uses. Expected exit code: 0 with redacted configuration output.
@@ -813,23 +1035,25 @@ Record the new image ID and apply a unique release tag containing the short Git 
 
 - [ ] **Step 6: Verify health, cadence, escalation, and resource use**
 
-Wait only in bounded polls of at most 30 seconds. Verify container health, zero restart/OOM count, startup configuration summary, successful low-resolution captures, and `capture-loop-paced` records with `cadence_reason=occupied` and an interval near eight seconds when a spot is occupied. Confirm stable empty state backs off to the configured stable interval.
+Wait only in bounded polls of at most 30 seconds. Verify container health, zero restart/OOM count, startup configuration summary, successful low-resolution captures, and `capture-loop-cadence-changed` records showing eight seconds for active/occupied state and 12 seconds for stable all-empty state.
 
 Run bounded resource samples for at least five minutes and record parking-monitor CPU, memory, PIDs, host available memory, and swap. Report competing workloads separately; do not mutate them.
 
-- [ ] **Step 7: Measure the next controlled or naturally occurring departure**
+- [ ] **Step 7: Measure controlled or naturally occurring transitions**
 
-For a confirmed occupied spot, record the last accepted occupied frame, first primary miss, second primary miss, `release-transition-candidate` 4K escalation, open event, outbox enqueue, and outbox delivered timestamps. Success requires:
+For a departure, record the last accepted occupied frame, first primary miss, second primary miss, `release-transition-candidate` 4K escalation, open event, outbox enqueue, and outbox delivered timestamps. For an arrival, record the last unambiguous empty frame, first entry evidence, any `weak-transition-candidate` 4K escalation, second accepted evidence, occupied event, outbox enqueue, and outbox delivered timestamps. Success requires:
 
 ```text
 one open event
-one immediate 4K verification
-departure-detection-latency <= 30 seconds under healthy conditions
+one occupied event
+one immediate 4K verification for release and for uncertain entry
+occupancy-transition-latency <= 30 seconds in each direction under healthy conditions
 no duplicate alert
-no capture counted as empty after a capture/verification failure
+no capture or verification failure counted as transition evidence
+vehicle-history enrichment failure does not suppress the occupied alert
 ```
 
-If a physical departure is not available during deployment, report automated timing coverage as passed and leave live latency validation explicitly pending rather than synthesizing a production event.
+If either physical transition is not available during deployment, report its automated timing coverage as passed and leave that live latency validation explicitly pending rather than synthesizing a production event.
 
 - [ ] **Step 8: Commit any verification-only documentation corrections and push**
 
@@ -846,6 +1070,6 @@ Before declaring completion, provide:
 - Immutable deployed image ID and release tag.
 - Protected rollback bundle and image tag.
 - Container health, restart count, OOM state, CPU, and memory.
-- Effective redacted cadence, timeout, and release threshold values.
-- A measured departure-to-delivery timeline, or an explicit note that live physical validation remains pending.
+- Effective redacted cadence, timeout, confirmation, and release threshold values.
+- Measured arrival-to-delivery and departure-to-delivery timelines, or explicit notes for any live physical validation still pending.
 - Current host available memory, swap use, and top competing container consumers without modifying them.

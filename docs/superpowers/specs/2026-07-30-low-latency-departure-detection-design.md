@@ -81,7 +81,7 @@ The primary resolution is not reduced further in this slice. Its current geometr
 
 ## Occupied Notification Independence
 
-A confirmed `EMPTY -> OCCUPIED` transition is the sole trigger for one occupied notification event. The transition event ID provides restart-safe idempotency. The alert uses the authoritative frame from the confirming iteration and contains a generic spot/vehicle message that does not require a recognized vehicle profile.
+A confirmed transition from a non-occupied state to `OCCUPIED` is the sole trigger for one occupied notification event. This preserves the existing startup behavior for a confirmed vehicle discovered from `UNKNOWN` while covering normal `EMPTY -> OCCUPIED` arrivals. The transition event ID provides restart-safe idempotency. The alert uses the authoritative frame from the confirming iteration and contains a generic spot/vehicle message that does not require a recognized vehicle profile.
 
 Vehicle-history session creation, image attachment, profile matching, and owner estimates remain best-effort enrichments. When available, their bounded fields may enrich the occupied alert. A failure in any enrichment phase is logged and recorded in health, but cannot suppress, delay, or duplicate the base notification.
 
