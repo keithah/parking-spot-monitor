@@ -39,10 +39,14 @@ def decision_memory_load_is_consistent(
     before: DecisionMemorySourceSnapshot,
     after: DecisionMemorySourceSnapshot,
     source_signature: SourceSignature | None = None,
+    *,
+    has_conflicts: bool = False,
 ) -> bool:
     if not before.available or not after.available or before.signature != after.signature:
         return False
-    expected_state = "missing" if before.signature is None else "available"
+    expected_state = (
+        "missing" if before.signature is None and not has_conflicts else "available"
+    )
     if state != expected_state:
         return False
     return source_signature is None or source_signature == before.signature

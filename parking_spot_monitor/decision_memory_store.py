@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -14,6 +13,9 @@ from parking_spot_monitor.decision_memory_reconciliation import (
     decision_memory_load_is_consistent,
     decision_memory_source_snapshot,
     deduplicated_decision_memory_tail,
+)
+from parking_spot_monitor.decision_memory_store_validation import (
+    positive_finite_float, positive_int,
 )
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.operator_decision_memory import (
@@ -39,13 +41,13 @@ class DecisionMemoryStore:
         logger: StructuredLogger | None = None,
     ) -> None:
         self.path = Path(path)
-        self.checkpoint_interval_seconds = _positive_finite_float(
+        self.checkpoint_interval_seconds = positive_finite_float(
             checkpoint_interval_seconds, "checkpoint_interval_seconds"
         )
-        self.checkpoint_max_pending_records = _positive_int(
+        self.checkpoint_max_pending_records = positive_int(
             checkpoint_max_pending_records, "checkpoint_max_pending_records"
         )
-        self.max_records = _positive_int(max_records, "max_records")
+        self.max_records = positive_int(max_records, "max_records")
         self._monotonic = monotonic
         self._logger = logger
         with _memory._MEMORY_WRITE_LOCK:
@@ -57,7 +59,13 @@ class DecisionMemoryStore:
                 logger=logger,
             )
             after = decision_memory_source_snapshot(self.path)
-        load_is_consistent = decision_memory_load_is_consistent(loaded.state, before, after, loaded.source_signature)
+        load_is_consistent = decision_memory_load_is_consistent(
+            loaded.state,
+            before,
+            after,
+            loaded.source_signature,
+            has_conflicts=bool(loaded.conflict_signatures),
+        )
         self._records: deque[DecisionMemoryRecord] = deque(
             loaded.records if load_is_consistent else (),
             maxlen=self.max_records,
@@ -68,7 +76,7 @@ class DecisionMemoryStore:
         now = self._monotonic()
         self._next_checkpoint_at = now + self.checkpoint_interval_seconds
         self._signature = after.signature
-        self._reconcile_required = not load_is_consistent
+        self._reconcile_required = not load_is_consistent or bool(loaded.conflict_signatures)
 
     @property
     def records(self) -> tuple[DecisionMemoryRecord, ...]:
@@ -136,6 +144,7 @@ class DecisionMemoryStore:
 
     def _flush_locked(self) -> bool:
         candidate = tuple(self._records)
+        conflicts_to_clear = ()
         try:
             before = decision_memory_source_snapshot(self.path)
             if not before.available:
@@ -155,7 +164,11 @@ class DecisionMemoryStore:
                 if not after.available or after.signature != before.signature:
                     return self._defer_reconciliation("source-changed-during-load")
                 if not decision_memory_load_is_consistent(
-                    external.state, before, after, external.source_signature
+                    external.state,
+                    before,
+                    after,
+                    external.source_signature,
+                    has_conflicts=bool(external.conflict_signatures),
                 ):
                     return self._defer_reconciliation("source-state-signature-mismatch")
                 if external.state == "available":
@@ -163,6 +176,7 @@ class DecisionMemoryStore:
                         (*external.records, *self._dirty_records),
                         max_records=self.max_records,
                     )
+                    conflicts_to_clear = external.conflict_signatures
             publication = _memory._write_memory(
                 self.path, candidate, expected_signature=before.signature)
         except Exception as exc:
@@ -185,7 +199,7 @@ class DecisionMemoryStore:
         self._records = deque(candidate, maxlen=self.max_records)
         self._signature = publication.signature
         self._dirty_records.clear()
-        self._reconcile_required = False
+        self._reconcile_required = not _memory.clear_decision_memory_conflicts(conflicts_to_clear)
         self._dirty = False
         self._pending_count = 0
         self._next_checkpoint_at = self._monotonic() + self.checkpoint_interval_seconds
@@ -223,18 +237,3 @@ class DecisionMemoryStore:
             source_state=source_state,
         )
         return False
-
-
-def _positive_finite_float(value: float, field_name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError(f"{field_name} must be a positive finite number")
-    resolved = float(value)
-    if not math.isfinite(resolved) or resolved <= 0:
-        raise ValueError(f"{field_name} must be a positive finite number")
-    return resolved
-
-
-def _positive_int(value: int, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{field_name} must be a positive integer")
-    return value

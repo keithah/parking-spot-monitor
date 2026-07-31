@@ -13,6 +13,8 @@ from typing import Any, Literal
 from parking_spot_monitor.decision_memory_publication import (
     ConditionalPublication,
     SourceSignature,
+    clear_decision_memory_conflict,
+    decision_memory_conflict_files,
     link_exclusive,
     publish_decision_memory_bytes,
     read_decision_memory_source,
@@ -166,6 +168,7 @@ class DecisionMemoryLoad:
     error_type: str | None = None
     quarantined_path: Path | None = None
     source_signature: SourceSignature | None = None
+    conflict_signatures: tuple[tuple[Path, SourceSignature], ...] = ()
 
 
 def decision_memory_path(data_dir: str | Path) -> Path:
@@ -258,31 +261,96 @@ def load_decision_memory(
 ) -> DecisionMemoryLoad:
     """Load a bounded tail of decision-memory records, quarantining unsafe artifacts."""
 
+    memory_path = Path(path)
+    raw: bytes | None
+    source_signature: SourceSignature | None
     try:
-        raw, source_signature = read_decision_memory_source(Path(path), max_file_bytes)
+        raw, source_signature = read_decision_memory_source(memory_path, max_file_bytes)
     except FileNotFoundError:
-        _log(logger, "debug", "operator-decision-memory-load-missing", path=path)
-        return DecisionMemoryLoad(state="missing")
+        raw = None
+        source_signature = None
     except OverflowError:
-        memory_path = Path(path)
         quarantined = _quarantine_file(memory_path)
         _log(logger, "warning", "operator-decision-memory-quarantined", path=memory_path, quarantine_path=quarantined, phase="size", error_type="oversized")
         return DecisionMemoryLoad(state="unavailable", error_type="oversized", quarantined_path=quarantined)
     except OSError as exc:
         _log(logger, "warning", "operator-decision-memory-load-failed", path=path, phase="read", error_type=type(exc).__name__, error=str(exc))
         return DecisionMemoryLoad(state="unavailable", error_type=type(exc).__name__)
-    memory_path = Path(path)
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-        records = _records_from_payload(payload)
-    except (UnicodeError, json.JSONDecodeError, DecisionMemorySchemaError) as exc:
-        quarantined = _quarantine_file(memory_path)
-        _log(logger, "warning", "operator-decision-memory-quarantined", path=memory_path, quarantine_path=quarantined, phase="load", error_type=type(exc).__name__, error=str(exc))
-        return DecisionMemoryLoad(state="unavailable", error_type=type(exc).__name__, quarantined_path=quarantined)
+    records: list[DecisionMemoryRecord] = []
+    if raw is not None:
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            records = _records_from_payload(payload)
+        except (UnicodeError, json.JSONDecodeError, DecisionMemorySchemaError) as exc:
+            quarantined = _quarantine_file(memory_path)
+            _log(logger, "warning", "operator-decision-memory-quarantined", path=memory_path, quarantine_path=quarantined, phase="load", error_type=type(exc).__name__, error=str(exc))
+            return DecisionMemoryLoad(state="unavailable", error_type=type(exc).__name__, quarantined_path=quarantined)
 
-    bounded = tuple(records[-_positive_limit(max_records, MAX_RECORDS) :])
+    try:
+        conflicts = decision_memory_conflict_files(memory_path)
+        conflict_payloads: list[
+            tuple[Path, SourceSignature, list[DecisionMemoryRecord]]
+        ] = []
+        for conflict in conflicts:
+            conflict_raw, conflict_signature = read_decision_memory_source(
+                conflict, max_file_bytes
+            )
+            conflict_payload = json.loads(conflict_raw.decode("utf-8"))
+            conflict_payloads.append(
+                (
+                    conflict,
+                    conflict_signature,
+                    _records_from_payload(conflict_payload),
+                )
+            )
+    except (OSError, OverflowError, UnicodeError, json.JSONDecodeError, DecisionMemorySchemaError) as exc:
+        _log(
+            logger,
+            "warning",
+            "operator-decision-memory-conflict-load-failed",
+            path=memory_path,
+            error_type=type(exc).__name__,
+        )
+        return DecisionMemoryLoad(state="unavailable", error_type=type(exc).__name__)
+
+    conflict_payloads.sort(key=lambda item: (item[1][4], item[0].name))
+    conflict_records = [
+        record for _path, _signature, items in conflict_payloads for record in items
+    ]
+    conflict_signatures = [
+        (conflict, signature) for conflict, signature, _items in conflict_payloads
+    ]
+    if raw is None and not conflict_signatures:
+        _log(logger, "debug", "operator-decision-memory-load-missing", path=path)
+        return DecisionMemoryLoad(state="missing")
+
+    bounded = _deduplicated_records(
+        (*records, *conflict_records),
+        max_records=_positive_limit(max_records, MAX_RECORDS),
+    )
     _log(logger, "debug", "operator-decision-memory-loaded", path=memory_path, record_count=len(bounded), state="available")
-    return DecisionMemoryLoad(state="available", records=bounded, source_signature=source_signature)
+    return DecisionMemoryLoad(
+        state="available",
+        records=bounded,
+        source_signature=source_signature,
+        conflict_signatures=tuple(conflict_signatures),
+    )
+
+
+def clear_decision_memory_conflicts(
+    conflicts: Sequence[tuple[Path, SourceSignature]],
+) -> bool:
+    cleared = True
+    for conflict, signature in conflicts:
+        try:
+            cleared = clear_decision_memory_conflict(
+                conflict,
+                signature,
+                MAX_MEMORY_FILE_BYTES,
+            ) and cleared
+        except OSError:
+            cleared = False
+    return cleared
 
 
 def format_why_reply(
@@ -403,6 +471,23 @@ def _records_from_payload(payload: Any) -> list[DecisionMemoryRecord]:
         except DecisionMemorySchemaError:
             continue
     return records
+
+
+def _deduplicated_records(
+    records: Sequence[DecisionMemoryRecord],
+    *,
+    max_records: int,
+) -> tuple[DecisionMemoryRecord, ...]:
+    unique: dict[str, DecisionMemoryRecord] = {}
+    for record in records:
+        key = json.dumps(
+            record.to_json_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        unique[key] = record
+    return tuple(unique.values())[-max_records:]
 
 
 def _record_from_any(value: DecisionMemoryRecord | Mapping[str, Any]) -> DecisionMemoryRecord:

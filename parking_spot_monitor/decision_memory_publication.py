@@ -18,6 +18,9 @@ ExclusiveLink = Callable[[Path, Path], None]
 
 _AT_FDCWD = -100
 _RENAME_EXCHANGE = 2
+MAX_ROLLBACK_EXCHANGES = 8
+MAX_CONFLICT_FILES = 16
+MAX_CONFLICT_SCAN_ENTRIES = 4096
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _LIBC.renameat2.argtypes = [
     ctypes.c_int,
@@ -175,13 +178,55 @@ def _restore_latest_canonical(
     canonical = read_source_signature(path, max_file_bytes)
     if not _same_content_identity(canonical, current):
         return True
-    while True:
+    for _attempt in range(MAX_ROLLBACK_EXCHANGES):
         exchange(temporary, path)
         _fsync_directory(path.parent)
         swapped_out = read_source_signature(temporary, max_file_bytes)
         if _same_content_identity(swapped_out, current):
             return True
         current, desired = desired, swapped_out
+    conflict = temporary.with_suffix(".conflict")
+    os.replace(temporary, conflict)
+    _fsync_directory(path.parent)
+    return False
+
+
+def decision_memory_conflict_files(path: Path) -> tuple[Path, ...]:
+    prefix = f".{path.name}."
+    conflicts: list[Path] = []
+    entries = 0
+    try:
+        with os.scandir(path.parent) as iterator:
+            for item in iterator:
+                entries += 1
+                if entries > MAX_CONFLICT_SCAN_ENTRIES:
+                    raise OSError("decision memory conflict scan exceeds entry limit")
+                if not item.name.startswith(prefix) or not item.name.endswith(".conflict"):
+                    continue
+                if not item.is_file(follow_symlinks=False):
+                    raise OSError("decision memory conflict must be a regular file")
+                conflicts.append(path.parent / item.name)
+                if len(conflicts) > MAX_CONFLICT_FILES:
+                    raise OverflowError("too many decision memory conflict files")
+    except FileNotFoundError:
+        return ()
+    return tuple(sorted(conflicts, key=lambda item: item.name))
+
+
+def clear_decision_memory_conflict(
+    path: Path,
+    signature: SourceSignature,
+    max_file_bytes: int,
+) -> bool:
+    try:
+        current = read_source_signature(path, max_file_bytes)
+    except FileNotFoundError:
+        return True
+    if not _same_content_identity(current, signature):
+        return False
+    path.unlink()
+    _fsync_directory(path.parent)
+    return True
 
 
 def _source_stat_fields(value: os.stat_result) -> tuple[int, int, int, int, int]:

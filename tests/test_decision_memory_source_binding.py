@@ -246,7 +246,7 @@ def test_rollback_restores_newer_canonical_writer_without_stranding_temp(
     ]
 
 
-def test_rollback_exhaustion_restores_latest_external_writer_to_canonical(
+def test_rollback_exhaustion_preserves_latest_external_writer_for_recovery(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -269,17 +269,17 @@ def test_rollback_exhaustion_restores_latest_external_writer_to_canonical(
     monkeypatch.setattr(memory, "_conditional_exchange", replace_before_every_exchange)
 
     assert store.flush() is False
-    assert exchange_count == 13
-    assert [item.summary for item in load_decision_memory(path).records] == [
-        "external-12"
-    ]
+    assert exchange_count == 9
+    assert "external-9" in {
+        item.summary for item in load_decision_memory(path).records
+    }
     assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
+    assert list(tmp_path.glob(f".{path.name}.*.conflict"))
     monkeypatch.undo()
     assert store.flush()
-    assert [item.summary for item in load_decision_memory(path).records] == [
-        "external-12",
-        "local___",
-    ]
+    summaries = {item.summary for item in load_decision_memory(path).records}
+    assert {"external-9", "local___"} <= summaries
+    assert not list(tmp_path.glob(f".{path.name}.*.conflict"))
 
 
 def test_rollback_churn_never_falls_back_to_nonconditional_replace(
@@ -328,9 +328,100 @@ def test_rollback_churn_never_falls_back_to_nonconditional_replace(
     monkeypatch.setattr(publication.os, "replace", replace_during_fallback)
 
     assert store.flush() is False
-    assert exchange_count == 11
+    assert exchange_count == 9
     assert fallback_attempts == 0
-    assert [item.summary for item in load_decision_memory(path).records] == [
-        "external-final"
-    ]
+    assert "external-9" in {
+        item.summary for item in load_decision_memory(path).records
+    }
+    assert list(tmp_path.glob(f".{path.name}.*.conflict"))
     assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
+
+
+def test_sustained_writer_churn_returns_bounded_and_recovers_conflict(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_exchange = memory._conditional_exchange
+    exchange_count = 0
+
+    def replace_before_every_exchange(source: Path, destination: Path) -> None:
+        nonlocal exchange_count
+        exchange_count += 1
+        _write_memory(path, (_record(f"external-{exchange_count}"),))
+        real_exchange(source, destination)
+
+    monkeypatch.setattr(memory, "_conditional_exchange", replace_before_every_exchange)
+
+    assert store.flush() is False
+    assert exchange_count <= 10
+    assert "external-9" in {
+        item.summary for item in load_decision_memory(path).records
+    }
+    assert list(tmp_path.glob(f".{path.name}.*.conflict"))
+    assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
+
+    monkeypatch.undo()
+    restarted = _store(path)
+    assert "external-9" in {item.summary for item in restarted.records}
+
+    def fail_reconciliation_publication(_source: Path, _destination: Path) -> None:
+        raise OSError("injected reconciliation publication failure")
+
+    monkeypatch.setattr(
+        memory,
+        "_conditional_exchange",
+        fail_reconciliation_publication,
+    )
+    assert restarted.append(_record("after-restart"), durability="immediate") is False
+    assert list(tmp_path.glob(f".{path.name}.*.conflict"))
+    assert "external-9" in {
+        item.summary for item in load_decision_memory(path).records
+    }
+    monkeypatch.undo()
+    assert restarted.flush()
+    assert not list(tmp_path.glob(f".{path.name}.*.conflict"))
+    summaries = {item.summary for item in load_decision_memory(path).records}
+    assert {"external-9", "after-restart"} <= summaries
+
+
+def test_conflict_fsync_failure_keeps_displaced_writer_readable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.decision_memory_publication as publication
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_exchange = memory._conditional_exchange
+    real_fsync_directory = publication._fsync_directory
+    exchange_count = 0
+
+    def replace_before_every_exchange(source: Path, destination: Path) -> None:
+        nonlocal exchange_count
+        exchange_count += 1
+        _write_memory(path, (_record(f"external-{exchange_count}"),))
+        real_exchange(source, destination)
+
+    def fail_after_conflict_publish(directory: Path) -> None:
+        real_fsync_directory(directory)
+        if list(directory.glob(f".{path.name}.*.conflict")):
+            raise OSError("injected conflict directory fsync failure")
+
+    monkeypatch.setattr(memory, "_conditional_exchange", replace_before_every_exchange)
+    monkeypatch.setattr(publication, "_fsync_directory", fail_after_conflict_publish)
+
+    assert store.flush() is False
+    assert exchange_count <= 10
+    assert "external-9" in {
+        item.summary for item in load_decision_memory(path).records
+    }
+    assert list(tmp_path.glob(f".{path.name}.*.conflict"))
