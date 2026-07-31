@@ -60,11 +60,16 @@ def test_deployment_documents_low_latency_profile_and_healthy_host_scope() -> No
     for behavior in (
         "authoritative final result",
         "independently of history enrichment",
-        "durable text fallback",
+        "retained-snapshot preparation and outbox enqueue happen without Matrix network I/O",
+        "recognized snapshot-preparation failure durably persists a text-only outbox record under "
+        "the same event ID",
+        "delivery worker drains text before upload and image",
         "external host starvation invalidates the latency target",
         "unrelated containers require separate operator authorization",
     ):
         assert behavior in runbook
+
+    assert "Matrix sends the base occupied text before snapshot preparation" not in runbook
 
 
 def test_deployment_documents_exact_conservative_profile_rollback() -> None:

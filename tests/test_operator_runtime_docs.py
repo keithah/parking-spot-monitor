@@ -26,6 +26,23 @@ def test_first_check_artifact_guidance_and_structured_events_are_documented() ->
     assert "startup-ready" in readme or "capture-frame-written" in readme
 
 
+def test_readme_documents_occupied_alert_outbox_durability_and_worker_order() -> None:
+    readme = " ".join(read_tracked("README.md").split())
+
+    assert_contains_all(
+        readme,
+        [
+            "open-spot and occupied-spot alerts are persisted to the local Matrix outbox before "
+            "Matrix network I/O",
+            "recognized occupied snapshot-preparation failure is durably persisted as a text-only "
+            "outbox record under the same event ID",
+            "delivery worker sends text before the upload and image phases",
+        ],
+    )
+    direct_occupied = r"occupied-spot alerts.{0,200}direct Matrix delivery paths"
+    assert re.search(direct_occupied, readme, flags=re.IGNORECASE) is None
+
+
 def test_readme_local_configuration_documents_adaptive_resource_semantics() -> None:
     section = read_readme_section("Local configuration")
     normalized = " ".join(section.split())
