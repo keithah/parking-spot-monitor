@@ -7,6 +7,7 @@ import pytest
 
 from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
+from parking_spot_monitor.runtime_loop_resources import paced_sleep_seconds
 from parking_spot_monitor.runtime_resource_policy import (
     RuntimeResourceDecision,
     RuntimeResourcePolicyState,
@@ -31,7 +32,11 @@ def settings():
     return loaded.model_copy(
         update={
             "runtime": loaded.runtime.model_copy(
-                update={"frame_interval_seconds": 15.0}
+                update={
+                    "frame_interval_seconds": 30.0,
+                    "occupied_frame_interval_seconds": 8.0,
+                    "stable_frame_interval_seconds": 60.0,
+                }
             )
         }
     )
@@ -65,13 +70,6 @@ def decide(settings, state: RuntimeState, **overrides) -> RuntimeResourceDecisio
             ),
             "partial-streak",
         ),
-        (
-            SpotOccupancyState(
-                status=OccupancyStatus.OCCUPIED,
-                miss_streak=1,
-            ),
-            "partial-streak",
-        ),
     ],
 )
 def test_uncertain_occupancy_uses_active_cadence_and_resets_settling(
@@ -80,46 +78,52 @@ def test_uncertain_occupancy_uses_active_cadence_and_resets_settling(
     decision = decide(settings, runtime_state(state))
 
     assert decision == RuntimeResourceDecision(
-        interval_seconds=15.0,
+        interval_seconds=30.0,
         reason=reason,
         stable_success_count=0,
     )
 
 
-@pytest.mark.parametrize(
-    "state",
-    [
+def test_confirmed_occupied_spot_uses_occupied_cadence(settings) -> None:
+    state = runtime_state(
+        SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=3)
+    )
+
+    assert decide(settings, state) == RuntimeResourceDecision(
+        interval_seconds=8.0,
+        reason="occupied",
+        stable_success_count=0,
+    )
+
+
+def test_partial_release_streak_stays_on_occupied_cadence(settings) -> None:
+    state = runtime_state(
         SpotOccupancyState(
             status=OccupancyStatus.OCCUPIED,
-            hit_streak=3,
-        ),
-        SpotOccupancyState(
-            status=OccupancyStatus.EMPTY,
-            miss_streak=3,
-        ),
-    ],
-)
-def test_confirmed_occupancy_reaches_stable_cadence_after_settle_frames(
-    settings, state: SpotOccupancyState
-) -> None:
-    decision = decide(settings, runtime_state(state))
-
-    assert decision == RuntimeResourceDecision(
-        interval_seconds=60.0,
-        reason="stable",
-        stable_success_count=3,
+            miss_streak=1,
+        )
     )
+
+    assert decide(settings, state) == RuntimeResourceDecision(8.0, "occupied", 0)
+
+
+def test_all_confirmed_empty_spots_reach_stable_cadence(settings) -> None:
+    state = runtime_state(
+        SpotOccupancyState(status=OccupancyStatus.EMPTY, miss_streak=3)
+    )
+
+    assert decide(settings, state) == RuntimeResourceDecision(60.0, "stable", 3)
 
 
 @pytest.mark.parametrize(
     ("state", "expected_reason"),
     [
         (
-            SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=3),
+            SpotOccupancyState(status=OccupancyStatus.EMPTY, hit_streak=3),
             "partial-streak",
         ),
         (
-            SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=4),
+            SpotOccupancyState(status=OccupancyStatus.EMPTY, hit_streak=4),
             "stable",
         ),
         (
@@ -157,17 +161,17 @@ def test_all_spots_must_be_confirmed_before_stable_cadence(settings) -> None:
 
 def test_stable_observation_remains_active_while_settling(settings) -> None:
     state = runtime_state(
-        SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=3)
+        SpotOccupancyState(status=OccupancyStatus.EMPTY, miss_streak=3)
     )
 
     decision = decide(settings, state, previous_stable_success_count=0)
 
-    assert decision == RuntimeResourceDecision(15.0, "settling", 1)
+    assert decision == RuntimeResourceDecision(30.0, "settling", 1)
 
 
 def test_stable_success_count_continues_after_settling(settings) -> None:
     state = runtime_state(
-        SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=4)
+        SpotOccupancyState(status=OccupancyStatus.EMPTY, miss_streak=4)
     )
 
     decision = decide(settings, state, previous_stable_success_count=3)
@@ -176,23 +180,34 @@ def test_stable_success_count_continues_after_settling(settings) -> None:
 
 
 @pytest.mark.parametrize(
-    ("overrides", "reason"),
+    ("state", "overrides", "reason"),
     [
-        ({"degraded": True}, "degraded"),
-        ({"frame_had_transition": True}, "transition-settle"),
-        ({"frame_has_weak_presence": True}, "weak-presence"),
+        (
+            SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=3),
+            {"degraded": True},
+            "degraded",
+        ),
+        (
+            SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=3),
+            {"frame_had_transition": True},
+            "transition-settle",
+        ),
+        (
+            SpotOccupancyState(status=OccupancyStatus.EMPTY, miss_streak=3),
+            {"frame_has_weak_presence": True},
+            "weak-presence",
+        ),
     ],
 )
 def test_non_stable_frame_conditions_reset_settling(
-    settings, overrides: dict[str, bool], reason: str
+    settings,
+    state: SpotOccupancyState,
+    overrides: dict[str, bool],
+    reason: str,
 ) -> None:
-    state = runtime_state(
-        SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=3)
-    )
+    decision = decide(settings, runtime_state(state), **overrides)
 
-    decision = decide(settings, state, **overrides)
-
-    assert decision == RuntimeResourceDecision(15.0, reason, 0)
+    assert decision == RuntimeResourceDecision(30.0, reason, 0)
 
 
 def test_disabled_adaptation_always_uses_active_cadence(settings) -> None:
@@ -212,7 +227,7 @@ def test_disabled_adaptation_always_uses_active_cadence(settings) -> None:
         frame_has_weak_presence=True,
     )
 
-    assert decision == RuntimeResourceDecision(15.0, "adaptive-disabled", 0)
+    assert decision == RuntimeResourceDecision(30.0, "adaptive-disabled", 0)
 
 
 def test_disabled_adaptation_tracks_stable_successes_for_verification(settings) -> None:
@@ -233,31 +248,29 @@ def test_disabled_adaptation_tracks_stable_successes_for_verification(settings) 
         previous_stable_success_count=2,
     )
 
-    assert decision == RuntimeResourceDecision(15.0, "adaptive-disabled", 3)
+    assert decision == RuntimeResourceDecision(30.0, "adaptive-disabled", 3)
 
 
-@pytest.mark.parametrize("previous_stable_success_count", [0, 2])
-def test_equal_active_and_stable_intervals_preserve_fixed_cadence(
-    settings, previous_stable_success_count: int
+def test_adaptive_occupied_cadence_subtracts_elapsed_work_when_active_and_stable_intervals_match(
+    settings,
 ) -> None:
-    fixed = settings.model_copy(
+    equal_intervals = settings.model_copy(
         update={
             "runtime": settings.runtime.model_copy(
-                update={"stable_frame_interval_seconds": 15.0}
+                update={"stable_frame_interval_seconds": 30.0}
             )
         }
     )
-    state = runtime_state(
-        SpotOccupancyState(status=OccupancyStatus.OCCUPIED, hit_streak=3)
-    )
 
-    decision = decide(
-        fixed,
-        state,
-        previous_stable_success_count=previous_stable_success_count,
+    assert (
+        paced_sleep_seconds(
+            equal_intervals,
+            RuntimeResourceDecision(8.0, "occupied", 0),
+            iteration_started_at=100.0,
+            now_monotonic=102.0,
+        )
+        == 6.0
     )
-
-    assert decision.interval_seconds == 15.0
 
 
 def test_resource_policy_state_defaults_and_policy_values_are_immutable() -> None:

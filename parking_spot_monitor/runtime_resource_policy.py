@@ -11,6 +11,7 @@ RuntimeResourceReason = Literal[
     "degraded",
     "transition-settle",
     "unknown",
+    "occupied",
     "partial-streak",
     "weak-presence",
     "settling",
@@ -20,6 +21,7 @@ RuntimeResourceReason = Literal[
 
 class _RuntimeCadenceSettings(Protocol):
     frame_interval_seconds: float
+    occupied_frame_interval_seconds: float
     adaptive_polling_enabled: bool
     stable_frame_interval_seconds: float
     stable_settle_frames: int
@@ -80,6 +82,13 @@ def decide_runtime_interval(
     if not states or any(state.status is OccupancyStatus.UNKNOWN for state in states):
         return _active_decision(
             active_interval, "unknown" if adaptive_enabled else "adaptive-disabled"
+        )
+    if adaptive_enabled and any(
+        state.status is OccupancyStatus.OCCUPIED for state in states
+    ):
+        return _active_decision(
+            settings.runtime.occupied_frame_interval_seconds,
+            "occupied",
         )
     if any(
         _has_partial_streak(

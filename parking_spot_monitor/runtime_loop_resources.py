@@ -156,11 +156,7 @@ def paced_sleep_seconds(
     iteration_started_at: float,
     now_monotonic: float,
 ) -> float:
-    if (
-        not settings.runtime.adaptive_polling_enabled
-        or settings.runtime.stable_frame_interval_seconds
-        == settings.runtime.frame_interval_seconds
-    ):
+    if not settings.runtime.adaptive_polling_enabled:
         return decision.interval_seconds
     return remaining_sleep_seconds(
         interval_seconds=decision.interval_seconds,
