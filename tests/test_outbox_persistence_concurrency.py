@@ -113,6 +113,67 @@ def test_concurrent_duplicate_id_enqueues_persist_once(tmp_path: Path, monkeypat
     assert LocalOutbox(outbox.path).list_records() == [records[0]]
 
 
+def test_two_instances_merge_distinct_enqueues_in_commit_order(tmp_path: Path) -> None:
+    path = tmp_path / "matrix-outbox.json"
+    first_instance = LocalOutbox(path)
+    second_instance = LocalOutbox(path)
+
+    first = first_instance.enqueue(AlertIntent(event_id="instance-a", phase="text", body="first"))
+    second = second_instance.enqueue(AlertIntent(event_id="instance-b", phase="text", body="second"))
+
+    assert second_instance.list_records() == [first, second]
+    assert LocalOutbox(path).list_records() == [first, second]
+
+
+def test_two_instances_merge_disjoint_transitions_without_reordering(tmp_path: Path) -> None:
+    path = tmp_path / "matrix-outbox.json"
+    seeded = LocalOutbox(path)
+    first = seeded.enqueue(AlertIntent(event_id="transition-a", phase="text", body="first"))
+    second = seeded.enqueue(AlertIntent(event_id="transition-b", phase="text", body="second"))
+    first_instance = LocalOutbox(path)
+    second_instance = LocalOutbox(path)
+
+    retrying = first_instance.mark_retrying(first.id, reason="timeout")
+    delivered = second_instance.mark_delivered(second.id)
+
+    assert LocalOutbox(path).list_records() == [retrying, delivered]
+
+
+def test_two_instances_reject_conflicting_same_record_transition(tmp_path: Path) -> None:
+    path = tmp_path / "matrix-outbox.json"
+    seeded = LocalOutbox(path)
+    record = seeded.enqueue(AlertIntent(event_id="transition-conflict", phase="text", body="body"))
+    first_instance = LocalOutbox(path)
+    second_instance = LocalOutbox(path)
+    delivered = first_instance.mark_delivered(record.id)
+
+    with pytest.raises(OutboxPersistenceError, match="concurrent outbox record mutation"):
+        second_instance.mark_retrying(record.id, reason="timeout")
+
+    assert LocalOutbox(path).list_records() == [delivered]
+
+
+def test_two_instances_reconcile_memory_after_merged_post_commit_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "matrix-outbox.json"
+    first_instance = LocalOutbox(path)
+    second_instance = LocalOutbox(path)
+    first = first_instance.enqueue(AlertIntent(event_id="post-commit-a", phase="text", body="first"))
+    second_intent = AlertIntent(event_id="post-commit-b", phase="text", body="second")
+
+    def fail_directory_sync(_path: Path) -> None:
+        raise OSError("directory sync failed after replace")
+
+    monkeypatch.setattr(outbox_module, "_fsync_directory", fail_directory_sync)
+    with pytest.raises(OutboxPersistenceError, match="failed to persist local outbox record"):
+        second_instance.enqueue(second_intent)
+
+    disk_records = LocalOutbox(path).list_records()
+    assert second_instance.list_records() == disk_records
+    assert [record.id for record in disk_records] == [first.id, derive_outbox_item_id(second_intent)]
+
+
 def test_mixed_enqueue_and_transition_share_one_mutation_lock(tmp_path: Path, monkeypatch) -> None:
     outbox = LocalOutbox(tmp_path / "matrix-outbox.json")
     existing = outbox.enqueue(AlertIntent(event_id="event-existing", phase="text", body="existing"))

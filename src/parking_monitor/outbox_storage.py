@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import stat
 import tempfile
-from typing import Any, BinaryIO, Iterator
+from typing import Any, BinaryIO
 
+from parking_monitor.outbox_locking import outbox_transaction
 from parking_monitor.outbox_models import (
     JsonValue,
     OutboxPersistenceError,
@@ -27,6 +26,7 @@ from parking_monitor.outbox_models import (
     parse_utc_timestamp,
     require_mapping,
 )
+from parking_monitor.outbox_reconciliation import merge_records
 
 MAX_QUARANTINE_FILES = 20
 MAX_OUTBOX_FILE_BYTES = 5_000_000
@@ -84,6 +84,7 @@ def load_records(
     max_bytes: int = MAX_OUTBOX_FILE_BYTES,
     max_record_bytes: int = MAX_OUTBOX_RECORD_BYTES,
     fsync_directory: Callable[[Path], None],
+    repair_records: bool = True,
 ) -> tuple[list[OutboxRecord], RecoveryResult]:
     try:
         descriptor = os.open(
@@ -148,7 +149,7 @@ def load_records(
             event = _quarantine_json(path, item, reason="malformed_record", fsync_directory=fsync_directory)
             recovery = recovery.with_event(event)
     recovery = recovery.with_recovered_count(len(records))
-    if recovery.quarantined_count:
+    if recovery.quarantined_count and repair_records:
         _repair_records(
             path,
             records,
@@ -173,8 +174,33 @@ def persist_records(
         max_bytes=max_bytes,
         max_record_bytes=max_record_bytes,
     )
-    with _outbox_transaction(path):
+    with outbox_transaction(path):
         _persist_serialized(path, serialized, fsync_directory=fsync_directory)
+
+
+def reconcile_records(
+    path: Path,
+    base_records: list[OutboxRecord],
+    proposed_records: list[OutboxRecord],
+    *,
+    retention: OutboxRetentionPolicy,
+    max_bytes: int = MAX_OUTBOX_FILE_BYTES,
+    max_record_bytes: int = MAX_OUTBOX_RECORD_BYTES,
+    fsync_directory: Callable[[Path], None],
+) -> list[OutboxRecord]:
+    """Merge one instance's mutation into the latest canonical snapshot."""
+    with outbox_transaction(path):
+        current, _recovery = load_records(
+            path,
+            max_bytes=max_bytes,
+            max_record_bytes=max_record_bytes,
+            fsync_directory=fsync_directory,
+            repair_records=False,
+        )
+        merged = apply_retention(merge_records(base_records, proposed_records, current), retention)
+        serialized = _serialized_document(merged, max_bytes=max_bytes, max_record_bytes=max_record_bytes)
+        _persist_serialized(path, serialized, fsync_directory=fsync_directory)
+        return merged
 
 
 def _persist_serialized(
@@ -225,7 +251,7 @@ def _repair_records(
         max_bytes=max_bytes,
         max_record_bytes=max_record_bytes,
     )
-    with _outbox_transaction(path):
+    with outbox_transaction(path):
         try:
             current = os.stat(path, follow_symlinks=False)
         except OSError as exc:
@@ -233,30 +259,6 @@ def _repair_records(
         if _stat_signature(current) != _stat_signature(source_stat):
             raise OutboxPersistenceError("local outbox changed before recovery repair")
         _persist_serialized(path, serialized, fsync_directory=fsync_directory)
-
-
-@contextmanager
-def _outbox_transaction(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(f".{path.name}.lock")
-    try:
-        descriptor = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-    except OSError as exc:
-        raise OutboxPersistenceError("failed to lock local outbox") from exc
-    try:
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise OutboxPersistenceError("local outbox lock must be a regular file")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-        except OSError as exc:
-            raise OutboxPersistenceError("failed to lock local outbox") from exc
-        yield
-    finally:
-        os.close(descriptor)
 
 
 def apply_retention(
