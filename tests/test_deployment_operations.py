@@ -433,6 +433,48 @@ def test_rollback_uses_bundled_model_dir_and_external_environment_file(
     )
 
 
+def test_rollback_failure_restores_both_distinct_model_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        deployment_operations, "wait_for_fresh_health", lambda *_args, **_kwargs: None
+    )
+    bundle = _bundle(tmp_path)
+    active_model_dir = tmp_path / "active-models"
+    rollback_model_dir = tmp_path / "rollback-models"
+    active_model_dir.mkdir()
+    rollback_model_dir.mkdir()
+    active_model = active_model_dir / "yolov8n.pt"
+    prior_rollback_model = rollback_model_dir / "yolov8n.pt"
+    active_model.write_bytes(b"active-model")
+    prior_rollback_model.write_bytes(b"unrelated-model")
+    config_file = tmp_path / "operator-config.yaml"
+    config_file.write_bytes(b"active-config")
+    env_file = tmp_path / "operator.env"
+    env_file.write_bytes(b"active-env")
+    (tmp_path / "data").mkdir()
+    runner = FakeRunner()
+    runner.rollback_image_exists = True
+    runner.fail_recreate_once = True
+    runner.model_dirs[env_file] = active_model_dir
+    runner.model_dirs[bundle / ".env"] = rollback_model_dir
+
+    with pytest.raises(deployment_operations.DeploymentError, match="recreate failure"):
+        deployment_operations.rollback_operation(
+            runner,
+            bundle,
+            tmp_path / "data",
+            config_file=config_file,
+            env_file=env_file,
+        )
+
+    assert config_file.read_bytes() == b"active-config"
+    assert env_file.read_bytes() == b"active-env"
+    assert active_model.read_bytes() == b"active-model"
+    assert prior_rollback_model.read_bytes() == b"unrelated-model"
+
+
 def test_restore_start_failure_reactivates_preserved_data(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
