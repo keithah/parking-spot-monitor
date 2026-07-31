@@ -288,10 +288,105 @@ docker compose logs --since 10m parking-spot-monitor \
   | grep '"event":"capture-frame-written"'
 ```
 
+### Low-latency production profile
+
+This is an explicit production override, not a change to the compatible defaults in `config.yaml.example`. Use it when confirmed departure detection needs to meet a target of 30 seconds on a healthy host. The target covers the service's transition-confirmation telemetry; camera availability, Matrix network delivery, and an externally starved host are separate concerns.
+
+Preflight the host before changing `config.yaml`:
+
+```sh
+free -h
+df -h data
+docker compose ps
+container_id="$(docker compose ps -q parking-spot-monitor)"
+if [ -n "$container_id" ]; then
+  docker stats --no-stream "$container_id"
+fi
+```
+
+Confirm that the host has usable available memory and disk space, that swap use is understood, and, for an existing service, that CPU and memory are not already saturated. Investigate an unhealthy service or sustained resource pressure before applying a faster capture cadence, because external host starvation invalidates the latency target. This profile authorizes changes only to the parking monitor: unrelated containers require separate operator authorization, so do not stop, restart, reconfigure, or resource-limit them as part of this procedure.
+
+Before editing, record the seven current values in the deployment change record or create the protected backup described under [Backup and recovery](#backup-and-recovery). Do not make a second config copy inside the checkout: only `config.yaml` itself is guaranteed to be ignored by Git. Apply these overrides to the matching sections of the operator-owned `config.yaml`:
+
+```yaml
+stream:
+  capture_timeout_seconds: 4
+
+occupancy:
+  confirm_frames: 2
+  release_frames: 2
+
+runtime:
+  frame_interval_seconds: 8
+  occupied_frame_interval_seconds: 8
+  adaptive_polling_enabled: true
+  stable_frame_interval_seconds: 12
+```
+
+Keep the other operator-specific keys, including stream environment names, polygons, Matrix routing, and detector thresholds. Validate before restart, and do not apply a configuration that fails validation:
+
+```sh
+docker compose config --quiet
+docker compose run --rm parking-spot-monitor \
+  python -m parking_spot_monitor \
+  --config /config/config.yaml \
+  --data-dir /data \
+  --validate-config
+docker compose restart parking-spot-monitor
+docker compose ps
+docker compose logs --tail 100 parking-spot-monitor
+```
+
+Every iteration begins with the primary low-resolution stream. When every spot is stably empty, the next primary capture uses the 12-second stable cadence; occupied, unknown, degraded, transitioning, partially confirmed, or weak-presence states use eight seconds. Thus occupied monitoring stays at eight seconds instead of slowing to the empty-stable cadence.
+
+High-resolution verification remains conditional. Weak primary evidence that could enter occupied state triggers entry verification. For a currently occupied spot, missing primary evidence triggers release verification on the frame that would reach `release_frames`. Periodic verification still follows `stream.escalation_verification_seconds`. When an iteration escalates successfully, the high-resolution detection is the authoritative final result for that iteration's occupancy decision, state transition, and event snapshot; it is not combined with the primary result.
+
+A confirmed occupied transition creates its base alert independently of history enrichment or profile matching. History or occupied-image preparation failures degrade that optional context without cancelling the confirmed alert. Matrix sends the base occupied text before snapshot preparation, so a snapshot preparation or upload failure leaves a durable text fallback when that text send succeeded. Treat the warning and degraded health as work to repair; do not infer that image delivery succeeded.
+
+### Validate departure latency
+
+After restart, confirm the service is healthy and observe representative real departures without moving the camera, modifying polygons, or disrupting other containers:
+
+```sh
+docker compose exec -T parking-spot-monitor \
+  python -m parking_spot_monitor.healthcheck \
+  --health-file /data/health.json \
+  --max-age-seconds 120
+docker compose logs --since 30m parking-spot-monitor \
+  | grep '"event":"occupancy-transition-latency"' \
+  | grep '"transition_direction":"occupied-to-empty"'
+docker compose logs --since 30m parking-spot-monitor \
+  | grep '"event":"capture-loop-cadence-changed"'
+```
+
+For each representative departure, check that `opposite_evidence_to_confirmation_seconds` is at most 30 seconds and retain the same event's `primary_capture_seconds`, optional `verification_capture_seconds`, `cadence_seconds`, and `cadence_reason`. The metric starts at the last contrary occupied evidence, so it is a conservative runtime proxy rather than a wall-clock timestamp supplied by a person watching the curb. Confirm that occupied/active decisions report an eight-second cadence and that only stable all-empty decisions report 12 seconds. Record host `free -h` and bounded service-only `docker stats --no-stream` samples alongside the transition events. A capture failure, decoder timeout, overloaded host, camera outage, or materially different workload invalidates that sample; repair the condition and repeat instead of claiming the target.
+
+### Restore conservative settings
+
+For an immediate fixed-cadence diagnostic rollback, set `adaptive_polling_enabled: false`; the loop then uses `frame_interval_seconds` regardless of occupied or stable state. To restore the tracked conservative transition behavior, set these values in the operator-owned `config.yaml`:
+
+```yaml
+stream:
+  capture_timeout_seconds: 15
+
+occupancy:
+  confirm_frames: 3
+  release_frames: 3
+
+runtime:
+  frame_interval_seconds: 30
+  occupied_frame_interval_seconds: 30
+  adaptive_polling_enabled: true
+  stable_frame_interval_seconds: 60
+```
+
+You may instead omit `occupied_frame_interval_seconds`; compatibility semantics make it follow `frame_interval_seconds`, which is 30 seconds in this rollback. If a protected pre-change backup contains deliberately different conservative values, restore that configuration through the documented backup and recovery workflow instead. In either case, rerun the validation command above, restart only `parking-spot-monitor`, confirm fresh health, and retain the latency-profile logs with the rollback record.
+
 The resource controls are:
 
-- `runtime.frame_interval_seconds`: active or uncertain polling interval; production example is 30 seconds.
-- `runtime.stable_frame_interval_seconds`: stable polling interval; production example is 60 seconds.
+- `runtime.frame_interval_seconds`: active or uncertain polling interval; compatible default is 30 seconds.
+- `runtime.occupied_frame_interval_seconds`: occupied polling interval; when omitted it follows the active interval.
+- `runtime.stable_frame_interval_seconds`: stable all-empty polling interval; compatible default is 60 seconds.
 - `runtime.stable_settle_frames`: consecutive stable frames required before slower polling.
 - `runtime.debug_overlay_interval_seconds`: periodic overlay interval; transitions still force an overlay.
 - `stream.escalation_verification_seconds`: periodic high-resolution verification interval; transitions can still escalate sooner.
@@ -336,8 +431,6 @@ Decision-memory durability has two classes. State transitions, alerts, command o
 Vehicle-history health remains a streamed archive reconciliation behind the existing revision/TTL cache. In-process mutations invalidate it immediately; external filesystem replacement may remain stale only until the TTL expires. Profile summaries reuse the effective closed records already loaded for that request. Full archive reconciliation and on-demand analytics scans remain bounded and intentionally unchanged because there is no current recent-session hot-path consumer.
 
 Canonical vehicle-history full JPEGs are published without re-encoding: copy-on-write reflink is preferred, with an exact bounded descriptor copy as fallback. Both yield an inode independently owned from the writable capture source; hardlinks are not used. Matrix retry evidence stores the exact validated derivative bytes selected for upload. Startup and the next applicable retention/capture operation recover indexed interrupted cleanup. Preserve `.owned-disposals.json` and `.upload-derivatives`, and keep these application-owned directories free of concurrent noncooperating writers.
-
-To restore the former faster active polling, set `frame_interval_seconds` to 15 and restart. To disable adaptive cadence entirely, set `adaptive_polling_enabled: false`. Keep the stable interval greater than or equal to the active interval.
 
 ### 2026-07-29 production rollout evidence
 

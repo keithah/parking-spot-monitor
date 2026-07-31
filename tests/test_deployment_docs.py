@@ -38,6 +38,75 @@ def test_deployment_runbook_is_discoverable_and_actionable() -> None:
         assert required in runbook
 
 
+def test_deployment_documents_low_latency_profile_and_healthy_host_scope() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+    required_fragments = (
+        "capture_timeout_seconds: 4",
+        "frame_interval_seconds: 8",
+        "occupied_frame_interval_seconds: 8",
+        "stable_frame_interval_seconds: 12",
+        "confirm_frames: 2",
+        "release_frames: 2",
+        "healthy host",
+        "low-resolution",
+        "high-resolution verification",
+        "30 seconds",
+        "docker stats --no-stream",
+        "free -h",
+    )
+    for fragment in required_fragments:
+        assert fragment in runbook
+
+    for behavior in (
+        "authoritative final result",
+        "independently of history enrichment",
+        "durable text fallback",
+        "external host starvation invalidates the latency target",
+        "unrelated containers require separate operator authorization",
+    ):
+        assert behavior in runbook
+
+
+def test_deployment_documents_exact_conservative_profile_rollback() -> None:
+    runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
+    rollback = runbook.split("### Restore conservative settings", 1)[1].split("\n### ", 1)[0]
+
+    for prior_value in (
+        "capture_timeout_seconds: 15",
+        "frame_interval_seconds: 30",
+        "occupied_frame_interval_seconds: 30",
+        "stable_frame_interval_seconds: 60",
+        "confirm_frames: 3",
+        "release_frames: 3",
+    ):
+        assert prior_value in rollback
+    assert "omit `occupied_frame_interval_seconds`" in rollback
+    assert "adaptive_polling_enabled: false" in rollback
+
+
+def test_tracked_example_keeps_compatible_defaults_not_low_latency_profile() -> None:
+    config = Path("config.yaml.example").read_text(encoding="utf-8")
+
+    for compatible_default in (
+        "capture_timeout_seconds: 15",
+        "frame_interval_seconds: 30",
+        "occupied_frame_interval_seconds: 30",
+        "stable_frame_interval_seconds: 60",
+        "confirm_frames: 3",
+        "release_frames: 3",
+    ):
+        assert compatible_default in config
+    for production_override in (
+        "capture_timeout_seconds: 4",
+        "frame_interval_seconds: 8",
+        "occupied_frame_interval_seconds: 8",
+        "stable_frame_interval_seconds: 12",
+        "confirm_frames: 2",
+        "release_frames: 2",
+    ):
+        assert production_override not in config
+
+
 def test_operator_docs_name_current_locked_docker_stages() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     runbook = Path("docs/deployment.md").read_text(encoding="utf-8")

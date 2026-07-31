@@ -57,6 +57,21 @@ def test_readme_local_configuration_documents_adaptive_resource_semantics() -> N
     )
 
 
+def test_readme_routes_operators_from_compatible_defaults_to_low_latency_profile() -> None:
+    section = read_readme_section("Local configuration")
+    normalized = " ".join(section.split())
+
+    assert_contains_all(
+        normalized,
+        [
+            "capture timeout is `15` seconds",
+            "is omitted, occupied cadence follows the active cadence",
+            "confirmation and release thresholds are `3` frames",
+            "[low-latency production profile](docs/deployment.md#low-latency-production-profile)",
+        ],
+    )
+
+
 def test_readme_distinguishes_primary_publication_from_cadence_limited_runtime_overlays() -> None:
     readme = read_tracked("README.md")
     normalized = " ".join(readme.split())

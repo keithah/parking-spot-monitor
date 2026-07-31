@@ -40,6 +40,8 @@ The copied `config.yaml` is ignored by Git and operator-owned. Runtime code does
 - `RTSP_URL_4K`
 - `MATRIX_ACCESS_TOKEN`
 
+The tracked example intentionally keeps the compatible, conservative settings: the capture timeout is `15` seconds, active and explicit occupied cadence are `30` seconds, stable cadence is `60` seconds, and confirmation and release thresholds are `3` frames. If `runtime.occupied_frame_interval_seconds` is omitted, occupied cadence follows the active cadence rather than selecting a new implicit rate. Production operators who need the reviewed 8/8/12 cadence, four-second decoder timeout, and 2/2 transition thresholds should follow the [low-latency production profile](docs/deployment.md#low-latency-production-profile); those overrides do not belong in `config.yaml.example`.
+
 Runtime artifact paths are anchored by the effective `--data-dir` value. Keep `storage.snapshots_dir` and `runtime.health_file` relative to the effective `--data-dir` unless you intentionally want an absolute operator override:
 
 ```yaml
