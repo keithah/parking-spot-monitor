@@ -16,16 +16,16 @@ Compatibility invariants:
 
 ## Verification gate
 
-All final code-gate commands were run serially from clean source boundary `503e2f53c0dd6386f61938405403f48e26efb2f6`. This boundary includes the final persistence, cache, recovery, and transactional rollback regressions; later changes are documentation/evidence only.
+All final code-gate commands were run serially from clean source boundary `8950717f1ea25086a87132628c94392a558be7cd`. This boundary includes the final persistence, cache, recovery, transactional rollback, backup-durability, and sustained-writer liveness regressions; later changes are documentation/evidence only.
 
 | Gate | Command | Result |
 | --- | --- | --- |
 | Focused final structural/deployment set | Deployment, decomposition, Docker, and closeout `pytest` commands | Passed; deployment/documentation subset `26 passed` and specialist subsets are recorded in the finding matrix |
 | Bytecode/static import gate | `python3 -m compileall -q parking_spot_monitor src scripts tests` | Exit `0` |
-| Complete regression suite | `python3 -m pytest -q` | `1,697 passed in 51.49s`; test-process peak RSS `205,704 KiB` |
+| Complete regression suite | `python3 -m pytest -q` | `1,706 passed in 44.88s`; test-process peak RSS `212,492 KiB` |
 | Dependency locks | `python3 -I scripts/lock_dependencies.py --check` | Current; digest `8899d93ce13a7c521fe4367bf348b51d30a3f2a65242309e1e7ef7884f009e33` |
 | Compose render | `docker compose config --no-interpolate` | Exit `0`; rendered evidence was not retained in the repository |
-| Detector image build | `docker compose build --pull parking-spot-monitor` | Exit `0`; built `sha256:97b05f5fd098f7d3dd2d5cb9ace459e0b82a776f4cb798ad058605f2bc0613a5` |
+| Detector image build | `docker compose build --pull parking-spot-monitor` | Exit `0`; built `sha256:b941c94a7a45e237bc02b21482b6068d3e1169d824467347bd748152ec24430c` |
 | Documentation contracts | Documentation/deployment tests plus `git diff --check` | `26 passed`; diff check exit `0` |
 
 ## Finding disposition matrix
@@ -48,6 +48,7 @@ Each row names every commit in the task group. “Fixed” means the finding has
 | 12. Final adversarial follow-up | `cb22d51`, `cfccc72`, `88b78e2`, `01036ac`, `95192d1`, `9d003ce`, `bffdbcf`, `ba9e575`, `bed302f`, `af1e7af`, `600a051`, `f07f028` | Full suite `1,691`; largest test module `896` lines; decision-memory writer races, correction compaction concurrency, non-finite outbox recovery, bounded recovery blocking, and single-traversal owner-cache behavior have deterministic regressions. | Durable schema versions and public command/config contracts retained. Read-only summary audits moved to bounded structured logging. | Runtime adversarial findings fixed at source boundary `f07f028`. |
 | 13. Transactional operations | `2584075`, `043c42d`, `b318a1a`, `ac6c228` | Backup, upgrade, stale-health, rollback, and restore failure-injection tests pass. The runbook shrank from 956 to 638 lines and invokes one checked-in helper. A live quiesced backup proved exact running-image selection, external bind support, root-owned data capture, cleanup, and restart. | Single Compose service and host bind layout retained. | Operational findings fixed; final recovery evidence is recorded below. |
 | 14. Final acceptance closure | `26aa71c`, `3b301e3`, `514b519`, `503e2f5` | Full suite `1,697`; selected recovery cannot delete before its bounded directory scan completes; malformed outbox records are removed from canonical storage after one quarantine; stable invalid owner registries reuse the last-good snapshot for the polling window; decision rollback remains conditional through writer churn; rollback resolves and transactionally restores distinct active/bundled model directories and external env files. | Durable schemas, public commands, single-service topology, and `.pt` backend retained. | All five final independent-review findings and the manual freshness-check ordering finding fixed. |
+| 15. Liveness and durability closure | `1d0cba4`, `44bbb6f`, `8950717` | Full suite `1,706`; outbox repair is source-conditional under a stable sidecar lock; persistent registry read failures reuse a degraded snapshot for the poll window; decision publication has a finite exchange budget and reader-visible bounded conflict recovery; backup fsync ordering and post-restart fresh-health failure paths have deterministic tests. | Cooperative writers, bounded retention, public commands, service topology, and `.pt` backend retained. | The five findings from the second independent acceptance review are fixed. |
 
 ## Design constraints checked again
 
@@ -80,17 +81,17 @@ The table contains only aggregate or metadata evidence. It omits resolved config
 
 | Item | Final value |
 | --- | --- |
-| Reviewed source and deployment-helper commit | `503e2f53c0dd6386f61938405403f48e26efb2f6` |
-| Built image ID/digest | `sha256:97b05f5fd098f7d3dd2d5cb9ace459e0b82a776f4cb798ad058605f2bc0613a5`; immutable local release tag `release-final-503e2f5-20260731` |
-| Compose recreation | `1.79s`; existing operator bind mounts retained |
-| Final container started at | `2026-07-31T00:25:35.029097248Z` after the explicit graceful-stop proof |
+| Reviewed source and deployment-helper commit | `8950717f1ea25086a87132628c94392a558be7cd` |
+| Built image ID/digest | `sha256:b941c94a7a45e237bc02b21482b6068d3e1169d824467347bd748152ec24430c`; immutable local release tag `release-final-8950717-20260731` |
+| Compose recreation | `1.26s`; existing operator bind mounts retained |
+| Final container started at | `2026-07-31T00:49:14.976101639Z` after the explicit graceful-stop proof |
 | Observation window | Five samples 10 seconds apart, followed by one point five seconds after the graceful restart; no equal-window or detector-heavy-phase claim is made |
 | Healthcheck / restart count | Compose healthy; explicit in-container healthcheck passed; successful-frame timestamp and health mtime both newer than `StartedAt`; restart count `0` |
-| Rollback image | Immediate predecessor `rollback-pre-503e2f5-20260731T002235Z -> sha256:780eb5e056276c53bda2004a89a8810a92cedfee4b1ce5822f12376bb78762a8` |
-| Protected backup reference | `/home/keith/backups/parking-spot-monitor/final-503e2f5-20260731T002235Z`; created `2026-07-31T00:23:03.669634+00:00`; directory `0700`; all files including `.env` `0600`; complete quiesced `/data` archive `1,191,096,320 B`, SHA-256 `1d4456afee248bc6404e4868c771b2fd8db020d0244d5364b188346fad913251`; safe archive, approved-model record, consistency manifests, and exact rollback tag/ID verified |
+| Rollback image | Immediate predecessor `rollback-pre-8950717-20260731T004635Z -> sha256:97b05f5fd098f7d3dd2d5cb9ace459e0b82a776f4cb798ad058605f2bc0613a5` |
+| Protected backup reference | `/home/keith/backups/parking-spot-monitor/final-8950717-20260731T004635Z`; created `2026-07-31T00:46:56.657999+00:00`; directory `0700`; all files including `.env` `0600`; complete quiesced `/data` archive `1,193,451,520 B`, SHA-256 `064a4dd3fa5e02e1b2b7337bc0ded5faa02cd1c5239826bb229f85dcb520ca64`; safe archive, approved-model record, consistency manifests, exact rollback tag/ID, durable publication ordering, and fresh post-backup restart verified |
 | Config/model continuity | Existing operator config, data, and read-only model mounts retained and validated; backend remains `.pt` |
-| Graceful-stop result | Final-image proof `4.25s`, exit `0`, OOM `false`, empty runtime error, and no forced-kill evidence; restart took `0.32s` and returned healthy with fresh-frame evidence |
-| Durable lifecycle evidence | Final artifact sizes were outbox `1,191,114 B`, decision memory `93,980 B`, and health `1,869 B`; no Matrix readback was performed, while restart idempotence remains covered by tests |
+| Graceful-stop result | Final-image proof `1.45s`, exit `0`, OOM `false`, empty runtime error, and no forced-kill evidence; restart took `0.19s` and returned healthy with fresh-frame evidence |
+| Durable lifecycle evidence | Final artifact sizes were outbox `1,195,128 B`, decision memory `94,925 B`, and health `1,869 B`; no Matrix readback was performed, while restart idempotence remains covered by tests |
 
 ## Comparable resource result
 
@@ -98,19 +99,19 @@ The available observations are recorded honestly below. They are not equal-durat
 
 | Measurement | Baseline/comparator | Final observed result | Workload note |
 | --- | ---: | ---: | --- |
-| CPU samples/distribution | Original `63.07%`; prior final series included `0–9.31%` | Final warm series `194.57%`, `0.00%`, `0.00%`, `200.62%`, `0.00%`; post-restart `0.00%` | Two samples overlapped detector work on the configured two-CPU limit; samples did not establish a distribution or peak |
-| RSS / peak RSS | Original `362.2 MiB`; earlier first-hardened `577.5–624.4 MiB`; prior final series `343.2–372.1 MiB` | Final warm series `387.8`, `356.1`, `356.1`, `388.4`, `388.4 MiB`; post-restart `356.3 MiB` | Workload and process age were not matched; none is peak RSS |
+| CPU samples/distribution | Original `63.07%`; prior final series included two approximately `200%` points | Final warm series `0.00%`, `0.01%`, `0.00%`, `0.00%`, `4.24%`; post-restart `0.00%` | Samples did not establish a distribution or peak |
+| RSS / peak RSS | Original `362.2 MiB`; earlier first-hardened `577.5–624.4 MiB`; prior final series `356.1–388.4 MiB` | Final warm series `354.7`, `377.0`, `377.0`, `377.0`, `391.4 MiB`; post-restart `350.5 MiB` | Workload and process age were not matched; none is peak RSS |
 | PIDs / threads | Original `13 / 13`; immediately prior `16 / 15` | Docker PIDs `16`; Python threads `15` plus one `docker-init` | Stable process/thread topology; workload was not matched |
-| Block-write delta | Original `5.7 GB` after about 11 hours; prior container lifetime was not comparable | Final short series changed from `7.23 MB / 3.07 MB` to `7.23 MB / 3.69 MB`; restart reset the comparison window | Counters changed across restart; no steady-state reduction claim |
+| Block-write delta | Original `5.7 GB` after about 11 hours; prior container lifetime was not comparable | Final short series changed from `7.10 MB / 2.65 MB` to `7.24 MB / 3.67 MB`; restart reset the comparison window | Counters changed across restart; no steady-state reduction claim |
 | Capture duration/cadence | Not measured before the prior residual deployment | Prior residual image: six captures averaged `1.176850s`, maximum `1.194097s`; not repeated for the final image | No comparative improvement claim |
 | Matrix-outage command duration | Prior controlled trace: `60s -> 120s -> success/reset` | No live Matrix outage induced | Retry persistence/backoff is supported by the controlled trace and serial tests, not this live window |
 | INFO / WARNING / ERROR | Original `13,117 / 31 / 0` over 24h | Prior residual short window INFO `26`; final window not recounted | The short prior window included startup and cannot be extrapolated |
 | Lifecycle event-name counts | Not collected for the baseline | Not recounted for the residual deployment | Lifecycle persistence and restart idempotence remain covered by the serial suite |
-| Outbox writes / retry latency | Original size `1,565,331 B`; pre-residual `1,173,077 B`; live retry latency not measured | Final `1,191,114 B`; no live outage retry | Size reflects retained content and lifecycle work, not write amplification |
-| Decision-memory writes | Pre-residual size `96,975 B`; write count not instrumented | Final `93,980 B`; write count not instrumented | Bounded retention/content changed; size is not a write-rate metric |
+| Outbox writes / retry latency | Original size `1,565,331 B`; pre-residual `1,173,077 B`; live retry latency not measured | Final `1,195,128 B`; no live outage retry | Size reflects retained content and lifecycle work, not write amplification |
+| Decision-memory writes | Pre-residual size `96,975 B`; write count not instrumented | Final `94,925 B`; write count not instrumented | Bounded retention/content changed; size is not a write-rate metric |
 | JPEG encode attempts / strategies | Immediately prior `4,124` files and `0` derivatives; encode attempts not instrumented | Prior residual deployment had `4,126` files; final count and derivative count were not repeated | Tests prove one source decode, one streaming committed-destination hash, and derivative retry reuse |
 | Health artifact bytes | Immediately prior `1,866 B` | Final `1,869 B` | Compact snapshot size only; health-scan timing was not repeated |
-| Graceful shutdown latency | No comparable baseline | Final-image proof `4.25s`, exit zero, OOM false | Same container restarted healthy with zero restarts and a fresh successful frame |
+| Graceful shutdown latency | No comparable baseline | Final-image proof `1.45s`, exit zero, OOM false | Same container restarted healthy with zero restarts and a fresh successful frame |
 
 Schema compatibility, redaction safety, service health, graceful shutdown, rollback readiness, and the unchanged `.pt` backend are verified. The short live window did not provide workload-matched transition coverage, peak RSS, steady-state block-write deltas, or a live Matrix outage. The correct final classification is therefore: **healthy and rollback-ready; production resource acceptance pending**. Extend the observation before claiming no missed transitions, no peak-RSS increase, or a measurable steady-state improvement.
 
