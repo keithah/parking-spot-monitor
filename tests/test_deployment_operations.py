@@ -219,6 +219,9 @@ def test_backup_tags_running_image_and_restarts_after_archive_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        deployment_operations, "wait_for_fresh_health", lambda *_args, **_kwargs: None
+    )
     (tmp_path / "models").mkdir()
     model = tmp_path / "models/yolov8n.pt"
     model.write_bytes(b"model")
@@ -260,6 +263,179 @@ def test_backup_tags_running_image_and_restarts_after_archive_failure(
     assert stop < start
     assert not (tmp_path / "backup").exists()
     assert not list(tmp_path.glob(".backup.partial-*"))
+
+
+def test_backup_fsyncs_archive_and_bundle_before_durable_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "models").mkdir()
+    model = tmp_path / "models/yolov8n.pt"
+    model.write_bytes(b"model")
+    config_file = tmp_path / "operator-config.yaml"
+    config_file.write_text("config", encoding="utf-8")
+    (tmp_path / ".env").write_text("environment", encoding="utf-8")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/state.json").write_text("{}", encoding="utf-8")
+    runner = FakeRunner()
+    monkeypatch.setattr(
+        deployment_operations, "wait_for_fresh_health", lambda *_args, **_kwargs: None
+    )
+    real_fsync = os.fsync
+    real_rename = os.rename
+    events: list[str] = []
+
+    def record_fsync(descriptor: int) -> None:
+        target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        if target.name == "data.tar":
+            events.append("archive-fsync")
+        elif target.name.startswith(".backup.partial-"):
+            events.append("stage-fsync")
+        elif target == tmp_path:
+            events.append("parent-fsync")
+        real_fsync(descriptor)
+
+    def record_rename(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        if Path(destination) == tmp_path / "backup":
+            events.append("publish-rename")
+        real_rename(source, destination)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "rename", record_rename)
+
+    deployment_operations.backup_operation(
+        runner,
+        tmp_path / "backup",
+        "parking-spot-monitor:rollback-test",
+        deployment_operations._sha256(model),
+        config_file=config_file,
+    )
+
+    assert events.index("archive-fsync") < events.index("stage-fsync")
+    assert events.index("stage-fsync") < events.index("publish-rename")
+    assert events.index("publish-rename") < events.index("parent-fsync")
+
+
+def test_backup_requires_fresh_health_after_restarting_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "models").mkdir()
+    model = tmp_path / "models/yolov8n.pt"
+    model.write_bytes(b"model")
+    config_file = tmp_path / "operator-config.yaml"
+    config_file.write_text("config", encoding="utf-8")
+    (tmp_path / ".env").write_text("environment", encoding="utf-8")
+    (tmp_path / "data").mkdir()
+    runner = FakeRunner()
+    health_calls: list[tuple[str, Path, Path | None]] = []
+
+    def record_health(
+        _runner: FakeRunner,
+        started_at: str,
+        data_dir: Path,
+        *,
+        env_file: Path | None = None,
+        **_kwargs: object,
+    ) -> None:
+        health_calls.append((started_at, data_dir, env_file))
+
+    monkeypatch.setattr(deployment_operations, "wait_for_fresh_health", record_health)
+
+    deployment_operations.backup_operation(
+        runner,
+        tmp_path / "backup",
+        "parking-spot-monitor:rollback-test",
+        deployment_operations._sha256(model),
+        config_file=config_file,
+    )
+
+    assert len(health_calls) == 1
+    assert health_calls[0][1:] == (Path("data"), Path(".env"))
+    assert any(
+        call[:2] == ("docker", "inspect") and "{{.State.StartedAt}}" in call
+        for call in runner.calls
+    )
+
+
+def test_backup_health_failure_prevents_success_after_bundle_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "models").mkdir()
+    model = tmp_path / "models/yolov8n.pt"
+    model.write_bytes(b"model")
+    config_file = tmp_path / "operator-config.yaml"
+    config_file.write_text("config", encoding="utf-8")
+    (tmp_path / ".env").write_text("environment", encoding="utf-8")
+    (tmp_path / "data").mkdir()
+    runner = FakeRunner()
+
+    def fail_health(*_args: object, **_kwargs: object) -> None:
+        raise deployment_operations.DeploymentError("injected fresh health failure")
+
+    monkeypatch.setattr(deployment_operations, "wait_for_fresh_health", fail_health)
+
+    with pytest.raises(
+        deployment_operations.DeploymentError,
+        match="bundle was published.*did not become healthy",
+    ):
+        deployment_operations.backup_operation(
+            runner,
+            tmp_path / "backup",
+            "parking-spot-monitor:rollback-test",
+            deployment_operations._sha256(model),
+            config_file=config_file,
+        )
+
+    assert (tmp_path / "backup").is_dir()
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "secondary_message"),
+    (
+        ("health", "injected restart health failure"),
+        ("start", "injected start failure"),
+    ),
+)
+def test_backup_preserves_archive_error_when_restart_or_health_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+    secondary_message: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "models").mkdir()
+    model = tmp_path / "models/yolov8n.pt"
+    model.write_bytes(b"model")
+    config_file = tmp_path / "operator-config.yaml"
+    config_file.write_text("config", encoding="utf-8")
+    (tmp_path / ".env").write_text("environment", encoding="utf-8")
+    (tmp_path / "data").mkdir()
+    runner = FakeRunner()
+    runner.fail_tar = True
+    runner.fail_start_once = failure_mode == "start"
+
+    def fail_health(*_args: object, **_kwargs: object) -> None:
+        if failure_mode == "health":
+            raise deployment_operations.DeploymentError(secondary_message)
+
+    monkeypatch.setattr(deployment_operations, "wait_for_fresh_health", fail_health)
+
+    with pytest.raises(deployment_operations.DeploymentError, match="tar failure") as caught:
+        deployment_operations.backup_operation(
+            runner,
+            tmp_path / "backup",
+            "parking-spot-monitor:rollback-test",
+            deployment_operations._sha256(model),
+            config_file=config_file,
+        )
+
+    assert "backup completed" not in str(caught.value)
+    assert any(
+        secondary_message in note
+        for note in getattr(caught.value, "__notes__", ())
+    )
 
 
 def test_rollback_validation_failure_removes_secret_staging(

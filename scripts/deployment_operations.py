@@ -136,6 +136,28 @@ def _durable_unlink(path: Path) -> None:
         os.close(directory_fd)
 
 
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -201,6 +223,7 @@ def _create_data_archive(
     )
     _require_regular_file(destination, "data archive")
     os.chmod(destination, 0o600)
+    _fsync_file(destination)
 
 
 def _verify_manifest(root: Path, manifest_name: str, allowed: set[str]) -> None:
@@ -495,13 +518,29 @@ def backup_operation(
                 ),
             )
             verify_bundle(stage)
+            _fsync_directory(stage)
             os.rename(stage, backup_dir)
+            _fsync_directory(parent)
         finally:
             if stopped:
+                original_error = sys.exception()
                 try:
                     _compose(runner, "start", SERVICE, env_file=env_file)
-                except DeploymentError as exc:
-                    raise DeploymentError("backup completed but the service did not restart") from exc
+                    wait_for_fresh_health(
+                        runner,
+                        _started_at(runner, env_file),
+                        data_dir,
+                        env_file=env_file,
+                    )
+                except Exception as exc:
+                    if original_error is not None:
+                        original_error.add_note(
+                            f"service restart/health verification also failed: {exc}"
+                        )
+                        raise original_error from exc
+                    raise DeploymentError(
+                        "backup bundle was published but the restarted service did not become healthy"
+                    ) from exc
 
 
 def _require_clean(runner: Runner) -> None:
