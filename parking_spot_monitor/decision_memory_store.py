@@ -177,6 +177,7 @@ class DecisionMemoryStore:
                         max_records=self.max_records,
                     )
                     conflicts_to_clear = external.conflict_signatures
+                    conflicts_to_clear = _memory.compact_decision_memory_conflicts(self.path, candidate, conflicts_to_clear)
             publication = _memory._write_memory(
                 self.path, candidate, expected_signature=before.signature)
         except Exception as exc:

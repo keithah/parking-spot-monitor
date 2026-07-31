@@ -12,11 +12,13 @@ from typing import Any, Literal
 
 from parking_spot_monitor.decision_memory_publication import (
     ConditionalPublication,
+    MAX_CONFLICT_FILES,
     SourceSignature,
     clear_decision_memory_conflict,
     decision_memory_conflict_files,
     link_exclusive,
     publish_decision_memory_bytes,
+    publish_decision_memory_conflict_bytes,
     read_decision_memory_source,
     rename_exchange,
 )
@@ -313,9 +315,12 @@ def load_decision_memory(
         )
         return DecisionMemoryLoad(state="unavailable", error_type=type(exc).__name__)
 
-    conflict_payloads.sort(key=lambda item: (item[1][4], item[0].name))
-    conflict_records = [
-        record for _path, _signature, items in conflict_payloads for record in items
+    source_payloads = list(conflict_payloads)
+    if source_signature is not None:
+        source_payloads.append((memory_path, source_signature, records))
+    source_payloads.sort(key=lambda item: (item[1][4], item[0].name))
+    merged_records = [
+        record for _path, _signature, items in source_payloads for record in items
     ]
     conflict_signatures = [
         (conflict, signature) for conflict, signature, _items in conflict_payloads
@@ -325,7 +330,7 @@ def load_decision_memory(
         return DecisionMemoryLoad(state="missing")
 
     bounded = _deduplicated_records(
-        (*records, *conflict_records),
+        merged_records,
         max_records=_positive_limit(max_records, MAX_RECORDS),
     )
     _log(logger, "debug", "operator-decision-memory-loaded", path=memory_path, record_count=len(bounded), state="available")
@@ -351,6 +356,39 @@ def clear_decision_memory_conflicts(
         except OSError:
             cleared = False
     return cleared
+
+
+def compact_decision_memory_conflicts(
+    path: Path,
+    records: Sequence[DecisionMemoryRecord],
+    conflicts: Sequence[tuple[Path, SourceSignature]],
+) -> tuple[tuple[Path, SourceSignature], ...]:
+    if len(conflicts) < max(2, MAX_CONFLICT_FILES // 2):
+        return tuple(conflicts)
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "records": [record.to_json_dict() for record in records],
+    }
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+    replacement, signature = publish_decision_memory_conflict_bytes(
+        path,
+        encoded,
+        max_file_bytes=MAX_MEMORY_FILE_BYTES,
+        replace=conflicts[0][0],
+    )
+    remaining: list[tuple[Path, SourceSignature]] = [(replacement, signature)]
+    for conflict, conflict_signature in conflicts[1:]:
+        try:
+            if not clear_decision_memory_conflict(
+                conflict, conflict_signature, MAX_MEMORY_FILE_BYTES
+            ):
+                remaining.append((conflict, conflict_signature))
+        except OSError:
+            remaining.append((conflict, conflict_signature))
+    return tuple(remaining)
 
 
 def format_why_reply(
@@ -487,7 +525,18 @@ def _deduplicated_records(
             allow_nan=False,
         )
         unique[key] = record
-    return tuple(unique.values())[-max_records:]
+    ordered = sorted(unique.values(), key=_record_observation_key)
+    return tuple(ordered[-max_records:])
+
+
+def _record_observation_key(record: DecisionMemoryRecord) -> tuple[int, float, str]:
+    try:
+        parsed = datetime.fromisoformat(record.observed_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return 1, parsed.timestamp(), record.observed_at
+    except (OverflowError, ValueError):
+        return 0, 0.0, record.observed_at
 
 
 def _record_from_any(value: DecisionMemoryRecord | Mapping[str, Any]) -> DecisionMemoryRecord:

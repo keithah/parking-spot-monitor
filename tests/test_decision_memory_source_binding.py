@@ -425,3 +425,165 @@ def test_conflict_fsync_failure_keeps_displaced_writer_readable(
         item.summary for item in load_decision_memory(path).records
     }
     assert list(tmp_path.glob(f".{path.name}.*.conflict"))
+
+
+def test_exchange_exception_after_swap_rescues_displaced_writer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_exchange = memory._conditional_exchange
+
+    def exchange_then_fail(source: Path, destination: Path) -> None:
+        _write_memory(path, (_record("external"),))
+        real_exchange(source, destination)
+        raise OSError("injected post-exchange failure")
+
+    monkeypatch.setattr(memory, "_conditional_exchange", exchange_then_fail)
+
+    assert store.flush() is False
+    assert "external" in {item.summary for item in load_decision_memory(path).records}
+    assert list(tmp_path.glob(f".{path.name}.*.conflict"))
+    assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
+
+
+def test_displaced_signature_read_failure_rescues_displaced_writer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.decision_memory_publication as publication
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_exchange = memory._conditional_exchange
+    real_read = publication.read_source_signature
+    temporary_reads = 0
+
+    def replace_before_exchange(source: Path, destination: Path) -> None:
+        _write_memory(path, (_record("external"),))
+        real_exchange(source, destination)
+
+    def fail_displaced_read(target: Path, max_file_bytes: int):
+        nonlocal temporary_reads
+        if target.name.startswith(f".{path.name}.") and target.suffix == ".tmp":
+            temporary_reads += 1
+            if temporary_reads == 2:
+                raise OSError("injected displaced signature read failure")
+        return real_read(target, max_file_bytes)
+
+    monkeypatch.setattr(memory, "_conditional_exchange", replace_before_exchange)
+    monkeypatch.setattr(publication, "read_source_signature", fail_displaced_read)
+
+    assert store.flush() is False
+    assert "external" in {item.summary for item in load_decision_memory(path).records}
+    assert list(tmp_path.glob(f".{path.name}.*.conflict"))
+    assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
+
+
+def test_restore_initial_read_failure_rescues_displaced_writer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.decision_memory_publication as publication
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_exchange = memory._conditional_exchange
+    real_read = publication.read_source_signature
+    canonical_read_failed = False
+
+    def replace_before_exchange(source: Path, destination: Path) -> None:
+        _write_memory(path, (_record("external"),))
+        real_exchange(source, destination)
+
+    def fail_restore_read(target: Path, max_file_bytes: int):
+        nonlocal canonical_read_failed
+        if target == path and not canonical_read_failed:
+            canonical_read_failed = True
+            raise OSError("injected restore canonical read failure")
+        return real_read(target, max_file_bytes)
+
+    monkeypatch.setattr(memory, "_conditional_exchange", replace_before_exchange)
+    monkeypatch.setattr(publication, "read_source_signature", fail_restore_read)
+
+    assert store.flush() is False
+    assert canonical_read_failed
+    assert "external" in {item.summary for item in load_decision_memory(path).records}
+    assert list(tmp_path.glob(f".{path.name}.*.conflict"))
+    assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
+
+
+def test_repeated_bounded_churn_compacts_conflicts_below_reader_limit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_exchange = memory._conditional_exchange
+    writer_index = 0
+
+    def replace_before_every_exchange(source: Path, destination: Path) -> None:
+        nonlocal writer_index
+        writer_index += 1
+        _write_memory(path, (_record(f"external-{writer_index}"),))
+        real_exchange(source, destination)
+
+    monkeypatch.setattr(memory, "_conditional_exchange", replace_before_every_exchange)
+
+    for _attempt in range(24):
+        assert store.flush() is False
+        assert load_decision_memory(path).state == "available"
+
+    conflicts = list(tmp_path.glob(f".{path.name}.*.conflict"))
+    assert 1 <= len(conflicts) < 16
+    monkeypatch.undo()
+    assert store.flush()
+    assert not list(tmp_path.glob(f".{path.name}.*.conflict"))
+
+
+def test_newer_canonical_tail_wins_over_stale_full_conflict(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    old_records = tuple(
+        make_decision_memory_record(
+            "alert",
+            observed_at=f"2025-01-01T00:{index // 60:02d}:{index % 60:02d}Z",
+            summary=f"old-{index}",
+        )
+        for index in range(200)
+    )
+    canonical_records = tuple(
+        make_decision_memory_record(
+            "alert",
+            observed_at=f"2026-01-01T00:{index // 60:02d}:{index % 60:02d}Z",
+            summary=f"canonical-{index}",
+        )
+        for index in range(200)
+    )
+    _write_memory(path, canonical_records)
+    conflict = tmp_path / f".{path.name}.stale.conflict"
+    _write_memory(conflict, old_records)
+
+    loaded = load_decision_memory(path)
+
+    assert loaded.state == "available"
+    assert len(loaded.records) == 200
+    assert {item.summary for item in loaded.records} == {
+        f"canonical-{index}" for index in range(200)
+    }

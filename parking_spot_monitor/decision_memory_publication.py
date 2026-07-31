@@ -62,14 +62,10 @@ def publish_decision_memory_bytes(
             temporary.unlink()
             cleanup_temporary = False
         else:
-            exchange(temporary, path)
             try:
+                exchange(temporary, path)
                 displaced = read_source_signature(temporary, max_file_bytes)
-            except (FileNotFoundError, OSError, OverflowError):
-                cleanup_temporary = False
-                raise
-            if not _same_content_identity(displaced, expected_signature):
-                try:
+                if not _same_content_identity(displaced, expected_signature):
                     restored = _restore_latest_canonical(
                         temporary,
                         path,
@@ -78,11 +74,15 @@ def publish_decision_memory_bytes(
                         max_file_bytes=max_file_bytes,
                         exchange=exchange,
                     )
-                except (FileNotFoundError, OSError, OverflowError):
-                    cleanup_temporary = False
-                    raise
-                cleanup_temporary = restored
-                return ConditionalPublication(False)
+                    cleanup_temporary = restored
+                    return ConditionalPublication(False)
+            except BaseException as exc:
+                cleanup_temporary = _rescue_temporary_conflict(
+                    temporary,
+                    path,
+                    primary_error=exc,
+                )
+                raise
         _fsync_directory(path.parent)
         published = read_source_signature(path, max_file_bytes)
         if not _same_content_identity(published, candidate):
@@ -191,6 +191,26 @@ def _restore_latest_canonical(
     return False
 
 
+def _rescue_temporary_conflict(
+    temporary: Path,
+    path: Path,
+    *,
+    primary_error: BaseException,
+) -> bool:
+    if not temporary.exists():
+        return True
+    conflict = temporary.with_suffix(".conflict")
+    try:
+        os.replace(temporary, conflict)
+        _fsync_directory(path.parent)
+    except OSError as rescue_error:
+        primary_error.add_note(
+            f"decision memory conflict rescue also failed: {type(rescue_error).__name__}"
+        )
+        return False
+    return True
+
+
 def decision_memory_conflict_files(path: Path) -> tuple[Path, ...]:
     prefix = f".{path.name}."
     conflicts: list[Path] = []
@@ -227,6 +247,23 @@ def clear_decision_memory_conflict(
     path.unlink()
     _fsync_directory(path.parent)
     return True
+
+
+def publish_decision_memory_conflict_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    max_file_bytes: int,
+    replace: Path | None = None,
+) -> tuple[Path, SourceSignature]:
+    temporary = _write_temporary(path, payload)
+    target = replace if replace is not None else temporary.with_suffix(".conflict")
+    try:
+        os.replace(temporary, target)
+        _fsync_directory(path.parent)
+        return target, read_source_signature(target, max_file_bytes)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _source_stat_fields(value: os.stat_result) -> tuple[int, int, int, int, int]:
