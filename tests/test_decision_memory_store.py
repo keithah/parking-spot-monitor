@@ -67,6 +67,26 @@ def test_immediate_decision_flushes_prior_routine_records(tmp_path: Path) -> Non
     assert [record.summary for record in load_decision_memory(path).records] == ["routine", "immediate"]
 
 
+def test_immediate_checkpoint_serializes_candidate_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = decision_memory_path(tmp_path)
+    real_encode = decision_memory._encode_memory_payload
+    encoded = 0
+
+    def count_encode(records):
+        nonlocal encoded
+        encoded += 1
+        return real_encode(records)
+
+    monkeypatch.setattr(decision_memory, "_encode_memory_payload", count_encode)
+    store = _store(path, monotonic=lambda: 0)
+
+    assert store.append(_record("alert", "left_spot", "once"), durability="immediate")
+    assert encoded == 1
+
+
 def test_decision_store_time_checkpoint_close_and_truncation(tmp_path: Path) -> None:
     path = decision_memory_path(tmp_path)
     clock = [10.0]

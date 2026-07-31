@@ -385,17 +385,19 @@ def compact_decision_memory_conflicts(
     *,
     max_records: int = MAX_RECORDS,
     max_file_bytes: int = MAX_MEMORY_FILE_BYTES,
+    encoded_payload: bytes | None = None,
 ) -> tuple[tuple[Path, SourceSignature], ...]:
     if len(conflicts) < max(2, MAX_CONFLICT_FILES // 2):
         return tuple(conflicts)
-    _bounded, encoded = _bounded_memory_payload(
-        records,
-        max_records=max_records,
-        max_file_bytes=max_file_bytes,
-    )
+    if encoded_payload is None:
+        _bounded, encoded_payload = _bounded_memory_payload(
+            records,
+            max_records=max_records,
+            max_file_bytes=max_file_bytes,
+        )
     replacement, signature = publish_decision_memory_conflict_bytes(
         path,
-        encoded,
+        encoded_payload,
         max_file_bytes=max_file_bytes,
         replace=conflicts[0][0],
     )
@@ -469,9 +471,14 @@ def _write_memory(
     *,
     expected_signature: SourceSignature | None | object = _UNCONDITIONAL_WRITE,
     max_file_bytes: int = MAX_MEMORY_FILE_BYTES,
+    encoded_payload: bytes | None = None,
 ) -> ConditionalPublication | None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = _encode_memory_payload(records)
+    encoded = (
+        encoded_payload
+        if encoded_payload is not None
+        else _encode_memory_payload(records)
+    )
     if len(encoded) > max_file_bytes:
         raise OverflowError("decision memory publication exceeds byte limit")
     if expected_signature is not _UNCONDITIONAL_WRITE:

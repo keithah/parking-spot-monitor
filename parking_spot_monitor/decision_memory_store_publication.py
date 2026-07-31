@@ -69,7 +69,7 @@ def publish_bounded_candidate(
     tuple[tuple[Path, SourceSignature], ...],
     ConditionalPublication | None,
 ]:
-    bounded, _encoded = _memory._bounded_memory_payload(
+    bounded, encoded = _memory._bounded_memory_payload(
         candidate,
         max_records=max_records,
         max_file_bytes=max_file_bytes,
@@ -82,12 +82,14 @@ def publish_bounded_candidate(
             retained_conflicts,
             max_records=max_records,
             max_file_bytes=max_file_bytes,
+            encoded_payload=encoded,
         )
     publication = _memory._write_memory(
         path,
         bounded,
         expected_signature=expected_signature,
         max_file_bytes=max_file_bytes,
+        encoded_payload=encoded,
     )
     return bounded, retained_conflicts, publication
 
