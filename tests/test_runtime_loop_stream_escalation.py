@@ -166,7 +166,7 @@ def test_runtime_loop_escalates_weak_primary_detection_and_uses_primary_artifact
     assert '"from_profile":"primary"' in output
     assert '"to_profile":"high_resolution"' in output
     assert '"stream_profile":"high_resolution"' in output
-    assert runtime_state_payload(tmp_path / "state.json")["spots"]["right_spot"]["last_bbox"][0] == pytest.approx(1010 * 3840 / 1458)
+    assert runtime_state_payload(tmp_path / "state.json")["spots"]["right_spot"]["last_bbox"][0] == pytest.approx(1010)
     assert sleeps == [30]
     timeline_frames = sorted((tmp_path / "timeline" / "frames").glob("*.jpg"))
     assert timeline_frames[0].read_bytes() == primary_path.read_bytes()
@@ -339,10 +339,11 @@ def test_runtime_loop_transition_enters_occupied_cadence_without_periodic_verifi
                 primary_detection_count += 1
                 if primary_detection_count == 1:
                     return []
+                confidence = 0.5 if primary_detection_count == 2 else 0.92
                 return [
                     VehicleDetection(
                         class_name="car",
-                        confidence=0.5,
+                        confidence=confidence,
                         bbox=(350, 200, 550, 330),
                     )
                 ]
@@ -385,7 +386,6 @@ def test_runtime_loop_transition_enters_occupied_cadence_without_periodic_verifi
         None,
         "high_resolution",
         None,
-        "high_resolution",
     ]
     assert sleeps[:2] == [pytest.approx(12.0), pytest.approx(8.0)]
     final_state = load_runtime_state(
@@ -706,3 +706,113 @@ def test_runtime_loop_failed_high_resolution_detection_records_high_resolution_c
     assert '"event":"detection-frame-failed"' in output
     assert primary_path.exists()
     assert_no_secret_leak(output + json.dumps(health))
+
+
+@pytest.mark.parametrize("failure_phase", ["capture", "detection"])
+def test_release_verification_failure_preserves_occupied_state(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    failure_phase: str,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        runtime_config_text()
+        .replace("  confirm_frames: 3", "  confirm_frames: 2")
+        .replace("  release_frames: 3", "  release_frames: 2"),
+        encoding="utf-8",
+    )
+    primary_path = tmp_path / "latest-primary.jpg"
+    high_path = tmp_path / "latest-high.jpg"
+    capture_profiles: list[str | None] = []
+    save_runtime_state(
+        tmp_path / "state.json",
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+                "right_spot": SpotOccupancyState(
+                    status=OccupancyStatus.OCCUPIED,
+                    miss_streak=1,
+                    last_bbox=(1010, 215, 1395, 355),
+                ),
+            }
+        ),
+    )
+
+    def fake_capture(
+        _settings: object,
+        data_dir: str | Path,
+        *,
+        stream_profile: str | None = None,
+    ) -> FrameCaptureResult:
+        capture_profiles.append(stream_profile)
+        if stream_profile == "high_resolution" and failure_phase == "capture":
+            raise CaptureError(
+                reason="ffmpeg-timeout",
+                mode=DecodeMode.SOFTWARE,
+                output_path=Path(data_dir) / "latest.jpg",
+                message="high-resolution capture failed",
+                timeout_seconds=15.0,
+            )
+        profile = stream_profile or "primary"
+        size = (3840, 2160) if profile == "high_resolution" else (1458, 806)
+        latest_path = high_path if profile == "high_resolution" else primary_path
+        Image.new("RGB", size, (20, 30, 40)).save(latest_path, format="JPEG")
+        return FrameCaptureResult(
+            timestamp=(
+                "2026-05-18T18:00:01Z"
+                if profile == "high_resolution"
+                else "2026-05-18T18:00:00Z"
+            ),
+            latest_path=latest_path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=0.01,
+            byte_size=latest_path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile=profile, expected_size=size),
+        )
+
+    class FailingReleaseDetector:
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            if Path(frame_path) == high_path and failure_phase == "detection":
+                raise DetectionError(
+                    "high-resolution detection failed",
+                    model_path="yolov8n.pt",
+                    frame_path=str(frame_path),
+                    phase="predict",
+                    error_type="RuntimeError",
+                )
+            return []
+
+    exit_code = _main(
+        ["--config", str(config_path), "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: FailingReleaseDetector(),
+        sleep=lambda _seconds: None,
+        max_iterations=1,
+    )
+
+    output = combined_output(capsys)
+    health = health_payload(tmp_path / "health.json")
+    state = load_runtime_state(
+        tmp_path / "state.json", ["left_spot", "right_spot"]
+    )
+    expected_capture_timestamp = (
+        "2026-05-18T18:00:00Z"
+        if failure_phase == "capture"
+        else "2026-05-18T18:00:01Z"
+    )
+    assert exit_code == 0
+    assert capture_profiles == [None, "high_resolution"]
+    assert state.state_by_spot["right_spot"].status is OccupancyStatus.OCCUPIED
+    assert state.state_by_spot["right_spot"].miss_streak == 1
+    assert '"event":"occupancy-open-event"' not in output
+    assert health["status"] == ("down" if failure_phase == "capture" else "degraded")
+    assert health["last_frame_at"] is None
+    assert health["capture"]["last_success_at"] == expected_capture_timestamp
+    assert health["last_error"]["phase"] == failure_phase

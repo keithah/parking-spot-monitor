@@ -503,6 +503,9 @@ def test_escalation_returns_final_frame_for_caller_owned_memory_recording(tmp_pa
     assert result.frame_geometry.stream_profile == "high_resolution"
     assert result.latest_path == high_path
     assert frame_result.escalated is True
+    accepted = frame_result.detection.by_spot["right_spot"].accepted
+    assert accepted is not None
+    assert accepted.bbox[0] == 1010 * 3840 / 1458
     assert not memory_path.exists()
 
     records = build_detection_memory_records(

@@ -9,9 +9,10 @@ from parking_spot_monitor.config import RuntimeSettings
 from parking_spot_monitor.detection import DetectionFilterResult
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.occupancy import OccupancyUpdate, update_occupancy
-from parking_spot_monitor.runtime_presence import _log_missed_occupied_spot_diagnostics, presence_by_spot
-from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleSnapshotProvider
+from parking_spot_monitor.runtime_detection_geometry import candidate_in_configured_frame
 from parking_spot_monitor.runtime_log_aggregation import RuntimeLogAggregator
+from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleSnapshotProvider
+from parking_spot_monitor.runtime_presence import _log_missed_occupied_spot_diagnostics, presence_by_spot
 from parking_spot_monitor.runtime_vehicle_events import _owner_vehicle_quiet_window_alerts
 from parking_spot_monitor.scheduler import QuietWindowStatus, evaluate_quiet_windows, quiet_window_notice_events
 from parking_spot_monitor.state import RuntimeState
@@ -68,7 +69,13 @@ def build_runtime_frame_plan(
     )
     occupancy_update = update_occupancy(
         runtime_state.state_by_spot,
-        {spot_id: spot_result.accepted for spot_id, spot_result in detection_result.by_spot.items()},
+        {
+            spot_id: candidate_in_configured_frame(
+                spot_result.accepted,
+                scale=detection_result.coordinate_scale,
+            )
+            for spot_id, spot_result in detection_result.by_spot.items()
+        },
         settings.occupancy,
         observed_at.isoformat(),
         quiet_status,

@@ -145,6 +145,7 @@ class DetectionFilterResult:
 
     by_spot: dict[str, SpotDetectionResult]
     rejection_counts: dict[RejectionReason, int]
+    coordinate_scale: tuple[float, float] = (1.0, 1.0)
 
 
 @dataclass(frozen=True)

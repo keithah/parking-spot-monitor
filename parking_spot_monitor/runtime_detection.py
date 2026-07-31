@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -61,15 +62,20 @@ def _process_detection_for_capture(
     scale = _frame_scale(configured_frame_size=configured_frame_size, actual_frame_size=effective_frame_size)
     spot_polygons = _configured_spot_polygons(settings, scale=scale)
     detections = [*full_frame_detections, *spot_crop_detections]
-    result = filter_spot_detections(
-        detections,
-        spots=spot_polygons,
-        allowed_classes=settings.detection.vehicle_classes,
-        confidence_threshold=settings.detection.confidence_threshold,
-        min_bbox_area_px=_scaled_min_bbox_area(settings.detection.min_bbox_area_px, scale=scale),
-        min_polygon_overlap_ratio=settings.detection.min_polygon_overlap_ratio,
-        source_frame_path=str(latest_path),
-        source_timestamp=frame_timestamp,
+    result = replace(
+        filter_spot_detections(
+            detections,
+            spots=spot_polygons,
+            allowed_classes=settings.detection.vehicle_classes,
+            confidence_threshold=settings.detection.confidence_threshold,
+            min_bbox_area_px=_scaled_min_bbox_area(
+                settings.detection.min_bbox_area_px, scale=scale
+            ),
+            min_polygon_overlap_ratio=settings.detection.min_polygon_overlap_ratio,
+            source_frame_path=str(latest_path),
+            source_timestamp=frame_timestamp,
+        ),
+        coordinate_scale=scale,
     )
     fields: dict[str, Any] = {
         "mode": mode,
