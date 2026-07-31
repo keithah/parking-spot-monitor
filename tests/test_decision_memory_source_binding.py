@@ -695,3 +695,53 @@ def test_oversized_conflict_publication_rejects_before_replacing_valid_source(
         )
 
     assert conflict.read_bytes() == preserved
+
+
+def test_store_surfaces_conflict_cleanup_failure_and_flush_retries_it(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    conflict = tmp_path / f".{path.name}.cleanup.conflict"
+    _write_memory(path, (_record("canonical"),))
+    _write_memory(conflict, (_record("conflict"),))
+    store = _store(path)
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    with monkeypatch.context() as context:
+        context.setattr(memory, "clear_decision_memory_conflicts", lambda *_args, **_kwargs: False)
+        assert store.append(_record("local"), durability="immediate") is False
+
+    assert conflict.exists()
+    assert store.flush() is True
+    assert not conflict.exists()
+    assert {item.summary for item in load_decision_memory(path).records} == {
+        "canonical",
+        "conflict",
+        "local",
+    }
+
+
+def test_legacy_append_retries_incomplete_conflict_cleanup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    conflict = tmp_path / f".{path.name}.cleanup.conflict"
+    _write_memory(path, (_record("canonical"),))
+    _write_memory(conflict, (_record("conflict"),))
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_clear = memory.clear_decision_memory_conflicts
+    attempts = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return False if attempts == 1 else real_clear(*args, **kwargs)
+
+    monkeypatch.setattr(memory, "clear_decision_memory_conflicts", fail_once)
+
+    assert append_decision_memory_record(path, _record("local")) is True
+    assert attempts == 2
+    assert not conflict.exists()

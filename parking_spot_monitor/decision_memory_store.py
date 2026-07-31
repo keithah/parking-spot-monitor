@@ -108,7 +108,7 @@ class DecisionMemoryStore:
 
     def checkpoint_if_due(self) -> bool:
         with _memory._MEMORY_WRITE_LOCK:
-            if not self._dirty or self._monotonic() < self._next_checkpoint_at:
+            if (not self._dirty and not self._reconcile_required) or self._monotonic() < self._next_checkpoint_at:
                 return False
             return self._flush_locked()
 
@@ -130,7 +130,7 @@ class DecisionMemoryStore:
 
     def flush(self) -> bool:
         with _memory._MEMORY_WRITE_LOCK:
-            if not self._dirty:
+            if not self._dirty and not self._reconcile_required:
                 return True
             return self._flush_locked()
 
@@ -211,11 +211,11 @@ class DecisionMemoryStore:
             path=self.path,
             record_count=len(self._records),
         )
-        return True
+        return not self._reconcile_required
 
     def _bounded_wait_seconds(self, wait_seconds: float) -> float:
         with _memory._MEMORY_WRITE_LOCK:
-            if not self._dirty:
+            if not self._dirty and not self._reconcile_required:
                 return wait_seconds
             return min(
                 wait_seconds,
