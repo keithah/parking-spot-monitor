@@ -22,7 +22,7 @@ All final runtime code-gate commands were run serially from source boundary `f07
 | --- | --- | --- |
 | Focused final structural/deployment set | Deployment, decomposition, Docker, and closeout `pytest` command | `114 passed` |
 | Bytecode/static import gate | `python3 -m compileall -q parking_spot_monitor src scripts tests` | Exit `0` |
-| Complete regression suite | `python3 -m pytest -q` | `1,691 passed in 44.31s` |
+| Complete regression suite | `python3 -m pytest -q` | `1,691 passed in 69.66s` at final documentation boundary `bf3ff12` |
 | Dependency locks | `python3 -I scripts/lock_dependencies.py --check` | Current; digest `8899d93ce13a7c521fe4367bf348b51d30a3f2a65242309e1e7ef7884f009e33` |
 | Compose render | `docker compose config --no-interpolate` | Exit `0`; rendered evidence was not retained in the repository |
 | Detector image build | `docker compose build --pull parking-spot-monitor` | Exit `0`; built `sha256:780eb5e056276c53bda2004a89a8810a92cedfee4b1ce5822f12376bb78762a8` |
