@@ -87,12 +87,6 @@ class OwnerVehicleRuntimeCache:
                 and registry_signature == self._last_good_signature
             ):
                 registry = self._last_good_registry
-            elif (
-                self._last_good_registry is not None
-                and registry_signature == self._last_failed_signature
-            ):
-                registry = self._last_good_registry
-                load_failed = True
             else:
                 try:
                     loaded_registry = load_owner_vehicle_registry(self.registry_path, strict=True)
@@ -130,7 +124,7 @@ class OwnerVehicleRuntimeCache:
                     self._last_good_signature = registry_signature
                     self._last_failed_signature = _UNSET
                 value = OwnerVehicleSnapshot(registry=registry, active_sessions=active_sessions)
-                if not load_failed:
+                if not load_failed or registry_signature == self._last_failed_signature:
                     self._entry = (after, value)
                     self._active_sessions_checked_at = checked_at
                 return value
@@ -144,7 +138,7 @@ class OwnerVehicleRuntimeCache:
         revision: int,
         checked_at: float,
     ) -> bool:
-        if self._last_failed_signature is not _UNSET or self._entry is None:
+        if self._entry is None:
             return False
         key, _snapshot = self._entry
         if key[0] != registry_signature or key[1] != revision:

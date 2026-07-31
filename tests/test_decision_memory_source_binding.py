@@ -244,3 +244,38 @@ def test_rollback_restores_newer_canonical_writer_without_stranding_temp(
         "external-newer",
         "local___",
     ]
+
+
+def test_rollback_exhaustion_restores_latest_external_writer_to_canonical(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    store = _store(path)
+    assert store.append(_record("local___"), durability="routine")
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_exchange = memory._conditional_exchange
+    exchange_count = 0
+
+    def replace_before_every_exchange(source: Path, destination: Path) -> None:
+        nonlocal exchange_count
+        exchange_count += 1
+        _write_memory(path, (_record(f"external-{exchange_count}"),))
+        real_exchange(source, destination)
+
+    monkeypatch.setattr(memory, "_conditional_exchange", replace_before_every_exchange)
+
+    assert store.flush() is False
+    assert exchange_count == 9
+    assert [item.summary for item in load_decision_memory(path).records] == [
+        "external-9"
+    ]
+    assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
+    monkeypatch.undo()
+    assert store.flush()
+    assert [item.summary for item in load_decision_memory(path).records] == [
+        "external-9",
+        "local___",
+    ]

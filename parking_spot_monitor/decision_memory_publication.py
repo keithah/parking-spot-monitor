@@ -183,7 +183,12 @@ def _restore_latest_canonical(
         if _same_content_identity(swapped_out, current):
             return True
         current, desired = desired, swapped_out
-    return False
+    canonical = read_source_signature(path, max_file_bytes)
+    if not _same_content_identity(canonical, current):
+        return True
+    os.replace(temporary, path)
+    _fsync_directory(path.parent)
+    return True
 
 
 def _source_stat_fields(value: os.stat_result) -> tuple[int, int, int, int, int]:

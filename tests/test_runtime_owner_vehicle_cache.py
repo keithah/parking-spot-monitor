@@ -584,6 +584,62 @@ def test_runtime_cache_keeps_valid_registry_across_invalid_replace(
     assert "{broken" not in output
 
 
+def test_stable_invalid_registry_reuses_stale_snapshot_until_poll_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry_path = tmp_path / "owner-vehicles.json"
+    write_registry(registry_path, "profile-a")
+    archive = FakeArchive()
+    clock = FakeClock()
+    cache = OwnerVehicleRuntimeCache(
+        registry_path,
+        logger=StructuredLogger(),
+        now=clock,
+        active_session_poll_seconds=10.0,
+    )
+    cache.snapshot(archive)
+    registry_path.write_text("{broken", encoding="utf-8")
+    real_load = runtime_owner_vehicle_cache.load_owner_vehicle_registry
+    registry_loads = 0
+
+    def counted_load(*args: object, **kwargs: object) -> OwnerVehicleRegistry:
+        nonlocal registry_loads
+        registry_loads += 1
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(
+        runtime_owner_vehicle_cache,
+        "load_owner_vehicle_registry",
+        counted_load,
+    )
+    stale = cache.snapshot(archive)
+    real_stat = Path.stat
+    registry_stats = 0
+
+    def counted_stat(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal registry_stats
+        if path == registry_path:
+            registry_stats += 1
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", counted_stat)
+
+    for _ in range(100):
+        assert cache.snapshot(archive) is stale
+
+    assert archive.active_loads == 2
+    assert registry_loads == 1
+    assert registry_stats == 100
+
+    clock.advance(10.0)
+    refreshed = cache.snapshot(archive)
+    assert refreshed.registry is stale.registry
+    assert archive.active_loads == 3
+    assert registry_loads == 2
+    assert cache.snapshot(archive) is refreshed
+
+
 def test_runtime_cache_initial_invalid_registry_fails_closed(tmp_path: Path) -> None:
     registry_path = tmp_path / "owner-vehicles.json"
     registry_path.write_text("{broken", encoding="utf-8")

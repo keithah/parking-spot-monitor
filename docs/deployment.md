@@ -420,6 +420,7 @@ Sample CPU/RSS/threads repeatedly at the same points in the capture cadence. Com
 Normal upgrades and backups must preserve `init: true`, `stop_signal: SIGTERM`, and `stop_grace_period: 2m`. Verify the stop path after the new image is healthy:
 
 ```sh
+set -eu
 start_seconds="$(date +%s)"
 docker compose stop parking-spot-monitor
 end_seconds="$(date +%s)"
@@ -427,9 +428,6 @@ echo "graceful_stop_seconds=$((end_seconds - start_seconds))"
 docker compose up -d --no-build parking-spot-monitor
 container_id="$(docker compose ps -q parking-spot-monitor)"
 started_at="$(docker inspect "$container_id" --format '{{.State.StartedAt}}')"
-docker compose exec -T parking-spot-monitor \
-  python -m parking_spot_monitor.healthcheck \
-  --health-file /data/health.json --max-age-seconds 120
 docker compose exec -T parking-spot-monitor python - "$started_at" <<'PY'
 import json
 import sys
@@ -447,6 +445,9 @@ if not isinstance(last_frame, str):
 if datetime.fromisoformat(last_frame.replace("Z", "+00:00")) <= started_at:
     raise SystemExit("last successful frame predates this container start")
 PY
+docker compose exec -T parking-spot-monitor \
+  python -m parking_spot_monitor.healthcheck \
+  --health-file /data/health.json --max-age-seconds 120
 ```
 
 The stop must complete without Docker reporting a forced kill. Retry the final freshness check until the configured startup/capture allowance expires; never accept the persistent file solely because it is younger than the generic healthcheck limit. After restart, the durable shutdown lifecycle record may drain once; it must not be duplicated. Inspect only aggregate event counts when preserving verification evidence.
@@ -566,7 +567,7 @@ python3 scripts/deployment_operations.py backup \
 
 The helper resolves the running service container and tags its immutable image ID; it never assumes the mutable `parking-spot-monitor:local` tag still names the deployed image. It creates a mode-`0700` private staging directory before copying secrets, installs signal-aware cleanup immediately, stops the service, archives the complete quiesced data tree, writes a UTC recovery timestamp and exact source/image identities, verifies the archive and manifests, publishes the bundle atomically, and restarts the service on both success and failure. Every bundle file is mode `0600`.
 
-The defaults are `config.yaml`, `.env`, and `data/` in the current checkout. Use `--config-file`, `--env-file`, or `--data-dir` when operator bind sources live elsewhere; rollback accepts the same `--config-file` and `--data-dir` overrides.
+The defaults are `config.yaml`, `.env`, and `data/` in the current checkout. Use `--config-file`, `--env-file`, or `--data-dir` when operator bind sources live elsewhere; rollback accepts the same three overrides. The selected environment file drives both `MODEL_DIR` resolution and every Compose command.
 
 The bundle contains `config.yaml`, `.env`, `yolov8n.pt`, `approved-model.sha256`, the complete `data.tar`, exact image metadata, and separate consistency manifests. Retain the image tag or an exported image on protected media. Do not describe the co-created manifests as signatures or authentication; they detect later corruption only.
 
@@ -590,10 +591,12 @@ Use the bundle created immediately before the failed upgrade:
 
 ```sh
 python3 scripts/deployment_operations.py rollback \
-  --rollback-dir /protected/parking-backups/2026-07-30T230000Z
+  --rollback-dir /protected/parking-backups/2026-07-30T230000Z \
+  --config-file /srv/parking/config.yaml \
+  --env-file /srv/parking/monitor.env
 ```
 
-Rollback verifies every bundle consistency manifest, the operator-approved model record, archive safety, bundle timestamp, and the exact rollback image tag/ID before downtime. Its private temporary directory and cleanup handler exist before `.env` or model bytes are copied. The rollback set is validated against the current data mount before the service stops. Config, environment, and model replacements use same-directory atomic renames. Any failure after stop restores the prior files and image, recreates the prior service, and applies the same post-`StartedAt` freshness gate before returning failure.
+Rollback verifies every bundle consistency manifest, the operator-approved model record, archive safety, bundle timestamp, and the exact rollback image tag/ID before downtime. Its private temporary directory and cleanup handler exist before environment or model bytes are copied. The rollback set is validated against the current data mount before the service stops. Config, the selected environment file, and the model in the bundle's resolved `MODEL_DIR` use same-directory atomic renames. If the active and bundled model directories differ, the active model remains intact and any pre-existing rollback-target model is preserved for failure recovery. Any failure after stop restores the prior files and image, recreates the prior service, and applies the same post-`StartedAt` freshness gate before returning failure.
 
 An ordinary rollback deliberately keeps the current data tree. This preserves the latest durable Matrix outbox, decision memory, state, and vehicle history.
 

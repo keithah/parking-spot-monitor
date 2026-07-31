@@ -26,6 +26,9 @@ SERVICE = "parking-spot-monitor"
 IMAGE_TAG = "parking-spot-monitor:local"
 HEALTH_STATUSES = frozenset({"ok", "starting", "degraded"})
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+ENV_ASSIGNMENT_PATTERN = re.compile(
+    r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*="
+)
 
 
 class DeploymentError(RuntimeError):
@@ -40,6 +43,7 @@ class Runner:
         capture: bool = False,
         cwd: Path | None = None,
         check: bool = True,
+        environment: Mapping[str, str] | None = None,
     ) -> str:
         completed = subprocess.run(
             list(command),
@@ -48,6 +52,7 @@ class Runner:
             text=True,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
+            env=dict(environment) if environment is not None else None,
         )
         if check and completed.returncode:
             detail = completed.stderr.strip() if capture and completed.stderr else ""
@@ -57,9 +62,18 @@ class Runner:
             )
         return completed.stdout.strip() if capture and completed.stdout else ""
 
-    def compose(self, *arguments: str, capture: bool = False, check: bool = True) -> str:
+    def compose(
+        self,
+        *arguments: str,
+        capture: bool = False,
+        check: bool = True,
+        environment: Mapping[str, str] | None = None,
+    ) -> str:
         return self.run(
-            ("docker", "compose", *arguments), capture=capture, check=check
+            ("docker", "compose", *arguments),
+            capture=capture,
+            check=check,
+            environment=environment,
         )
 
 
@@ -108,6 +122,18 @@ def _atomic_install(source: Path, destination: Path, mode: int) -> None:
     finally:
         with suppress(FileNotFoundError):
             temporary.unlink()
+
+
+def _durable_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _sha256(path: Path) -> str:
@@ -254,10 +280,40 @@ def _validate_archive(path: Path) -> None:
         raise DeploymentError("data archive is unreadable") from exc
 
 
-def _model_dir(runner: Runner) -> Path:
-    configured = os.environ.get("MODEL_DIR")
+def _compose(
+    runner: Runner,
+    *arguments: str,
+    env_file: Path | None = None,
+    capture: bool = False,
+    check: bool = True,
+) -> str:
+    prefix = ("--env-file", str(env_file)) if env_file is not None else ()
+    environment = None
+    if env_file is not None:
+        environment = dict(os.environ)
+        try:
+            with env_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    match = ENV_ASSIGNMENT_PATTERN.match(line)
+                    if match is not None:
+                        environment.pop(match.group(1), None)
+        except (OSError, UnicodeError) as exc:
+            raise DeploymentError("selected environment file is unreadable") from exc
+    return runner.compose(
+        *prefix,
+        *arguments,
+        capture=capture,
+        check=check,
+        environment=environment,
+    )
+
+
+def _model_dir(runner: Runner, env_file: Path | None = None) -> Path:
+    configured = os.environ.get("MODEL_DIR") if env_file is None else None
     if configured is None:
-        environment = runner.compose("config", "--environment", capture=True)
+        environment = _compose(
+            runner, "config", "--environment", env_file=env_file, capture=True
+        )
         configured = next(
             (
                 line.removeprefix("MODEL_DIR=")
@@ -269,8 +325,12 @@ def _model_dir(runner: Runner) -> Path:
     return Path(configured or "./models").resolve()
 
 
-def _running_container(runner: Runner) -> tuple[str, str]:
-    container_id = runner.compose("ps", "-q", SERVICE, capture=True)
+def _running_container(
+    runner: Runner, env_file: Path | None = None
+) -> tuple[str, str]:
+    container_id = _compose(
+        runner, "ps", "-q", SERVICE, env_file=env_file, capture=True
+    )
     if not container_id:
         raise DeploymentError("service container is unavailable")
     running = runner.run(
@@ -307,6 +367,7 @@ def wait_for_fresh_health(
     *,
     timeout_seconds: float = 180,
     poll_seconds: float = 2,
+    env_file: Path | None = None,
 ) -> None:
     started = _parse_time(started_at)
     if started is None:
@@ -331,7 +392,8 @@ def wait_for_fresh_health(
                 and frame > started
                 and artifact_new
             ):
-                runner.compose(
+                _compose(
+                    runner,
                     "exec",
                     "-T",
                     SERVICE,
@@ -342,6 +404,7 @@ def wait_for_fresh_health(
                     "/data/health.json",
                     "--max-age-seconds",
                     "120",
+                    env_file=env_file,
                 )
                 return
         except (OSError, json.JSONDecodeError, AttributeError):
@@ -350,8 +413,8 @@ def wait_for_fresh_health(
     raise DeploymentError("no healthy successful frame newer than container start")
 
 
-def _started_at(runner: Runner) -> str:
-    container_id, _ = _running_container(runner)
+def _started_at(runner: Runner, env_file: Path | None = None) -> str:
+    container_id, _ = _running_container(runner, env_file)
     return runner.run(
         ("docker", "inspect", container_id, "--format", "{{.State.StartedAt}}"),
         capture=True,
@@ -372,7 +435,8 @@ def backup_operation(
         raise DeploymentError("backup destination already exists")
     if not SHA256_PATTERN.fullmatch(approved_model_sha256):
         raise DeploymentError("approved model SHA-256 must be 64 lowercase hex characters")
-    model = _model_dir(runner) / "yolov8n.pt"
+    _require_regular_file(env_file, "environment")
+    model = _model_dir(runner, env_file) / "yolov8n.pt"
     for path, label in ((config_file, "config"), (env_file, "environment"), (model, "model")):
         _require_regular_file(path, label)
     if _sha256(model) != approved_model_sha256:
@@ -384,7 +448,7 @@ def backup_operation(
     )
     if existing:
         raise DeploymentError("rollback image tag already exists")
-    _, running_image_id = _running_container(runner)
+    _, running_image_id = _running_container(runner, env_file)
     runner.run(("docker", "image", "tag", running_image_id, rollback_tag))
     stopped = False
     parent = backup_dir.parent.resolve()
@@ -396,7 +460,7 @@ def backup_operation(
         os.chmod(stage, 0o700)
         try:
             stopped = True
-            runner.compose("stop", SERVICE)
+            _compose(runner, "stop", SERVICE, env_file=env_file)
             _copy_private(config_file, stage / "config.yaml")
             _copy_private(env_file, stage / ".env")
             _copy_private(model, stage / "yolov8n.pt")
@@ -435,7 +499,7 @@ def backup_operation(
         finally:
             if stopped:
                 try:
-                    runner.compose("start", SERVICE)
+                    _compose(runner, "start", SERVICE, env_file=env_file)
                 except DeploymentError as exc:
                     raise DeploymentError("backup completed but the service did not restart") from exc
 
@@ -477,6 +541,7 @@ def rollback_operation(
     rollback_dir: Path,
     data_dir: Path,
     config_file: Path = Path("config.yaml"),
+    env_file: Path = Path(".env"),
 ) -> None:
     metadata = verify_bundle(rollback_dir)
     rollback_tag = metadata["rollback-image-tag"]
@@ -487,9 +552,16 @@ def rollback_operation(
     )
     if actual != rollback_image:
         raise DeploymentError("rollback image tag does not match bundle identity")
-    model_dir = _model_dir(runner)
-    model_dir.mkdir(parents=True, exist_ok=True)
-    _, active_image = _running_container(runner)
+    _require_regular_file(env_file, "active environment")
+    active_model_dir = _model_dir(runner, env_file)
+    rollback_model_dir = _model_dir(runner, rollback_dir / ".env")
+    active_model = active_model_dir / "yolov8n.pt"
+    rollback_model = rollback_model_dir / "yolov8n.pt"
+    _require_regular_file(active_model, "active model")
+    rollback_model_existed = rollback_model != active_model and rollback_model.exists()
+    if rollback_model_existed:
+        _require_regular_file(rollback_model, "existing rollback-target model")
+    _, active_image = _running_container(runner, env_file)
     service_stopped = False
     switched = False
     with tempfile.TemporaryDirectory(prefix="parking-rollback-") as temporary_name:
@@ -500,8 +572,10 @@ def rollback_operation(
         _copy_private(rollback_dir / ".env", stage / ".env")
         _copy_private(rollback_dir / "yolov8n.pt", stage / "models/yolov8n.pt")
         _copy_private(config_file, stage / "active-config.yaml")
-        _copy_private(Path(".env"), stage / "active.env")
-        _copy_private(model_dir / "yolov8n.pt", stage / "active-yolov8n.pt")
+        _copy_private(env_file, stage / "active.env")
+        _copy_private(active_model, stage / "active-yolov8n.pt")
+        if rollback_model_existed:
+            _copy_private(rollback_model, stage / "rollback-target-yolov8n.pt")
         runner.run(
             (
                 "docker", "run", "--rm", "--env-file", str(stage / ".env"),
@@ -514,24 +588,45 @@ def rollback_operation(
         )
         try:
             service_stopped = True
-            runner.compose("stop", SERVICE)
+            _compose(runner, "stop", SERVICE, env_file=env_file)
             switched = True
             _atomic_install(stage / "config.yaml", config_file, 0o600)
-            _atomic_install(stage / ".env", Path(".env"), 0o600)
-            _atomic_install(stage / "models/yolov8n.pt", model_dir / "yolov8n.pt", 0o644)
+            _atomic_install(stage / ".env", env_file, 0o600)
+            _atomic_install(stage / "models/yolov8n.pt", rollback_model, 0o644)
             runner.run(("docker", "image", "tag", rollback_image, IMAGE_TAG))
-            runner.compose("up", "-d", "--no-build", "--force-recreate", SERVICE)
-            wait_for_fresh_health(runner, _started_at(runner), data_dir)
+            _compose(
+                runner,
+                "up", "-d", "--no-build", "--force-recreate", SERVICE,
+                env_file=env_file,
+            )
+            wait_for_fresh_health(
+                runner, _started_at(runner, env_file), data_dir, env_file=env_file
+            )
         except BaseException:
             if service_stopped:
-                runner.compose("stop", SERVICE, check=False)
+                _compose(runner, "stop", SERVICE, env_file=env_file, check=False)
                 if switched:
                     _atomic_install(stage / "active-config.yaml", config_file, 0o600)
-                    _atomic_install(stage / "active.env", Path(".env"), 0o600)
-                    _atomic_install(stage / "active-yolov8n.pt", model_dir / "yolov8n.pt", 0o644)
+                    _atomic_install(stage / "active.env", env_file, 0o600)
+                    _atomic_install(stage / "active-yolov8n.pt", active_model, 0o644)
+                    if rollback_model != active_model:
+                        if rollback_model_existed:
+                            _atomic_install(
+                                stage / "rollback-target-yolov8n.pt",
+                                rollback_model,
+                                0o644,
+                            )
+                        else:
+                            _durable_unlink(rollback_model)
                 runner.run(("docker", "image", "tag", active_image, IMAGE_TAG))
-                runner.compose("up", "-d", "--no-build", "--force-recreate", SERVICE)
-                wait_for_fresh_health(runner, _started_at(runner), data_dir)
+                _compose(
+                    runner,
+                    "up", "-d", "--no-build", "--force-recreate", SERVICE,
+                    env_file=env_file,
+                )
+                wait_for_fresh_health(
+                    runner, _started_at(runner, env_file), data_dir, env_file=env_file
+                )
             raise
 
 
@@ -589,6 +684,7 @@ def _parser() -> argparse.ArgumentParser:
     rollback.add_argument("--rollback-dir", required=True, type=Path)
     rollback.add_argument("--data-dir", default=Path("data"), type=Path)
     rollback.add_argument("--config-file", default=Path("config.yaml"), type=Path)
+    rollback.add_argument("--env-file", default=Path(".env"), type=Path)
     restore = subparsers.add_parser("restore-data")
     restore.add_argument("--rollback-dir", required=True, type=Path)
     restore.add_argument("--data-dir", default=Path("data"), type=Path)
@@ -613,7 +709,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             upgrade_operation(runner, args.reviewed_revision, args.rollback_tag, args.data_dir)
         elif args.operation == "rollback":
             rollback_operation(
-                runner, args.rollback_dir, args.data_dir, args.config_file
+                runner,
+                args.rollback_dir,
+                args.data_dir,
+                args.config_file,
+                args.env_file,
             )
         else:
             preserved = restore_data_operation(runner, args.rollback_dir, args.data_dir)

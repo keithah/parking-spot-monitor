@@ -23,6 +23,8 @@ class FakeRunner:
         self.fail_recreate_once = False
         self.fail_start_once = False
         self.status_values: list[str] = []
+        self.model_dirs: dict[Path, Path] = {}
+        self.compose_environments: list[dict[str, str] | None] = []
 
     def run(
         self,
@@ -31,6 +33,7 @@ class FakeRunner:
         capture: bool = False,
         cwd: Path | None = None,
         check: bool = True,
+        environment: dict[str, str] | None = None,
     ) -> str:
         call = tuple(command)
         self.calls.append(call)
@@ -76,17 +79,31 @@ class FakeRunner:
             raise deployment_operations.DeploymentError("injected validation failure")
         return ""
 
-    def compose(self, *arguments: str, capture: bool = False, check: bool = True) -> str:
+    def compose(
+        self,
+        *arguments: str,
+        capture: bool = False,
+        check: bool = True,
+        environment: dict[str, str] | None = None,
+    ) -> str:
         call = ("docker", "compose", *arguments)
         self.calls.append(call)
-        if arguments[:2] == ("config", "--environment"):
+        self.compose_environments.append(environment)
+        operation = arguments
+        env_file: Path | None = None
+        if operation[:1] == ("--env-file",):
+            env_file = Path(operation[1])
+            operation = operation[2:]
+        if operation[:2] == ("config", "--environment"):
+            if env_file is not None and env_file in self.model_dirs:
+                return f"MODEL_DIR={self.model_dirs[env_file]}"
             return f"MODEL_DIR={Path('models').resolve()}"
-        if arguments[:3] == ("ps", "-q", deployment_operations.SERVICE):
+        if operation[:3] == ("ps", "-q", deployment_operations.SERVICE):
             return "container-id"
-        if arguments[:1] == ("up",) and self.fail_recreate_once:
+        if operation[:1] == ("up",) and self.fail_recreate_once:
             self.fail_recreate_once = False
             raise deployment_operations.DeploymentError("injected recreate failure")
-        if arguments[:1] == ("start",) and self.fail_start_once:
+        if operation[:1] == ("start",) and self.fail_start_once:
             self.fail_start_once = False
             raise deployment_operations.DeploymentError("injected start failure")
         return ""
@@ -228,8 +245,18 @@ def test_backup_tags_running_image_and_restarts_after_archive_failure(
         "sha256:" + "a" * 64,
         "parking-spot-monitor:rollback-test",
     ) in runner.calls
-    stop = runner.calls.index(("docker", "compose", "stop", deployment_operations.SERVICE))
-    start = runner.calls.index(("docker", "compose", "start", deployment_operations.SERVICE))
+    stop = runner.calls.index(
+        (
+            "docker", "compose", "--env-file", ".env", "stop",
+            deployment_operations.SERVICE,
+        )
+    )
+    start = runner.calls.index(
+        (
+            "docker", "compose", "--env-file", ".env", "start",
+            deployment_operations.SERVICE,
+        )
+    )
     assert stop < start
     assert not (tmp_path / "backup").exists()
     assert not list(tmp_path.glob(".backup.partial-*"))
@@ -330,10 +357,80 @@ def test_rollback_recreate_failure_restores_prior_files_and_image(
     ) in runner.calls
     assert runner.calls.count(
         (
-            "docker", "compose", "up", "-d", "--no-build", "--force-recreate",
+            "docker", "compose", "--env-file", ".env", "up", "-d", "--no-build", "--force-recreate",
             deployment_operations.SERVICE,
         )
     ) == 2
+
+
+def test_rollback_uses_bundled_model_dir_and_external_environment_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MODEL_DIR", str(tmp_path / "wrong-shell-models"))
+    monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "wrong-shell-token")
+    monkeypatch.setattr(
+        deployment_operations, "wait_for_fresh_health", lambda *_args, **_kwargs: None
+    )
+    bundle = _bundle(tmp_path)
+    active_model_dir = tmp_path / "active-models"
+    rollback_model_dir = tmp_path / "rollback-models"
+    active_model_dir.mkdir()
+    rollback_model_dir.mkdir()
+    rollback_environment = (
+        f"MODEL_DIR={rollback_model_dir}\nMATRIX_ACCESS_TOKEN=rollback-token\n"
+    ).encode()
+    (bundle / ".env").write_bytes(rollback_environment)
+    _manifest(
+        bundle,
+        "bundle-files.sha256",
+        ("config.yaml", ".env", "image-id.txt", "approved-model.sha256"),
+    )
+    (active_model_dir / "yolov8n.pt").write_bytes(b"active-model")
+    (rollback_model_dir / "yolov8n.pt").write_bytes(b"unrelated-model")
+    config_file = tmp_path / "operator-config.yaml"
+    config_file.write_bytes(b"active-config")
+    env_file = tmp_path / "operator.env"
+    env_file.write_text(
+        f"MODEL_DIR={active_model_dir}\nMATRIX_ACCESS_TOKEN=active-token\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "data").mkdir()
+    runner = FakeRunner()
+    runner.rollback_image_exists = True
+    runner.model_dirs[env_file] = active_model_dir
+    runner.model_dirs[bundle / ".env"] = rollback_model_dir
+
+    deployment_operations.rollback_operation(
+        runner,
+        bundle,
+        tmp_path / "data",
+        config_file=config_file,
+        env_file=env_file,
+    )
+
+    assert config_file.read_bytes() == b"old-config"
+    assert env_file.read_bytes() == rollback_environment
+    assert (active_model_dir / "yolov8n.pt").read_bytes() == b"active-model"
+    assert (rollback_model_dir / "yolov8n.pt").read_bytes() == b"old-model"
+    assert (
+        "docker",
+        "compose",
+        "--env-file",
+        str(env_file),
+        "up",
+        "-d",
+        "--no-build",
+        "--force-recreate",
+        deployment_operations.SERVICE,
+    ) in runner.calls
+    assert runner.compose_environments
+    assert all(
+        environment is not None
+        and "MODEL_DIR" not in environment
+        and "MATRIX_ACCESS_TOKEN" not in environment
+        for environment in runner.compose_environments
+    )
 
 
 def test_restore_start_failure_reactivates_preserved_data(
