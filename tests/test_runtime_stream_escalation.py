@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 
@@ -11,13 +12,22 @@ from parking_spot_monitor.config import load_settings
 from parking_spot_monitor.detection import VehicleDetection
 from parking_spot_monitor.detector_adapter import adapt_detector
 from parking_spot_monitor.logging import StructuredLogger
-from parking_spot_monitor.occupancy import OccupancyStatus, SpotOccupancyState
+from parking_spot_monitor.occupancy import (
+    OccupancyEventType,
+    OccupancyStatus,
+    SpotOccupancyState,
+)
 from parking_spot_monitor.operator_decision_memory import (
     append_decision_memory_records,
     load_decision_memory,
 )
 from parking_spot_monitor.runtime_decision_memory import build_detection_memory_records
-from parking_spot_monitor.runtime_stream_escalation import detect_with_stream_escalation
+from parking_spot_monitor.runtime_frame_plan import build_runtime_frame_plan
+from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache
+from parking_spot_monitor.runtime_stream_escalation import (
+    StreamDetectionResult,
+    detect_with_stream_escalation,
+)
 from parking_spot_monitor.state import RuntimeState
 
 
@@ -228,6 +238,164 @@ def test_occupied_spot_near_release_escalates_on_missing_candidate(tmp_path: Pat
 
     assert captured_profiles == [None, "high_resolution"]
     assert result.escalated is True
+
+
+def test_two_frame_release_uses_high_resolution_absence_before_open_event(
+    tmp_path: Path,
+) -> None:
+    settings = _settings()
+    settings = settings.model_copy(
+        update={
+            "occupancy": settings.occupancy.model_copy(
+                update={"confirm_frames": 2, "release_frames": 2}
+            )
+        }
+    )
+    captured_profiles, capture, primary = _capture_profiles(tmp_path)
+
+    class NoDetection:
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            return []
+
+    runtime_state = RuntimeState(
+        state_by_spot={
+            "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+            "right_spot": SpotOccupancyState(
+                status=OccupancyStatus.OCCUPIED,
+                miss_streak=1,
+            ),
+        }
+    )
+    result = detect_with_stream_escalation(
+        settings,
+        tmp_path,
+        capture=capture,
+        detector=adapt_detector(NoDetection()),
+        runtime_state=runtime_state,
+        primary_result=primary,
+        logger=StructuredLogger(),
+        mode="runtime-loop",
+        iteration=1,
+        periodic_verification_due=False,
+    )
+
+    assert isinstance(result, StreamDetectionResult)
+    assert captured_profiles == [None, "high_resolution"]
+    assert result.escalated is True
+    assert result.detection.by_spot["right_spot"].accepted is None
+
+    plan = build_runtime_frame_plan(
+        settings=settings,
+        runtime_state=runtime_state,
+        detection_result=result.detection,
+        observed_at=datetime.fromisoformat(result.final_capture.timestamp.replace("Z", "+00:00")),
+        snapshot_path=str(result.final_capture.latest_path),
+        configured_spot_ids=["left_spot", "right_spot"],
+        history_archive=None,
+        logger=StructuredLogger(),
+        owner_vehicle_snapshot_provider=OwnerVehicleRuntimeCache(
+            tmp_path / "owner-vehicles.json", logger=StructuredLogger()
+        ),
+    )
+
+    open_events = [
+        event
+        for event in plan.occupancy_update.events
+        if event.event_type is OccupancyEventType.OPEN_EVENT
+    ]
+    assert len(open_events) == 1
+    assert open_events[0].spot_id == "right_spot"
+    assert plan.runtime_state.state_by_spot["right_spot"].status is OccupancyStatus.EMPTY
+
+
+def test_two_frame_release_is_cancelled_when_high_resolution_still_sees_vehicle(
+    tmp_path: Path,
+) -> None:
+    settings = _settings()
+    settings = settings.model_copy(
+        update={
+            "occupancy": settings.occupancy.model_copy(
+                update={"confirm_frames": 2, "release_frames": 2}
+            )
+        }
+    )
+    captured_profiles, capture, primary = _capture_profiles(tmp_path)
+
+    class HighResolutionVehicle:
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            with Image.open(frame_path) as image:
+                if image.size != (3840, 2160):
+                    return []
+            return [
+                VehicleDetection(
+                    class_name="car",
+                    confidence=0.92,
+                    bbox=(
+                        1010 * 3840 / 1458,
+                        215 * 2160 / 806,
+                        1395 * 3840 / 1458,
+                        355 * 2160 / 806,
+                    ),
+                )
+            ]
+
+    runtime_state = RuntimeState(
+        state_by_spot={
+            "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+            "right_spot": SpotOccupancyState(
+                status=OccupancyStatus.OCCUPIED,
+                miss_streak=1,
+            ),
+        }
+    )
+    result = detect_with_stream_escalation(
+        settings,
+        tmp_path,
+        capture=capture,
+        detector=adapt_detector(HighResolutionVehicle()),
+        runtime_state=runtime_state,
+        primary_result=primary,
+        logger=StructuredLogger(),
+        mode="runtime-loop",
+        iteration=1,
+        periodic_verification_due=False,
+    )
+
+    assert isinstance(result, StreamDetectionResult)
+    assert captured_profiles == [None, "high_resolution"]
+    assert result.escalated is True
+    assert result.detection.by_spot["right_spot"].accepted is not None
+
+    plan = build_runtime_frame_plan(
+        settings=settings,
+        runtime_state=runtime_state,
+        detection_result=result.detection,
+        observed_at=datetime.fromisoformat(result.final_capture.timestamp.replace("Z", "+00:00")),
+        snapshot_path=str(result.final_capture.latest_path),
+        configured_spot_ids=["left_spot", "right_spot"],
+        history_archive=None,
+        logger=StructuredLogger(),
+        owner_vehicle_snapshot_provider=OwnerVehicleRuntimeCache(
+            tmp_path / "owner-vehicles.json", logger=StructuredLogger()
+        ),
+    )
+
+    assert all(
+        event.event_type is not OccupancyEventType.OPEN_EVENT
+        for event in plan.occupancy_update.events
+    )
+    assert plan.runtime_state.state_by_spot["right_spot"].status is OccupancyStatus.OCCUPIED
+    assert plan.runtime_state.state_by_spot["right_spot"].miss_streak == 0
 
 
 def test_missing_escalation_profile_does_not_recapture_primary_stream(tmp_path: Path) -> None:

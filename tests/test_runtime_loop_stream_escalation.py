@@ -23,7 +23,7 @@ from parking_spot_monitor.runtime_frame_outcome import (
     prepare_runtime_frame_loop_result,
 )
 from parking_spot_monitor.runtime_health import RuntimeLoopHealthState
-from parking_spot_monitor.state import RuntimeState, save_runtime_state
+from parking_spot_monitor.state import RuntimeState, load_runtime_state, save_runtime_state
 
 SECRET_MARKER = "startup-secret-should-not-leak"
 FAKE_RTSP_VALUE = f"camera-value-{SECRET_MARKER}"
@@ -262,7 +262,7 @@ def test_runtime_frame_periodic_outcome_preserves_primary_and_final_capture_iden
 
 
 def test_runtime_loop_transition_enters_occupied_cadence_without_periodic_verification(
-    tmp_path: Path,
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     settings = load_settings("config.yaml.example", environ=fake_environ())
     settings = settings.model_copy(
@@ -270,12 +270,18 @@ def test_runtime_loop_transition_enters_occupied_cadence_without_periodic_verifi
             "runtime": settings.runtime.model_copy(
                 update={
                     "health_file": tmp_path / "health.json",
+                    "frame_interval_seconds": 8,
                     "occupied_frame_interval_seconds": 8,
+                    "stable_frame_interval_seconds": 12,
+                    "stable_settle_frames": 1,
                     "debug_overlay_interval_seconds": 0,
                 }
             ),
+            "occupancy": settings.occupancy.model_copy(
+                update={"confirm_frames": 2, "release_frames": 2}
+            ),
             "stream": settings.stream.model_copy(
-                update={"escalation_verification_seconds": 100}
+                update={"escalation_verification_seconds": 0}
             ),
         }
     )
@@ -290,11 +296,11 @@ def test_runtime_loop_transition_enters_occupied_cadence_without_periodic_verifi
             state_by_spot={
                 "left_spot": SpotOccupancyState(
                     status=OccupancyStatus.EMPTY,
-                    hit_streak=2,
+                    miss_streak=2,
                 ),
                 "right_spot": SpotOccupancyState(
                     status=OccupancyStatus.EMPTY,
-                    miss_streak=3,
+                    miss_streak=2,
                 ),
             }
         ),
@@ -331,11 +337,12 @@ def test_runtime_loop_transition_enters_occupied_cadence_without_periodic_verifi
             path = Path(frame_path)
             if path == primary_path:
                 primary_detection_count += 1
-                confidence = 0.5 if primary_detection_count == 1 else 0.92
+                if primary_detection_count == 1:
+                    return []
                 return [
                     VehicleDetection(
                         class_name="car",
-                        confidence=confidence,
+                        confidence=0.5,
                         bbox=(350, 200, 550, 330),
                     )
                 ]
@@ -352,11 +359,7 @@ def test_runtime_loop_transition_enters_occupied_cadence_without_periodic_verifi
                 )
             ]
 
-    timestamps = iter(
-        value
-        for iteration in range(12)
-        for value in (float(iteration * 10), float(iteration * 10 + 1))
-    )
+    timestamps = iter([0.0, 0.0, 12.0, 12.0, 20.0, 20.0])
 
     exit_code = run_capture_loop(
         settings,
@@ -367,7 +370,7 @@ def test_runtime_loop_transition_enters_occupied_cadence_without_periodic_verifi
         detector_factory=lambda _settings: TransitionThenStableDetector(),
         matrix_delivery=None,
         sleep=sleeps.append,
-        max_iterations=12,
+        max_iterations=3,
         monotonic=lambda: next(timestamps),
         decision_memory_store=DecisionMemoryStore(
             tmp_path / "operator-decision-memory.json",
@@ -379,10 +382,27 @@ def test_runtime_loop_transition_enters_occupied_cadence_without_periodic_verifi
     assert exit_code == 0
     assert capture_profiles == [
         None,
+        None,
         "high_resolution",
-        *([None] * 11),
+        None,
+        "high_resolution",
     ]
-    assert sleeps == [*([29.0] * 4), *([7.0] * 8)]
+    assert sleeps[:2] == [pytest.approx(12.0), pytest.approx(8.0)]
+    final_state = load_runtime_state(
+        tmp_path / "state.json", ["left_spot", "right_spot"]
+    )
+    assert final_state.state_by_spot["left_spot"].status is OccupancyStatus.OCCUPIED
+    occupied_transitions = [
+        record
+        for record in (
+            json.loads(line)
+            for line in combined_output(capsys).splitlines()
+            if line.startswith("{")
+        )
+        if record.get("event") == "occupancy-state-changed"
+        and record.get("new_status") == OccupancyStatus.OCCUPIED.value
+    ]
+    assert len(occupied_transitions) == 1
 
 
 def test_disabled_adaptive_polling_keeps_fixed_cadence_and_periodic_verification(
@@ -553,9 +573,23 @@ def test_runtime_loop_failed_escalation_records_capture_success_without_processe
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(runtime_config_text(), encoding="utf-8")
+    config_path.write_text(
+        runtime_config_text()
+        .replace("  confirm_frames: 3", "  confirm_frames: 2")
+        .replace("  release_frames: 3", "  release_frames: 2"),
+        encoding="utf-8",
+    )
     primary_path = tmp_path / "latest-primary.jpg"
     capture_profiles: list[str | None] = []
+    save_runtime_state(
+        tmp_path / "state.json",
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+                "right_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+            }
+        ),
+    )
 
     def fake_capture(_settings: object, data_dir: str | Path, *, stream_profile: str | None = None) -> FrameCaptureResult:
         capture_profiles.append(stream_profile)
@@ -604,6 +638,11 @@ def test_runtime_loop_failed_escalation_records_capture_success_without_processe
     }
     assert health["last_error"]["phase"] == "capture"
     assert primary_path.exists()
+    state = load_runtime_state(
+        tmp_path / "state.json", ["left_spot", "right_spot"]
+    )
+    assert state.state_by_spot["right_spot"].status is OccupancyStatus.EMPTY
+    assert state.state_by_spot["right_spot"].hit_streak == 0
     assert_no_secret_leak(output + json.dumps(health))
 
 
