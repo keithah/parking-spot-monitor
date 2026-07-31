@@ -175,3 +175,37 @@ def test_loader_quarantines_non_finite_legacy_record(tmp_path: Path) -> None:
     assert restarted.status_summary()["recovery"]["quarantined_count"] == 0
     assert tuple((tmp_path / ".matrix-outbox-quarantine").iterdir()) == quarantine_files
     assert len(json.loads(path.read_text(encoding="utf-8"))["items"]) == 1
+
+
+def test_repair_does_not_overwrite_concurrent_canonical_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "matrix-outbox.json"
+    seeded = LocalOutbox(path)
+    seeded.enqueue(AlertIntent(event_id="legacy-nan", phase="text", body="invalid"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["items"][0]["retry_attempt_count"] = float("nan")
+    path.write_text(json.dumps(payload, allow_nan=True), encoding="utf-8")
+    replacement = tmp_path / "replacement.json"
+    replacement_outbox = LocalOutbox(replacement)
+    concurrent = replacement_outbox.enqueue(
+        AlertIntent(event_id="concurrent", phase="text", body="must survive")
+    )
+    real_quarantine = outbox_storage._quarantine_json
+    replaced = False
+
+    def replace_after_quarantine(*args: object, **kwargs: object) -> object:
+        nonlocal replaced
+        event = real_quarantine(*args, **kwargs)
+        if not replaced:
+            replaced = True
+            os.replace(replacement, path)
+        return event
+
+    monkeypatch.setattr(outbox_storage, "_quarantine_json", replace_after_quarantine)
+
+    with pytest.raises(OutboxPersistenceError, match="changed before recovery repair"):
+        LocalOutbox(path)
+
+    assert replaced is True
+    assert LocalOutbox(path).list_records() == [concurrent]

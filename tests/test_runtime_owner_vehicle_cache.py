@@ -11,7 +11,7 @@ import pytest
 from parking_spot_monitor import runtime_owner_vehicle_cache
 from parking_spot_monitor.logging import StructuredLogger
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
-from parking_spot_monitor.owner_vehicles import OwnerVehicle, OwnerVehicleRegistry
+from parking_spot_monitor.owner_vehicles import OwnerVehicle, OwnerVehicleRegistry, OwnerVehicleRegistryError
 from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleRuntimeCache, OwnerVehicleSnapshot
 from parking_spot_monitor.runtime_vehicle_events import _owner_vehicle_quiet_window_alerts
 from parking_spot_monitor.scheduler import QuietWindowStatus
@@ -427,7 +427,13 @@ def test_registry_load_failure_retries_without_claiming_the_new_signature(
     registry_path = tmp_path / "owner-vehicles.json"
     write_registry(registry_path)
     archive = FakeArchive()
-    cache = OwnerVehicleRuntimeCache(registry_path, logger=StructuredLogger())
+    clock = FakeClock()
+    cache = OwnerVehicleRuntimeCache(
+        registry_path,
+        logger=StructuredLogger(),
+        now=clock,
+        active_session_poll_seconds=10.0,
+    )
     original = cache.snapshot(archive)
     write_registry(registry_path, "profile-b")
     real_open = Path.open
@@ -444,6 +450,8 @@ def test_registry_load_failure_retries_without_claiming_the_new_signature(
     monkeypatch.setattr(Path, "open", fail_once)
 
     stale = cache.snapshot(archive)
+    assert cache.snapshot(archive) is stale
+    clock.advance(10.0)
     recovered = cache.snapshot(archive)
 
     assert stale.registry is original.registry
@@ -638,6 +646,61 @@ def test_stable_invalid_registry_reuses_stale_snapshot_until_poll_deadline(
     assert archive.active_loads == 3
     assert registry_loads == 2
     assert cache.snapshot(archive) is refreshed
+
+
+def test_persistent_read_failure_reuses_last_good_until_poll_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry_path = tmp_path / "owner-vehicles.json"
+    write_registry(registry_path, "profile-a")
+    archive = FakeArchive()
+    clock = FakeClock()
+    cache = OwnerVehicleRuntimeCache(
+        registry_path,
+        logger=StructuredLogger(),
+        now=clock,
+        active_session_poll_seconds=10.0,
+    )
+    original = cache.snapshot(archive)
+    replacement = tmp_path / "owner-vehicles.replacement.json"
+    write_registry(replacement, "profile-b")
+    replacement.replace(registry_path)
+    registry_loads = 0
+
+    def fail_read(*_args: object, **_kwargs: object) -> OwnerVehicleRegistry:
+        nonlocal registry_loads
+        registry_loads += 1
+        raise OwnerVehicleRegistryError("read_failed", "owner vehicle registry could not be read")
+
+    monkeypatch.setattr(runtime_owner_vehicle_cache, "load_owner_vehicle_registry", fail_read)
+    stale = cache.snapshot(archive)
+    real_stat = Path.stat
+    registry_stats = 0
+
+    def counted_stat(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal registry_stats
+        if path == registry_path:
+            registry_stats += 1
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", counted_stat)
+    for _ in range(100):
+        assert cache.snapshot(archive) is stale
+
+    assert stale.registry is original.registry
+    assert archive.active_loads == 2
+    assert registry_loads == 1
+    assert registry_stats == 100
+    assert capsys.readouterr().err.count('"event":"owner-vehicle-registry-invalid"') == 1
+
+    clock.advance(10.0)
+    refreshed = cache.snapshot(archive)
+    assert refreshed.registry is original.registry
+    assert archive.active_loads == 3
+    assert registry_loads == 2
+    assert capsys.readouterr().err == ""
 
 
 def test_runtime_cache_initial_invalid_registry_fails_closed(tmp_path: Path) -> None:

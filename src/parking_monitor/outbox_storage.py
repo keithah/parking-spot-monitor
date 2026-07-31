@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import stat
 import tempfile
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Iterator
 
 from parking_monitor.outbox_models import (
     JsonValue,
@@ -147,9 +149,10 @@ def load_records(
             recovery = recovery.with_event(event)
     recovery = recovery.with_recovered_count(len(records))
     if recovery.quarantined_count:
-        persist_records(
+        _repair_records(
             path,
             records,
+            source_stat=before,
             max_bytes=max_bytes,
             max_record_bytes=max_record_bytes,
             fsync_directory=fsync_directory,
@@ -170,6 +173,16 @@ def persist_records(
         max_bytes=max_bytes,
         max_record_bytes=max_record_bytes,
     )
+    with _outbox_transaction(path):
+        _persist_serialized(path, serialized, fsync_directory=fsync_directory)
+
+
+def _persist_serialized(
+    path: Path,
+    serialized: bytes,
+    *,
+    fsync_directory: Callable[[Path], None],
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path: str | None = None
     replaced = False
@@ -196,6 +209,54 @@ def persist_records(
                 pass
         error = OutboxPostCommitPersistenceError if replaced else OutboxPersistenceError
         raise error("failed to persist local outbox record") from exc
+
+
+def _repair_records(
+    path: Path,
+    records: list[OutboxRecord],
+    *,
+    source_stat: os.stat_result,
+    max_bytes: int,
+    max_record_bytes: int,
+    fsync_directory: Callable[[Path], None],
+) -> None:
+    serialized = _serialized_document(
+        records,
+        max_bytes=max_bytes,
+        max_record_bytes=max_record_bytes,
+    )
+    with _outbox_transaction(path):
+        try:
+            current = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise OutboxPersistenceError("local outbox changed before recovery repair") from exc
+        if _stat_signature(current) != _stat_signature(source_stat):
+            raise OutboxPersistenceError("local outbox changed before recovery repair")
+        _persist_serialized(path, serialized, fsync_directory=fsync_directory)
+
+
+@contextmanager
+def _outbox_transaction(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as exc:
+        raise OutboxPersistenceError("failed to lock local outbox") from exc
+    try:
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OutboxPersistenceError("local outbox lock must be a regular file")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise OutboxPersistenceError("failed to lock local outbox") from exc
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def apply_retention(

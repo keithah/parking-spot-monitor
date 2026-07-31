@@ -101,8 +101,7 @@ class OwnerVehicleRuntimeCache:
                             error_code=exc.code,
                             error_message=exc.safe_message,
                         )
-                        if exc.code != "read_failed":
-                            self._last_failed_signature = registry_signature
+                        self._last_failed_signature = registry_signature
                     if self._last_good_registry is None:
                         raise OwnerVehicleSnapshotUnavailableError(
                             "no valid owner vehicle registry snapshot is available"
@@ -113,6 +112,7 @@ class OwnerVehicleRuntimeCache:
             if after == before:
                 if (
                     not load_failed
+                    and self._last_failed_signature is _UNSET
                     and self._entry is not None
                     and self._entry[0] == after
                     and self._entry[1].active_sessions == active_sessions
