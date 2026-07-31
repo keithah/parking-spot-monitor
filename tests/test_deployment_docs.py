@@ -72,6 +72,41 @@ def test_deployment_documents_low_latency_profile_and_healthy_host_scope() -> No
     assert "Matrix sends the base occupied text before snapshot preparation" not in runbook
 
 
+def test_operator_docs_agree_on_occupied_alert_outbox_contract() -> None:
+    documents = {
+        path: " ".join(Path(path).read_text(encoding="utf-8").split())
+        for path in ("README.md", "docs/deployment.md", "docs/outbox.md")
+    }
+
+    for path, text in documents.items():
+        for required in (
+            "Matrix network I/O",
+            "snapshot-preparation failure",
+            "text-only outbox record",
+            "same event ID",
+        ):
+            assert required in text, f"{path} missing occupied-alert contract: {required}"
+        assert re.search(
+            r"worker.{0,120}text.{0,120}upload.{0,120}image",
+            text,
+            flags=re.IGNORECASE,
+        ), f"{path} missing worker text/upload/image order"
+        assert not re.search(
+            r"occupied(?:-spot)? alerts?.{0,200}(?:remain|is) direct",
+            text,
+            flags=re.IGNORECASE,
+        ), f"{path} still classifies occupied alerts as direct"
+
+    outbox = documents["docs/outbox.md"]
+    for required in (
+        "`occupancy-open-event` and `occupancy-occupied-event`",
+        "durable outbox",
+        "live-proof delivery",
+        "Matrix command replies",
+    ):
+        assert required in outbox
+
+
 def test_deployment_documents_exact_conservative_profile_rollback() -> None:
     runbook = Path("docs/deployment.md").read_text(encoding="utf-8")
     rollback = runbook.split("### Restore conservative settings", 1)[1].split("\n### ", 1)[0]

@@ -1,8 +1,8 @@
 # Matrix Alert Outbox Contract
 
-The local Matrix delivery outbox is wired into the default runtime open-spot Matrix delivery path and exposed through safe operator visibility surfaces. An open-spot alert is persisted before any Matrix network I/O, retryable failures survive process restart in `<data-dir>/matrix-outbox.json`, and later drains skip already delivered phases before retrying the remaining work.
+The local Matrix delivery outbox is wired into the default runtime alert and notice paths and exposed through safe operator visibility surfaces. Open-spot and occupied-spot alerts are persisted before any Matrix network I/O, retryable failures survive process restart in `<data-dir>/matrix-outbox.json`, and later worker drains skip already delivered phases before retrying the remaining work.
 
-The persistence boundary lives in `parking_monitor.outbox`; the runtime open-alert executor lives in `parking_monitor.matrix_outbox_delivery` and is created by the default runtime Matrix delivery factory. Runtime health JSON and Matrix cockpit replies consume the redacted `LocalOutbox.status_summary()` shape; operators should use those summaries before inspecting the raw outbox file.
+The persistence boundary lives in `parking_monitor.outbox`; the runtime alert executor lives in `parking_monitor.matrix_outbox_delivery` and is created by the default runtime Matrix delivery factory. Runtime health JSON and Matrix cockpit replies consume the redacted `LocalOutbox.status_summary()` shape; operators should use those summaries before inspecting the raw outbox file.
 
 ## Runtime operator contract
 
@@ -16,48 +16,47 @@ At runtime the outbox file is resolved from the effective data directory:
 
 `parking_spot_monitor.paths.resolve_runtime_paths()` exposes this as `RuntimePaths.matrix_outbox_file`. The file is a single JSON document written by temp-file plus `os.replace`, so successful updates replace the previous durable payload atomically.
 
-### Which Matrix events are outbox-backed in S02
+### Which runtime Matrix events are outbox-backed
 
-Only `occupancy-open-event` alerts sent through the default runtime Matrix delivery factory are backed by the durable outbox in S02.
+Both `occupancy-open-event` and `occupancy-occupied-event` alerts sent through the default runtime Matrix delivery factory are backed by the durable outbox. Frame-dispatched quiet-window notices, owner-vehicle quiet-window alerts, and monitor lifecycle notices are also persisted as text-only records before network delivery.
 
-The following Matrix paths remain direct delivery paths for now:
+The genuinely direct default-runtime paths are:
 
-- quiet-window notices;
-- owner-vehicle quiet-window alerts;
-- occupied-spot alerts;
 - live-proof delivery;
-- tests or integrations that inject a custom `matrix_delivery_factory` without a `drain_outbox()` method.
+- Matrix command replies, including command-requested images after their bounded preparation.
 
-The runtime loop detects outbox-capable deliveries with duck-typed outbox hooks. A delivery object with `enqueue_open_spot_alert` lets frame dispatch persist an open alert without immediately draining Matrix network work. A delivery object with `drain_outbox` is drained at runtime startup and at the beginning of each capture-loop iteration. Legacy or test Matrix delivery fakes that do not expose those methods are ignored.
+Tests or integrations that inject a custom `matrix_delivery_factory` define their own persistence boundary and are not evidence for the default runtime. The default runtime starts one outbox delivery worker. Frame dispatch calls enqueue-only alert or notice methods; a successful enqueue wakes the worker without performing Matrix network I/O on the capture thread. The worker selects and drains at most one due durable record per pass.
 
-### Open-alert phase order and idempotency
+### Snapshot-alert preparation, fallback, phase order, and idempotency
 
-Each open alert is represented by one outbox record with three phases:
+Each full open or occupied alert is represented by one outbox record with three phases:
 
 1. `text` — sends the Matrix text event with the human alert text.
-2. `upload` — prepares/copies the retained JPEG snapshot and uploads it to Matrix media.
+2. `upload` — prepares a bounded upload derivative from the already retained JPEG and uploads it to Matrix media.
 3. `image` — sends the Matrix image event using the uploaded `content_uri`.
 
-`enqueue_open_spot_alert(event)` enqueues the sanitized alert intent and predeclares all three phases without performing Matrix network I/O. The runtime frame dispatch path uses this enqueue-only method so frame processing does not block on Matrix text, upload, or image delivery.
+`enqueue_open_spot_alert(event)` and `enqueue_occupied_spot_alert(event)` prepare retained-snapshot evidence, enqueue the sanitized alert intent, and predeclare all three phases without performing Matrix network I/O. The runtime frame dispatch path uses these enqueue-only methods so frame processing does not block on Matrix text, upload, or image delivery.
 
-`send_open_spot_alert(event)` remains available as a direct helper for callers that want enqueue-and-drain behavior in one call. That helper enqueues the same three-phase record and then drains phases in `text`, `upload`, `image` order.
+For an occupied alert, retained-snapshot preparation occurs before network delivery. A recognized snapshot-preparation failure durably persists a text-only outbox record under the same event ID instead. The recognized reasons are invalid or missing source, copy failure, metadata failure, and resize failure. An unrecognized preparation error or outbox persistence failure is surfaced rather than reported as queued. A text-only fallback has only the `text` phase; it does not claim that upload or image delivery occurred.
+
+`send_open_spot_alert(event)` remains available as a compatibility helper for callers that want enqueue-and-drain behavior in one call. The default runtime alert dispatch uses enqueue-only methods and lets the delivery worker drain. For a full snapshot record, the worker drains `text` before `upload` and `image`; a failure stops that pass before later phases.
 
 Already delivered phases are skipped on later drains. This prevents a successful text phase from being sent again if upload fails, and prevents a successful upload from being repeated if image send fails after a restart. Upload success stores secret-safe phase result metadata needed by the image phase, including the Matrix `content_uri`, snapshot body, filename, and image info.
 
-Open-alert phase transaction IDs are derived from the stable open event ID plus phase suffix:
+Snapshot-alert phase transaction IDs are derived from the stable open or occupied event ID plus phase suffix:
 
-- `<open-event-id>:text`
-- `<open-event-id>:image`
+- `<event-id>:text`
+- `<event-id>:image`
 
 The base `OutboxRecord.matrix_transaction_id` remains available for stable whole-record diagnostics. The runtime phase sender currently uses the phase-specific transaction IDs above for Matrix idempotency.
 
 ### Retry and drain semantics
 
-Runtime drain points:
+Runtime drain mechanisms:
 
-- once at capture-loop startup, before the first frame is captured;
-- once at the beginning of every capture-loop iteration;
-- direct `send_open_spot_alert(event)` calls outside the frame dispatch path.
+- the single background delivery worker started with the default runtime;
+- worker wake-up after a successful enqueue and when a retry becomes due;
+- explicit `drain_outbox()` calls and the compatibility `send_open_spot_alert(event)` helper outside default frame dispatch.
 
 `MatrixOutboxDelivery.drain_outbox()` selects records in `pending` or `retrying` state. Terminal `delivered`, `failed`, and `dead_lettered` records are not re-sent.
 
@@ -68,9 +67,9 @@ On a retryable phase exception, the executor:
 3. leaves the failed phase pending;
 4. returns without attempting later phases.
 
-A later successful drain resumes from the first non-delivered phase and marks the record `delivered` only after all three phases are delivered.
+A later successful drain resumes from the first non-delivered phase and marks the record `delivered` only after all required phases are delivered. Full snapshot records require text, upload, and image; an occupied text-only fallback requires text alone.
 
-Startup or iteration drains that still have retrying records are reflected as degraded Matrix health context with `error_type: retrying_records`; the durable outbox remains the source of truth for the pending work.
+Worker passes that still have retrying records are reflected as degraded Matrix health context with `error_type: retrying_records`; the durable outbox remains the source of truth for the pending work.
 
 ### Operator visibility surfaces
 
@@ -146,7 +145,7 @@ Interpret recovery states conservatively:
 - Phase state `text=delivered, upload=pending, image=pending` after a Matrix upload failure means the next drain should resume at upload, not resend text.
 - Phase state `text=delivered, upload=delivered, image=pending` means the upload result metadata survived and the next drain should resume at image send.
 
-A normal container restart is safe for retryable outbox records. The runtime drains the same durable `<data-dir>/matrix-outbox.json` at startup and every capture-loop iteration, so a fresh container should resume from the first non-delivered phase. Duplicate suppression depends on the persisted phase states and stable transaction IDs: after `text` succeeds, later drains skip text; after `upload` succeeds, later drains reuse the persisted upload result and skip upload before sending the image phase. Operators should treat repeated text sends for the same open event after a persisted text success as a duplicate-suppression regression.
+A normal container restart is safe for retryable outbox records. The fresh runtime starts its delivery worker against the same durable `<data-dir>/matrix-outbox.json`, so a fresh worker can resume from the first non-delivered phase when the record is due. Duplicate suppression depends on the persisted phase states and stable transaction IDs: after `text` succeeds, later drains skip text; after `upload` succeeds, later drains reuse the persisted upload result and skip upload before sending the image phase. Operators should treat repeated text sends for the same snapshot-alert event after a persisted text success as a duplicate-suppression regression.
 
 The M007 Matrix outbox closeout smoke is the finite container-local proof for this behavior:
 
@@ -250,7 +249,7 @@ Whole-record states:
 - `failed`: terminal non-retryable failure.
 - `dead_lettered`: permanent failure retained for inspection; `dead_letter_reason` contains a normalized reason code.
 
-Phase names are `text`, `upload`, and `image`. Phase states are `pending`, `delivered`, and `failed`. Marking the only pending phase delivered promotes the whole record to `delivered`; a predeclared multi-phase open-alert record is promoted only after all phases are delivered. Marking a phase failed dead-letters the whole record when using `mark_phase_failed`.
+Phase names are `text`, `upload`, and `image`. Phase states are `pending`, `delivered`, and `failed`. Marking the only pending phase delivered promotes the whole record to `delivered`; a predeclared multi-phase snapshot-alert record is promoted only after all phases are delivered. Marking a phase failed dead-letters the whole record when using `mark_phase_failed`.
 
 Delivered phases can carry an optional `result` object. This object is sanitized with the same secret filters as alert intent metadata and is intended only for safe retry inputs that must survive restart, for example Matrix event IDs, a Matrix media upload `content_uri`, image dimensions, MIME type, filename, and snapshot body. Empty result fields are dropped. Secret-shaped keys or values, raw image bytes, RTSP URLs, authorization/bearer strings, exception text, tracebacks, cookies, passwords, and token-like fields are rejected before persistence. Reloading older records where `result` is absent remains valid and exposes an empty `phase_results` mapping in memory.
 
