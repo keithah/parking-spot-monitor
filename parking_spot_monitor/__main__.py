@@ -169,7 +169,7 @@ def _main(
     )
 
     logger.info("startup-ready", config_path=config_path, data_dir=str(paths.data_dir), mode=mode)
-    capture_fn = capture if capture is not None else partial(capture_latest, logger=logger)
+    capture_fn = capture if capture is not None else partial(capture_latest, logger=logger, timeout_seconds=settings.stream.capture_timeout_seconds)
     overlay_fn = overlay if overlay is not None else _write_debug_overlay
     detector_fn = detector_factory if detector_factory is not None else _default_detector_factory
     matrix_factory = matrix_delivery_factory if matrix_delivery_factory is not None else _default_matrix_delivery_factory

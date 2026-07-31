@@ -281,6 +281,55 @@ def test_runtime_loop_passes_effective_paths_to_capture_state_and_matrix(
     assert_no_secret_leak(output)
 
 
+def test_capture_once_default_capture_binds_configured_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from parking_spot_monitor import __main__ as cli
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        Path("config.yaml.example")
+        .read_text(encoding="utf-8")
+        .replace("capture_timeout_seconds: 15", "capture_timeout_seconds: 4"),
+        encoding="utf-8",
+    )
+    capture_calls: list[dict[str, object]] = []
+
+    def record_capture(
+        _settings: object,
+        data_dir: str | Path,
+        *,
+        logger: StructuredLogger,
+        timeout_seconds: float | None = None,
+        stream_profile: str | None = None,
+    ) -> FrameCaptureResult:
+        capture_calls.append(
+            {
+                "stream_profile": stream_profile,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return captured_frame(Path(data_dir))
+
+    monkeypatch.setattr(cli, "capture_latest", record_capture)
+
+    exit_code = _main(
+        ["--config", str(config_path), "--data-dir", str(tmp_path), "--capture-once"],
+        environ=fake_environ(),
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+    )
+
+    assert exit_code == 0
+    assert capture_calls == [
+        {
+            "stream_profile": None,
+            "timeout_seconds": 4.0,
+        }
+    ]
+
+
 def test_validate_config_success_emits_sanitized_startup_events(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = main(["--config", "config.yaml.example", "--validate-config"], environ=fake_environ())
 

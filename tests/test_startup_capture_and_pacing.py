@@ -85,6 +85,32 @@ def test_capture_once_success_writes_debug_overlay_then_spot_filtered_detection(
     assert_no_secret_leak(output)
 
 
+def test_capture_once_injected_capture_keeps_stream_profile_signature(
+    tmp_path: Path,
+) -> None:
+    capture_calls: list[dict[str, object]] = []
+
+    def injected_capture(
+        _settings: object,
+        data_dir: str | Path,
+        *,
+        stream_profile: str | None = None,
+    ) -> FrameCaptureResult:
+        capture_calls.append({"stream_profile": stream_profile})
+        return captured_frame(Path(data_dir))
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path), "--capture-once"],
+        environ=fake_environ(),
+        capture=injected_capture,
+        overlay=noop_overlay,
+        detector_factory=noop_detector_factory,
+    )
+
+    assert exit_code == 0
+    assert capture_calls == [{"stream_profile": None}]
+
+
 def test_capture_once_failure_skips_debug_overlay(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
