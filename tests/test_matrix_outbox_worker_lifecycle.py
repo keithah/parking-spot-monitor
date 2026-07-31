@@ -3,6 +3,95 @@ from __future__ import annotations
 from tests.support._matrix_outbox_delivery import *  # noqa: F403
 
 
+def test_delivered_record_logs_observation_enqueue_and_delivery_latency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import parking_monitor.outbox as outbox_module
+
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    clock = {"value": "2026-07-31T05:00:18Z"}
+    monkeypatch.setattr(outbox_module, "utc_now_text", lambda: clock["value"])
+    stream = StringIO()
+    delivery = MatrixOutboxDelivery(
+        client=FakeMatrixClient(),
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(tmp_path / "matrix-outbox.json"),
+        logger=StructuredLogger(stream=stream),
+        utc_now=lambda: datetime(2026, 7, 31, 5, 0, 22, tzinfo=timezone.utc),
+    )
+    event = open_event(source) | {
+        "observed_at": datetime(2026, 7, 31, 5, 0, 16, tzinfo=timezone.utc)
+    }
+    record = delivery.enqueue_open_spot_alert(event)
+    clock["value"] = "2026-07-31T05:00:22Z"
+
+    result = delivery.drain_outbox(record_id=record.id)
+
+    delivered_log = next(
+        json.loads(line)
+        for line in stream.getvalue().splitlines()
+        if '"event":"matrix-outbox-record-delivered"' in line
+    )
+    assert result.delivered_count == 1
+    assert delivered_log["observation_to_enqueue_seconds"] == 2.0
+    assert delivered_log["enqueue_to_delivery_seconds"] == 4.0
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "created_at", "delivered_at"),
+    [
+        ("not-a-timestamp", "invalid-created-at", "invalid-delivered-at"),
+        (
+            "2026-07-31T05:00:22Z",
+            "2026-07-31T05:00:18Z",
+            "2026-07-31T05:00:16Z",
+        ),
+    ],
+)
+def test_invalid_or_backward_delivery_timestamps_omit_latency_without_blocking_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observed_at: str,
+    created_at: str,
+    delivered_at: str,
+) -> None:
+    import parking_monitor.outbox as outbox_module
+
+    source = tmp_path / "latest.jpg"
+    write_jpeg(source)
+    clock = {"value": created_at}
+    monkeypatch.setattr(outbox_module, "utc_now_text", lambda: clock["value"])
+    stream = StringIO()
+    delivery = MatrixOutboxDelivery(
+        client=FakeMatrixClient(),
+        room_id=ROOM_ID,
+        data_dir=tmp_path,
+        snapshots_dir=tmp_path / "snapshots",
+        outbox=LocalOutbox(tmp_path / "matrix-outbox.json"),
+        logger=StructuredLogger(stream=stream),
+        utc_now=lambda: datetime(2026, 7, 31, 5, 0, 30, tzinfo=timezone.utc),
+    )
+    record = delivery.enqueue_open_spot_alert(
+        open_event(source) | {"observed_at": observed_at}
+    )
+    clock["value"] = delivered_at
+
+    result = delivery.drain_outbox(record_id=record.id)
+
+    delivered_log = next(
+        json.loads(line)
+        for line in stream.getvalue().splitlines()
+        if '"event":"matrix-outbox-record-delivered"' in line
+    )
+    assert result.delivered_count == 1
+    assert "observation_to_enqueue_seconds" not in delivered_log
+    assert "enqueue_to_delivery_seconds" not in delivered_log
+
+
 def test_matrix_outbox_delivery_close_closes_owned_client(tmp_path: Path) -> None:
     client = FakeMatrixClient()
     delivery = make_delivery(tmp_path, client)

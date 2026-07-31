@@ -46,6 +46,7 @@ from parking_monitor.matrix_outbox_snapshots import (
     MatrixOutboxSnapshots,
     SNAPSHOT_ALERT_PHASES,
 )
+from parking_monitor.matrix_outbox_timing import delivery_latency_fields
 from parking_monitor.matrix_outbox_occupied_fallback import build_occupied_snapshot_fallback_intent
 from parking_spot_monitor.matrix_support import MatrixError
 
@@ -486,7 +487,7 @@ class MatrixOutboxDelivery:
                     )
                 return current
         if current.state == "delivered":
-            self._log("info", "matrix-outbox-record-delivered", item_id=current.id, event_id=current.intent.event_id)
+            self._log("info", "matrix-outbox-record-delivered", item_id=current.id, event_id=current.intent.event_id, **delivery_latency_fields(current))
         return current
 
     def _retry_schedule(self, record: OutboxRecord, *, reason: str) -> RetrySchedule:

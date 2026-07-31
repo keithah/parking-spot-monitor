@@ -29,6 +29,7 @@ from parking_spot_monitor.runtime_decision_memory import build_detection_memory_
 from parking_spot_monitor.runtime_detection import _configured_spot_polygons
 from parking_spot_monitor.runtime_resource_policy import RuntimeResourcePolicyState
 from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
+from parking_spot_monitor.runtime_transition_latency import RuntimeTransitionTelemetry
 from parking_spot_monitor.runtime_lifecycle import ShutdownState, monitor_signal_handlers, return_if_shutdown_requested
 from parking_spot_monitor.runtime_log_aggregation import RuntimeLogAggregator, flush_runtime_log_summary
 from parking_spot_monitor.runtime_reconnect import log_capture_reconnect_failure
@@ -67,6 +68,7 @@ def run_capture_loop(
     now_fn = now if now is not None else lambda: datetime.now(timezone.utc)
     health_state = RuntimeLoopHealthState(retention_failure_count=startup_retention_failure_count)
     resource_policy_state = RuntimeResourcePolicyState()
+    transition_telemetry = RuntimeTransitionTelemetry.from_interval(settings.runtime.frame_interval_seconds)
     matrix_command_poll_state = runtime_matrix_commands.MatrixCommandPollState()
     capture_failure_count = 0
     log_aggregator = RuntimeLogAggregator(settings.runtime.log_summary_interval_seconds, 0)
@@ -124,9 +126,7 @@ def run_capture_loop(
             iteration += 1
             iteration_started_at = monotonic()
             if log_aggregator.next_summary_at == 0:
-                log_aggregator.next_summary_at = (
-                    iteration_started_at + log_aggregator.interval_seconds
-                )
+                log_aggregator.next_summary_at = iteration_started_at + log_aggregator.interval_seconds
             logger.debug("capture-loop-iteration", iteration=iteration, data_dir=str(data_dir))
             try:
                 frame_attempt = capture_and_detect_runtime_frame(
@@ -172,6 +172,8 @@ def run_capture_loop(
                     )
                     health_state.record_detection_success()
                     frame_observed_at = observed_at(result.timestamp, now_fn)
+                    transition_telemetry.observe_frame(settings, detection_result, frame_observed_at)
+                    previous_runtime_state = runtime_state
                     frame_update = _update_runtime_state_for_frame(
                         settings=settings,
                         runtime_state=runtime_state,
@@ -189,10 +191,9 @@ def run_capture_loop(
                         log_aggregator=log_aggregator,
                     )
                     runtime_state = frame_update.runtime_state
+                    transition_telemetry.log_confirmed_transitions(previous_runtime_state, runtime_state, frame_result, frame_observed_at, spot_ids, logger)
                     transition_occurred = frame_update.transition_occurred
-                    frame_has_weak_presence = runtime_loop_resources.frame_has_weak_presence(
-                        settings, detection_result
-                    )
+                    frame_has_weak_presence = runtime_loop_resources.frame_has_weak_presence(settings, detection_result)
                     health_state.record_frame_update(
                         matrix_errors=frame_update.matrix_errors,
                         history_errors=frame_update.history_errors,
@@ -238,6 +239,7 @@ def run_capture_loop(
                     completed_at=iteration_finished_at,
                 )
                 resource_policy_state = policy_update.state
+                transition_telemetry.record_policy_decision(policy_update.decision, iteration=iteration, logger=logger)
                 sleep_seconds = runtime_loop_resources.paced_sleep_seconds(
                     settings,
                     policy_update.decision,
@@ -250,9 +252,7 @@ def run_capture_loop(
                     sleep_seconds=sleep_seconds,
                     cadence_reason=policy_update.decision.reason,
                 )
-                decision_memory_store.wait_for_checkpoint(
-                    sleep_seconds, wait=wait_for_shutdown
-                )
+                decision_memory_store.wait_for_checkpoint(sleep_seconds, wait=wait_for_shutdown)
                 requested_exit = shutdown_exit(iteration)
                 if requested_exit is not None:
                     return requested_exit

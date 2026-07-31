@@ -218,6 +218,7 @@ def test_outbox_is_decomposed_behind_a_small_compatibility_facade() -> None:
         "src/parking_monitor/outbox.py": 450,
         "src/parking_monitor/outbox_derivatives.py": 80,
         "src/parking_monitor/matrix_outbox_delivery.py": 650,
+        "src/parking_monitor/matrix_outbox_timing.py": 80,
         "src/parking_monitor/matrix_outbox_occupied_fallback.py": 80,
         "src/parking_monitor/matrix_outbox_snapshots.py": 300,
         "src/parking_monitor/outbox_locking.py": 80,
@@ -469,6 +470,7 @@ def test_runtime_modules_stay_decomposed() -> None:
         "parking_spot_monitor/runtime_log_aggregation.py": 120,
         "parking_spot_monitor/runtime_state_update.py": 180,
         "parking_spot_monitor/runtime_stream_escalation.py": 170,
+        "parking_spot_monitor/runtime_transition_latency.py": 180,
         "parking_spot_monitor/runtime_vehicle_events.py": 500,
     }
     for path, max_lines in module_caps.items():

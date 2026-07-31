@@ -405,8 +405,164 @@ def test_runtime_loop_transition_enters_occupied_cadence_without_periodic_verifi
     assert len(occupied_transitions) == 1
 
 
+def test_runtime_loop_logs_both_transition_latencies_and_bounded_cadence_changes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    settings = settings.model_copy(
+        update={
+            "runtime": settings.runtime.model_copy(
+                update={
+                    "health_file": tmp_path / "health.json",
+                    "frame_interval_seconds": 8,
+                    "occupied_frame_interval_seconds": 8,
+                    "stable_frame_interval_seconds": 12,
+                    "stable_settle_frames": 2,
+                    "debug_overlay_interval_seconds": 0,
+                }
+            ),
+            "occupancy": settings.occupancy.model_copy(
+                update={"confirm_frames": 2, "release_frames": 2}
+            ),
+        }
+    )
+    primary_path = tmp_path / "latest-primary.jpg"
+    high_path = tmp_path / "latest-high.jpg"
+    current_iteration = 0
+    timestamps = [
+        "2026-07-31T05:00:00Z",
+        "2026-07-31T05:00:08Z",
+        "2026-07-31T05:00:16Z",
+        "2026-07-31T05:00:24Z",
+        "2026-07-31T05:00:32Z",
+    ]
+    save_runtime_state(
+        tmp_path / "state.json",
+        RuntimeState(
+            state_by_spot={
+                "left_spot": SpotOccupancyState(status=OccupancyStatus.EMPTY),
+                "right_spot": SpotOccupancyState(
+                    status=OccupancyStatus.OCCUPIED,
+                    last_bbox=(1010, 215, 1395, 355),
+                ),
+            }
+        ),
+    )
+
+    def fake_capture(
+        _settings: object,
+        _data_dir: str | Path,
+        *,
+        stream_profile: str | None = None,
+    ) -> FrameCaptureResult:
+        nonlocal current_iteration
+        if stream_profile is None:
+            current_iteration += 1
+        profile = stream_profile or "primary"
+        size = (3840, 2160) if profile == "high_resolution" else (1458, 806)
+        path = high_path if profile == "high_resolution" else primary_path
+        Image.new("RGB", size, (20, 30, 40)).save(path, format="JPEG")
+        return FrameCaptureResult(
+            timestamp=timestamps[current_iteration - 1],
+            latest_path=path,
+            selected_mode=DecodeMode.SOFTWARE,
+            duration_seconds=1.2 if stream_profile else 0.4,
+            byte_size=path.stat().st_size,
+            frame_geometry=FrameGeometry(stream_profile=profile, expected_size=size),
+        )
+
+    class DepartureThenArrivalDetector:
+        def detect(
+            self,
+            frame_path: str | Path,
+            *,
+            confidence_threshold: float | None = None,
+        ) -> list[VehicleDetection]:
+            path = Path(frame_path)
+            if current_iteration in {2, 3}:
+                return []
+            scale_x = 3840 / 1458 if path == high_path else 1
+            scale_y = 2160 / 806 if path == high_path else 1
+            return [
+                VehicleDetection(
+                    class_name="car",
+                    confidence=0.92,
+                    bbox=(
+                        1010 * scale_x,
+                        215 * scale_y,
+                        1395 * scale_x,
+                        355 * scale_y,
+                    ),
+                )
+            ]
+
+    monotonic_values = iter(
+        [value for second in (0.0, 8.0, 16.0, 24.0, 32.0) for value in (second, second)]
+    )
+    exit_code = run_capture_loop(
+        settings,
+        tmp_path,
+        logger=StructuredLogger(),
+        capture=fake_capture,
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: DepartureThenArrivalDetector(),
+        matrix_delivery=None,
+        sleep=lambda _seconds: None,
+        max_iterations=5,
+        monotonic=lambda: next(monotonic_values),
+        decision_memory_store=DecisionMemoryStore(
+            tmp_path / "operator-decision-memory.json",
+            checkpoint_interval_seconds=300,
+            checkpoint_max_pending_records=50,
+        ),
+    )
+
+    records = [
+        json.loads(line)
+        for line in combined_output(capsys).splitlines()
+        if line.startswith("{")
+    ]
+    assert exit_code == 0
+    departure = next(
+        record
+        for record in records
+        if record["event"] == "occupancy-transition-latency"
+        and record["transition_direction"] == "occupied-to-empty"
+    )
+    assert departure["spot_id"] == "right_spot"
+    assert departure["opposite_evidence_to_confirmation_seconds"] == 16.0
+    assert departure["primary_capture_seconds"] == 0.4
+    assert departure["verification_capture_seconds"] == 1.2
+    assert departure["cadence_reason"] == "occupied"
+    arrival = next(
+        record
+        for record in records
+        if record["event"] == "occupancy-transition-latency"
+        and record["transition_direction"] == "empty-to-occupied"
+    )
+    assert arrival["spot_id"] == "right_spot"
+    assert arrival["opposite_evidence_to_confirmation_seconds"] == 16.0
+    assert arrival["primary_capture_seconds"] == 0.4
+    assert "verification_capture_seconds" not in arrival
+    assert arrival["cadence_reason"] == "partial-streak"
+
+    cadence_changes = [
+        record
+        for record in records
+        if record["event"] == "capture-loop-cadence-changed"
+    ]
+    assert [record["cadence_reason"] for record in cadence_changes] == [
+        "occupied",
+        "transition-settle",
+        "partial-streak",
+        "transition-settle",
+    ]
+    assert cadence_changes[0]["previous_reason"] == "unknown"
+
+
 def test_disabled_adaptive_polling_keeps_fixed_cadence_and_periodic_verification(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     settings = load_settings("config.yaml.example", environ=fake_environ())
     settings = settings.model_copy(
@@ -492,6 +648,14 @@ def test_disabled_adaptive_polling_keeps_fixed_cadence_and_periodic_verification
     assert exit_code == 0
     assert sleeps == [30, 30, 30, 30]
     assert capture_profiles == [None, None, None, None, "high_resolution"]
+    cadence_changes = [
+        json.loads(line)
+        for line in combined_output(capsys).splitlines()
+        if line.startswith("{") and "capture-loop-cadence-changed" in line
+    ]
+    assert len(cadence_changes) == 1
+    assert cadence_changes[0]["previous_reason"] == "unknown"
+    assert cadence_changes[0]["cadence_reason"] == "adaptive-disabled"
 
 
 def test_failed_high_resolution_detection_preserves_primary_capture_identity(tmp_path: Path) -> None:
