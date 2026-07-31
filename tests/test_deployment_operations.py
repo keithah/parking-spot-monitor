@@ -265,6 +265,54 @@ def test_backup_tags_running_image_and_restarts_after_archive_failure(
     assert not list(tmp_path.glob(".backup.partial-*"))
 
 
+def test_backup_requires_parent_to_preexist_before_any_mutation(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    parent = tmp_path / "missing-backup-parent"
+
+    with pytest.raises(
+        deployment_operations.DeploymentError,
+        match="backup parent must pre-exist as a non-symlink directory",
+    ):
+        deployment_operations.backup_operation(
+            runner,
+            parent / "backup",
+            "parking-spot-monitor:rollback-test",
+            "a" * 64,
+        )
+
+    assert not parent.exists()
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "writable"))
+def test_backup_rejects_unprotected_parent_before_any_mutation(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    runner = FakeRunner()
+    parent = tmp_path / "backup-parent"
+    if unsafe_kind == "symlink":
+        protected = tmp_path / "protected"
+        protected.mkdir(mode=0o700)
+        parent.symlink_to(protected, target_is_directory=True)
+    else:
+        parent.mkdir(mode=0o777)
+        parent.chmod(0o777)
+
+    with pytest.raises(
+        deployment_operations.DeploymentError,
+        match="backup parent must pre-exist as a non-symlink directory",
+    ):
+        deployment_operations.backup_operation(
+            runner,
+            parent / "backup",
+            "parking-spot-monitor:rollback-test",
+            "a" * 64,
+        )
+
+    assert runner.calls == []
+
+
 def test_backup_fsyncs_archive_and_bundle_before_durable_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -432,10 +480,45 @@ def test_backup_preserves_archive_error_when_restart_or_health_also_fails(
         )
 
     assert "backup completed" not in str(caught.value)
-    assert any(
-        secondary_message in note
-        for note in getattr(caught.value, "__notes__", ())
+    assert getattr(caught.value, "__notes__", ()) == [
+        "service restart/health verification also failed (DeploymentError)"
+    ]
+    assert secondary_message not in caught.value.__notes__[0]
+
+
+def test_main_reports_secondary_backup_recovery_failure_without_secret_note(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    failure = deployment_operations.DeploymentError("injected archive failure")
+    failure.add_note(
+        "service restart/health verification also failed: token=private-value"
     )
+
+    def fail_backup(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(deployment_operations, "backup_operation", fail_backup)
+
+    result = deployment_operations.main(
+        (
+            "backup",
+            "--backup-dir",
+            str(tmp_path / "backup"),
+            "--rollback-tag",
+            "parking-spot-monitor:rollback-test",
+            "--approved-model-sha256",
+            "a" * 64,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert "injected archive failure" in captured.err
+    assert "service restart/health verification also failed" in captured.err
+    assert "private-value" not in captured.err
+    assert "token=" not in captured.err
 
 
 def test_rollback_validation_failure_removes_secret_staging(

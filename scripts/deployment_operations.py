@@ -29,6 +29,10 @@ SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 ENV_ASSIGNMENT_PATTERN = re.compile(
     r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*="
 )
+RECOVERY_NOTE_PREFIX = "service restart/health verification also failed"
+SAFE_RECOVERY_NOTE_PATTERN = re.compile(
+    rf"^{re.escape(RECOVERY_NOTE_PREFIX)} \([A-Za-z][A-Za-z0-9_]{{0,79}}\)$"
+)
 
 
 class DeploymentError(RuntimeError):
@@ -84,6 +88,26 @@ def _require_regular_file(path: Path, label: str) -> None:
         raise DeploymentError(f"{label} is unavailable") from exc
     if not stat.S_ISREG(value.st_mode) or path.is_symlink():
         raise DeploymentError(f"{label} must be a non-symlink regular file")
+
+
+def _require_protected_directory(path: Path, label: str) -> Path:
+    message = (
+        f"{label} must pre-exist as a non-symlink directory without group or other write permissions"
+    )
+    try:
+        value = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise DeploymentError(message) from exc
+    expected = Path(os.path.abspath(path))
+    if (
+        not stat.S_ISDIR(value.st_mode)
+        or stat.S_ISLNK(value.st_mode)
+        or resolved != expected
+        or stat.S_IMODE(value.st_mode) & 0o022
+    ):
+        raise DeploymentError(message)
+    return resolved
 
 
 def _copy_private(source: Path, destination: Path, mode: int = 0o600) -> None:
@@ -456,6 +480,7 @@ def backup_operation(
 ) -> None:
     if backup_dir.exists() or backup_dir.is_symlink():
         raise DeploymentError("backup destination already exists")
+    parent = _require_protected_directory(backup_dir.parent, "backup parent")
     if not SHA256_PATTERN.fullmatch(approved_model_sha256):
         raise DeploymentError("approved model SHA-256 must be 64 lowercase hex characters")
     _require_regular_file(env_file, "environment")
@@ -474,8 +499,6 @@ def backup_operation(
     _, running_image_id = _running_container(runner, env_file)
     runner.run(("docker", "image", "tag", running_image_id, rollback_tag))
     stopped = False
-    parent = backup_dir.parent.resolve()
-    parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix=f".{backup_dir.name}.partial-", dir=parent
     ) as temporary_name:
@@ -535,7 +558,7 @@ def backup_operation(
                 except Exception as exc:
                     if original_error is not None:
                         original_error.add_note(
-                            f"service restart/health verification also failed: {exc}"
+                            f"{RECOVERY_NOTE_PREFIX} ({type(exc).__name__})"
                         )
                         raise original_error from exc
                     raise DeploymentError(
@@ -759,6 +782,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"preserved pre-restore data at {preserved}")
     except (DeploymentError, OSError) as exc:
         print(f"deployment operation failed: {exc}", file=sys.stderr)
+        for note in getattr(exc, "__notes__", ()):
+            if not isinstance(note, str) or not note.startswith(RECOVERY_NOTE_PREFIX):
+                continue
+            safe_note = (
+                note
+                if SAFE_RECOVERY_NOTE_PATTERN.fullmatch(note)
+                else RECOVERY_NOTE_PREFIX
+            )
+            print(f"deployment operation recovery note: {safe_note}", file=sys.stderr)
         return 2
     return 0
 
