@@ -41,6 +41,12 @@ class FakeRunner:
             if self.rollback_image_exists and "{{.Id}}" in call:
                 return "sha256:" + "a" * 64
             return ""
+        if call[:3] == ("docker", "image", "tag"):
+            self.rollback_image_exists = True
+            return ""
+        if call[:3] == ("docker", "image", "rm"):
+            self.rollback_image_exists = False
+            return ""
         if call[:2] == ("docker", "inspect") and "{{.State.Running}}" in call:
             return "true"
         if call[:2] == ("docker", "inspect") and "{{.Image}}" in call:
@@ -215,7 +221,7 @@ def test_stale_health_times_out_without_running_one_shot_healthcheck(
     assert not any("parking_spot_monitor.healthcheck" in call for call in runner.calls)
 
 
-def test_backup_tags_running_image_and_restarts_after_archive_failure(
+def test_backup_cleans_failed_rollback_tag_and_allows_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -261,8 +267,37 @@ def test_backup_tags_running_image_and_restarts_after_archive_failure(
         )
     )
     assert stop < start
+    remove_tag = runner.calls.index(
+        (
+            "docker",
+            "image",
+            "rm",
+            "parking-spot-monitor:rollback-test",
+        )
+    )
+    assert start < remove_tag
     assert not (tmp_path / "backup").exists()
     assert not list(tmp_path.glob(".backup.partial-*"))
+
+    runner.fail_tar = False
+    deployment_operations.backup_operation(
+        runner,
+        tmp_path / "backup",
+        "parking-spot-monitor:rollback-test",
+        deployment_operations._sha256(model),
+        config_file=config_file,
+    )
+
+    assert (tmp_path / "backup").is_dir()
+    assert runner.calls.count(
+        (
+            "docker",
+            "image",
+            "tag",
+            "sha256:" + "a" * 64,
+            "parking-spot-monitor:rollback-test",
+        )
+    ) == 2
 
 
 def test_backup_requires_parent_to_preexist_before_any_mutation(tmp_path: Path) -> None:
@@ -313,6 +348,57 @@ def test_backup_rejects_unprotected_parent_before_any_mutation(
     assert runner.calls == []
 
 
+def test_backup_parent_swap_cannot_redirect_staging_or_service_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        deployment_operations, "wait_for_fresh_health", lambda *_args, **_kwargs: None
+    )
+    (tmp_path / "models").mkdir()
+    model = tmp_path / "models/yolov8n.pt"
+    model.write_bytes(b"model")
+    config_file = tmp_path / "operator-config.yaml"
+    config_file.write_text("config", encoding="utf-8")
+    (tmp_path / ".env").write_text("environment", encoding="utf-8")
+    (tmp_path / "data").mkdir()
+    parent = tmp_path / "backups"
+    displaced = tmp_path / "backups-original"
+    attacker = tmp_path / "attacker"
+    parent.mkdir(mode=0o700)
+    attacker.mkdir(mode=0o700)
+    runner = FakeRunner()
+    real_run = runner.run
+    swapped = False
+
+    def swap_after_parent_validation(*args: object, **kwargs: object) -> str:
+        nonlocal swapped
+        command = tuple(args[0])
+        if command[:3] == ("docker", "image", "inspect") and not swapped:
+            swapped = True
+            parent.rename(displaced)
+            parent.symlink_to(attacker, target_is_directory=True)
+        return real_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner, "run", swap_after_parent_validation)
+
+    with pytest.raises(deployment_operations.DeploymentError, match="backup parent changed"):
+        deployment_operations.backup_operation(
+            runner,
+            parent / "backup",
+            "parking-spot-monitor:rollback-test",
+            deployment_operations._sha256(model),
+            config_file=config_file,
+        )
+
+    assert not (attacker / "backup").exists()
+    assert not list(attacker.glob(".backup.partial-*"))
+    assert not (displaced / "backup").exists()
+    assert not any(call[:3] == ("docker", "image", "tag") for call in runner.calls)
+    assert not any("stop" in call for call in runner.calls)
+
+
 def test_backup_fsyncs_archive_and_bundle_before_durable_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -343,10 +429,14 @@ def test_backup_fsyncs_archive_and_bundle_before_durable_publish(
             events.append("parent-fsync")
         real_fsync(descriptor)
 
-    def record_rename(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
-        if Path(destination) == tmp_path / "backup":
+    def record_rename(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+        **kwargs: object,
+    ) -> None:
+        if Path(destination).name == "backup":
             events.append("publish-rename")
-        real_rename(source, destination)
+        real_rename(source, destination, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os, "fsync", record_fsync)
     monkeypatch.setattr(os, "rename", record_rename)
@@ -481,9 +571,14 @@ def test_backup_preserves_archive_error_when_restart_or_health_also_fails(
 
     assert "backup completed" not in str(caught.value)
     assert getattr(caught.value, "__notes__", ()) == [
-        "service restart/health verification also failed (DeploymentError)"
+        "service restart/health verification also failed (DeploymentError)",
+        "rollback image tag retained after backup failure",
     ]
     assert secondary_message not in caught.value.__notes__[0]
+    assert not any(
+        call[:3] == ("docker", "image", "rm") for call in runner.calls
+    )
+    assert runner.rollback_image_exists
 
 
 def test_main_reports_secondary_backup_recovery_failure_without_secret_note(
@@ -494,6 +589,9 @@ def test_main_reports_secondary_backup_recovery_failure_without_secret_note(
     failure = deployment_operations.DeploymentError("injected archive failure")
     failure.add_note(
         "service restart/health verification also failed: token=private-value"
+    )
+    failure.add_note(
+        "rollback image tag retained after backup failure: token=private-value"
     )
 
     def fail_backup(*_args: object, **_kwargs: object) -> None:
@@ -517,6 +615,7 @@ def test_main_reports_secondary_backup_recovery_failure_without_secret_note(
     assert result == 2
     assert "injected archive failure" in captured.err
     assert "service restart/health verification also failed" in captured.err
+    assert "rollback image tag retained after backup failure" in captured.err
     assert "private-value" not in captured.err
     assert "token=" not in captured.err
 

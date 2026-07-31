@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -30,13 +31,48 @@ ENV_ASSIGNMENT_PATTERN = re.compile(
     r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*="
 )
 RECOVERY_NOTE_PREFIX = "service restart/health verification also failed"
-SAFE_RECOVERY_NOTE_PATTERN = re.compile(
-    rf"^{re.escape(RECOVERY_NOTE_PREFIX)} \([A-Za-z][A-Za-z0-9_]{{0,79}}\)$"
-)
+TAG_RETAINED_NOTE_PREFIX = "rollback image tag retained after backup failure"
+SAFE_NOTE_SUFFIX_PATTERN = re.compile(r" \([A-Za-z][A-Za-z0-9_]{0,79}\)")
+SAFE_NOTE_PREFIXES = (RECOVERY_NOTE_PREFIX, TAG_RETAINED_NOTE_PREFIX)
 
 
 class DeploymentError(RuntimeError):
     """A deployment precondition or recovery operation failed."""
+
+
+@dataclass(slots=True)
+class ProtectedDirectory:
+    path: Path
+    descriptor: int
+    device: int
+    inode: int
+
+    @property
+    def anchor(self) -> Path:
+        return Path("/proc/self/fd") / str(self.descriptor)
+
+    def require_current(self) -> None:
+        try:
+            value = os.stat(self.path, follow_symlinks=False)
+        except OSError as exc:
+            raise DeploymentError("backup parent changed during backup") from exc
+        if (
+            not stat.S_ISDIR(value.st_mode)
+            or value.st_dev != self.device
+            or value.st_ino != self.inode
+            or stat.S_IMODE(value.st_mode) & 0o022
+        ):
+            raise DeploymentError("backup parent changed during backup")
+
+    def contains(self, name: str) -> bool:
+        try:
+            os.stat(name, dir_fd=self.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def close(self) -> None:
+        os.close(self.descriptor)
 
 
 class Runner:
@@ -90,7 +126,7 @@ def _require_regular_file(path: Path, label: str) -> None:
         raise DeploymentError(f"{label} must be a non-symlink regular file")
 
 
-def _require_protected_directory(path: Path, label: str) -> Path:
+def _require_protected_directory(path: Path, label: str) -> ProtectedDirectory:
     message = (
         f"{label} must pre-exist as a non-symlink directory without group or other write permissions"
     )
@@ -100,6 +136,7 @@ def _require_protected_directory(path: Path, label: str) -> Path:
     except OSError as exc:
         raise DeploymentError(message) from exc
     expected = Path(os.path.abspath(path))
+    descriptor = -1
     if (
         not stat.S_ISDIR(value.st_mode)
         or stat.S_ISLNK(value.st_mode)
@@ -107,7 +144,25 @@ def _require_protected_directory(path: Path, label: str) -> Path:
         or stat.S_IMODE(value.st_mode) & 0o022
     ):
         raise DeploymentError(message)
-    return resolved
+    try:
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        current = os.stat(expected, follow_symlinks=False)
+        if (
+            opened.st_dev != value.st_dev
+            or opened.st_ino != value.st_ino
+            or current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+        ):
+            raise DeploymentError("backup parent changed during validation")
+        return ProtectedDirectory(expected, descriptor, opened.st_dev, opened.st_ino)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
 
 
 def _copy_private(source: Path, destination: Path, mode: int = 0o600) -> None:
@@ -481,6 +536,32 @@ def backup_operation(
     if backup_dir.exists() or backup_dir.is_symlink():
         raise DeploymentError("backup destination already exists")
     parent = _require_protected_directory(backup_dir.parent, "backup parent")
+    try:
+        _backup_operation_in_parent(
+            runner,
+            backup_dir,
+            rollback_tag,
+            approved_model_sha256,
+            parent=parent,
+            data_dir=data_dir,
+            env_file=env_file,
+            config_file=config_file,
+        )
+    finally:
+        parent.close()
+
+
+def _backup_operation_in_parent(
+    runner: Runner,
+    backup_dir: Path,
+    rollback_tag: str,
+    approved_model_sha256: str,
+    *,
+    parent: ProtectedDirectory,
+    data_dir: Path,
+    env_file: Path,
+    config_file: Path,
+) -> None:
     if not SHA256_PATTERN.fullmatch(approved_model_sha256):
         raise DeploymentError("approved model SHA-256 must be 64 lowercase hex characters")
     _require_regular_file(env_file, "environment")
@@ -496,15 +577,62 @@ def backup_operation(
     )
     if existing:
         raise DeploymentError("rollback image tag already exists")
+    parent.require_current()
     _, running_image_id = _running_container(runner, env_file)
     runner.run(("docker", "image", "tag", running_image_id, rollback_tag))
+    try:
+        _create_backup_bundle(
+            runner,
+            backup_dir,
+            running_image_id,
+            rollback_tag,
+            approved_model_sha256,
+            model=model,
+            parent=parent,
+            data_dir=data_dir,
+            env_file=env_file,
+            config_file=config_file,
+        )
+    except BaseException as error:
+        bundle_published = parent.contains(backup_dir.name)
+        recovery_failed = any(
+            isinstance(note, str) and note.startswith(RECOVERY_NOTE_PREFIX)
+            for note in getattr(error, "__notes__", ())
+        )
+        if not bundle_published and recovery_failed:
+            error.add_note(TAG_RETAINED_NOTE_PREFIX)
+        elif not bundle_published:
+            try:
+                runner.run(("docker", "image", "rm", rollback_tag))
+            except Exception as cleanup_error:
+                error.add_note(
+                    f"{TAG_RETAINED_NOTE_PREFIX} ({type(cleanup_error).__name__})"
+                )
+                raise error from cleanup_error
+        raise
+
+
+def _create_backup_bundle(
+    runner: Runner,
+    backup_dir: Path,
+    running_image_id: str,
+    rollback_tag: str,
+    approved_model_sha256: str,
+    *,
+    model: Path,
+    parent: ProtectedDirectory,
+    data_dir: Path,
+    env_file: Path,
+    config_file: Path,
+) -> None:
     stopped = False
     with tempfile.TemporaryDirectory(
-        prefix=f".{backup_dir.name}.partial-", dir=parent
+        prefix=f".{backup_dir.name}.partial-", dir=parent.anchor
     ) as temporary_name:
         stage = Path(temporary_name)
         os.chmod(stage, 0o700)
         try:
+            parent.require_current()
             stopped = True
             _compose(runner, "stop", SERVICE, env_file=env_file)
             _copy_private(config_file, stage / "config.yaml")
@@ -542,8 +670,15 @@ def backup_operation(
             )
             verify_bundle(stage)
             _fsync_directory(stage)
-            os.rename(stage, backup_dir)
-            _fsync_directory(parent)
+            parent.require_current()
+            os.rename(
+                stage.name,
+                backup_dir.name,
+                src_dir_fd=parent.descriptor,
+                dst_dir_fd=parent.descriptor,
+            )
+            os.fsync(parent.descriptor)
+            parent.require_current()
         finally:
             if stopped:
                 original_error = sys.exception()
@@ -783,13 +918,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (DeploymentError, OSError) as exc:
         print(f"deployment operation failed: {exc}", file=sys.stderr)
         for note in getattr(exc, "__notes__", ()):
-            if not isinstance(note, str) or not note.startswith(RECOVERY_NOTE_PREFIX):
+            if not isinstance(note, str):
                 continue
-            safe_note = (
-                note
-                if SAFE_RECOVERY_NOTE_PATTERN.fullmatch(note)
-                else RECOVERY_NOTE_PREFIX
+            prefix = next(
+                (value for value in SAFE_NOTE_PREFIXES if note.startswith(value)),
+                None,
             )
+            if prefix is None:
+                continue
+            suffix = note[len(prefix) :]
+            safe_note = note if SAFE_NOTE_SUFFIX_PATTERN.fullmatch(suffix) else prefix
             print(f"deployment operation recovery note: {safe_note}", file=sys.stderr)
         return 2
     return 0
