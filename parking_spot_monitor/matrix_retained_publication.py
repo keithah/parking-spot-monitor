@@ -79,7 +79,7 @@ def _publish_into_owner(
         raise
     finally:
         if not replaced and temporary_fd >= 0:
-            owner.unlink_if_matches(temporary_name, descriptor_identity(temporary_fd))
+            owner.unlink_if_matches(temporary_name, descriptor_identity(temporary_fd), recover_legacy=False)
         if temporary_fd >= 0:
             os.close(temporary_fd)
 

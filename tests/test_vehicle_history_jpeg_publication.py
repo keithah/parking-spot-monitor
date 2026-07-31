@@ -234,10 +234,12 @@ def test_canonical_copy_growth_never_writes_beyond_preflight_size(
         owner: file_descriptor_binding.RootedDirectoryOwner,
         name: str,
         identity: file_descriptor_binding.FileIdentity,
+        *,
+        recover_legacy: bool = True,
     ) -> bool:
         if name.endswith(".tmp"):
             discarded_sizes.append(os.stat(name, dir_fd=owner.fd, follow_symlinks=False).st_size)
-        return real_unlink(owner, name, identity)
+        return real_unlink(owner, name, identity, recover_legacy=recover_legacy)
 
     monkeypatch.setattr(jpeg_artifacts, "_reflink", unsupported_reflink)
     monkeypatch.setattr(jpeg_artifacts, "_copy_file", append_during_copy)

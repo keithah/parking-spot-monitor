@@ -86,7 +86,7 @@ def _recover_locked(directory_fd: int, selected: str | None, *, max_entries: int
         transition_pattern=_TRANSITION_PATTERN,
     )
     pending = pending or not scan.exhausted
-    blocking = blocking or (selected is None and not scan.exhausted)
+    blocking = blocking or not scan.exhausted
     for candidate, recovery, kind in sorted(scan.candidates):
         if kind == "dispose":
             result = recover_disposal_at(directory_fd, candidate, recovery)

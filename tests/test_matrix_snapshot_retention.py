@@ -635,10 +635,12 @@ def test_retained_snapshot_growth_never_writes_beyond_preflight_size(
                 handle.write(b"x" * 4096)
         return chunk
 
-    def record_discarded_size(owner: object, name: str, identity: object) -> bool:
+    def record_discarded_size(
+        owner: object, name: str, identity: object, *, recover_legacy: bool = True
+    ) -> bool:
         directory_fd = owner.fd
         discarded_sizes.append(os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_size)
-        return real_unlink(owner, name, identity)
+        return real_unlink(owner, name, identity, recover_legacy=recover_legacy)
 
     monkeypatch.setattr(matrix_snapshot_storage.os, "read", append_after_first_source_read)
     monkeypatch.setattr(file_descriptor_binding.RootedDirectoryOwner, "unlink_if_matches", record_discarded_size)

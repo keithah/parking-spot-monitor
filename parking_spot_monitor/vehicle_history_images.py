@@ -205,6 +205,6 @@ def _write_jpeg_atomic(path: Path, image: Image.Image, *, owner: RootedDirectory
         raise
     finally:
         if not replaced and temporary_fd >= 0:
-            owner.unlink_if_matches(temporary_name, descriptor_identity(temporary_fd))
+            owner.unlink_if_matches(temporary_name, descriptor_identity(temporary_fd), recover_legacy=False)
         if temporary_fd >= 0:
             os.close(temporary_fd)

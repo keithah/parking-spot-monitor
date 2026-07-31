@@ -85,3 +85,35 @@ def test_unfinished_legacy_directory_scan_blocks_conflicting_publication(
     assert result.blocking is True
     assert target.read_bytes() == b"current publication"
     assert list(tmp_path.glob(".*.quarantine")) == []
+
+
+def test_unfinished_selected_scan_prevents_later_stale_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.jpg"
+    target.write_bytes(b"stale publication")
+    stale = tmp_path / ".owned.jpg.0123456789abcdef.quarantine"
+    os.link(target, stale)
+    target.unlink()
+    target.write_bytes(b"current publication")
+    current_identity = FileIdentity.from_stat(target.stat())
+    batches = iter(
+        (
+            TransitionScanBatch((), exhausted=False),
+            TransitionScanBatch(((stale.name, target.name, "quarantine"),), exhausted=True),
+        )
+    )
+    monkeypatch.setattr(
+        owned_file_recovery,
+        "scan_transition_batch",
+        lambda *_args, **_kwargs: next(batches),
+    )
+
+    with RootedDirectoryOwner(tmp_path, create=False) as owner:
+        deleted = owned_file_cleanup.unlink_owned_at_result(owner.fd, target.name, current_identity)
+        recovery = owned_file_recovery.recover_owned_at(owner.fd, target.name)
+
+    assert deleted.deleted is False
+    assert recovery.blocking is True
+    assert target.read_bytes() == b"current publication"
+    assert stale.read_bytes() == b"stale publication"

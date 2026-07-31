@@ -254,6 +254,8 @@ def test_owned_directory_manifest_recovers_pending_artifact_behind_decoys(
 
     monkeypatch.setattr(owned_file_disposal.os, "unlink", interrupt_disposal)
     assert file_descriptor_binding.unlink_owned_path(target, identity) is False
+    assert target.exists()
+    assert file_descriptor_binding.unlink_owned_path(target, identity) is False
     assert not target.exists()
     assert (tmp_path / ".owned-disposals.json").exists()
 
@@ -408,6 +410,8 @@ def test_owned_disposal_first_bind_eio_retains_manifest_until_recovery(
 
     monkeypatch.setattr(owned_file_disposal.os, "open", fail_disposal_bind)
     assert file_descriptor_binding.unlink_owned_path(target, identity) is False
+    assert target.exists()
+    assert file_descriptor_binding.unlink_owned_path(target, identity) is False
     disposal = next(path for path in tmp_path.iterdir() if path.name.endswith(".dispose"))
     with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as owner:
         entries = owned_disposal_manifest.manifest_entries_at(owner.fd)
@@ -445,6 +449,8 @@ def test_owned_disposal_same_identity_eio_retains_manifest_until_recovery(
         return value
 
     monkeypatch.setattr(owned_file_disposal.os, "stat", fail_existing_disposal_stat)
+    assert file_descriptor_binding.unlink_owned_path(target, identity) is False
+    assert target.exists()
     assert file_descriptor_binding.unlink_owned_path(target, identity) is False
     disposal = next(path for path in tmp_path.iterdir() if path.name.endswith(".dispose"))
     with file_descriptor_binding.RootedDirectoryOwner(tmp_path, create=False) as owner:
@@ -568,6 +574,8 @@ def test_vehicle_capture_recovers_owned_full_and_crop_directories(
             (directory / f"decoy-{index:03d}").write_bytes(b"x")
         target.write_bytes(b"pending")
         identity = file_descriptor_binding.FileIdentity.from_stat(target.stat())
+        assert file_descriptor_binding.unlink_owned_path(target, identity) is False
+        assert target.exists()
         assert file_descriptor_binding.unlink_owned_path(target, identity) is False
         assert not target.exists()
 

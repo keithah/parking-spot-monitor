@@ -123,7 +123,7 @@ def _publish_validated_to_owner(
         return JpegPublication(path=destination, strategy=strategy, identity=committed_identity)
     finally:
         if not replaced and temporary_fd >= 0:
-            owner.unlink_if_matches(temporary_name, descriptor_identity(temporary_fd))
+            owner.unlink_if_matches(temporary_name, descriptor_identity(temporary_fd), recover_legacy=False)
         for descriptor in (committed_fd, temporary_fd):
             if descriptor >= 0:
                 os.close(descriptor)
@@ -161,7 +161,7 @@ def _reflink(source_fd: int, owner: RootedDirectoryOwner, temporary_name: str, s
             identity = descriptor_identity(destination_fd)
             os.close(destination_fd)
             destination_fd = -1
-            owner.unlink_if_matches(temporary_name, identity)
+            owner.unlink_if_matches(temporary_name, identity, recover_legacy=False)
         raise
     finally:
         if destination_fd >= 0:
@@ -185,7 +185,7 @@ def _copy_file(
         identity = descriptor_identity(destination_fd)
         os.close(destination_fd)
         destination_fd = -1
-        owner.unlink_if_matches(temporary_name, identity)
+        owner.unlink_if_matches(temporary_name, identity, recover_legacy=False)
         raise
     finally:
         if destination_fd >= 0:

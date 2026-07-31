@@ -33,18 +33,25 @@ class OwnedUnlinkResult:
     durable: bool = True
 
 
-def unlink_owned_at(directory_fd: int, name: str, identity: FileIdentity) -> bool:
-    return unlink_owned_at_result(directory_fd, name, identity).deleted
+def unlink_owned_at(
+    directory_fd: int, name: str, identity: FileIdentity, *, recover_legacy: bool = True
+) -> bool:
+    return unlink_owned_at_result(directory_fd, name, identity, recover_legacy=recover_legacy).deleted
 
 
-def unlink_owned_at_result(directory_fd: int, name: str, identity: FileIdentity) -> OwnedUnlinkResult:
+def unlink_owned_at_result(
+    directory_fd: int, name: str, identity: FileIdentity, *, recover_legacy: bool = True
+) -> OwnedUnlinkResult:
     safe_name = _safe_basename(name)
-    try:
-        recovery = recover_owned_at(directory_fd, safe_name)
-    except OSError:
+    if not recover_legacy and not (safe_name.startswith(".") and safe_name.endswith(".tmp")):
         return OwnedUnlinkResult(False)
-    if recovery.blocking:
-        return OwnedUnlinkResult(False)
+    if recover_legacy:
+        try:
+            recovery = recover_owned_at(directory_fd, safe_name)
+        except OSError:
+            return OwnedUnlinkResult(False)
+        if recovery.blocking:
+            return OwnedUnlinkResult(False)
     try:
         current = os.stat(safe_name, dir_fd=directory_fd, follow_symlinks=False)
     except OSError:

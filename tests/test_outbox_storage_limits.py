@@ -159,11 +159,19 @@ def test_loader_quarantines_non_finite_legacy_record(tmp_path: Path) -> None:
     path = tmp_path / "matrix-outbox.json"
     seeded = LocalOutbox(path)
     seeded.enqueue(AlertIntent(event_id="legacy-nan", phase="text", body="ok"))
+    retained = seeded.enqueue(AlertIntent(event_id="retained", phase="text", body="valid"))
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["items"][0]["retry_attempt_count"] = float("nan")
+    invalid = next(item for item in payload["items"] if item["intent"]["event_id"] == "legacy-nan")
+    invalid["retry_attempt_count"] = float("nan")
     path.write_text(json.dumps(payload, allow_nan=True), encoding="utf-8")
 
     reloaded = LocalOutbox(path)
+    quarantine_files = tuple((tmp_path / ".matrix-outbox-quarantine").iterdir())
+    restarted = LocalOutbox(path)
 
-    assert reloaded.list_records() == []
+    assert reloaded.list_records() == [retained]
     assert reloaded.status_summary()["recovery"]["reason_counts"] == {"malformed_record": 1}
+    assert restarted.list_records() == [retained]
+    assert restarted.status_summary()["recovery"]["quarantined_count"] == 0
+    assert tuple((tmp_path / ".matrix-outbox-quarantine").iterdir()) == quarantine_files
+    assert len(json.loads(path.read_text(encoding="utf-8"))["items"]) == 1

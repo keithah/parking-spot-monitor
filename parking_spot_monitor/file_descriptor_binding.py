@@ -81,8 +81,10 @@ class RootedDirectoryOwner:
             return False
         return (not regular or stat.S_ISREG(value.st_mode)) and FileIdentity.from_stat(value) == identity
 
-    def unlink_if_matches(self, name: str, identity: FileIdentity) -> bool:
-        return unlink_owned_at(self.fd, name, identity)
+    def unlink_if_matches(
+        self, name: str, identity: FileIdentity, *, recover_legacy: bool = True
+    ) -> bool:
+        return unlink_owned_at(self.fd, name, identity, recover_legacy=recover_legacy)
 
     def recover_owned(self) -> RecoveryResult:
         return recover_owned_directory_at(self.fd)

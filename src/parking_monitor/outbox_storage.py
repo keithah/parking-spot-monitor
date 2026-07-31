@@ -145,7 +145,16 @@ def load_records(
         except (TypeError, ValueError):
             event = _quarantine_json(path, item, reason="malformed_record", fsync_directory=fsync_directory)
             recovery = recovery.with_event(event)
-    return records, recovery.with_recovered_count(len(records))
+    recovery = recovery.with_recovered_count(len(records))
+    if recovery.quarantined_count:
+        persist_records(
+            path,
+            records,
+            max_bytes=max_bytes,
+            max_record_bytes=max_record_bytes,
+            fsync_directory=fsync_directory,
+        )
+    return records, recovery
 
 
 def persist_records(
