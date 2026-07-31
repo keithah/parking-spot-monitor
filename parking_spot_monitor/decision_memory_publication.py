@@ -256,6 +256,8 @@ def publish_decision_memory_conflict_bytes(
     max_file_bytes: int,
     replace: Path | None = None,
 ) -> tuple[Path, SourceSignature]:
+    if len(payload) > max_file_bytes:
+        raise OverflowError("decision memory conflict exceeds byte limit")
     temporary = _write_temporary(path, payload)
     target = replace if replace is not None else temporary.with_suffix(".conflict")
     try:

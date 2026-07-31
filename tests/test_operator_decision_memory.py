@@ -150,7 +150,7 @@ def test_batch_append_persists_multiple_records_once(tmp_path: Path) -> None:
     assert [record.summary for record in load_decision_memory(path).records] == ["first", "second"]
 
 
-def test_atomic_write_orders_permissions_file_fsync_replace_and_directory_fsync(
+def test_atomic_write_orders_permissions_file_fsync_exclusive_link_and_directory_fsync(
     tmp_path: Path,
 ) -> None:
     path = decision_memory_path(tmp_path)
@@ -160,6 +160,7 @@ def test_atomic_write_orders_permissions_file_fsync_replace_and_directory_fsync(
     real_close = os.close
     real_fchmod = os.fchmod
     real_fsync = os.fsync
+    real_link = os.link
     real_replace = os.replace
 
     def tracked_open(target, flags, *args, **kwargs):
@@ -193,11 +194,16 @@ def test_atomic_write_orders_permissions_file_fsync_replace_and_directory_fsync(
         operations.append("replace")
         real_replace(source, destination)
 
+    def tracked_link(source, destination, *args, **kwargs) -> None:
+        operations.append("link")
+        real_link(source, destination, *args, **kwargs)
+
     with (
         patch.object(os, "open", side_effect=tracked_open),
         patch.object(os, "close", side_effect=tracked_close),
         patch.object(os, "fchmod", side_effect=tracked_fchmod),
         patch.object(os, "fsync", side_effect=tracked_fsync),
+        patch.object(os, "link", side_effect=tracked_link),
         patch.object(os, "replace", side_effect=tracked_replace),
     ):
         assert append_decision_memory_record(
@@ -207,7 +213,7 @@ def test_atomic_write_orders_permissions_file_fsync_replace_and_directory_fsync(
     assert operations == [
         "permissions",
         "fsync-file",
-        "replace",
+        "link",
         "open-directory",
         "fsync-directory",
         "close-directory",

@@ -24,9 +24,12 @@ class DecisionMemorySourceSnapshot:
     available: bool
 
 
-def decision_memory_source_snapshot(path: Path) -> DecisionMemorySourceSnapshot:
+def decision_memory_source_snapshot(
+    path: Path,
+    max_file_bytes: int = MAX_MEMORY_FILE_BYTES,
+) -> DecisionMemorySourceSnapshot:
     try:
-        _raw, signature = read_decision_memory_source(path, MAX_MEMORY_FILE_BYTES)
+        _raw, signature = read_decision_memory_source(path, max_file_bytes)
     except FileNotFoundError:
         return DecisionMemorySourceSnapshot(None, True)
     except (OSError, OverflowError):

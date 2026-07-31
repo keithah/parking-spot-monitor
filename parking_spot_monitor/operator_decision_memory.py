@@ -128,6 +128,7 @@ _SAFE_LAB_DETAIL_KEYS = (
 _MAX_FORMAT_DEPTH = 3
 _MAX_FORMAT_ITEMS = 6
 _MAX_FORMAT_TEXT_CHARS = 160
+_LEGACY_APPEND_ATTEMPTS = 2
 _MEMORY_WRITE_LOCK = threading.RLock()
 _UNCONDITIONAL_WRITE = object()
 _conditional_exchange = rename_exchange
@@ -235,10 +236,27 @@ def append_decision_memory_records(
         sanitized = [_record_from_any(record) for record in records]
         if not sanitized:
             return True
-        with _MEMORY_WRITE_LOCK:
-            loaded = load_decision_memory(memory_path, max_file_bytes=max_file_bytes, logger=logger)
-            retained = [*loaded.records, *sanitized][-_positive_limit(max_records, MAX_RECORDS) :]
-            _write_memory(memory_path, retained)
+        from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
+
+        store = DecisionMemoryStore(
+            memory_path,
+            checkpoint_interval_seconds=300,
+            checkpoint_max_pending_records=max(1, len(sanitized)),
+            max_records=_positive_limit(max_records, MAX_RECORDS),
+            max_file_bytes=min(
+                _positive_limit(max_file_bytes, MAX_MEMORY_FILE_BYTES),
+                MAX_MEMORY_FILE_BYTES,
+            ),
+            logger=logger,
+        )
+        persisted = store.extend(sanitized, durability="immediate")
+        for _attempt in range(_LEGACY_APPEND_ATTEMPTS - 1):
+            if persisted:
+                break
+            persisted = store.flush()
+        if not persisted:
+            return False
+        retained = store.records
     except Exception as exc:
         _log(logger, "warning", "operator-decision-memory-append-failed", path=memory_path, error_type=type(exc).__name__, error=str(exc))
         return False
@@ -344,6 +362,8 @@ def load_decision_memory(
 
 def clear_decision_memory_conflicts(
     conflicts: Sequence[tuple[Path, SourceSignature]],
+    *,
+    max_file_bytes: int = MAX_MEMORY_FILE_BYTES,
 ) -> bool:
     cleared = True
     for conflict, signature in conflicts:
@@ -351,7 +371,7 @@ def clear_decision_memory_conflicts(
             cleared = clear_decision_memory_conflict(
                 conflict,
                 signature,
-                MAX_MEMORY_FILE_BYTES,
+                max_file_bytes,
             ) and cleared
         except OSError:
             cleared = False
@@ -362,28 +382,28 @@ def compact_decision_memory_conflicts(
     path: Path,
     records: Sequence[DecisionMemoryRecord],
     conflicts: Sequence[tuple[Path, SourceSignature]],
+    *,
+    max_records: int = MAX_RECORDS,
+    max_file_bytes: int = MAX_MEMORY_FILE_BYTES,
 ) -> tuple[tuple[Path, SourceSignature], ...]:
     if len(conflicts) < max(2, MAX_CONFLICT_FILES // 2):
         return tuple(conflicts)
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "records": [record.to_json_dict() for record in records],
-    }
-    encoded = (
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        + "\n"
-    ).encode("utf-8")
+    _bounded, encoded = _bounded_memory_payload(
+        records,
+        max_records=max_records,
+        max_file_bytes=max_file_bytes,
+    )
     replacement, signature = publish_decision_memory_conflict_bytes(
         path,
         encoded,
-        max_file_bytes=MAX_MEMORY_FILE_BYTES,
+        max_file_bytes=max_file_bytes,
         replace=conflicts[0][0],
     )
     remaining: list[tuple[Path, SourceSignature]] = [(replacement, signature)]
     for conflict, conflict_signature in conflicts[1:]:
         try:
             if not clear_decision_memory_conflict(
-                conflict, conflict_signature, MAX_MEMORY_FILE_BYTES
+                conflict, conflict_signature, max_file_bytes
             ):
                 remaining.append((conflict, conflict_signature))
         except OSError:
@@ -448,25 +468,26 @@ def _write_memory(
     records: Sequence[DecisionMemoryRecord],
     *,
     expected_signature: SourceSignature | None | object = _UNCONDITIONAL_WRITE,
+    max_file_bytes: int = MAX_MEMORY_FILE_BYTES,
 ) -> ConditionalPublication | None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"schema_version": SCHEMA_VERSION, "records": [record.to_json_dict() for record in records]}
+    encoded = _encode_memory_payload(records)
+    if len(encoded) > max_file_bytes:
+        raise OverflowError("decision memory publication exceeds byte limit")
     if expected_signature is not _UNCONDITIONAL_WRITE:
-        encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
         return publish_decision_memory_bytes(
             path,
             encoded,
             expected_signature=expected_signature,  # type: ignore[arg-type]
-            max_file_bytes=MAX_MEMORY_FILE_BYTES,
+            max_file_bytes=max_file_bytes,
             exchange=_conditional_exchange,
             exclusive_link=_conditional_link,
         )
     temp_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=path.parent, prefix=f".{path.name}.", suffix=".tmp") as handle:
+        with tempfile.NamedTemporaryFile("wb", delete=False, dir=path.parent, prefix=f".{path.name}.", suffix=".tmp") as handle:
             temp_path = Path(handle.name)
-            json.dump(payload, handle, sort_keys=True, separators=(",", ":"), allow_nan=False)
-            handle.write("\n")
+            handle.write(encoded)
             handle.flush()
             os.fchmod(handle.fileno(), 0o644)
             os.fsync(handle.fileno())
@@ -480,6 +501,47 @@ def _write_memory(
                 pass
         raise
     return None
+
+
+def _encode_memory_payload(records: Sequence[DecisionMemoryRecord]) -> bytes:
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "records": [record.to_json_dict() for record in records],
+    }
+    return (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+
+
+def _bounded_memory_payload(
+    records: Sequence[DecisionMemoryRecord],
+    *,
+    max_records: int,
+    max_file_bytes: int,
+) -> tuple[tuple[DecisionMemoryRecord, ...], bytes]:
+    retained = tuple(records)[-_positive_limit(max_records, MAX_RECORDS) :]
+    encoded = _encode_memory_payload(retained)
+    if len(encoded) <= max_file_bytes:
+        return retained, encoded
+    if retained and len(_encode_memory_payload(retained[-1:])) > max_file_bytes:
+        raise OverflowError("decision memory record exceeds byte limit")
+    if not retained:
+        raise OverflowError("decision memory byte limit cannot contain schema")
+    low = 1
+    high = len(retained) - 1
+    while low < high:
+        removed = (low + high) // 2
+        candidate = retained[removed:]
+        if len(_encode_memory_payload(candidate)) <= max_file_bytes:
+            high = removed
+        else:
+            low = removed + 1
+    retained = retained[low:]
+    encoded = _encode_memory_payload(retained)
+    if len(encoded) > max_file_bytes:
+        raise OverflowError("decision memory publication exceeds byte limit")
+    return retained, encoded
 
 
 def _fsync_directory(path: Path) -> None:

@@ -4,9 +4,15 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
+from parking_spot_monitor.decision_memory_publication import (
+    publish_decision_memory_conflict_bytes,
+)
 from parking_spot_monitor.decision_memory_store import DecisionMemoryStore
 from parking_spot_monitor.operator_decision_memory import (
     _write_memory,
+    append_decision_memory_record,
     load_decision_memory,
     make_decision_memory_record,
 )
@@ -587,3 +593,105 @@ def test_newer_canonical_tail_wins_over_stale_full_conflict(
     assert {item.summary for item in loaded.records} == {
         f"canonical-{index}" for index in range(200)
     }
+
+
+def test_legacy_append_retries_conditional_publication_without_losing_external_write(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("baseline"),))
+    import parking_spot_monitor.operator_decision_memory as memory
+
+    real_exchange = memory._conditional_exchange
+    raced = False
+
+    def replace_before_exchange(source: Path, destination: Path) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            _write_memory(path, (_record("external"),))
+        real_exchange(source, destination)
+
+    monkeypatch.setattr(memory, "_conditional_exchange", replace_before_exchange)
+
+    assert append_decision_memory_record(path, _record("local"))
+    assert raced
+    assert [item.summary for item in load_decision_memory(path).records] == [
+        "external",
+        "local",
+    ]
+
+
+def test_legacy_append_clears_conflicts_only_after_incorporating_them(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    conflict = tmp_path / f".{path.name}.legacy.conflict"
+    _write_memory(path, (_record("canonical"),))
+    _write_memory(conflict, (_record("conflict"),))
+
+    assert append_decision_memory_record(path, _record("local"))
+
+    assert [item.summary for item in load_decision_memory(path).records] == [
+        "canonical",
+        "conflict",
+        "local",
+    ]
+    assert not list(tmp_path.glob(f".{path.name}.*.conflict"))
+
+
+def test_conflict_compaction_and_canonical_publication_are_byte_bounded(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    _write_memory(path, (_record("canonical"),))
+    large_details = {
+        f"outer-{outer}": {
+            f"inner-{inner}": "x" * 500
+            for inner in range(24)
+        }
+        for outer in range(12)
+    }
+    for index in range(8):
+        conflict = tmp_path / f".{path.name}.{index}.conflict"
+        _write_memory(
+            conflict,
+            (
+                make_decision_memory_record(
+                    "alert",
+                    observed_at=f"2026-07-30T12:00:{index:02d}Z",
+                    summary=f"large-{index}",
+                    details=large_details,
+                ),
+            ),
+        )
+        assert conflict.stat().st_size < 256_000
+
+    assert append_decision_memory_record(path, _record("local"))
+
+    loaded = load_decision_memory(path)
+    assert loaded.state == "available"
+    assert path.stat().st_size <= 256_000
+    assert all(item.stat().st_size <= 256_000 for item in tmp_path.glob(f".{path.name}.*.conflict"))
+    assert "local" in {item.summary for item in loaded.records}
+    assert not list(tmp_path.glob(f".{path.name}.*.conflict"))
+
+
+def test_oversized_conflict_publication_rejects_before_replacing_valid_source(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "operator-decision-memory.json"
+    conflict = tmp_path / f".{path.name}.valid.conflict"
+    _write_memory(conflict, (_record("preserved"),))
+    preserved = conflict.read_bytes()
+
+    with pytest.raises(OverflowError):
+        publish_decision_memory_conflict_bytes(
+            path,
+            b"x" * 256_001,
+            max_file_bytes=256_000,
+            replace=conflict,
+        )
+
+    assert conflict.read_bytes() == preserved

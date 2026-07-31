@@ -37,6 +37,7 @@ class DecisionMemoryStore:
         checkpoint_interval_seconds: float,
         checkpoint_max_pending_records: int,
         max_records: int = MAX_RECORDS,
+        max_file_bytes: int = MAX_MEMORY_FILE_BYTES,
         monotonic: Callable[[], float] = time.monotonic,
         logger: StructuredLogger | None = None,
     ) -> None:
@@ -48,17 +49,21 @@ class DecisionMemoryStore:
             checkpoint_max_pending_records, "checkpoint_max_pending_records"
         )
         self.max_records = positive_int(max_records, "max_records")
+        self.max_file_bytes = min(
+            positive_int(max_file_bytes, "max_file_bytes"),
+            MAX_MEMORY_FILE_BYTES,
+        )
         self._monotonic = monotonic
         self._logger = logger
         with _memory._MEMORY_WRITE_LOCK:
-            before = decision_memory_source_snapshot(self.path)
+            before = decision_memory_source_snapshot(self.path, self.max_file_bytes)
             loaded = _memory.load_decision_memory(
                 self.path,
                 max_records=self.max_records,
-                max_file_bytes=MAX_MEMORY_FILE_BYTES,
+                max_file_bytes=self.max_file_bytes,
                 logger=logger,
             )
-            after = decision_memory_source_snapshot(self.path)
+            after = decision_memory_source_snapshot(self.path, self.max_file_bytes)
         load_is_consistent = decision_memory_load_is_consistent(
             loaded.state,
             before,
@@ -146,17 +151,17 @@ class DecisionMemoryStore:
         candidate = tuple(self._records)
         conflicts_to_clear = ()
         try:
-            before = decision_memory_source_snapshot(self.path)
+            before = decision_memory_source_snapshot(self.path, self.max_file_bytes)
             if not before.available:
                 return self._defer_reconciliation("source-stat-unavailable")
             if self._reconcile_required or before.signature != self._signature:
                 external = _memory.load_decision_memory(
                     self.path,
                     max_records=self.max_records,
-                    max_file_bytes=MAX_MEMORY_FILE_BYTES,
+                    max_file_bytes=self.max_file_bytes,
                     logger=self._logger,
                 )
-                after = decision_memory_source_snapshot(self.path)
+                after = decision_memory_source_snapshot(self.path, self.max_file_bytes)
                 if external.state not in {"available", "missing"}:
                     return self._defer_reconciliation(
                         "source-load-unavailable", source_state=external.state
@@ -177,9 +182,25 @@ class DecisionMemoryStore:
                         max_records=self.max_records,
                     )
                     conflicts_to_clear = external.conflict_signatures
-                    conflicts_to_clear = _memory.compact_decision_memory_conflicts(self.path, candidate, conflicts_to_clear)
+            candidate, _encoded = _memory._bounded_memory_payload(
+                candidate,
+                max_records=self.max_records,
+                max_file_bytes=self.max_file_bytes,
+            )
+            if conflicts_to_clear:
+                conflicts_to_clear = _memory.compact_decision_memory_conflicts(
+                    self.path,
+                    candidate,
+                    conflicts_to_clear,
+                    max_records=self.max_records,
+                    max_file_bytes=self.max_file_bytes,
+                )
             publication = _memory._write_memory(
-                self.path, candidate, expected_signature=before.signature)
+                self.path,
+                candidate,
+                expected_signature=before.signature,
+                max_file_bytes=self.max_file_bytes,
+            )
         except Exception as exc:
             _memory._log(
                 self._logger,
@@ -189,7 +210,7 @@ class DecisionMemoryStore:
                 error_type=type(exc).__name__,
             )
             return False
-        written = decision_memory_source_snapshot(self.path)
+        written = decision_memory_source_snapshot(self.path, self.max_file_bytes)
         if (
             publication is None
             or not publication.published
@@ -200,7 +221,10 @@ class DecisionMemoryStore:
         self._records = deque(candidate, maxlen=self.max_records)
         self._signature = publication.signature
         self._dirty_records.clear()
-        self._reconcile_required = not _memory.clear_decision_memory_conflicts(conflicts_to_clear)
+        self._reconcile_required = not _memory.clear_decision_memory_conflicts(
+            conflicts_to_clear,
+            max_file_bytes=self.max_file_bytes,
+        )
         self._dirty = False
         self._pending_count = 0
         self._next_checkpoint_at = self._monotonic() + self.checkpoint_interval_seconds
