@@ -261,7 +261,7 @@ def test_runtime_frame_periodic_outcome_preserves_primary_and_final_capture_iden
     assert frame_result.escalated is True
 
 
-def test_runtime_loop_transition_verification_resets_periodic_deadline(
+def test_runtime_loop_transition_enters_occupied_cadence_without_periodic_verification(
     tmp_path: Path,
 ) -> None:
     settings = load_settings("config.yaml.example", environ=fake_environ())
@@ -270,6 +270,7 @@ def test_runtime_loop_transition_verification_resets_periodic_deadline(
             "runtime": settings.runtime.model_copy(
                 update={
                     "health_file": tmp_path / "health.json",
+                    "occupied_frame_interval_seconds": 8,
                     "debug_overlay_interval_seconds": 0,
                 }
             ),
@@ -281,6 +282,7 @@ def test_runtime_loop_transition_verification_resets_periodic_deadline(
     primary_path = tmp_path / "latest-primary.jpg"
     high_path = tmp_path / "latest-high.jpg"
     capture_profiles: list[str | None] = []
+    sleeps: list[float] = []
     primary_detection_count = 0
     save_runtime_state(
         tmp_path / "state.json",
@@ -364,7 +366,7 @@ def test_runtime_loop_transition_verification_resets_periodic_deadline(
         overlay=noop_overlay,
         detector_factory=lambda _settings: TransitionThenStableDetector(),
         matrix_delivery=None,
-        sleep=lambda _seconds: None,
+        sleep=sleeps.append,
         max_iterations=12,
         monotonic=lambda: next(timestamps),
         decision_memory_store=DecisionMemoryStore(
@@ -378,10 +380,9 @@ def test_runtime_loop_transition_verification_resets_periodic_deadline(
     assert capture_profiles == [
         None,
         "high_resolution",
-        *([None] * 10),
-        None,
-        "high_resolution",
+        *([None] * 11),
     ]
+    assert sleeps == [*([29.0] * 4), *([7.0] * 8)]
 
 
 def test_disabled_adaptive_polling_keeps_fixed_cadence_and_periodic_verification(

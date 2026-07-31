@@ -456,7 +456,7 @@ def test_runtime_loop_success_writes_health_and_uses_configured_frame_interval(
     assert_no_secret_leak(output)
 
 
-def test_runtime_loop_equal_active_and_stable_intervals_preserve_fixed_cadence(
+def test_runtime_loop_equal_active_and_stable_intervals_use_adaptive_deadline_pacing(
     tmp_path: Path,
 ) -> None:
     sleeps: list[float] = []
@@ -495,7 +495,7 @@ def test_runtime_loop_equal_active_and_stable_intervals_preserve_fixed_cadence(
     )
 
     assert exit_code == 0
-    assert sleeps == [2, 2]
+    assert sleeps == [1.0, 1.0]
 
 
 def test_runtime_loop_paces_successful_noop_matrix_command_polls_with_monotonic_clock(
