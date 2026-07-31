@@ -3,6 +3,112 @@ from __future__ import annotations
 from tests.support._matrix_outbox_delivery import *  # noqa: F403
 
 
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        "snapshot_copy_failed",
+        "snapshot_invalid_source",
+        "snapshot_metadata_failed",
+        "snapshot_resize_failed",
+    ],
+)
+def test_occupied_snapshot_preparation_failure_persists_and_drains_text_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: str,
+) -> None:
+    from parking_spot_monitor.matrix_alerts import occupied_spot_event_id
+
+    source = tmp_path / "occupied.jpg"
+    write_jpeg(source)
+    client = FakeMatrixClient()
+    stream = StringIO()
+    delivery = make_delivery(tmp_path, client, stream=stream)
+    event = occupied_event(source)
+
+    def fail_snapshot_enqueue(**_kwargs: object) -> object:
+        raise MatrixError(
+            "snapshot preparation failed bearer secret-must-not-persist",
+            error_type=error_type,
+        )
+
+    monkeypatch.setattr(delivery._snapshot_artifacts, "enqueue", fail_snapshot_enqueue)
+
+    record = delivery.enqueue_occupied_spot_alert(event)
+
+    assert record.state == "pending"
+    assert record.intent.event_id == occupied_spot_event_id(event)
+    assert record.phase_states == {"text": "pending"}
+    assert record.intent.metadata == {
+        "event_type": "occupancy-occupied-event",
+        "spot_id": "left_spot",
+        "observed_at": "2026-05-20T21:22:54Z",
+        "snapshot_degraded_reason": error_type,
+    }
+    result = delivery.drain_outbox(record_id=record.id)
+    assert result.delivered_count == 1
+    assert [call["kind"] for call in client.calls] == ["text"]
+    assert "secret-must-not-persist" not in stream.getvalue()
+    [persisted] = LocalOutbox(tmp_path / "matrix-outbox.json").list_records()
+    assert persisted.phase_states == {"text": "delivered"}
+
+
+def test_occupied_snapshot_fallback_does_not_replace_existing_durable_snapshot_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from parking_monitor.outbox import AlertIntent
+    from parking_spot_monitor.matrix_alerts import occupied_spot_event_id
+
+    source = tmp_path / "occupied.jpg"
+    write_jpeg(source)
+    delivery = make_delivery(tmp_path, FakeMatrixClient())
+    event = occupied_event(source)
+    event_id = occupied_spot_event_id(event)
+    existing = delivery.outbox.enqueue_with_phases(
+        AlertIntent(
+            event_id=event_id,
+            phase="text",
+            room_id=ROOM_ID,
+            body="Parking spot occupied: left_spot",
+            metadata={"event_type": "occupancy-occupied-event"},
+        ),
+        ("text", "upload", "image"),
+    )
+
+    def fail_after_durable_enqueue(**_kwargs: object) -> object:
+        raise MatrixError("resize failed", error_type="snapshot_resize_failed")
+
+    monkeypatch.setattr(delivery._snapshot_artifacts, "enqueue", fail_after_durable_enqueue)
+
+    record = delivery.enqueue_occupied_spot_alert(event)
+
+    assert record.id == existing.id
+    assert record.phase_states == {"text": "pending", "upload": "pending", "image": "pending"}
+    assert len(delivery.outbox.list_records()) == 1
+
+
+def test_occupied_text_fallback_does_not_swallow_outbox_persistence_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "occupied.jpg"
+    write_jpeg(source)
+    client = FakeMatrixClient()
+    delivery = make_delivery(tmp_path, client)
+
+    def fail_persistence(_intent: AlertIntent, _phases: object) -> object:
+        raise OSError("outbox persistence failed")
+
+    monkeypatch.setattr(delivery.outbox, "enqueue_with_phases", fail_persistence)
+
+    with pytest.raises(OSError, match="outbox persistence failed"):
+        delivery.enqueue_occupied_spot_alert(occupied_event(source))
+
+    assert client.calls == []
+    assert delivery.outbox.list_records() == []
+
+
 def test_open_alert_queues_image_outbox_record_without_network(tmp_path: Path) -> None:
     source = tmp_path / "latest.jpg"
     write_jpeg(source)

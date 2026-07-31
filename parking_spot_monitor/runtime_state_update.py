@@ -21,7 +21,10 @@ from parking_spot_monitor.runtime_frame_plan import build_runtime_frame_plan
 from parking_spot_monitor.runtime_health import safe_error_context as _safe_error_context
 from parking_spot_monitor.runtime_owner_vehicle_cache import OwnerVehicleSnapshotProvider
 from parking_spot_monitor.runtime_log_aggregation import RuntimeLogAggregator
-from parking_spot_monitor.runtime_vehicle_events import _record_vehicle_history_events
+from parking_spot_monitor.runtime_vehicle_events import (
+    _record_vehicle_history_events,
+    build_occupied_transition_alerts,
+)
 from parking_spot_monitor.state import RuntimeState, save_runtime_state
 from parking_spot_monitor.vehicle_history import VehicleHistoryArchive
 
@@ -118,7 +121,11 @@ def _update_runtime_state_for_frame(
         if matrix_error is not None:
             matrix_errors.append(matrix_error)
 
-    for occupied_alert in history_result.occupied_alerts:
+    occupied_alerts = build_occupied_transition_alerts(
+        frame_plan.occupancy_update.events,
+        history_result.occupied_alerts,
+    )
+    for occupied_alert in occupied_alerts:
         matrix_error = dispatch_matrix_event(
             matrix_delivery,
             str(occupied_alert.get("event_type", OCCUPIED_SPOT_EVENT_TYPE)),

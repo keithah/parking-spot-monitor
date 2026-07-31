@@ -218,6 +218,7 @@ def test_outbox_is_decomposed_behind_a_small_compatibility_facade() -> None:
         "src/parking_monitor/outbox.py": 450,
         "src/parking_monitor/outbox_derivatives.py": 80,
         "src/parking_monitor/matrix_outbox_delivery.py": 650,
+        "src/parking_monitor/matrix_outbox_occupied_fallback.py": 80,
         "src/parking_monitor/matrix_outbox_snapshots.py": 300,
         "src/parking_monitor/outbox_locking.py": 80,
         "src/parking_monitor/outbox_models.py": 500,

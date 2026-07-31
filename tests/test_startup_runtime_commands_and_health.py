@@ -525,6 +525,129 @@ def test_runtime_loop_vehicle_history_profile_failure_degrades_health_after_reco
     assert_no_secret_leak(output)
 
 
+def test_runtime_loop_vehicle_history_start_failure_still_queues_confirmed_occupied_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from parking_spot_monitor import __main__ as cli
+
+    delivery = FakeMatrixDelivery()
+
+    class FailingStartHistoryArchive:
+        def __init__(self, _root: Path, *, logger: StructuredLogger | None = None) -> None:
+            self.logger = logger
+
+        def health_snapshot(self) -> dict[str, Any]:
+            return {"archive_status": "test-double"}
+
+        def mutation_revision(self) -> int:
+            return 0
+
+        def start_session(self, event: object) -> object:
+            raise RuntimeError(f"history start denied token={SECRET_MARKER}")
+
+        def attach_occupied_images(self, **_kwargs: object) -> object:
+            raise AssertionError("images are not attached when start_session fails")
+
+        def match_or_create_profile(self, *, session_id: str) -> object:
+            raise AssertionError("profiles are not matched when start_session fails")
+
+    class SequencedDetector:
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            return [VehicleDetection(class_name="car", confidence=0.9, bbox=(1050, 210, 1280, 350))]
+
+    monkeypatch.setattr(cli, "VehicleHistoryArchive", FailingStartHistoryArchive)
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: SequencedDetector(),
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
+        sleep=lambda _seconds: None,
+        max_iterations=3,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    health = health_payload(tmp_path / "health.json")
+    assert exit_code == 0
+    assert runtime_state_payload(tmp_path / "state.json")["spots"]["right_spot"]["status"] == "occupied"
+    assert len(delivery.occupied_alerts) == 1
+    alert = delivery.occupied_alerts[0]
+    assert alert["event_type"] == "occupancy-occupied-event"
+    assert alert["spot_id"] == "right_spot"
+    assert alert["occupied_snapshot_path"] == str(tmp_path / "latest.jpg")
+    assert alert["event_id"].startswith("occupancy-occupied-event:right_spot:")
+    assert health["status"] == "degraded"
+    assert health["last_vehicle_history_error"]["action"] == "start"
+    assert '"event":"vehicle-history-record-failed"' in output
+    assert SECRET_MARKER not in json.dumps(health)
+    assert_no_secret_leak(output)
+
+
+def test_runtime_loop_vehicle_history_image_recovery_failure_still_queues_confirmed_occupied_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from parking_spot_monitor import __main__ as cli
+    from parking_spot_monitor.vehicle_history_images import VehicleHistoryImageError
+
+    delivery = FakeMatrixDelivery()
+
+    class FailingImageHistoryArchive:
+        def __init__(self, _root: Path, *, logger: StructuredLogger | None = None) -> None:
+            self.logger = logger
+
+        def health_snapshot(self) -> dict[str, Any]:
+            return {"archive_status": "test-double"}
+
+        def mutation_revision(self) -> int:
+            return 0
+
+        def start_session(self, event: object) -> object:
+            return type("SessionRecord", (), {"session_id": "session-right"})()
+
+        def attach_occupied_images(self, **_kwargs: object) -> object:
+            raise VehicleHistoryImageError("vehicle image recovery remains pending")
+
+        def match_or_create_profile(self, *, session_id: str) -> object:
+            raise AssertionError("profiles are not matched when image attachment fails")
+
+    class SequencedDetector:
+        def detect(self, frame_path: str | Path, *, confidence_threshold: float | None = None) -> list[VehicleDetection]:
+            return [VehicleDetection(class_name="car", confidence=0.9, bbox=(1050, 210, 1280, 350))]
+
+    monkeypatch.setattr(cli, "VehicleHistoryArchive", FailingImageHistoryArchive)
+
+    exit_code = _main(
+        ["--config", "config.yaml.example", "--data-dir", str(tmp_path)],
+        environ=fake_environ(),
+        capture=lambda _settings, _data_dir, **_kwargs: captured_frame(tmp_path, timestamp="2026-05-18T19:00:00Z"),
+        overlay=noop_overlay,
+        detector_factory=lambda _settings: SequencedDetector(),
+        matrix_delivery_factory=lambda _settings, _data_dir, _logger: delivery,
+        sleep=lambda _seconds: None,
+        max_iterations=3,
+        now=lambda: datetime(2026, 5, 18, 19, 0, tzinfo=timezone.utc),
+    )
+
+    output = combined_output(capsys)
+    health = health_payload(tmp_path / "health.json")
+    assert exit_code == 0
+    assert runtime_state_payload(tmp_path / "state.json")["spots"]["right_spot"]["status"] == "occupied"
+    assert len(delivery.occupied_alerts) == 1
+    alert = delivery.occupied_alerts[0]
+    assert alert["event_type"] == "occupancy-occupied-event"
+    assert alert["spot_id"] == "right_spot"
+    assert alert["occupied_snapshot_path"] == str(tmp_path / "latest.jpg")
+    assert alert["event_id"].startswith("occupancy-occupied-event:right_spot:")
+    assert health["status"] == "degraded"
+    assert health["last_vehicle_history_error"]["action"] == "attach-images"
+    assert health["last_vehicle_history_error"]["error_type"] == "VehicleHistoryImageError"
+    assert '"event":"vehicle-history-record-failed"' in output
+    assert_no_secret_leak(output)
+
+
 def test_runtime_loop_capture_failure_remains_down_with_prior_vehicle_history_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -39,8 +39,9 @@ def test_runtime_loop_vehicle_history_confirmed_occupied_creates_one_active_sess
     occupied_alert = delivery.occupied_alerts[0]
     assert occupied_alert["event_type"] == "occupancy-occupied-event"
     assert occupied_alert["spot_id"] == "left_spot"
+    assert occupied_alert["event_id"].startswith("occupancy-occupied-event:left_spot:")
     assert occupied_alert["session_id"]
-    assert occupied_alert["occupied_snapshot_path"] is not None
+    assert occupied_alert["occupied_snapshot_path"] == str(tmp_path / "latest.jpg")
     assert "occupied_crop_path" not in occupied_alert
     assert "candidate_summary" not in occupied_alert
     assert occupied_alert["vehicle_history_estimate"]["status"] == "insufficient_history"
@@ -84,6 +85,63 @@ def test_runtime_loop_vehicle_history_confirmed_occupied_creates_one_active_sess
     assert '"match_status":"new_profile"' in output
     assert '"action":"start"' in output
     assert_no_secret_leak(output)
+
+
+def test_frame_updates_without_history_archive_still_queue_one_confirmed_occupied_alert(
+    tmp_path: Path,
+) -> None:
+    from parking_spot_monitor.detection import SpotDetectionCandidate, SpotDetectionResult
+    from parking_spot_monitor.runtime_state_update import _update_runtime_state_for_frame
+
+    settings = load_settings("config.yaml.example", environ=fake_environ())
+    snapshot_path = tmp_path / "latest.jpg"
+    Image.new("RGB", (1458, 806), (20, 30, 40)).save(snapshot_path, format="JPEG")
+    candidate = SpotDetectionCandidate(
+        spot_id="right_spot",
+        class_name="car",
+        confidence=0.9,
+        bbox=(1050.0, 210.0, 1280.0, 350.0),
+        bbox_area_px=32_200.0,
+        centroid=(1165.0, 280.0),
+        overlap_ratio=1.0,
+        source_frame_path=str(snapshot_path),
+        source_timestamp="2026-05-18T19:00:00Z",
+    )
+    detection_result = DetectionFilterResult(
+        by_spot={
+            "left_spot": SpotDetectionResult(spot_id="left_spot", accepted=None, rejected=[]),
+            "right_spot": SpotDetectionResult(spot_id="right_spot", accepted=candidate, rejected=[]),
+        },
+        rejection_counts={},
+    )
+    delivery = FakeMatrixDelivery()
+    logger = StructuredLogger()
+    runtime_state = RuntimeState.default(["left_spot", "right_spot"])
+    owner_cache = OwnerVehicleRuntimeCache(tmp_path / "owner-vehicles.json", logger=logger)
+
+    for second in range(3):
+        update = _update_runtime_state_for_frame(
+            settings=settings,
+            runtime_state=runtime_state,
+            detection_result=detection_result,
+            observed_at=datetime(2026, 5, 18, 19, 0, second, tzinfo=timezone.utc),
+            snapshot_path=str(snapshot_path),
+            logger=logger,
+            matrix_delivery=delivery,
+            state_path=tmp_path / "state.json",
+            configured_spot_ids=["left_spot", "right_spot"],
+            owner_vehicle_snapshot_provider=owner_cache,
+            history_archive=None,
+        )
+        runtime_state = update.runtime_state
+
+    assert runtime_state.state_by_spot["right_spot"].status is OccupancyStatus.OCCUPIED
+    assert len(delivery.occupied_alerts) == 1
+    alert = delivery.occupied_alerts[0]
+    assert alert["event_type"] == "occupancy-occupied-event"
+    assert alert["spot_id"] == "right_spot"
+    assert alert["occupied_snapshot_path"] == str(snapshot_path)
+    assert alert["event_id"].startswith("occupancy-occupied-event:right_spot:")
 
 
 def test_runtime_loop_owner_vehicle_in_quiet_window_sends_deduped_alert(

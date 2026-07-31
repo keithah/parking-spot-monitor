@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Generic, TypeVar
@@ -11,6 +11,7 @@ from parking_spot_monitor.logging import StructuredLogger, redact_diagnostic_tex
 from parking_spot_monitor.matrix_alerts import (
     OCCUPIED_SPOT_EVENT_TYPE,
     OWNER_VEHICLE_QUIET_WINDOW_EVENT_TYPE,
+    occupied_spot_event_id,
     owner_vehicle_quiet_window_event_id,
 )
 from parking_spot_monitor.occupancy import OccupancyEvent, OccupancyEventType, OccupancyStatus
@@ -42,6 +43,30 @@ class VehicleHistoryEventResult:
 class _VehicleHistoryStepResult(Generic[_T]):
     value: _T | None
     errors: list[dict[str, Any]]
+
+
+def build_occupied_transition_alerts(
+    events: Sequence[OccupancyEvent], enriched_alerts: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    enriched_by_transition = {
+        (str(alert.get("spot_id", "")), str(alert.get("observed_at", ""))): alert for alert in enriched_alerts
+    }
+    alerts: list[dict[str, Any]] = []
+    for event in events:
+        if (event.event_type is not OccupancyEventType.STATE_CHANGED
+            or event.previous_status is OccupancyStatus.OCCUPIED
+            or event.new_status is not OccupancyStatus.OCCUPIED):
+            continue
+        enrichment = dict(enriched_by_transition.get((event.spot_id, str(event.observed_at)), {}))
+        base: dict[str, Any] = dict(
+            event_type=OCCUPIED_SPOT_EVENT_TYPE, spot_id=event.spot_id,
+            observed_at=event.observed_at, source_timestamp=event.source_timestamp,
+            occupied_snapshot_path=event.snapshot_path,
+        )
+        payload = base | enrichment | base
+        payload["event_id"] = occupied_spot_event_id(payload)
+        alerts.append(payload)
+    return alerts
 
 
 def _owner_vehicle_quiet_window_alerts(

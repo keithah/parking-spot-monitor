@@ -46,6 +46,7 @@ from parking_monitor.matrix_outbox_snapshots import (
     MatrixOutboxSnapshots,
     SNAPSHOT_ALERT_PHASES,
 )
+from parking_monitor.matrix_outbox_occupied_fallback import build_occupied_snapshot_fallback_intent
 from parking_spot_monitor.matrix_support import MatrixError
 
 _QUIET_WINDOW_EVENT_TYPES = frozenset({"quiet-window-upcoming", "quiet-window-started", "quiet-window-ended"})
@@ -284,14 +285,38 @@ class MatrixOutboxDelivery:
 
         event_id = occupied_spot_event_id(event)
         metadata = _occupied_alert_metadata(event)
-        return self._enqueue_snapshot_alert(
-            event=event,
-            event_id=event_id,
-            body=format_occupied_spot_alert(event),
-            metadata=metadata,
-            snapshot_source_path=str(metadata.get("occupied_snapshot_path", "")),
-            snapshot_event_type=OCCUPIED_SPOT_EVENT_TYPE,
-        )
+        body = format_occupied_spot_alert(event)
+        try:
+            return self._enqueue_snapshot_alert(
+                event=event,
+                event_id=event_id,
+                body=body,
+                metadata=metadata,
+                snapshot_source_path=str(metadata.get("occupied_snapshot_path", "")),
+                snapshot_event_type=OCCUPIED_SPOT_EVENT_TYPE,
+            )
+        except MatrixError as exc:
+            fallback_intent = build_occupied_snapshot_fallback_intent(
+                error_type=exc.diagnostics.get("error_type"),
+                event=event,
+                event_id=event_id,
+                room_id=self.room_id,
+                body=body,
+            )
+            if fallback_intent is None:
+                raise
+            existing = self.outbox.find_event_record(event_id)
+            if existing is not None:
+                self._wake_event.set()
+                return existing
+            record = self.outbox.enqueue_with_phases(fallback_intent, ("text",))
+            reason = fallback_intent.metadata["snapshot_degraded_reason"]
+            self._log(
+                "warning", "matrix-outbox-occupied-snapshot-degraded", item_id=record.id, event_id=event_id, snapshot_degraded_reason=reason
+            )
+            self._log("info", "matrix-outbox-enqueued", item_id=record.id, event_id=event_id, phase="text")
+            self._wake_event.set()
+            return record
 
     def enqueue_text_notice(self, event_name: str, event: Mapping[str, Any]) -> OutboxRecord:
         """Persist a text-only frame notice without performing Matrix network I/O."""
